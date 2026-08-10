@@ -10,6 +10,12 @@ use captastic_core::{
     PixelFormat, Rect, TimingProvenance,
 };
 use windows::core::{ComInterface, Error as WindowsError};
+use windows::Win32::Devices::Display::{
+    DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
+    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+    DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
+    DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS,
+};
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
@@ -1164,10 +1170,26 @@ struct OutputRecord {
     info: DisplayInfo,
 }
 
+#[derive(Clone, Debug)]
+struct DisplayConfigIdentity {
+    gdi_name: String,
+    persistent_id: DisplayId,
+    friendly_name: String,
+}
+
 fn enumerate_outputs() -> Result<Vec<OutputRecord>, CaptureError> {
     // SAFETY: The generic result is a supported DXGI factory interface and Windows initializes it.
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }
         .map_err(|error| map_windows_error("create_dxgi_factory", error))?;
+    let identities = match display_config_identities() {
+        Ok(identities) => identities,
+        Err(error) => {
+            log::warn!(
+                "persistent display identity query failed; using session-local output names: {error}"
+            );
+            Vec::new()
+        }
+    };
     let mut records = Vec::new();
     let mut adapter_index = 0_u32;
     loop {
@@ -1198,8 +1220,17 @@ fn enumerate_outputs() -> Result<Vec<OutputRecord>, CaptureError> {
                 .map_err(|error| map_windows_error("output_desc", error))?;
             if desc.AttachedToDesktop.as_bool() {
                 let bounds = rect_from_windows(desc.DesktopCoordinates)?;
-                let name = wide_array_to_string(&desc.DeviceName);
-                let id = DisplayId(format!("dxgi:{}:{}:{}", adapter_index, output_index, name));
+                let gdi_name = wide_array_to_string(&desc.DeviceName);
+                let identity = identities
+                    .iter()
+                    .find(|identity| identity.gdi_name.eq_ignore_ascii_case(&gdi_name));
+                let id = identity
+                    .map(|identity| identity.persistent_id.clone())
+                    .unwrap_or_else(|| persistent_display_id(&gdi_name));
+                let name = identity
+                    .filter(|identity| !identity.friendly_name.is_empty())
+                    .map(|identity| identity.friendly_name.clone())
+                    .unwrap_or(gdi_name);
                 records.push(OutputRecord {
                     adapter: adapter.clone(),
                     output: output1,
@@ -1219,6 +1250,123 @@ fn enumerate_outputs() -> Result<Vec<OutputRecord>, CaptureError> {
         adapter_index = adapter_index.saturating_add(1);
     }
     Ok(records)
+}
+
+fn display_config_identities() -> Result<Vec<DisplayConfigIdentity>, CaptureError> {
+    const MAX_ATTEMPTS: usize = 3;
+    for attempt in 0..MAX_ATTEMPTS {
+        let mut path_count = 0_u32;
+        let mut mode_count = 0_u32;
+        // SAFETY: Both counts are valid writable values and the query flag requests active paths.
+        unsafe {
+            GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count)
+        }
+        .map_err(|error| map_windows_error("display_config_buffer_sizes", error))?;
+        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
+        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
+        // SAFETY: The arrays have the capacities reported immediately above. The mutable counts
+        // describe their current lengths and are updated by Windows to the number of valid items.
+        let result = unsafe {
+            QueryDisplayConfig(
+                QDC_ONLY_ACTIVE_PATHS,
+                &mut path_count,
+                paths.as_mut_ptr(),
+                &mut mode_count,
+                modes.as_mut_ptr(),
+                None,
+            )
+        };
+        match result {
+            Ok(()) => {
+                paths.truncate(path_count as usize);
+                let mut identities = Vec::with_capacity(paths.len());
+                for path in paths {
+                    let source_name = display_config_source_name(&path)?;
+                    let target_name = display_config_target_name(&path)?;
+                    let monitor_path = wide_array_to_string(&target_name.monitorDevicePath);
+                    let friendly_name =
+                        wide_array_to_string(&target_name.monitorFriendlyDeviceName);
+                    let identity_material = if monitor_path.is_empty() {
+                        source_name.clone()
+                    } else {
+                        monitor_path
+                    };
+                    identities.push(DisplayConfigIdentity {
+                        gdi_name: source_name,
+                        persistent_id: persistent_display_id(&identity_material),
+                        friendly_name,
+                    });
+                }
+                return Ok(identities);
+            }
+            Err(error) if attempt + 1 < MAX_ATTEMPTS => {
+                log::debug!(
+                    "display identity query raced or failed transiently; retrying: {error}"
+                );
+            }
+            Err(error) => return Err(map_windows_error("query_display_config", error)),
+        }
+    }
+    unreachable!("display identity query loop always returns")
+}
+
+fn display_config_source_name(path: &DISPLAYCONFIG_PATH_INFO) -> Result<String, CaptureError> {
+    let mut name = DISPLAYCONFIG_SOURCE_DEVICE_NAME {
+        header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+            r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+            size: std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32,
+            adapterId: path.sourceInfo.adapterId,
+            id: path.sourceInfo.id,
+        },
+        ..Default::default()
+    };
+    // SAFETY: The packet header identifies the concrete structure and its exact initialized size.
+    let result = unsafe { DisplayConfigGetDeviceInfo(&mut name.header) };
+    if result != 0 {
+        return Err(display_config_error("display_config_source_name", result));
+    }
+    Ok(wide_array_to_string(&name.viewGdiDeviceName))
+}
+
+fn display_config_target_name(
+    path: &DISPLAYCONFIG_PATH_INFO,
+) -> Result<DISPLAYCONFIG_TARGET_DEVICE_NAME, CaptureError> {
+    let mut name = DISPLAYCONFIG_TARGET_DEVICE_NAME {
+        header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+            r#type: DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+            size: std::mem::size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32,
+            adapterId: path.targetInfo.adapterId,
+            id: path.targetInfo.id,
+        },
+        ..Default::default()
+    };
+    // SAFETY: The packet header identifies the concrete structure and its exact initialized size.
+    let result = unsafe { DisplayConfigGetDeviceInfo(&mut name.header) };
+    if result != 0 {
+        return Err(display_config_error("display_config_target_name", result));
+    }
+    Ok(name)
+}
+
+fn display_config_error(operation: &'static str, result: i32) -> CaptureError {
+    capture_error(
+        CaptureErrorKind::NativeFailure,
+        operation,
+        format!("Windows display configuration query failed with status {result}"),
+        true,
+        Some(i64::from(result)),
+    )
+}
+
+fn persistent_display_id(identity: &str) -> DisplayId {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in identity.bytes().map(|byte| byte.to_ascii_lowercase()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    DisplayId(format!("windows-monitor-{hash:016x}"))
 }
 
 struct AcquiredFrame {
@@ -1466,6 +1614,21 @@ mod tests {
     #[test]
     fn converts_wide_device_names() {
         assert_eq!(wide_array_to_string(&[65, 66, 0, 67]), "AB");
+    }
+
+    #[test]
+    fn persistent_display_ids_are_case_insensitive_and_device_specific() {
+        assert_eq!(
+            persistent_display_id(r"\\?\DISPLAY#DEL40A9#first"),
+            persistent_display_id(r"\\?\display#del40a9#FIRST")
+        );
+        assert_ne!(
+            persistent_display_id(r"\\?\DISPLAY#DEL40A9#first"),
+            persistent_display_id(r"\\?\DISPLAY#DEL40A9#second")
+        );
+        assert!(persistent_display_id("monitor")
+            .0
+            .starts_with("windows-monitor-"));
     }
 
     #[test]
