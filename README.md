@@ -156,4 +156,6 @@ Ctrl+C or `captastic stop` requests an orderly shutdown, unregisters the hotkey,
 
 For a smaller distributable binary without changing the profiled release build, use `cargo build --profile dist -p captastic-app`.
 
-See [outputs/Captastic-Specification.md](outputs/Captastic-Specification.md) for the complete implementation plan.
+See [ROADMAP.md](ROADMAP.md) for prioritized work after the Windows desktop milestone and
+[outputs/Captastic-Specification.md](outputs/Captastic-Specification.md) for the complete original
+implementation plan.
