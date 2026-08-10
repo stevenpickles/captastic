@@ -98,7 +98,7 @@ impl CaptureBackend for FakeBackend {
         if self
             .config
             .fail_every
-            .is_some_and(|n| n != 0 && self.attempts % n == 0)
+            .is_some_and(|n| n != 0 && self.attempts.is_multiple_of(n))
         {
             return Err(CaptureError::synthetic("configured deterministic failure"));
         }

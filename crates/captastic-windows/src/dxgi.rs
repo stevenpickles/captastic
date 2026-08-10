@@ -261,7 +261,7 @@ impl CaptureBackend for DxgiBackend {
                 Some(anchor_offset_ns.saturating_add(qpc_to_ns(qpc_delta, self.qpc_frequency)))
             };
 
-            if presentation_offset_ns.map_or(true, |offset| offset < 0) {
+            if presentation_offset_ns.is_none_or(|offset| offset < 0) {
                 acquired.release()?;
                 continue;
             }
@@ -652,7 +652,7 @@ impl DxgiBackend {
         &mut self,
         source_desc: D3D11_TEXTURE2D_DESC,
     ) -> Result<ID3D11Texture2D, CaptureError> {
-        let needs_rebuild = self.staging.as_ref().map_or(true, |staging| {
+        let needs_rebuild = self.staging.as_ref().is_none_or(|staging| {
             staging.width != source_desc.Width
                 || staging.height != source_desc.Height
                 || staging.format != source_desc.Format
