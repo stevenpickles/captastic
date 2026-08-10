@@ -52,6 +52,11 @@ cargo run --release -p captastic-app -- daemon --config captastic.example.toml
 Running Captastic without a subcommand starts the resident desktop capture daemon with the default
 configuration. The explicit `daemon` form remains available for scripts, diagnostics, and CLI
 overrides. A named per-session control event prevents more than one daemon instance from running.
+While the daemon is active, Captastic places an icon in the Windows notification area. Double-click
+the icon to capture, or right-click it to capture, pause/resume the global hotkey, open
+`captastic.toml`, open the persistent log, or exit cleanly. If Windows Explorer restarts, Captastic
+restores its notification icon automatically. Tray initialization failures are logged and do not
+disable the capture daemon.
 
 When `--config` is omitted, the daemon automatically loads
 `%USERPROFILE%\.captastic\captastic.toml` if it exists. The same file stores Captastic-managed UI

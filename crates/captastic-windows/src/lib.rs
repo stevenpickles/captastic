@@ -11,6 +11,8 @@ mod hotkey;
 #[cfg(windows)]
 mod overlay;
 #[cfg(windows)]
+mod tray;
+#[cfg(windows)]
 mod window_capture;
 
 #[cfg(windows)]
@@ -29,5 +31,7 @@ pub use overlay::{
     select_from_frozen_frame_with_controller, NativeWindowHandle, OverlayController,
     OverlaySelection, SelectionKind,
 };
+#[cfg(windows)]
+pub use tray::{open_path, TrayEvent, TrayIcon};
 #[cfg(windows)]
 pub use window_capture::materialize_selection;

@@ -1,8 +1,9 @@
 #![deny(unsafe_code)]
 
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::ErrorKind;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,37 @@ pub fn storage_directory() -> Option<PathBuf> {
 
 pub fn default_config_path() -> Option<PathBuf> {
     storage_directory().map(|path| path.join(CONFIG_FILE_NAME))
+}
+
+pub fn ensure_default_config() -> Result<PathBuf, ConfigError> {
+    let path = default_config_path().ok_or(ConfigError::HomeDirectoryUnavailable)?;
+    if path.exists() {
+        return Ok(path);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+    let contents = AppConfig::default().to_toml_pretty()?;
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => {
+            file.write_all(contents.as_bytes())
+                .map_err(|source| ConfigError::Write {
+                    path: path.display().to_string(),
+                    source,
+                })?
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+        Err(source) => {
+            return Err(ConfigError::Write {
+                path: path.display().to_string(),
+                source,
+            });
+        }
+    }
+    Ok(path)
 }
 
 fn storage_directory_from(user_profile: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
