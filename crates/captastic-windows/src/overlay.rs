@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
@@ -68,10 +68,14 @@ const UI_FONT_HEIGHT: i32 = 21;
 const MENU_WIDTH: i32 = 320;
 const MENU_HEIGHT: i32 = 164;
 const NO_TOOLBAR_POSITION: u64 = u64::MAX;
+const CAPTURE_TOOL_FULL_DISPLAY: u8 = 0;
+const CAPTURE_TOOL_WINDOW: u8 = 1;
+const CAPTURE_TOOL_REGION: u8 = 2;
 const IOSKELEY_MONO_MEDIUM: &[u8] = include_bytes!("../assets/fonts/IoskeleyMono-Medium.ttf");
 
 static LAST_TOOLBAR_POSITION: AtomicU64 = AtomicU64::new(NO_TOOLBAR_POSITION);
 static TOOLBAR_POSITION_LOADED: AtomicBool = AtomicBool::new(false);
+static LAST_CAPTURE_TOOL: AtomicU8 = AtomicU8::new(CAPTURE_TOOL_REGION);
 static LAST_CAPTURED_REGION: Mutex<Option<Rect>> = Mutex::new(None);
 
 thread_local! {
@@ -192,7 +196,9 @@ pub fn select_from_frozen_frame_with_controller(
     let toolbar_position = remembered_toolbar_position(surface.width, surface.height)
         .unwrap_or_else(|| ToolbarLayout::default_origin(surface.width, surface.height));
     let last_region = remembered_last_region(source);
-    let state = Box::new(OverlayState {
+    let tool = remembered_capture_tool();
+    let (selection, selection_kind) = initial_selection(tool, last_region, source);
+    let mut state = Box::new(OverlayState {
         source,
         surface,
         back_buffer,
@@ -204,15 +210,15 @@ pub fn select_from_frozen_frame_with_controller(
         hovered: None,
         anchor: None,
         dragging: false,
-        selection: None,
-        selection_kind: None,
+        selection,
+        selection_kind,
         selected_window: None,
         selected_window_frame: None,
         hovered_handle: None,
         resizing: None,
         moving_region: None,
         last_region,
-        tool: CaptureTool::Region,
+        tool,
         options_open: false,
         dim_background: true,
         hovered_control: None,
@@ -233,6 +239,9 @@ pub fn select_from_frozen_frame_with_controller(
         preparation_ns: duration_ns(preparation_started.elapsed()),
         window_overview_ns: None,
     });
+    if tool == CaptureTool::Window {
+        build_window_overview(&mut state);
+    }
     run_overlay(state, controller)
 }
 
@@ -356,6 +365,24 @@ enum CaptureTool {
     FullDisplay,
     Window,
     Region,
+}
+
+impl CaptureTool {
+    const fn from_selection_kind(kind: SelectionKind) -> Self {
+        match kind {
+            SelectionKind::Display => Self::FullDisplay,
+            SelectionKind::Region => Self::Region,
+            SelectionKind::Window => Self::Window,
+        }
+    }
+
+    const fn code(self) -> u8 {
+        match self {
+            Self::FullDisplay => CAPTURE_TOOL_FULL_DISPLAY,
+            Self::Window => CAPTURE_TOOL_WINDOW,
+            Self::Region => CAPTURE_TOOL_REGION,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -908,6 +935,37 @@ fn remembered_toolbar_position(client_width: i32, client_height: i32) -> Option<
     })
 }
 
+fn remembered_capture_tool() -> CaptureTool {
+    match LAST_CAPTURE_TOOL.load(Ordering::Acquire) {
+        CAPTURE_TOOL_FULL_DISPLAY => CaptureTool::FullDisplay,
+        CAPTURE_TOOL_WINDOW => CaptureTool::Window,
+        _ => CaptureTool::Region,
+    }
+}
+
+fn remember_capture_tool(kind: SelectionKind) {
+    LAST_CAPTURE_TOOL.store(
+        CaptureTool::from_selection_kind(kind).code(),
+        Ordering::Release,
+    );
+}
+
+fn initial_selection(
+    tool: CaptureTool,
+    last_region: Option<Rect>,
+    source: Rect,
+) -> (Option<Rect>, Option<SelectionKind>) {
+    match tool {
+        CaptureTool::FullDisplay => (Some(source), Some(SelectionKind::Display)),
+        CaptureTool::Window => (None, None),
+        CaptureTool::Region => {
+            let region = last_region.map(|region| fit_region_to_source(region, source));
+            let kind = region.map(|_| SelectionKind::Region);
+            (region, kind)
+        }
+    }
+}
+
 fn remembered_last_region(source: Rect) -> Option<Rect> {
     LAST_CAPTURED_REGION
         .lock()
@@ -1450,6 +1508,7 @@ fn confirm_and_close(hwnd: HWND, state: &mut OverlayState) {
             .as_ref()
             .map(|frame| frame.metadata.source_rect)
             .unwrap_or(rect);
+        remember_capture_tool(kind);
         if kind == SelectionKind::Region {
             remember_last_region(rect);
             state.last_region = Some(rect);
@@ -3899,6 +3958,62 @@ mod tests {
                 width: 320,
                 height: 180,
             }
+        );
+    }
+
+    #[test]
+    fn capture_tools_match_confirmed_selection_kinds() {
+        assert_eq!(
+            CaptureTool::from_selection_kind(SelectionKind::Display),
+            CaptureTool::FullDisplay
+        );
+        assert_eq!(
+            CaptureTool::from_selection_kind(SelectionKind::Region),
+            CaptureTool::Region
+        );
+        assert_eq!(
+            CaptureTool::from_selection_kind(SelectionKind::Window),
+            CaptureTool::Window
+        );
+    }
+
+    #[test]
+    fn region_mode_restores_the_last_confirmed_rectangle() {
+        let source = Rect {
+            x: 0,
+            y: 0,
+            width: 1_920,
+            height: 1_080,
+        };
+        let region = Rect {
+            x: 120,
+            y: 80,
+            width: 640,
+            height: 360,
+        };
+        assert_eq!(
+            initial_selection(CaptureTool::Region, Some(region), source),
+            (Some(region), Some(SelectionKind::Region))
+        );
+    }
+
+    #[test]
+    fn window_mode_starts_without_a_stale_rectangle() {
+        let source = Rect {
+            x: 0,
+            y: 0,
+            width: 1_920,
+            height: 1_080,
+        };
+        let region = Rect {
+            x: 120,
+            y: 80,
+            width: 640,
+            height: 360,
+        };
+        assert_eq!(
+            initial_selection(CaptureTool::Window, Some(region), source),
+            (None, None)
         );
     }
 
