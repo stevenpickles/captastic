@@ -20,7 +20,7 @@ function Wait-CaptasticStopped {
             throw "Captastic status failed with exit code $LASTEXITCODE."
         }
         switch ($statusResult.status) {
-            'stopped' {
+            'not_running' {
                 return
             }
             'running' {
