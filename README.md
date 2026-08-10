@@ -69,6 +69,23 @@ captastic startup status --json
 captastic startup disable
 ```
 
+## Install and release packages
+
+Tagged releases and manually dispatched release workflows produce a
+`captastic-<version>-windows-x86_64.zip` archive plus a SHA-256 checksum. Extract the archive and
+run the current-user installer from PowerShell:
+
+```powershell
+.\install.ps1
+.\install.ps1 -StartWithWindows
+```
+
+The installer copies the CLI and console-free desktop launcher to
+`%LOCALAPPDATA%\Programs\Captastic`, creates a Start Menu shortcut, and starts the tray application.
+It does not require administrator privileges. Run the installed `uninstall.ps1` to stop Captastic,
+remove login startup and installed files, and preserve `~/.captastic` by default. Pass
+`-RemoveSettings` only when configuration and logs should also be deleted.
+
 When `--config` is omitted, the daemon automatically loads
 `%USERPROFILE%\.captastic\captastic.toml` if it exists. The same file stores Captastic-managed UI
 state under `[ui]`, including the toolbar position, last confirmed capture tool, and last confirmed
