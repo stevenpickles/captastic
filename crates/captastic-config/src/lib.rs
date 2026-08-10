@@ -30,6 +30,39 @@ fn storage_directory_from(user_profile: Option<PathBuf>, home: Option<PathBuf>) 
         .map(|path| path.join(".captastic"))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureTool {
+    FullDisplay,
+    Window,
+    Region,
+}
+
+impl CaptureTool {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::FullDisplay => "full_display",
+            Self::Window => "window",
+            Self::Region => "region",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureRegion {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CaptureHistory {
+    pub tool: Option<CaptureTool>,
+    pub region: Option<CaptureRegion>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AppConfig {
@@ -170,6 +203,15 @@ impl AppConfig {
                     .to_owned(),
             ));
         }
+        if self
+            .ui
+            .last_region
+            .is_some_and(|region| region.width == 0 || region.height == 0)
+        {
+            return Err(ConfigError::InvalidValue(
+                "ui.last_region width and height must be greater than zero".to_owned(),
+            ));
+        }
         Ok(())
     }
 
@@ -216,6 +258,62 @@ fn update_overlay_position(source: &str, x: i32, y: i32) -> Result<String, Confi
     };
     document["ui"]["overlay_x"] = toml_edit::value(i64::from(x));
     document["ui"]["overlay_y"] = toml_edit::value(i64::from(y));
+    Ok(document.to_string())
+}
+
+pub fn load_capture_history() -> Result<CaptureHistory, ConfigError> {
+    let config = AppConfig::load_default()?;
+    Ok(CaptureHistory {
+        tool: config.ui.last_capture_tool,
+        region: config.ui.last_region,
+    })
+}
+
+pub fn save_capture_history(
+    tool: CaptureTool,
+    region: Option<CaptureRegion>,
+) -> Result<(), ConfigError> {
+    let path = default_config_path().ok_or(ConfigError::HomeDirectoryUnavailable)?;
+    let source = match fs::read_to_string(&path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
+        Err(source) => {
+            return Err(ConfigError::Read {
+                path: path.display().to_string(),
+                source,
+            });
+        }
+    };
+    let updated = update_capture_history(&source, tool, region)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+    fs::write(&path, updated).map_err(|source| ConfigError::Write {
+        path: path.display().to_string(),
+        source,
+    })
+}
+
+fn update_capture_history(
+    source: &str,
+    tool: CaptureTool,
+    region: Option<CaptureRegion>,
+) -> Result<String, ConfigError> {
+    let mut document = if source.trim().is_empty() {
+        toml_edit::Document::new()
+    } else {
+        source.parse::<toml_edit::Document>()?
+    };
+    document["ui"]["last_capture_tool"] = toml_edit::value(tool.as_str());
+    if let Some(region) = region {
+        document["ui"]["last_region"]["x"] = toml_edit::value(i64::from(region.x));
+        document["ui"]["last_region"]["y"] = toml_edit::value(i64::from(region.y));
+        document["ui"]["last_region"]["width"] = toml_edit::value(i64::from(region.width));
+        document["ui"]["last_region"]["height"] = toml_edit::value(i64::from(region.height));
+    }
     Ok(document.to_string())
 }
 
@@ -356,6 +454,10 @@ pub struct UiConfig {
     pub overlay_x: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overlay_y: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_capture_tool: Option<CaptureTool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_region: Option<CaptureRegion>,
 }
 
 impl Default for LoggingConfig {
@@ -447,6 +549,41 @@ mod tests {
     }
 
     #[test]
+    fn capture_history_update_preserves_comments_and_the_previous_region() {
+        let source = "# keep this comment\n[logging]\nlevel = \"debug\"\n\n[ui]\nlast_capture_tool = \"region\"\n\n[ui.last_region]\nx = 120\ny = 80\nwidth = 640\nheight = 360\n";
+        let updated = update_capture_history(source, CaptureTool::Window, None)
+            .expect("updated capture history");
+        assert!(updated.contains("# keep this comment"));
+        assert!(updated.contains("level = \"debug\""));
+        let config: AppConfig = toml::from_str(&updated).expect("valid Captastic config");
+        assert_eq!(config.ui.last_capture_tool, Some(CaptureTool::Window));
+        assert_eq!(
+            config.ui.last_region,
+            Some(CaptureRegion {
+                x: 120,
+                y: 80,
+                width: 640,
+                height: 360,
+            })
+        );
+    }
+
+    #[test]
+    fn capture_history_update_records_a_confirmed_region() {
+        let region = CaptureRegion {
+            x: -100,
+            y: 40,
+            width: 960,
+            height: 540,
+        };
+        let updated = update_capture_history("", CaptureTool::Region, Some(region))
+            .expect("updated capture history");
+        let config: AppConfig = toml::from_str(&updated).expect("valid Captastic config");
+        assert_eq!(config.ui.last_capture_tool, Some(CaptureTool::Region));
+        assert_eq!(config.ui.last_region, Some(region));
+    }
+
+    #[test]
     fn unknown_fields_are_rejected() {
         let error = toml::from_str::<AppConfig>("schema_version = 1\nsurprise = true")
             .expect_err("unknown field should fail");
@@ -483,6 +620,21 @@ mod tests {
         ));
         config.logging.max_file_bytes = 5 * 1_024 * 1_024;
         config.logging.retained_files = 0;
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidValue(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_an_empty_saved_region() {
+        let mut config = AppConfig::default();
+        config.ui.last_region = Some(CaptureRegion {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 100,
+        });
         assert!(matches!(
             config.validate(),
             Err(ConfigError::InvalidValue(_))
