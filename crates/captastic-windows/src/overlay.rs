@@ -59,7 +59,7 @@ const MIN_REGION_SIZE: i64 = 8;
 const DIMENSION_LABEL_HEIGHT: i32 = 34;
 const REGION_CURSOR_SIZE: u32 = 64;
 const REGION_CURSOR_CENTER: i32 = REGION_CURSOR_SIZE as i32 / 2;
-const TOOLBAR_WIDTH: i32 = 664;
+const TOOLBAR_WIDTH: i32 = 600;
 const TOOLBAR_HEIGHT: i32 = 82;
 const TOOLBAR_BOTTOM_MARGIN: i32 = 36;
 const TOOLBAR_CORNER_RADIUS: i32 = 18;
@@ -397,7 +397,6 @@ enum ToolbarControl {
     FullDisplay,
     Window,
     Region,
-    LastRegion,
     Options,
     Capture,
     DimBackground,
@@ -426,7 +425,6 @@ struct ToolbarLayout {
     full_display: UiRect,
     window: UiRect,
     region: UiRect,
-    last_region: UiRect,
     options: UiRect,
     capture: UiRect,
     menu: UiRect,
@@ -848,22 +846,16 @@ impl ToolbarLayout {
                 right: left + 240,
                 bottom: top + 72,
             },
-            last_region: UiRect {
-                left: left + 240,
-                top: top + 10,
-                right: left + 304,
-                bottom: top + 72,
-            },
             options: UiRect {
-                left: left + 334,
+                left: left + 270,
                 top: top + 10,
-                right: left + 466,
+                right: left + 402,
                 bottom: top + 72,
             },
             capture: UiRect {
-                left: left + 482,
+                left: left + 418,
                 top: top + 10,
-                right: left + 648,
+                right: left + 584,
                 bottom: top + 72,
             },
             dim_background: UiRect {
@@ -910,8 +902,6 @@ impl ToolbarLayout {
             Some(ToolbarControl::Window)
         } else if self.region.contains(point) {
             Some(ToolbarControl::Region)
-        } else if self.last_region.contains(point) {
-            Some(ToolbarControl::LastRegion)
         } else if self.options.contains(point) {
             Some(ToolbarControl::Options)
         } else if self.capture.contains(point) {
@@ -1320,7 +1310,6 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                     }
                     ToolbarControl::Window => activate_tool(state, CaptureTool::Window),
                     ToolbarControl::Region => activate_tool(state, CaptureTool::Region),
-                    ToolbarControl::LastRegion => activate_last_region(state),
                     ToolbarControl::Options => state.options_open = !state.options_open,
                     ToolbarControl::Capture => {
                         confirm_and_close(hwnd, state);
@@ -2562,12 +2551,11 @@ fn draw_toolbar(state: &OverlayState) {
     draw_tool_button(device, layout.full_display, CaptureTool::FullDisplay, state);
     draw_tool_button(device, layout.window, CaptureTool::Window, state);
     draw_tool_button(device, layout.region, CaptureTool::Region, state);
-    draw_last_region_button(device, layout.last_region, state);
     draw_lines(
         device,
         &[
-            (layout.bounds.left + 317, layout.bounds.top + 17),
-            (layout.bounds.left + 317, layout.bounds.bottom - 17),
+            (layout.bounds.left + 253, layout.bounds.top + 17),
+            (layout.bounds.left + 253, layout.bounds.bottom - 17),
         ],
         rgb(92, 92, 98),
         1,
@@ -2660,19 +2648,6 @@ fn draw_tool_button(device: HDC, bounds: UiRect, tool: CaptureTool, state: &Over
     }
 }
 
-fn draw_last_region_button(device: HDC, bounds: UiRect, state: &OverlayState) {
-    let enabled = state.last_region.is_some();
-    if state.hovered_control == Some(ToolbarControl::LastRegion) {
-        draw_round_box(device, bounds, rgb(58, 58, 63), rgb(58, 58, 63), 8);
-    }
-    let color = if enabled {
-        rgb(245, 245, 247)
-    } else {
-        rgb(128, 128, 134)
-    };
-    draw_last_region_icon(device, bounds, color);
-}
-
 fn draw_hover_tooltip(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
     if state.options_open {
         return;
@@ -2683,13 +2658,6 @@ fn draw_hover_tooltip(device: HDC, state: &OverlayState, layout: ToolbarLayout) 
         }
         Some(ToolbarControl::Window) => (layout.window, "Capture a window".to_owned()),
         Some(ToolbarControl::Region) => (layout.region, "Select a region".to_owned()),
-        Some(ToolbarControl::LastRegion) => {
-            let value = state.last_region.map_or_else(
-                || "Last region — none captured yet".to_owned(),
-                |region| format!("Last region — {} × {} px", region.width, region.height),
-            );
-            (layout.last_region, value)
-        }
         Some(ToolbarControl::Options) => (layout.options, "Capture options".to_owned()),
         Some(ToolbarControl::Capture) => {
             let value = if state.selection.is_some() {
@@ -2849,37 +2817,6 @@ fn draw_region_icon(device: HDC, bounds: UiRect, color: COLORREF) {
     ] {
         draw_lines(device, &points, color, 2);
     }
-}
-
-fn draw_last_region_icon(device: HDC, bounds: UiRect, color: COLORREF) {
-    let left = bounds.left + 15;
-    let top = bounds.top + 15;
-    let right = left + 31;
-    let bottom = top + 28;
-    for points in [
-        [(left, top + 7), (left, top), (left + 7, top)],
-        [(right - 7, top), (right, top), (right, top + 7)],
-        [(right, bottom - 7), (right, bottom), (right - 7, bottom)],
-        [(left + 7, bottom), (left, bottom), (left, bottom - 7)],
-    ] {
-        draw_lines(device, &points, color, 2);
-    }
-    draw_lines(
-        device,
-        &[
-            (left + 8, top + 12),
-            (left + 15, top + 7),
-            (left + 23, top + 10),
-        ],
-        color,
-        2,
-    );
-    draw_lines(
-        device,
-        &[(left + 8, top + 12), (left + 9, top + 5)],
-        color,
-        2,
-    );
 }
 
 fn draw_camera_icon(device: HDC, left: i32, top: i32, color: COLORREF) {
@@ -3304,7 +3241,8 @@ fn activate_tool(state: &mut OverlayState, tool: CaptureTool) {
     state.dragging = false;
     state.resizing = None;
     state.moving_region = None;
-    if state.tool != tool {
+    let tool_changed = state.tool != tool;
+    if tool_changed {
         state.selection = None;
         state.selection_kind = None;
         state.selected_window = None;
@@ -3322,26 +3260,12 @@ fn activate_tool(state: &mut OverlayState, tool: CaptureTool) {
             state.selected_window_frame = None;
         }
         CaptureTool::Window => build_window_overview(state),
+        CaptureTool::Region if tool_changed => {
+            (state.selection, state.selection_kind) =
+                initial_selection(CaptureTool::Region, state.last_region, state.source);
+        }
         CaptureTool::Region => {}
     }
-}
-
-fn activate_last_region(state: &mut OverlayState) {
-    let Some(region) = state.last_region else {
-        return;
-    };
-    state.anchor = None;
-    state.dragging = false;
-    state.resizing = None;
-    state.moving_region = None;
-    state.tool = CaptureTool::Region;
-    state.options_open = false;
-    state.selection = Some(fit_region_to_source(region, state.source));
-    state.selection_kind = Some(SelectionKind::Region);
-    state.selected_window = None;
-    state.selected_window_frame = None;
-    state.hovered = None;
-    state.hovered_handle = None;
 }
 
 fn rect_from_points(source: Rect, first: POINT, second: POINT) -> Option<Rect> {
@@ -4040,16 +3964,6 @@ mod tests {
                 false,
             ),
             Some(ToolbarControl::FullDisplay)
-        );
-        assert_eq!(
-            layout.hit_test(
-                POINT {
-                    x: layout.last_region.left + 4,
-                    y: layout.last_region.top + 4,
-                },
-                false,
-            ),
-            Some(ToolbarControl::LastRegion)
         );
         assert_eq!(
             layout.hit_test(
