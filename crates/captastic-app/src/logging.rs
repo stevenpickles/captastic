@@ -1,3 +1,4 @@
+#[cfg(windows)]
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -205,14 +206,17 @@ pub fn init(config: &LoggingConfig) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+#[cfg(windows)]
 pub fn path() -> Option<&'static Path> {
     LOG_PATH.get().map(PathBuf::as_path)
 }
 
+#[cfg(windows)]
 pub fn error(arguments: fmt::Arguments<'_>) {
     log::error!("{arguments}");
 }
 
+#[cfg(windows)]
 pub fn warn(arguments: fmt::Arguments<'_>) {
     log::warn!("{arguments}");
 }

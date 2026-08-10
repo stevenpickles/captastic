@@ -1,16 +1,25 @@
+#[cfg(windows)]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(windows)]
 use std::sync::{mpsc, Arc};
+#[cfg(windows)]
 use std::thread;
+#[cfg(windows)]
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
 use captastic_config::AppConfig;
+#[cfg(windows)]
 use captastic_core::{
     validate_event_order, CaptureError, CaptureErrorKind, CaptureId, CaptureMode, CaptureRequest,
     CaptureSource, CpuFrame, CursorMode, DisplayId, EventRecorder, NativeFrame, PerfEventKind,
 };
+#[cfg(windows)]
 use serde_json::json;
 
-use crate::cli::{DaemonArgs, ModeArg};
+use crate::cli::DaemonArgs;
+#[cfg(windows)]
+use crate::cli::ModeArg;
 use crate::error::AppError;
 
 #[cfg(windows)]
@@ -621,12 +630,14 @@ pub fn run(_args: DaemonArgs) -> Result<(), AppError> {
     ))
 }
 
+#[cfg(windows)]
 #[derive(Debug)]
 enum CaptureCommand {
     Trigger(TriggerEvent),
     Shutdown,
 }
 
+#[cfg(windows)]
 #[derive(Debug)]
 struct TriggerEvent {
     received_at: Instant,
@@ -634,10 +645,12 @@ struct TriggerEvent {
     source: &'static str,
 }
 
+#[cfg(windows)]
 fn duration_ns(start: Instant, end: Instant) -> u64 {
     u64::try_from(end.saturating_duration_since(start).as_nanos()).unwrap_or(u64::MAX)
 }
 
+#[cfg(windows)]
 fn ns_to_ms(ns: u64) -> f64 {
     ns as f64 / 1_000_000.0
 }

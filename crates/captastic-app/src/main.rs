@@ -149,9 +149,14 @@ fn capture(args: cli::CaptureArgs) -> Result<(), AppError> {
     recorder.record(request.id, PerfEventKind::TriggerEnqueued, 0);
     recorder.record(request.id, PerfEventKind::TriggerDequeued, 0);
     let outcome = backend.capture(&request, &mut recorder)?;
-    let mut frame = outcome.frame;
+    let frame = outcome.frame;
+    #[cfg(windows)]
+    let mut frame = frame;
     let native_frame = outcome.native_frame;
+    #[cfg(windows)]
     let mut selection_value = None;
+    #[cfg(not(windows))]
+    let selection_value: Option<serde_json::Value> = None;
     if args.selection {
         #[cfg(windows)]
         {
@@ -251,7 +256,10 @@ fn capture(args: cli::CaptureArgs) -> Result<(), AppError> {
             ));
         }
     }
+    #[cfg(windows)]
     let mut clipboard_value = None;
+    #[cfg(not(windows))]
+    let clipboard_value: Option<serde_json::Value> = None;
     if args.clipboard {
         #[cfg(windows)]
         {
@@ -466,6 +474,7 @@ fn ns_to_ms(ns: u64) -> f64 {
     ns as f64 / 1_000_000.0
 }
 
+#[cfg(windows)]
 fn duration_ns(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
