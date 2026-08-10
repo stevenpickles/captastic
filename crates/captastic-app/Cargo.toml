@@ -1,0 +1,26 @@
+[package]
+name = "captastic-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "captastic"
+path = "src/main.rs"
+
+[dependencies]
+anstream.workspace = true
+clap.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+captastic-config = { path = "../captastic-config" }
+captastic-core = { path = "../captastic-core" }
+thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+captastic-windows = { path = "../captastic-windows" }
+
+[lints]
+workspace = true

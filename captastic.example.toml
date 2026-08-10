@@ -1,0 +1,53 @@
+schema_version = 1
+
+[daemon]
+backend = "dxgi"
+display = "primary"
+trigger_queue_capacity = 4
+
+[hotkey]
+binding = "Ctrl+Shift+F9"
+repeat = "ignore"
+
+[capture]
+mode = "latest"
+fresh_timeout_ms = 100
+max_frame_age_ms = 0
+cpu_frame = true
+cursor = "exclude"
+buffer_slots = 3
+fake_width = 64
+fake_height = 64
+fake_native_delay_us = 250
+fake_readback_delay_us = 250
+fake_frame_age_us = 1000
+
+[selection]
+enabled = true
+queue_capacity = 1
+
+[clipboard]
+enabled = true
+queue_capacity = 1
+
+[output]
+enabled = false
+format = "png"
+queue_capacity = 2
+
+[metrics]
+enabled = true
+ring_capacity = 10000
+raw_events = false
+
+[logging]
+level = "info"
+format = "compact"
+# file = "C:/Users/you/.captastic/logs/captastic.log"
+max_file_bytes = 5242880
+retained_files = 3
+
+# Captastic maintains these values when the overlay toolbar is moved.
+[ui]
+# overlay_x = 640
+# overlay_y = 920

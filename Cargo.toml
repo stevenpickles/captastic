@@ -1,0 +1,45 @@
+[workspace]
+members = [
+    "crates/captastic-app",
+    "crates/captastic-config",
+    "crates/captastic-core",
+    "crates/captastic-windows",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97.1"
+license = "MIT OR Apache-2.0"
+authors = ["Captastic contributors"]
+
+[workspace.dependencies]
+anstream = "=0.6.5"
+clap = { version = "=4.4.14", features = ["derive"] }
+crossbeam-channel = "=0.5.8"
+log = { version = "=0.4.20", features = ["std"] }
+serde = { version = "=1.0.195", features = ["derive"] }
+serde_json = "=1.0.111"
+thiserror = "=1.0.56"
+toml = "=0.7.4"
+toml_edit = "=0.19.10"
+windows = "=0.51.1"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+debug = 1
+lto = "thin"
+codegen-units = 1
+
+[profile.dist]
+inherits = "release"
+debug = 0
+strip = "symbols"
