@@ -46,6 +46,10 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    Startup {
+        #[command(subcommand)]
+        command: StartupCommand,
+    },
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -147,6 +151,16 @@ pub enum ConfigCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum StartupCommand {
+    Enable,
+    Disable,
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +179,17 @@ mod tests {
         let cli =
             Cli::try_parse_from(["captastic", "status", "--json"]).expect("explicit CLI command");
         assert!(matches!(cli.command, Some(Command::Status { json: true })));
+    }
+
+    #[test]
+    fn startup_management_is_an_explicit_cli_workflow() {
+        let cli = Cli::try_parse_from(["captastic", "startup", "status", "--json"])
+            .expect("startup status command");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Startup {
+                command: StartupCommand::Status { json: true }
+            })
+        ));
     }
 }

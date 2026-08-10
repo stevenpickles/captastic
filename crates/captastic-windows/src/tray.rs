@@ -19,22 +19,24 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, LoadIconW, PostMessageW,
     PostQuitMessage, PostThreadMessageW, RegisterClassW, RegisterWindowMessageW,
     SetForegroundWindow, SetWindowLongPtrW, TrackPopupMenu, TranslateMessage, UnregisterClassW,
-    CREATESTRUCTW, GWLP_USERDATA, HMENU, HWND_MESSAGE, IDI_APPLICATION, MF_GRAYED, MF_SEPARATOR,
-    MF_STRING, MSG, SW_SHOWNORMAL, TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, WM_APP, WM_COMMAND,
-    WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_QUIT,
-    WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
+    CREATESTRUCTW, GWLP_USERDATA, HMENU, HWND_MESSAGE, IDI_APPLICATION, MB_ICONERROR, MB_OK,
+    MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, SW_SHOWNORMAL, TPM_BOTTOMALIGN,
+    TPM_RIGHTBUTTON, WM_APP, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NCCREATE,
+    WM_NCDESTROY, WM_NULL, WM_QUIT, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
 };
 
 const CLASS_NAME: PCWSTR = w!("CaptasticTrayWindow-v1");
 const WINDOW_NAME: PCWSTR = w!("Captastic");
 const TASKBAR_CREATED_NAME: PCWSTR = w!("TaskbarCreated");
 const TRAY_CALLBACK: u32 = WM_APP + 1;
+const TRAY_SET_STARTUP: u32 = WM_APP + 2;
 const TRAY_ICON_ID: u32 = 1;
 const COMMAND_CAPTURE: usize = 1_001;
 const COMMAND_PAUSE: usize = 1_002;
 const COMMAND_CONFIG: usize = 1_003;
 const COMMAND_LOGS: usize = 1_004;
-const COMMAND_EXIT: usize = 1_005;
+const COMMAND_STARTUP: usize = 1_005;
+const COMMAND_EXIT: usize = 1_006;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TrayEvent {
@@ -42,32 +44,35 @@ pub enum TrayEvent {
     PausedChanged(bool),
     OpenConfig,
     OpenLogs,
+    ToggleStartup,
     Exit,
 }
 
 pub struct TrayIcon {
     receiver: Receiver<TrayEvent>,
     thread_id: u32,
+    hwnd: isize,
     join: Option<JoinHandle<()>>,
 }
 
 impl TrayIcon {
-    pub fn start() -> Result<Self, CaptureError> {
+    pub fn start(startup_enabled: bool) -> Result<Self, CaptureError> {
         let (event_sender, receiver) = mpsc::sync_channel(8);
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let join = thread::Builder::new()
             .name("captastic-tray".to_owned())
             .spawn(move || {
-                if let Err(error) = run_tray(event_sender, &ready_sender) {
+                if let Err(error) = run_tray(event_sender, startup_enabled, &ready_sender) {
                     let _ = ready_sender.send(Err(error.clone()));
                     log::error!("native tray stopped with an error: {error}");
                 }
             })
             .map_err(|error| tray_error("spawn_tray_thread", error.to_string()))?;
         match ready_receiver.recv() {
-            Ok(Ok(thread_id)) => Ok(Self {
+            Ok(Ok((thread_id, hwnd))) => Ok(Self {
                 receiver,
                 thread_id,
+                hwnd,
                 join: Some(join),
             }),
             Ok(Err(error)) => {
@@ -83,6 +88,19 @@ impl TrayIcon {
 
     pub fn try_recv(&self) -> Option<TrayEvent> {
         self.receiver.try_recv().ok()
+    }
+
+    pub fn set_startup_enabled(&self, enabled: bool) -> Result<(), CaptureError> {
+        // SAFETY: hwnd identifies the live hidden tray window owned by the tray thread.
+        unsafe {
+            PostMessageW(
+                HWND(self.hwnd),
+                TRAY_SET_STARTUP,
+                WPARAM(usize::from(enabled)),
+                LPARAM(0),
+            )
+        }
+        .map_err(|error| native_error("update_startup_menu", error))
     }
 
     pub fn stop(mut self) -> Result<(), CaptureError> {
@@ -133,9 +151,23 @@ pub fn open_path(path: &Path) -> Result<(), CaptureError> {
     Ok(())
 }
 
+pub fn show_error_dialog(message: &str) {
+    let text: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: text is null-terminated for the modal call and the title is a static wide string.
+    let _ = unsafe {
+        windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
+            HWND(0),
+            PCWSTR(text.as_ptr()),
+            w!("Captastic"),
+            MB_OK | MB_ICONERROR,
+        )
+    };
+}
+
 fn run_tray(
     event_sender: SyncSender<TrayEvent>,
-    ready_sender: &SyncSender<Result<u32, CaptureError>>,
+    startup_enabled: bool,
+    ready_sender: &SyncSender<Result<(u32, isize), CaptureError>>,
 ) -> Result<(), CaptureError> {
     // SAFETY: No module name requests the current executable module.
     let module = unsafe { GetModuleHandleW(None) }
@@ -163,6 +195,7 @@ fn run_tray(
     let state = Box::new(TrayState {
         event_sender,
         paused: false,
+        startup_enabled,
         icon,
         taskbar_created,
     });
@@ -202,7 +235,7 @@ fn run_tray(
     }
     // SAFETY: Called on the tray thread after its message queue and hidden window exist.
     let thread_id = unsafe { GetCurrentThreadId() };
-    if ready_sender.send(Ok(thread_id)).is_err() {
+    if ready_sender.send(Ok((thread_id, hwnd.0))).is_err() {
         delete_tray_icon(hwnd);
         // SAFETY: hwnd is the live hidden window on this thread.
         let _ = unsafe { DestroyWindow(hwnd) };
@@ -243,6 +276,7 @@ fn run_tray(
 struct TrayState {
     event_sender: SyncSender<TrayEvent>,
     paused: bool,
+    startup_enabled: bool,
     icon: windows::Win32::UI::WindowsAndMessaging::HICON,
     taskbar_created: u32,
 }
@@ -300,7 +334,7 @@ fn tray_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPAR
             if notification == WM_LBUTTONDBLCLK && !state.paused {
                 let _ = state.event_sender.try_send(TrayEvent::Capture);
             } else if notification == WM_RBUTTONUP || notification == WM_CONTEXTMENU {
-                if let Err(error) = show_context_menu(hwnd, state.paused) {
+                if let Err(error) = show_context_menu(hwnd, state.paused, state.startup_enabled) {
                     log::warn!("failed to show tray menu: {error}");
                 }
             }
@@ -328,11 +362,18 @@ fn tray_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPAR
                 COMMAND_LOGS => {
                     let _ = state.event_sender.try_send(TrayEvent::OpenLogs);
                 }
+                COMMAND_STARTUP => {
+                    let _ = state.event_sender.try_send(TrayEvent::ToggleStartup);
+                }
                 COMMAND_EXIT => {
                     let _ = state.event_sender.try_send(TrayEvent::Exit);
                 }
                 _ => {}
             }
+            LRESULT(0)
+        }
+        TRAY_SET_STARTUP => {
+            state.startup_enabled = wparam.0 != 0;
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -404,7 +445,7 @@ fn tray_data(
     data
 }
 
-fn show_context_menu(hwnd: HWND, paused: bool) -> Result<(), CaptureError> {
+fn show_context_menu(hwnd: HWND, paused: bool, startup_enabled: bool) -> Result<(), CaptureError> {
     // SAFETY: Creates an empty popup menu owned by this function.
     let menu =
         unsafe { CreatePopupMenu() }.map_err(|error| native_error("create_tray_menu", error))?;
@@ -430,6 +471,21 @@ fn show_context_menu(hwnd: HWND, paused: bool) -> Result<(), CaptureError> {
         // SAFETY: menu and static labels are live for each call.
         unsafe { AppendMenuW(menu, MF_STRING, COMMAND_LOGS, w!("Open Logs")) }
             .map_err(|error| native_error("append_logs_menu", error))?;
+        let startup_flags = if startup_enabled {
+            MF_STRING | MF_CHECKED
+        } else {
+            MF_STRING
+        };
+        // SAFETY: menu and static label are live for the call.
+        unsafe {
+            AppendMenuW(
+                menu,
+                startup_flags,
+                COMMAND_STARTUP,
+                w!("Start with Windows"),
+            )
+        }
+        .map_err(|error| native_error("append_startup_menu", error))?;
         // SAFETY: A separator ignores its command and text parameters.
         unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) }
             .map_err(|error| native_error("append_second_separator", error))?;

@@ -355,7 +355,16 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             return Err(error.into());
         }
     };
-    let tray = match captastic_windows::TrayIcon::start() {
+    let startup_enabled = match captastic_windows::startup_command() {
+        Ok(command) => command.is_some(),
+        Err(error) => {
+            crate::logging::warn(format_args!(
+                "failed to read launch-at-login state: {error}"
+            ));
+            false
+        }
+    };
+    let tray = match captastic_windows::TrayIcon::start(startup_enabled) {
         Ok(tray) => Some(tray),
         Err(error) => {
             crate::logging::warn(format_args!(
@@ -446,6 +455,9 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                             }
                             captastic_windows::TrayEvent::OpenConfig => open_config_from_tray(),
                             captastic_windows::TrayEvent::OpenLogs => open_logs_from_tray(),
+                            captastic_windows::TrayEvent::ToggleStartup => {
+                                toggle_startup_from_tray(tray)
+                            }
                             captastic_windows::TrayEvent::Exit => {
                                 tray_shutdown_requested = true;
                             }
@@ -524,6 +536,47 @@ fn open_logs_from_tray() {
     if let Err(error) = captastic_windows::open_path(path) {
         crate::logging::warn(format_args!("failed to open persistent log: {error}"));
     }
+}
+
+#[cfg(windows)]
+fn toggle_startup_from_tray(tray: &captastic_windows::TrayIcon) {
+    let result = match captastic_windows::startup_command() {
+        Ok(Some(_)) => captastic_windows::disable_startup().map(|_| false),
+        Ok(None) => desktop_launcher_path()
+            .map_err(|error| captastic_core::CaptureError {
+                kind: CaptureErrorKind::SourceUnavailable,
+                backend: "windows-startup",
+                operation: "locate_desktop_launcher",
+                message: error.to_string(),
+                retryable: false,
+                native_code: None,
+            })
+            .and_then(|path| captastic_windows::enable_startup(&path).map(|()| true)),
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(enabled) => {
+            if let Err(error) = tray.set_startup_enabled(enabled) {
+                crate::logging::warn(format_args!(
+                    "launch-at-login changed but the tray menu did not update: {error}"
+                ));
+            }
+            log::info!(
+                "launch at login {} from the notification area",
+                if enabled { "enabled" } else { "disabled" }
+            );
+        }
+        Err(error) => crate::logging::warn(format_args!(
+            "failed to change launch-at-login state: {error}"
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn desktop_launcher_path() -> Result<std::path::PathBuf, std::io::Error> {
+    let mut path = std::env::current_exe()?;
+    path.set_file_name("captastic-desktop.exe");
+    Ok(path)
 }
 
 #[cfg(windows)]

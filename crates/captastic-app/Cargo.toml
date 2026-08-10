@@ -9,6 +9,10 @@ license.workspace = true
 name = "captastic"
 path = "src/main.rs"
 
+[[bin]]
+name = "captastic-desktop"
+path = "src/bin/captastic-desktop.rs"
+
 [dependencies]
 anstream.workspace = true
 clap.workspace = true
@@ -21,6 +25,7 @@ thiserror.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 captastic-windows = { path = "../captastic-windows" }
+windows = { workspace = true, features = ["Win32_System_Threading"] }
 
 [lints]
 workspace = true
