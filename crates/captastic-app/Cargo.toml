@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+build = "build.rs"
 
 [[bin]]
 name = "captastic"
@@ -26,6 +27,9 @@ thiserror.workspace = true
 [target.'cfg(windows)'.dependencies]
 captastic-windows = { path = "../captastic-windows" }
 windows = { workspace = true, features = ["Win32_System_Threading"] }
+
+[build-dependencies]
+winresource = { version = "=0.1.31", default-features = false }
 
 [lints]
 workspace = true

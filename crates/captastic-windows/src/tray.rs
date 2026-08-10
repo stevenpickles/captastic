@@ -19,10 +19,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, LoadIconW, PostMessageW,
     PostQuitMessage, PostThreadMessageW, RegisterClassW, RegisterWindowMessageW,
     SetForegroundWindow, SetWindowLongPtrW, TrackPopupMenu, TranslateMessage, UnregisterClassW,
-    CREATESTRUCTW, GWLP_USERDATA, HMENU, HWND_MESSAGE, IDI_APPLICATION, MB_ICONERROR, MB_OK,
-    MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, SW_SHOWNORMAL, TPM_BOTTOMALIGN,
-    TPM_RIGHTBUTTON, WM_APP, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NCCREATE,
-    WM_NCDESTROY, WM_NULL, WM_QUIT, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
+    CREATESTRUCTW, GWLP_USERDATA, HMENU, HWND_MESSAGE, MB_ICONERROR, MB_OK, MF_CHECKED, MF_GRAYED,
+    MF_SEPARATOR, MF_STRING, MSG, SW_SHOWNORMAL, TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, WM_APP,
+    WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NCCREATE, WM_NCDESTROY, WM_NULL,
+    WM_QUIT, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
 };
 
 const CLASS_NAME: PCWSTR = w!("CaptasticTrayWindow-v1");
@@ -31,6 +31,7 @@ const TASKBAR_CREATED_NAME: PCWSTR = w!("TaskbarCreated");
 const TRAY_CALLBACK: u32 = WM_APP + 1;
 const TRAY_SET_STARTUP: u32 = WM_APP + 2;
 const TRAY_ICON_ID: u32 = 1;
+const APPLICATION_ICON_RESOURCE_ID: usize = 1;
 const COMMAND_CAPTURE: usize = 1_001;
 const COMMAND_PAUSE: usize = 1_002;
 const COMMAND_CONFIG: usize = 1_003;
@@ -173,8 +174,8 @@ fn run_tray(
     let module = unsafe { GetModuleHandleW(None) }
         .map_err(|error| native_error("get_tray_module", error))?;
     let instance = HINSTANCE(module.0);
-    // SAFETY: IDI_APPLICATION is a shared system icon resource.
-    let icon = unsafe { LoadIconW(None, IDI_APPLICATION) }
+    // SAFETY: Resource ID 1 is embedded into each Captastic executable at build time.
+    let icon = unsafe { LoadIconW(instance, PCWSTR(APPLICATION_ICON_RESOURCE_ID as *const u16)) }
         .map_err(|error| native_error("load_tray_icon", error))?;
     // SAFETY: The registered system message name is static for the process lifetime.
     let taskbar_created = unsafe { RegisterWindowMessageW(TASKBAR_CREATED_NAME) };
