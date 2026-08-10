@@ -13,6 +13,14 @@ cargo test --workspace
 cargo run -p captastic-app -- benchmark --backend fake --iterations 500 --json
 ```
 
+## Continuous integration
+
+GitHub Actions checks formatting, rejects compiler and Clippy warnings, runs the workspace tests,
+and performs release builds on Windows and Ubuntu. A separate Windows job instruments the workspace
+with LLVM source coverage and uploads a browsable `captastic-coverage-html` artifact. Download that
+artifact from the workflow run and open `index.html` to inspect line, function, and region coverage.
+Interactive desktop and clipboard tests remain ignored in hosted CI because they require a live user session.
+
 ## Useful commands
 
 ```powershell

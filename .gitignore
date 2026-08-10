@@ -1,4 +1,5 @@
 /target
 /work
+/coverage
 *.jsonl
 benchmark-results/
