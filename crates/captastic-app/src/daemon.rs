@@ -1,5 +1,5 @@
 #[cfg(windows)]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(windows)]
 use std::sync::{mpsc, Arc};
 #[cfg(windows)]
@@ -315,11 +315,17 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         AppError::BackendUnavailable(format!("capture worker ended during startup: {error}"))
     })??;
     let dropped = Arc::new(AtomicU64::new(0));
+    let paused = Arc::new(AtomicBool::new(false));
     let callback_sender = command_sender.clone();
     let callback_dropped = dropped.clone();
+    let callback_paused = paused.clone();
     let hotkey = match captastic_windows::HotkeyListener::start(
         captastic_windows::HotkeySpec::ctrl_shift_f9(),
         move |received_at| {
+            if callback_paused.load(Ordering::Acquire) {
+                log::debug!("capture hotkey ignored while Captastic is paused");
+                return;
+            }
             let trigger = TriggerEvent {
                 received_at,
                 enqueued_at: Instant::now(),
@@ -349,6 +355,24 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             return Err(error.into());
         }
     };
+    let startup_enabled = match captastic_windows::startup_command() {
+        Ok(command) => command.is_some(),
+        Err(error) => {
+            crate::logging::warn(format_args!(
+                "failed to read launch-at-login state: {error}"
+            ));
+            false
+        }
+    };
+    let tray = match captastic_windows::TrayIcon::start(startup_enabled) {
+        Ok(tray) => Some(tray),
+        Err(error) => {
+            crate::logging::warn(format_args!(
+                "native tray is unavailable; daemon will continue without it: {error}"
+            ));
+            None
+        }
+    };
 
     let ready_value = json!({
         "schema_version": 1,
@@ -360,6 +384,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         "clipboard_queue_capacity": args.clipboard.then_some(args.clipboard_queue_capacity),
         "selection": args.selection,
         "selection_queue_capacity": args.selection.then_some(args.selection_queue_capacity),
+        "tray": tray.is_some(),
         "log_file": crate::logging::path().map(|path| path.display().to_string()),
     });
     if args.json {
@@ -396,6 +421,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     }
 
     let mut shutdown_sent = false;
+    let mut tray_shutdown_requested = false;
     loop {
         match done_receiver.recv_timeout(Duration::from_millis(50)) {
             Ok(result) => {
@@ -403,7 +429,46 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                 break;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if (console_shutdown.requested() || daemon_control.requested()) && !shutdown_sent {
+                if let Some(tray) = tray.as_ref() {
+                    while let Some(event) = tray.try_recv() {
+                        match event {
+                            captastic_windows::TrayEvent::Capture => {
+                                let received_at = Instant::now();
+                                let trigger = TriggerEvent {
+                                    received_at,
+                                    enqueued_at: Instant::now(),
+                                    source: "tray",
+                                };
+                                if command_sender
+                                    .try_send(CaptureCommand::Trigger(trigger))
+                                    .is_err()
+                                {
+                                    dropped.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            captastic_windows::TrayEvent::PausedChanged(value) => {
+                                paused.store(value, Ordering::Release);
+                                log::info!(
+                                    "Captastic {} from the notification area",
+                                    if value { "paused" } else { "resumed" }
+                                );
+                            }
+                            captastic_windows::TrayEvent::OpenConfig => open_config_from_tray(),
+                            captastic_windows::TrayEvent::OpenLogs => open_logs_from_tray(),
+                            captastic_windows::TrayEvent::ToggleStartup => {
+                                toggle_startup_from_tray(tray)
+                            }
+                            captastic_windows::TrayEvent::Exit => {
+                                tray_shutdown_requested = true;
+                            }
+                        }
+                    }
+                }
+                if (console_shutdown.requested()
+                    || daemon_control.requested()
+                    || tray_shutdown_requested)
+                    && !shutdown_sent
+                {
                     match command_sender.try_send(CaptureCommand::Shutdown) {
                         Ok(()) => shutdown_sent = true,
                         Err(mpsc::TrySendError::Full(_)) => {}
@@ -421,6 +486,9 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                 ));
             }
         }
+    }
+    if let Some(tray) = tray {
+        tray.stop()?;
     }
     hotkey.stop()?;
     let _ = command_sender.send(CaptureCommand::Shutdown);
@@ -443,6 +511,72 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         log::info!("daemon stopped cleanly");
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn open_config_from_tray() {
+    match captastic_config::ensure_default_config() {
+        Ok(path) => {
+            if let Err(error) = captastic_windows::open_path(&path) {
+                crate::logging::warn(format_args!("failed to open configuration: {error}"));
+            }
+        }
+        Err(error) => crate::logging::warn(format_args!(
+            "failed to prepare the default configuration: {error}"
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn open_logs_from_tray() {
+    let Some(path) = crate::logging::path() else {
+        crate::logging::warn(format_args!("persistent log path is unavailable"));
+        return;
+    };
+    if let Err(error) = captastic_windows::open_path(path) {
+        crate::logging::warn(format_args!("failed to open persistent log: {error}"));
+    }
+}
+
+#[cfg(windows)]
+fn toggle_startup_from_tray(tray: &captastic_windows::TrayIcon) {
+    let result = match captastic_windows::startup_command() {
+        Ok(Some(_)) => captastic_windows::disable_startup().map(|_| false),
+        Ok(None) => desktop_launcher_path()
+            .map_err(|error| captastic_core::CaptureError {
+                kind: CaptureErrorKind::SourceUnavailable,
+                backend: "windows-startup",
+                operation: "locate_desktop_launcher",
+                message: error.to_string(),
+                retryable: false,
+                native_code: None,
+            })
+            .and_then(|path| captastic_windows::enable_startup(&path).map(|()| true)),
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(enabled) => {
+            if let Err(error) = tray.set_startup_enabled(enabled) {
+                crate::logging::warn(format_args!(
+                    "launch-at-login changed but the tray menu did not update: {error}"
+                ));
+            }
+            log::info!(
+                "launch at login {} from the notification area",
+                if enabled { "enabled" } else { "disabled" }
+            );
+        }
+        Err(error) => crate::logging::warn(format_args!(
+            "failed to change launch-at-login state: {error}"
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn desktop_launcher_path() -> Result<std::path::PathBuf, std::io::Error> {
+    let mut path = std::env::current_exe()?;
+    path.set_file_name("captastic-desktop.exe");
+    Ok(path)
 }
 
 #[cfg(windows)]

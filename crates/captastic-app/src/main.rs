@@ -19,7 +19,7 @@ use captastic_core::{
     EventRecorder, PerfEventKind,
 };
 use clap::Parser;
-use cli::{BenchmarkArgs, Cli, Command, ConfigCommand, ModeArg};
+use cli::{BenchmarkArgs, Cli, Command, ConfigCommand, ModeArg, StartupCommand};
 use error::AppError;
 use serde_json::json;
 
@@ -54,13 +54,15 @@ fn main() {
 
 fn resolve_logging_config(cli: &Cli) -> LoggingConfig {
     let mut logging = match &cli.command {
-        Command::Daemon(args) => {
+        Some(Command::Daemon(args)) => {
             let config = match args.config.as_deref() {
                 Some(path) => AppConfig::load(path),
                 None => AppConfig::load_default(),
             };
             config.map_or_else(|_| LoggingConfig::default(), |config| config.logging)
         }
+        None => AppConfig::load_default()
+            .map_or_else(|_| LoggingConfig::default(), |config| config.logging),
         _ => LoggingConfig::default(),
     };
     if let Some(path) = &cli.log_file {
@@ -76,7 +78,7 @@ fn resolve_logging_config(cli: &Cli) -> LoggingConfig {
 }
 
 fn run(cli: Cli) -> Result<(), AppError> {
-    match cli.command {
+    match cli.command.unwrap_or_default() {
         Command::Daemon(args) => daemon::run(args),
         Command::Status { json } => status(json),
         Command::Stop => stop(),
@@ -87,8 +89,56 @@ fn run(cli: Cli) -> Result<(), AppError> {
         Command::Capture(args) => capture(args),
         Command::Benchmark(args) => benchmark(args),
         Command::Doctor { json } => doctor(json),
+        Command::Startup { command } => startup(command),
         Command::Config { command } => config(command),
     }
+}
+
+#[cfg(windows)]
+fn startup(command: StartupCommand) -> Result<(), AppError> {
+    match command {
+        StartupCommand::Enable => {
+            let launcher = desktop_launcher_path()?;
+            captastic_windows::enable_startup(&launcher)?;
+            println!("Captastic will start with Windows");
+            Ok(())
+        }
+        StartupCommand::Disable => {
+            if captastic_windows::disable_startup()? {
+                println!("Captastic will no longer start with Windows");
+            } else {
+                println!("Captastic startup was already disabled");
+            }
+            Ok(())
+        }
+        StartupCommand::Status { json } => {
+            let command = captastic_windows::startup_command()?;
+            print_value(
+                json,
+                &json!({
+                    "schema_version": 1,
+                    "enabled": command.is_some(),
+                    "command": command,
+                }),
+            )
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn startup(_command: StartupCommand) -> Result<(), AppError> {
+    Err(AppError::BackendUnavailable(
+        "launch at login is currently available only on Windows".to_owned(),
+    ))
+}
+
+#[cfg(windows)]
+fn desktop_launcher_path() -> Result<std::path::PathBuf, AppError> {
+    let mut path = std::env::current_exe().map_err(|error| {
+        AppError::BackendUnavailable(format!("failed to locate Captastic executable: {error}"))
+    })?;
+    path.set_file_name("captastic-desktop.exe");
+    Ok(path)
 }
 
 #[cfg(windows)]

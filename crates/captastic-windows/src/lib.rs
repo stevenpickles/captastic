@@ -11,6 +11,10 @@ mod hotkey;
 #[cfg(windows)]
 mod overlay;
 #[cfg(windows)]
+mod startup;
+#[cfg(windows)]
+mod tray;
+#[cfg(windows)]
 mod window_capture;
 
 #[cfg(windows)]
@@ -29,5 +33,9 @@ pub use overlay::{
     select_from_frozen_frame_with_controller, NativeWindowHandle, OverlayController,
     OverlaySelection, SelectionKind,
 };
+#[cfg(windows)]
+pub use startup::{disable_startup, enable_startup, startup_command};
+#[cfg(windows)]
+pub use tray::{open_path, show_error_dialog, TrayEvent, TrayIcon};
 #[cfg(windows)]
 pub use window_capture::materialize_selection;

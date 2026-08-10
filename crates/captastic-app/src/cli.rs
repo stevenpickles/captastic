@@ -6,7 +6,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 #[command(
     name = "captastic",
     version,
-    about = "Headless screenshot latency prototype"
+    about = "Fast native screenshot capture for Windows"
 )]
 pub struct Cli {
     /// Persistent log file (defaults to %USERPROFILE%\.captastic\logs\captastic.log on Windows).
@@ -23,7 +23,7 @@ pub struct Cli {
     #[arg(long, global = true, value_parser = ["compact", "json"])]
     pub log_format: Option<String>,
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -46,13 +46,23 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    Startup {
+        #[command(subcommand)]
+        command: StartupCommand,
+    },
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
     },
 }
 
-#[derive(Debug, Args)]
+impl Default for Command {
+    fn default() -> Self {
+        Self::Daemon(DaemonArgs::default())
+    }
+}
+
+#[derive(Debug, Args, Default)]
 pub struct DaemonArgs {
     /// Configuration file (defaults to %USERPROFILE%\.captastic\captastic.toml when present).
     #[arg(long)]
@@ -139,4 +149,47 @@ pub enum ConfigCommand {
         #[arg(long)]
         path: PathBuf,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum StartupCommand {
+    Enable,
+    Disable,
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_arguments_resolve_to_the_desktop_daemon() {
+        let cli = Cli::try_parse_from(["captastic"]).expect("zero-argument desktop launch");
+        assert!(matches!(
+            cli.command.unwrap_or_default(),
+            Command::Daemon(_)
+        ));
+    }
+
+    #[test]
+    fn explicit_commands_remain_available() {
+        let cli =
+            Cli::try_parse_from(["captastic", "status", "--json"]).expect("explicit CLI command");
+        assert!(matches!(cli.command, Some(Command::Status { json: true })));
+    }
+
+    #[test]
+    fn startup_management_is_an_explicit_cli_workflow() {
+        let cli = Cli::try_parse_from(["captastic", "startup", "status", "--json"])
+            .expect("startup status command");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Startup {
+                command: StartupCommand::Status { json: true }
+            })
+        ));
+    }
 }

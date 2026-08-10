@@ -2,7 +2,7 @@
 
 Captastic is a Windows-first Rust prototype for measuring extremely fast screenshot capture and providing a native selection-to-clipboard workflow.
 
-The DXGI backend supports two deliberately different modes. `latest` is the resident-daemon default: an idle acquisition loop keeps a GPU texture updated so a hotkey can snapshot it without waiting for the desktop to change. `fresh` waits for a desktop frame presented after the trigger and is intended for controlled latency experiments. Both modes report frame age/timing provenance, and BGRA8 CPU readback uses preallocated staging and CPU buffers. By default, the resident daemon opens a native frozen-frame overlay after capture. Its floating toolbar provides full-display, window, resizable-region, and last-region modes, an Options menu, and a Capture button. Results are published to the Windows clipboard as uncompressed DIBV5 images plus a registered PNG compatibility representation. Region selections crop the frozen desktop; window selections retain the native window identity and render that window independently so other windows covering it are not copied.
+The DXGI backend supports two deliberately different modes. `latest` is the resident-daemon default: an idle acquisition loop keeps a GPU texture updated so a hotkey can snapshot it without waiting for the desktop to change. `fresh` waits for a desktop frame presented after the trigger and is intended for controlled latency experiments. Both modes report frame age/timing provenance, and BGRA8 CPU readback uses preallocated staging and CPU buffers. By default, the resident daemon opens a native frozen-frame overlay after capture. Its floating toolbar provides full-display, window, and resizable-region modes, an Options menu, and a Capture button. Results are published to the Windows clipboard as uncompressed DIBV5 images plus a registered PNG compatibility representation. Region selections crop the frozen desktop and automatically restore the last confirmed rectangle; window selections retain the native window identity and render that window independently so other windows covering it are not copied.
 
 ## Build and verify
 
@@ -44,9 +44,47 @@ cargo run --release -p captastic-app -- benchmark --backend dxgi --mode fresh --
 Run the resident foreground daemon and press `Ctrl+Shift+F9`:
 
 ```powershell
+cargo run --release -p captastic-app
 cargo run --release -p captastic-app -- daemon --backend dxgi --mode latest --cpu-frame true
 cargo run --release -p captastic-app -- daemon --config captastic.example.toml
 ```
+
+Running Captastic without a subcommand starts the resident desktop capture daemon with the default
+configuration. The explicit `daemon` form remains available for scripts, diagnostics, and CLI
+overrides. A named per-session control event prevents more than one daemon instance from running.
+While the daemon is active, Captastic places an icon in the Windows notification area. Double-click
+the icon to capture, or right-click it to capture, pause/resume the global hotkey, open
+`captastic.toml`, open the persistent log, toggle **Start with Windows**, or exit cleanly. If Windows
+Explorer restarts, Captastic restores its notification icon automatically. Tray initialization
+failures are logged and do not disable the capture daemon.
+
+Release builds also contain `captastic-desktop.exe`, a console-free launcher intended for shortcuts
+and login startup. It starts the sibling `captastic.exe` daemon without creating a terminal window
+and exits immediately; launching it while the daemon is already running is a no-op. Launch at login
+can also be managed explicitly:
+
+```powershell
+captastic startup enable
+captastic startup status --json
+captastic startup disable
+```
+
+## Install and release packages
+
+Tagged releases and manually dispatched release workflows produce a
+`captastic-<version>-windows-x86_64.zip` archive plus a SHA-256 checksum. Extract the archive and
+run the current-user installer from PowerShell:
+
+```powershell
+.\install.ps1
+.\install.ps1 -StartWithWindows
+```
+
+The installer copies the CLI and console-free desktop launcher to
+`%LOCALAPPDATA%\Programs\Captastic`, creates a Start Menu shortcut, and starts the tray application.
+It does not require administrator privileges. Run the installed `uninstall.ps1` to stop Captastic,
+remove login startup and installed files, and preserve `~/.captastic` by default. Pass
+`-RemoveSettings` only when configuration and logs should also be deleted.
 
 When `--config` is omitted, the daemon automatically loads
 `%USERPROFILE%\.captastic\captastic.toml` if it exists. The same file stores Captastic-managed UI
