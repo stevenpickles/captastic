@@ -1,0 +1,112 @@
+# Captastic
+
+Captastic is a Windows-first Rust prototype for measuring extremely fast screenshot capture and providing a native selection-to-clipboard workflow.
+
+The DXGI backend supports two deliberately different modes. `latest` is the resident-daemon default: an idle acquisition loop keeps a GPU texture updated so a hotkey can snapshot it without waiting for the desktop to change. `fresh` waits for a desktop frame presented after the trigger and is intended for controlled latency experiments. Both modes report frame age/timing provenance, and BGRA8 CPU readback uses preallocated staging and CPU buffers. By default, the resident daemon opens a native frozen-frame overlay after capture. Its floating toolbar provides full-display, window, resizable-region, and last-region modes, an Options menu, and a Capture button. Results are published to the Windows clipboard as uncompressed DIBV5 images plus a registered PNG compatibility representation. Region selections crop the frozen desktop; window selections retain the native window identity and render that window independently so other windows covering it are not copied.
+
+## Build and verify
+
+```powershell
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo run -p captastic-app -- benchmark --backend fake --iterations 500 --json
+```
+
+## Useful commands
+
+```powershell
+cargo run -p captastic-app -- doctor
+cargo run -p captastic-app -- displays --json
+cargo run -p captastic-app -- capture --backend fake --json
+cargo run -p captastic-app -- config validate --path captastic.example.toml
+cargo run -p captastic-app -- status --json
+cargo run -p captastic-app -- stop
+```
+
+On an interactive Windows desktop:
+
+```powershell
+cargo run -p captastic-app -- doctor --json
+cargo run -p captastic-app -- displays --backend dxgi --json
+cargo run -p captastic-app -- capture --backend dxgi --mode fresh --cpu-frame true --json
+cargo run --release -p captastic-app -- benchmark --backend dxgi --mode fresh --cpu-frame true --iterations 100 --json
+```
+
+Run the resident foreground daemon and press `Ctrl+Shift+F9`:
+
+```powershell
+cargo run --release -p captastic-app -- daemon --backend dxgi --mode latest --cpu-frame true
+cargo run --release -p captastic-app -- daemon --config captastic.example.toml
+```
+
+When `--config` is omitted, the daemon automatically loads
+`%USERPROFILE%\.captastic\captastic.toml` if it exists. The same file stores Captastic-managed UI
+state under `[ui]`; updates preserve the rest of the TOML document and its comments.
+
+Captastic writes operational output through Rust's `log` facade to both stderr and a persistent file.
+Capture, selection, clipboard, recovery, and daemon lifecycle messages therefore share one format
+and filtering policy. The default compact format uses an RFC 3339 UTC timestamp with microsecond
+precision, followed by the level, Rust module target, and message:
+
+```text
+2026-08-10T01:38:14.402172Z DEBUG captastic::daemon: capture engine resumed
+```
+
+Compact console output is colorized automatically: timestamps are gray, levels use
+severity-specific colors, and module targets are cyan. Captastic adapts the output for the active
+Windows terminal and strips all color escapes when stderr is redirected or color is disabled.
+Persistent log files remain plain text. JSON logging is never colorized.
+
+Machine-readable command results continue to use stdout, so `--json` can be redirected or parsed
+without mixing in diagnostics. Captastic keeps its per-user configuration, UI state, and logs in
+`%USERPROFILE%\.captastic` on Windows (or `$HOME/.captastic` elsewhere). Configuration and UI state
+share `%USERPROFILE%\.captastic\captastic.toml`. The default log file is
+`%USERPROFILE%\.captastic\logs\captastic.log`; the resolved path is logged when the process starts and
+is included in daemon ready JSON. File writes run on a bounded background queue and never block the
+capture or overlay threads. Configure `logging.level` (`off`, `error`, `warn`, `info`, `debug`, or
+`trace`), `logging.format` (`compact` or `json`), and optional `logging.file` in TOML, or override
+them with the global `--log-level`, `--log-format`, and `--log-file` flags. The active log rotates
+at `logging.max_file_bytes` (5 MiB by default), retaining `logging.retained_files` archives (three
+by default) as `captastic.log.1`, `captastic.log.2`, and `captastic.log.3`.
+
+Daemon settings use TOML values first and explicit CLI flags second. `max_frame_age_ms = 0` preserves static-desktop `latest` behavior; set a positive value when a workflow must reject older retained frames.
+
+Selection and clipboard output are enabled by default. Choose full display, window, region, or the last captured region from the toolbar. Drag the three-dot grip or any empty toolbar background to reposition the toolbar; its bounds remain clamped to the captured display and the last position is restored from the `[ui]` section of `captastic.toml`. Window mode blurs and dims the frozen desktop, then arranges eligible application windows as independent, aspect-correct surfaces. Overview surfaces are capped at 1.2 megapixels to bound memory; clicking a preview still requests a fresh full-resolution native frame for clipboard output. DWM-cloaked placeholders, shell surfaces, the desktop, minimized windows, and failed native renders are excluded. Region mode supports drawing, moving, and resizing with eight side/corner handles and displays exact pixel dimensions. Click **Capture** or press Enter to copy the selection; Esc or right-click cancels. **Options** can toggle background dimming or cancel capture. Captastic avoids Win32 mouse capture so mouse-sharing/KVM software can retain input ownership. Selection, materialization, PNG/DIB clipboard preparation, and clipboard timing remain outside native/CPU capture latency. `PrintWindow` rendering is isolated behind a 350 ms timeout with at most two timed-out native calls in flight, so a nonresponsive target cannot block the overlay or shutdown. Windows Graphics Capture remains planned for broader window compatibility.
+
+Window mode is single-action: clicking a valid preview immediately confirms that fresh native window frame, closes the overlay, and sends it to the clipboard worker. The Capture button remains the confirmation action for full-display and region modes. Empty chooser space and windows that fail their fresh render leave the chooser open.
+
+Window previews preserve each window's DWM corner preference. Their straight-alpha capture pixels are converted to a private premultiplied paint surface, resampled once to the exact layout size with an area filter for reduction or bilinear filter for enlargement, and then composited 1:1 with `AlphaBlend`. This avoids both low-quality `AlphaBlend` stretching and GDI HALFTONE's loss of the alpha channel. Hover outlines use the same fitted bounds and scaled corner radius as the preview; square and custom-framed windows are no longer forced through a fixed rounded mask.
+
+Native window rendering runs in a per-monitor-v2 DPI context and removes the artifact-prone border pixels reported by DWM, then reconstructs a clean light border at the same physical thickness. This prevents asymmetric black or white rows while preserving a visible frame in previews and copied windows.
+
+Overlay typography uses the bundled hinted Ioskeley Mono Medium face at a 21-pixel height. Captastic registers it only for the lifetime of the overlay process, so no system font installation is required. Ioskeley Mono is distributed under the SIL Open Font License 1.1; the bundled notice is in `crates/captastic-windows/assets/fonts/OFL-1.1.txt`.
+
+Window mode precomposes its blurred backdrop and bounded-resolution overview surfaces into a static cache. Pointer movement that remains over the same target does not repaint; an actual hover transition copies the cache and draws only the rounded accent synchronously. Selecting a window captures and retains a fresh full-resolution native frame.
+
+For an automated lifecycle smoke test that registers/unregisters the hotkey and performs one resident capture:
+
+```powershell
+cargo run -p captastic-app -- daemon --backend dxgi --mode latest --cpu-frame true --selection false --self-trigger --max-captures 1 --json
+```
+
+`latest` is the product-behavior mode and should also work on a static desktop. A `fresh` DXGI capture needs the desktop image itself to change after the trigger. A static desktop can legitimately time out; pointer-only updates do not count as a fresh desktop image.
+
+Ctrl+C or `captastic stop` requests an orderly shutdown, unregisters the hotkey, and exits successfully. `captastic status` reports whether the per-session daemon is running. DXGI access/device loss triggers bounded backend reinitialization rather than requiring a process restart.
+
+## Performance implementation notes
+
+- Region-mode overlay startup does not enumerate application windows or construct the blurred chooser background; both are created only if Window is selected.
+- Full-screen overlay DIBs, the private font registration, and the native region cursor are reused by the persistent selection worker for captures made within 30 seconds. The cache is released after an idle interval.
+- Window thumbnails are rendered two at a time, downscaled inside the bounded native render worker, and never materialized as an additional full-resolution overview surface.
+- Tightly pitched DXGI staging textures use one contiguous CPU copy; padded textures retain the checked row-copy fallback.
+- Transparent-window PNG is streamed directly into its final byte vector with one 64 KiB scratch block. PNG and all clipboard allocations remain after CPU-frame readiness.
+- Selection JSON reports `overlay_preparation_ns`, `window_overview_ns`, retained preview count/bytes, and clipboard JSON reports `png_encode_ns`.
+- DXGI selection captures now retain an opt-in immutable GPU snapshot. Confirmed regions use
+  `CopySubresourceRegion` and read back only the selected pixels; JSON identifies
+  `dxgi_gpu_region` materialization and reports GPU copy submission, map wait, CPU copy, byte
+  count, and total materialization time. A native error falls back to the checked CPU crop.
+
+For a smaller distributable binary without changing the profiled release build, use `cargo build --profile dist -p captastic-app`.
+
+See [outputs/Captastic-Specification.md](outputs/Captastic-Specification.md) for the complete implementation plan.
