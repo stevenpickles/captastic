@@ -41,6 +41,10 @@ use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerforma
 const GPU_MAP_TIMEOUT: Duration = Duration::from_millis(250);
 const GPU_MAP_RETRY_DELAY: Duration = Duration::from_millis(1);
 
+pub fn enumerate_displays() -> Result<Vec<DisplayInfo>, CaptureError> {
+    enumerate_outputs().map(|outputs| outputs.into_iter().map(|output| output.info).collect())
+}
+
 pub struct DxgiBackend {
     _com: ComApartment,
     device: ID3D11Device,
@@ -59,23 +63,31 @@ pub struct DxgiBackend {
 
 impl DxgiBackend {
     pub fn new_primary() -> Result<Self, CaptureError> {
+        Self::new(&DisplayId::primary())
+    }
+
+    pub fn new(display_id: &DisplayId) -> Result<Self, CaptureError> {
         let com = ComApartment::initialize()?;
         let outputs = enumerate_outputs()?;
-        let selected_output = outputs
-            .iter()
-            .position(|output| output.info.is_primary)
-            .or_else(|| (!outputs.is_empty()).then_some(0))
-            .ok_or_else(|| {
-                capture_error(
-                    CaptureErrorKind::SourceUnavailable,
-                    "enumerate_outputs",
-                    "no attached desktop outputs were found",
-                    false,
-                    None,
-                )
-            })?;
+        let displays: Vec<_> = outputs.iter().map(|output| output.info.clone()).collect();
+        let selected_output = select_display_index(&displays, display_id).ok_or_else(|| {
+            let available = displays
+                .iter()
+                .map(|display| display.id.0.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            capture_error(
+                CaptureErrorKind::SourceUnavailable,
+                "enumerate_outputs",
+                format!(
+                    "configured display {} is not attached; available displays: [{}]",
+                    display_id.0, available
+                ),
+                false,
+                None,
+            )
+        })?;
 
-        let displays = outputs.iter().map(|output| output.info.clone()).collect();
         let selected_record = &outputs[selected_output];
         let adapter: IDXGIAdapter = selected_record
             .adapter
@@ -1170,6 +1182,19 @@ struct OutputRecord {
     info: DisplayInfo,
 }
 
+fn select_display_index(displays: &[DisplayInfo], display_id: &DisplayId) -> Option<usize> {
+    if display_id.is_primary_alias() {
+        displays
+            .iter()
+            .position(|display| display.is_primary)
+            .or_else(|| (!displays.is_empty()).then_some(0))
+    } else {
+        displays
+            .iter()
+            .position(|display| display.id == *display_id)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct DisplayConfigIdentity {
     gdi_name: String,
@@ -1629,6 +1654,42 @@ mod tests {
         assert!(persistent_display_id("monitor")
             .0
             .starts_with("windows-monitor-"));
+    }
+
+    #[test]
+    fn configured_display_selection_prefers_identity_over_enumeration_order() {
+        let displays = [
+            test_display("secondary", false),
+            test_display("primary-id", true),
+        ];
+        assert_eq!(
+            select_display_index(&displays, &DisplayId::primary()),
+            Some(1)
+        );
+        assert_eq!(
+            select_display_index(&displays, &DisplayId("secondary".to_owned())),
+            Some(0)
+        );
+        assert_eq!(
+            select_display_index(&displays, &DisplayId("missing".to_owned())),
+            None
+        );
+    }
+
+    fn test_display(id: &str, is_primary: bool) -> DisplayInfo {
+        DisplayInfo {
+            id: DisplayId(id.to_owned()),
+            name: id.to_owned(),
+            bounds: Rect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            scale_factor: 1.0,
+            rotation_degrees: 0,
+            is_primary,
+        }
     }
 
     #[test]

@@ -83,8 +83,8 @@ fn run(cli: Cli) -> Result<(), AppError> {
         Command::Status { json } => status(json),
         Command::Stop => stop(),
         Command::Displays { backend, json } => {
-            let backend = create_backend(&backend)?;
-            print_value(json, backend.displays())
+            let displays = enumerate_displays(&backend)?;
+            print_value(json, &displays)
         }
         Command::Capture(args) => capture(args),
         Command::Benchmark(args) => benchmark(args),
@@ -184,12 +184,13 @@ fn capture(args: cli::CaptureArgs) -> Result<(), AppError> {
             "selection and clipboard output require --cpu-frame true".to_owned(),
         ));
     }
-    let mut backend = create_backend(&args.backend)?;
+    let display_id = resolve_display_id(&args.display)?;
+    let mut backend = create_backend(&args.backend, &display_id)?;
     let mut recorder = EventRecorder::with_capacity(16);
     let request = CaptureRequest {
         id: CaptureId(1),
         triggered_at: Instant::now(),
-        source: CaptureSource::Display(DisplayId::primary()),
+        source: CaptureSource::Display(display_id),
         mode: capture_mode(args.mode),
         cpu_frame: args.cpu_frame,
         retain_native_frame: args.selection,
@@ -366,11 +367,13 @@ fn capture(args: cli::CaptureArgs) -> Result<(), AppError> {
 }
 
 fn benchmark(args: BenchmarkArgs) -> Result<(), AppError> {
+    let display_id = resolve_display_id(&args.display)?;
     let options = benchmark::BenchmarkOptions {
         iterations: args.iterations,
         warmup: args.warmup,
         mode: capture_mode(args.mode),
         cpu_frame: args.cpu_frame,
+        display_id: display_id.clone(),
         trigger_queue_capacity: 4,
         metrics_capacity: args.iterations.saturating_mul(10).saturating_add(32),
         fake: benchmark::fake_config(
@@ -382,7 +385,7 @@ fn benchmark(args: BenchmarkArgs) -> Result<(), AppError> {
     let run = if args.backend == "fake" {
         benchmark::run(&options)?
     } else {
-        let mut backend = create_backend(&args.backend)?;
+        let mut backend = create_backend(&args.backend, &display_id)?;
         benchmark::run_with_backend(backend.as_mut(), &options)?
     };
     if let Some(path) = args.output_results.as_deref() {
@@ -451,12 +454,30 @@ fn capture_mode(mode: ModeArg) -> CaptureMode {
     }
 }
 
-fn create_backend(name: &str) -> Result<Box<dyn CaptureBackend>, AppError> {
-    match name {
-        "fake" => Ok(Box::new(captastic_core::FakeBackend::new(
-            Default::default(),
-        ))),
-        "auto" | "dxgi" => create_dxgi_backend(),
+fn resolve_display_id(value: &str) -> Result<DisplayId, AppError> {
+    let value = value.trim();
+    if value == "primary" {
+        return Ok(DisplayId::primary());
+    }
+    if let Some(id) = value.strip_prefix("display:") {
+        let id = id.trim();
+        if !id.is_empty() {
+            return Ok(DisplayId(id.to_owned()));
+        }
+    }
+    Err(AppError::InvalidArgument(
+        "display must be primary or display:<persistent-id>; pointer and virtual_desktop are not implemented yet"
+            .to_owned(),
+    ))
+}
+
+fn enumerate_displays(backend: &str) -> Result<Vec<captastic_core::DisplayInfo>, AppError> {
+    match backend {
+        "fake" => {
+            let backend = captastic_core::FakeBackend::new(Default::default());
+            Ok(backend.displays().to_vec())
+        }
+        "auto" | "dxgi" => enumerate_dxgi_displays(),
         other => Err(AppError::BackendUnavailable(format!(
             "unknown backend {other}; available backends: fake, dxgi"
         ))),
@@ -464,19 +485,43 @@ fn create_backend(name: &str) -> Result<Box<dyn CaptureBackend>, AppError> {
 }
 
 #[cfg(windows)]
-fn create_dxgi_backend() -> Result<Box<dyn CaptureBackend>, AppError> {
-    Ok(Box::new(captastic_windows::DxgiBackend::new_primary()?))
+fn enumerate_dxgi_displays() -> Result<Vec<captastic_core::DisplayInfo>, AppError> {
+    captastic_windows::enumerate_displays().map_err(AppError::from)
 }
 
 #[cfg(not(windows))]
-fn create_dxgi_backend() -> Result<Box<dyn CaptureBackend>, AppError> {
+fn enumerate_dxgi_displays() -> Result<Vec<captastic_core::DisplayInfo>, AppError> {
+    Err(AppError::BackendUnavailable(
+        "DXGI is available only on Windows".to_owned(),
+    ))
+}
+
+fn create_backend(name: &str, display_id: &DisplayId) -> Result<Box<dyn CaptureBackend>, AppError> {
+    match name {
+        "fake" => Ok(Box::new(captastic_core::FakeBackend::new(
+            Default::default(),
+        ))),
+        "auto" | "dxgi" => create_dxgi_backend(display_id),
+        other => Err(AppError::BackendUnavailable(format!(
+            "unknown backend {other}; available backends: fake, dxgi"
+        ))),
+    }
+}
+
+#[cfg(windows)]
+fn create_dxgi_backend(display_id: &DisplayId) -> Result<Box<dyn CaptureBackend>, AppError> {
+    Ok(Box::new(captastic_windows::DxgiBackend::new(display_id)?))
+}
+
+#[cfg(not(windows))]
+fn create_dxgi_backend(_display_id: &DisplayId) -> Result<Box<dyn CaptureBackend>, AppError> {
     Err(AppError::BackendUnavailable(
         "DXGI is available only on Windows".to_owned(),
     ))
 }
 
 fn doctor(json_output: bool) -> Result<(), AppError> {
-    let (native_status, native_error, displays) = match create_dxgi_backend() {
+    let (native_status, native_error, displays) = match create_dxgi_backend(&DisplayId::primary()) {
         Ok(backend) => ("available", None, Some(backend.displays().to_vec())),
         Err(error) => ("unavailable", Some(error.to_string()), None),
     };
@@ -527,4 +572,32 @@ fn ns_to_ms(ns: u64) -> f64 {
 #[cfg(windows)]
 fn duration_ns(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_policy_resolves_primary_and_fixed_ids() {
+        assert!(resolve_display_id("primary")
+            .expect("primary")
+            .is_primary_alias());
+        assert_eq!(
+            resolve_display_id("display:windows-monitor-0123456789abcdef")
+                .expect("fixed display")
+                .0,
+            "windows-monitor-0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn unresolved_display_policies_fail_before_backend_initialization() {
+        for value in ["pointer", "virtual_desktop", "display:", "unexpected"] {
+            assert!(matches!(
+                resolve_display_id(value),
+                Err(AppError::InvalidArgument(_))
+            ));
+        }
+    }
 }

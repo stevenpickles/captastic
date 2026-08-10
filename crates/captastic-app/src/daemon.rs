@@ -25,6 +25,7 @@ use crate::error::AppError;
 #[cfg(windows)]
 struct ResolvedDaemonArgs {
     backend: String,
+    display_id: DisplayId,
     mode: CaptureMode,
     cpu_frame: bool,
     clipboard: bool,
@@ -64,6 +65,9 @@ fn resolve_daemon_args(args: DaemonArgs) -> Result<ResolvedDaemonArgs, AppError>
     };
     Ok(ResolvedDaemonArgs {
         backend: args.backend.unwrap_or(config.daemon.backend),
+        display_id: super::resolve_display_id(
+            args.display.as_deref().unwrap_or(&config.daemon.display),
+        )?,
         mode,
         cpu_frame: args.cpu_frame.unwrap_or(config.capture.cpu_frame),
         clipboard: args.clipboard.unwrap_or(config.clipboard.enabled),
@@ -81,8 +85,9 @@ fn resolve_daemon_args(args: DaemonArgs) -> Result<ResolvedDaemonArgs, AppError>
 pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let args = resolve_daemon_args(args)?;
     log::info!(
-        "starting daemon backend={} mode={:?} cpu_frame={} selection={} clipboard={}",
+        "starting daemon backend={} display={} mode={:?} cpu_frame={} selection={} clipboard={}",
         args.backend,
+        args.display_id.0,
         args.mode,
         args.cpu_frame,
         args.selection,
@@ -135,6 +140,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
     let (done_sender, done_receiver) = mpsc::sync_channel::<Result<(), AppError>>(1);
     let backend_name = args.backend.clone();
+    let display_id = args.display_id.clone();
     let mode = args.mode.clone();
     let cpu_frame = args.cpu_frame;
     let retain_native_frame = args.selection;
@@ -144,7 +150,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let capture_join = thread::Builder::new()
         .name("captastic-capture".to_owned())
         .spawn(move || {
-            let mut backend = match super::create_backend(&backend_name) {
+            let mut backend = match super::create_backend(&backend_name, &display_id) {
                 Ok(backend) => backend,
                 Err(error) => {
                     let _ = ready_sender.send(Err(error));
@@ -153,6 +159,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             };
             let ready = json!({
                 "backend": backend.name(),
+                "configured_display": display_id,
                 "displays": backend.displays(),
             });
             if ready_sender.send(Ok(ready)).is_err() {
@@ -170,7 +177,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                             .as_ref()
                             .is_some_and(|state| Instant::now() >= state.next_attempt)
                         {
-                            match super::create_backend(&backend_name) {
+                            match super::create_backend(&backend_name, &display_id) {
                                 Ok(replacement) => {
                                     backend = replacement;
                                     recovery = None;
@@ -226,7 +233,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                         let request = CaptureRequest {
                             id: capture_id,
                             triggered_at: trigger.received_at,
-                            source: CaptureSource::Display(DisplayId::primary()),
+                            source: CaptureSource::Display(display_id.clone()),
                             mode: mode.clone(),
                             cpu_frame,
                             retain_native_frame,

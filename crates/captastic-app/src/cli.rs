@@ -69,6 +69,9 @@ pub struct DaemonArgs {
     pub config: Option<PathBuf>,
     #[arg(long)]
     pub backend: Option<String>,
+    /// Display policy: primary or display:<persistent-id>.
+    #[arg(long)]
+    pub display: Option<String>,
     #[arg(long, value_enum)]
     pub mode: Option<ModeArg>,
     #[arg(long)]
@@ -99,6 +102,9 @@ pub enum ModeArg {
 pub struct CaptureArgs {
     #[arg(long, default_value = "fake")]
     pub backend: String,
+    /// Display policy: primary or display:<persistent-id>.
+    #[arg(long, default_value = "primary")]
+    pub display: String,
     #[arg(long, value_enum, default_value_t = ModeArg::Latest)]
     pub mode: ModeArg,
     #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
@@ -115,6 +121,9 @@ pub struct CaptureArgs {
 pub struct BenchmarkArgs {
     #[arg(long, default_value = "fake")]
     pub backend: String,
+    /// Display policy: primary or display:<persistent-id>.
+    #[arg(long, default_value = "primary")]
+    pub display: String,
     #[arg(long, value_enum, default_value_t = ModeArg::Latest)]
     pub mode: ModeArg,
     #[arg(long, default_value_t = 100)]
@@ -191,5 +200,23 @@ mod tests {
                 command: StartupCommand::Status { json: true }
             })
         ));
+    }
+
+    #[test]
+    fn display_policy_can_override_daemon_configuration() {
+        let cli = Cli::try_parse_from([
+            "captastic",
+            "daemon",
+            "--display",
+            "display:windows-monitor-0123456789abcdef",
+        ])
+        .expect("daemon display override");
+        let Some(Command::Daemon(args)) = cli.command else {
+            panic!("daemon command");
+        };
+        assert_eq!(
+            args.display.as_deref(),
+            Some("display:windows-monitor-0123456789abcdef")
+        );
     }
 }

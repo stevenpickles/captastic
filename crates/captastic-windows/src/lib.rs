@@ -24,7 +24,7 @@ pub use console::ConsoleShutdown;
 #[cfg(windows)]
 pub use daemon_control::DaemonControl;
 #[cfg(windows)]
-pub use dxgi::{materialize_native_region, DxgiBackend, GpuMaterialization};
+pub use dxgi::{enumerate_displays, materialize_native_region, DxgiBackend, GpuMaterialization};
 #[cfg(windows)]
 pub use hotkey::{HotkeyListener, HotkeySpec};
 #[cfg(windows)]

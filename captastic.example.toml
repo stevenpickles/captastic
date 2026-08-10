@@ -3,6 +3,8 @@ schema_version = 1
 [daemon]
 backend = "dxgi"
 display = "primary"
+# To select one monitor, run `captastic displays --backend dxgi --json` and use:
+# display = "display:windows-monitor-0123456789abcdef"
 trigger_queue_capacity = 4
 
 [hotkey]

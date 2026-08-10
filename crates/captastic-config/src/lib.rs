@@ -159,6 +159,17 @@ impl AppConfig {
             "daemon.trigger_queue_capacity",
             self.daemon.trigger_queue_capacity,
         )?;
+        if self.daemon.display != "primary"
+            && self
+                .daemon
+                .display
+                .strip_prefix("display:")
+                .is_none_or(|id| id.trim().is_empty())
+        {
+            return Err(ConfigError::InvalidValue(
+                "daemon.display must be primary or display:<persistent-id>".to_owned(),
+            ));
+        }
         validate_capacity("selection.queue_capacity", self.selection.queue_capacity)?;
         validate_capacity("clipboard.queue_capacity", self.clipboard.queue_capacity)?;
         validate_capacity("output.queue_capacity", self.output.queue_capacity)?;
@@ -630,6 +641,32 @@ mod tests {
             config.validate(),
             Err(ConfigError::InvalidValue(_))
         ));
+    }
+
+    #[test]
+    fn accepts_primary_or_a_persistent_display_id() {
+        let mut config = AppConfig::default();
+        config.daemon.display = "primary".to_owned();
+        config.validate().expect("primary display policy");
+        config.daemon.display = "display:windows-monitor-0123456789abcdef".to_owned();
+        config.validate().expect("fixed display policy");
+    }
+
+    #[test]
+    fn rejects_unimplemented_or_empty_display_policies() {
+        for value in [
+            "pointer",
+            "virtual_desktop",
+            "display:",
+            "windows-monitor-id",
+        ] {
+            let mut config = AppConfig::default();
+            config.daemon.display = value.to_owned();
+            assert!(matches!(
+                config.validate(),
+                Err(ConfigError::InvalidValue(_))
+            ));
+        }
     }
 
     #[test]

@@ -119,6 +119,19 @@ by default) as `captastic.log.1`, `captastic.log.2`, and `captastic.log.3`.
 
 Daemon settings use TOML values first and explicit CLI flags second. `max_frame_age_ms = 0` preserves static-desktop `latest` behavior; set a positive value when a workflow must reject older retained frames.
 
+The default `daemon.display = "primary"` follows the current Windows primary monitor. To pin
+Captastic to one physical monitor, list the attached displays without creating a capture session:
+
+```powershell
+captastic displays --backend dxgi --json
+```
+
+Copy the desired persistent ID into `captastic.toml` as
+`display = "display:windows-monitor-0123456789abcdef"`. The same value can be tested without
+editing configuration by passing `--display display:windows-monitor-0123456789abcdef` to
+`daemon`, `capture`, or `benchmark`. A missing or disconnected configured display produces an
+actionable error listing the IDs that remain attached.
+
 Selection and clipboard output are enabled by default. Choose full display, window, or region from the toolbar. Captastic restores the last successfully used tool across daemon restarts. Region mode also restores the last confirmed rectangle; when no region has been captured yet, it starts with a rectangle centered on the display at half its width and half its height. Switching from another tool into Region mode recalls that rectangle automatically. Drag the three-dot grip or any empty toolbar background to reposition the toolbar; its bounds remain clamped to the captured display and the last position is restored from the `[ui]` section of `captastic.toml`. Window mode blurs and dims the frozen desktop, then arranges eligible application windows as independent, aspect-correct surfaces. Overview surfaces are capped at 1.2 megapixels to bound memory; clicking a preview still requests a fresh full-resolution native frame for clipboard output. DWM-cloaked placeholders, shell surfaces, the desktop, minimized windows, and failed native renders are excluded. Region mode supports drawing, moving, and resizing with eight side/corner handles and displays exact pixel dimensions. Click **Capture** or press Enter to copy the selection; Esc or right-click cancels. **Options** can toggle background dimming or cancel capture. Captastic avoids Win32 mouse capture so mouse-sharing/KVM software can retain input ownership. Selection, materialization, PNG/DIB clipboard preparation, and clipboard timing remain outside native/CPU capture latency. `PrintWindow` rendering is isolated behind a 350 ms timeout with at most two timed-out native calls in flight, so a nonresponsive target cannot block the overlay or shutdown. Windows Graphics Capture remains planned for broader window compatibility.
 
 Window mode is single-action: clicking a valid preview immediately confirms that fresh native window frame, closes the overlay, and sends it to the clipboard worker. The Capture button remains the confirmation action for full-display and region modes. Empty chooser space and windows that fail their fresh render leave the chooser open.
