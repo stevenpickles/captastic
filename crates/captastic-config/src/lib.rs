@@ -418,13 +418,19 @@ mod tests {
 
     #[test]
     fn storage_directory_is_hidden_under_the_user_home() {
+        let user_profile = PathBuf::from("user-profile-home");
+        let home = PathBuf::from("home");
         assert_eq!(
-            storage_directory_from(Some(PathBuf::from(r"C:\Users\example")), None),
-            Some(PathBuf::from(r"C:\Users\example\.captastic"))
+            storage_directory_from(Some(user_profile.clone()), Some(home.clone())),
+            Some(user_profile.join(".captastic"))
         );
         assert_eq!(
-            storage_directory_from(None, Some(PathBuf::from("/home/example"))),
-            Some(PathBuf::from("/home/example/.captastic"))
+            storage_directory_from(None, Some(home.clone())),
+            Some(home.join(".captastic"))
+        );
+        assert_eq!(
+            storage_directory_from(Some(PathBuf::new()), Some(home.clone())),
+            Some(home.join(".captastic"))
         );
         assert_eq!(storage_directory_from(None, None), None);
     }
