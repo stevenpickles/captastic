@@ -54,13 +54,15 @@ fn main() {
 
 fn resolve_logging_config(cli: &Cli) -> LoggingConfig {
     let mut logging = match &cli.command {
-        Command::Daemon(args) => {
+        Some(Command::Daemon(args)) => {
             let config = match args.config.as_deref() {
                 Some(path) => AppConfig::load(path),
                 None => AppConfig::load_default(),
             };
             config.map_or_else(|_| LoggingConfig::default(), |config| config.logging)
         }
+        None => AppConfig::load_default()
+            .map_or_else(|_| LoggingConfig::default(), |config| config.logging),
         _ => LoggingConfig::default(),
     };
     if let Some(path) = &cli.log_file {
@@ -76,7 +78,7 @@ fn resolve_logging_config(cli: &Cli) -> LoggingConfig {
 }
 
 fn run(cli: Cli) -> Result<(), AppError> {
-    match cli.command {
+    match cli.command.unwrap_or_default() {
         Command::Daemon(args) => daemon::run(args),
         Command::Status { json } => status(json),
         Command::Stop => stop(),
