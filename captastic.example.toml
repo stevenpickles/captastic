@@ -47,7 +47,14 @@ format = "compact"
 max_file_bytes = 5242880
 retained_files = 3
 
-# Captastic maintains these values when the overlay toolbar is moved.
+# Captastic maintains these values as the overlay is used.
 [ui]
 # overlay_x = 640
 # overlay_y = 920
+# last_capture_tool = "region"
+
+# [ui.last_region]
+# x = 480
+# y = 270
+# width = 960
+# height = 540

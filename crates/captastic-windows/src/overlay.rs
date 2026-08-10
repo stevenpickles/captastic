@@ -75,6 +75,7 @@ const IOSKELEY_MONO_MEDIUM: &[u8] = include_bytes!("../assets/fonts/IoskeleyMono
 
 static LAST_TOOLBAR_POSITION: AtomicU64 = AtomicU64::new(NO_TOOLBAR_POSITION);
 static TOOLBAR_POSITION_LOADED: AtomicBool = AtomicBool::new(false);
+static CAPTURE_HISTORY_LOADED: AtomicBool = AtomicBool::new(false);
 static LAST_CAPTURE_TOOL: AtomicU8 = AtomicU8::new(CAPTURE_TOOL_REGION);
 static LAST_CAPTURED_REGION: Mutex<Option<Rect>> = Mutex::new(None);
 
@@ -195,7 +196,8 @@ pub fn select_from_frozen_frame_with_controller(
     };
     let toolbar_position = remembered_toolbar_position(surface.width, surface.height)
         .unwrap_or_else(|| ToolbarLayout::default_origin(surface.width, surface.height));
-    let last_region = remembered_last_region(source);
+    let last_region =
+        Some(remembered_last_region(source).unwrap_or_else(|| default_region_for_source(source)));
     let tool = remembered_capture_tool();
     let (selection, selection_kind) = initial_selection(tool, last_region, source);
     let mut state = Box::new(OverlayState {
@@ -381,6 +383,22 @@ impl CaptureTool {
             Self::FullDisplay => CAPTURE_TOOL_FULL_DISPLAY,
             Self::Window => CAPTURE_TOOL_WINDOW,
             Self::Region => CAPTURE_TOOL_REGION,
+        }
+    }
+
+    const fn from_config(tool: captastic_config::CaptureTool) -> Self {
+        match tool {
+            captastic_config::CaptureTool::FullDisplay => Self::FullDisplay,
+            captastic_config::CaptureTool::Window => Self::Window,
+            captastic_config::CaptureTool::Region => Self::Region,
+        }
+    }
+
+    const fn to_config(self) -> captastic_config::CaptureTool {
+        match self {
+            Self::FullDisplay => captastic_config::CaptureTool::FullDisplay,
+            Self::Window => captastic_config::CaptureTool::Window,
+            Self::Region => captastic_config::CaptureTool::Region,
         }
     }
 }
@@ -926,18 +944,12 @@ fn remembered_toolbar_position(client_width: i32, client_height: i32) -> Option<
 }
 
 fn remembered_capture_tool() -> CaptureTool {
+    ensure_capture_history_loaded();
     match LAST_CAPTURE_TOOL.load(Ordering::Acquire) {
         CAPTURE_TOOL_FULL_DISPLAY => CaptureTool::FullDisplay,
         CAPTURE_TOOL_WINDOW => CaptureTool::Window,
         _ => CaptureTool::Region,
     }
-}
-
-fn remember_capture_tool(kind: SelectionKind) {
-    LAST_CAPTURE_TOOL.store(
-        CaptureTool::from_selection_kind(kind).code(),
-        Ordering::Release,
-    );
 }
 
 fn initial_selection(
@@ -949,14 +961,16 @@ fn initial_selection(
         CaptureTool::FullDisplay => (Some(source), Some(SelectionKind::Display)),
         CaptureTool::Window => (None, None),
         CaptureTool::Region => {
-            let region = last_region.map(|region| fit_region_to_source(region, source));
-            let kind = region.map(|_| SelectionKind::Region);
-            (region, kind)
+            let region = last_region
+                .map(|region| fit_region_to_source(region, source))
+                .unwrap_or_else(|| default_region_for_source(source));
+            (Some(region), Some(SelectionKind::Region))
         }
     }
 }
 
 fn remembered_last_region(source: Rect) -> Option<Rect> {
+    ensure_capture_history_loaded();
     LAST_CAPTURED_REGION
         .lock()
         .ok()
@@ -964,9 +978,61 @@ fn remembered_last_region(source: Rect) -> Option<Rect> {
         .map(|region| fit_region_to_source(region, source))
 }
 
-fn remember_last_region(region: Rect) {
-    if let Ok(mut remembered) = LAST_CAPTURED_REGION.lock() {
-        *remembered = Some(region);
+fn remember_capture_history(kind: SelectionKind, confirmed_region: Option<Rect>) {
+    let tool = CaptureTool::from_selection_kind(kind);
+    LAST_CAPTURE_TOOL.store(tool.code(), Ordering::Release);
+    if let Some(region) = confirmed_region {
+        if let Ok(mut remembered) = LAST_CAPTURED_REGION.lock() {
+            *remembered = Some(region);
+        }
+    }
+    let persisted_region = confirmed_region.map(|region| captastic_config::CaptureRegion {
+        x: region.x,
+        y: region.y,
+        width: region.width,
+        height: region.height,
+    });
+    if let Err(error) = captastic_config::save_capture_history(tool.to_config(), persisted_region) {
+        log::warn!("failed to save capture history: {error}");
+    }
+}
+
+fn ensure_capture_history_loaded() {
+    if CAPTURE_HISTORY_LOADED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    match captastic_config::load_capture_history() {
+        Ok(history) => {
+            if let Some(tool) = history.tool {
+                LAST_CAPTURE_TOOL.store(CaptureTool::from_config(tool).code(), Ordering::Release);
+            }
+            if let Some(region) = history.region {
+                if let Ok(mut remembered) = LAST_CAPTURED_REGION.lock() {
+                    *remembered = Some(Rect {
+                        x: region.x,
+                        y: region.y,
+                        width: region.width,
+                        height: region.height,
+                    });
+                }
+            }
+        }
+        Err(error) => log::warn!("failed to load capture history: {error}"),
+    }
+}
+
+fn default_region_for_source(source: Rect) -> Rect {
+    let width = (source.width / 2).max(1);
+    let height = (source.height / 2).max(1);
+    Rect {
+        x: source
+            .x
+            .saturating_add(((source.width - width) / 2).min(i32::MAX as u32) as i32),
+        y: source
+            .y
+            .saturating_add(((source.height - height) / 2).min(i32::MAX as u32) as i32),
+        width,
+        height,
     }
 }
 
@@ -1497,9 +1563,9 @@ fn confirm_and_close(hwnd: HWND, state: &mut OverlayState) {
             .as_ref()
             .map(|frame| frame.metadata.source_rect)
             .unwrap_or(rect);
-        remember_capture_tool(kind);
-        if kind == SelectionKind::Region {
-            remember_last_region(rect);
+        let confirmed_region = (kind == SelectionKind::Region).then_some(rect);
+        remember_capture_history(kind, confirmed_region);
+        if confirmed_region.is_some() {
             state.last_region = Some(rect);
         }
         state.result = Some(OverlaySelection {
@@ -3899,6 +3965,14 @@ mod tests {
             CaptureTool::from_selection_kind(SelectionKind::Window),
             CaptureTool::Window
         );
+        assert_eq!(
+            CaptureTool::from_config(captastic_config::CaptureTool::FullDisplay),
+            CaptureTool::FullDisplay
+        );
+        assert_eq!(
+            CaptureTool::Window.to_config(),
+            captastic_config::CaptureTool::Window
+        );
     }
 
     #[test]
@@ -3918,6 +3992,27 @@ mod tests {
         assert_eq!(
             initial_selection(CaptureTool::Region, Some(region), source),
             (Some(region), Some(SelectionKind::Region))
+        );
+    }
+
+    #[test]
+    fn region_mode_defaults_to_a_centered_half_display_rectangle() {
+        let source = Rect {
+            x: -1_920,
+            y: 100,
+            width: 1_920,
+            height: 1_080,
+        };
+        let expected = Rect {
+            x: -1_440,
+            y: 370,
+            width: 960,
+            height: 540,
+        };
+        assert_eq!(default_region_for_source(source), expected);
+        assert_eq!(
+            initial_selection(CaptureTool::Region, None, source),
+            (Some(expected), Some(SelectionKind::Region))
         );
     }
 
