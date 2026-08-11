@@ -1,10 +1,10 @@
 use windows::Win32::Foundation::POINT;
 
-const TOOLBAR_WIDTH: i32 = 600;
-const TOOLBAR_HEIGHT: i32 = 82;
-const TOOLBAR_BOTTOM_MARGIN: i32 = 36;
-const MENU_WIDTH: i32 = 320;
-const MENU_HEIGHT: i32 = 164;
+const TOOLBAR_WIDTH: i32 = 418;
+const TOOLBAR_HEIGHT: i32 = 56;
+const TOOLBAR_BOTTOM_MARGIN: i32 = 24;
+const MENU_WIDTH: i32 = 248;
+const MENU_HEIGHT: i32 = 132;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ToolbarControl {
@@ -81,6 +81,9 @@ pub(super) struct RegionLayoutTokens {
     pub(super) label_padding_x: i32,
     pub(super) label_padding_y: i32,
     pub(super) label_corner_radius: i32,
+    pub(super) handle_hit_radius: i32,
+    pub(super) handle_outer_radius: i32,
+    pub(super) handle_inner_radius: i32,
     monitor_inset: i32,
     selection_gap: i32,
     handle_clearance: i32,
@@ -94,10 +97,52 @@ impl RegionLayoutTokens {
             label_padding_x: metrics.px(10),
             label_padding_y: metrics.px(5),
             label_corner_radius: metrics.px(8),
+            handle_hit_radius: metrics.px(9),
+            handle_outer_radius: metrics.px(6),
+            handle_inner_radius: metrics.px(3),
             monitor_inset: metrics.px(8),
             selection_gap: metrics.px(8),
             handle_clearance: metrics.px(12),
             inside_hysteresis: metrics.px(8),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ToolbarLayoutTokens {
+    pub(super) font_height: i32,
+    pub(super) toolbar_corner_radius: i32,
+    pub(super) control_corner_radius: i32,
+    pub(super) menu_corner_radius: i32,
+    pub(super) tooltip_corner_radius: i32,
+    pub(super) icon_size: i32,
+    pub(super) icon_stroke: i32,
+    pub(super) text_padding: i32,
+    pub(super) tooltip_padding_x: i32,
+    pub(super) tooltip_padding_y: i32,
+    pub(super) menu_check_offset: i32,
+    pub(super) menu_text_offset: i32,
+    pub(super) grip_dot_size: i32,
+    pub(super) grip_dot_gap: i32,
+}
+
+impl ToolbarLayoutTokens {
+    fn new(metrics: UiMetrics) -> Self {
+        Self {
+            font_height: metrics.px(16),
+            toolbar_corner_radius: metrics.px(12),
+            control_corner_radius: metrics.px(8),
+            menu_corner_radius: metrics.px(10),
+            tooltip_corner_radius: metrics.px(8),
+            icon_size: metrics.px(22),
+            icon_stroke: metrics.px(2).max(1),
+            text_padding: metrics.px(8),
+            tooltip_padding_x: metrics.px(12),
+            tooltip_padding_y: metrics.px(7),
+            menu_check_offset: metrics.px(16),
+            menu_text_offset: metrics.px(36),
+            grip_dot_size: metrics.px(4).max(2),
+            grip_dot_gap: metrics.px(6),
         }
     }
 }
@@ -123,6 +168,10 @@ impl UiMetrics {
 
     pub(super) fn region_tokens(self) -> RegionLayoutTokens {
         RegionLayoutTokens::new(self)
+    }
+
+    pub(super) fn toolbar_tokens(self) -> ToolbarLayoutTokens {
+        ToolbarLayoutTokens::new(self)
     }
 
     pub(super) fn toolbar_width(self) -> i32 {
@@ -196,17 +245,70 @@ impl ToolbarLayout {
             right: left + metrics.toolbar_width(),
             bottom: top + metrics.toolbar_height(),
         };
+        let control_top = top + metrics.px(6);
+        let control_bottom = top + metrics.px(50);
+        let drag_handle = UiRect {
+            left: left + metrics.px(6),
+            top: control_top,
+            right: left + metrics.px(30),
+            bottom: control_bottom,
+        };
+        let full_display = UiRect {
+            left: left + metrics.px(34),
+            top: control_top,
+            right: left + metrics.px(78),
+            bottom: control_bottom,
+        };
+        let window = UiRect {
+            left: left + metrics.px(78),
+            top: control_top,
+            right: left + metrics.px(122),
+            bottom: control_bottom,
+        };
+        let region = UiRect {
+            left: left + metrics.px(122),
+            top: control_top,
+            right: left + metrics.px(166),
+            bottom: control_bottom,
+        };
+        let options = UiRect {
+            left: left + metrics.px(184),
+            top: control_top,
+            right: left + metrics.px(284),
+            bottom: control_bottom,
+        };
+        let capture = UiRect {
+            left: left + metrics.px(292),
+            top: control_top,
+            right: left + metrics.px(412),
+            bottom: control_bottom,
+        };
+
         let menu_width = metrics.px(MENU_WIDTH);
         let menu_height = metrics.px(MENU_HEIGHT);
         let inset = metrics.px(8);
-        let menu_left = (bounds.right - menu_width - metrics.px(12)).clamp(
+        let gap = metrics.px(8);
+        let menu_left = ((options.left + options.right - menu_width) / 2).clamp(
             work_area.left + inset,
             (work_area.right - menu_width - inset).max(work_area.left + inset),
         );
-        let menu_top = if top >= work_area.top + menu_height + metrics.px(16) {
-            top - menu_height - metrics.px(10)
+        let above = bounds.top - gap - menu_height;
+        let below = bounds.bottom + gap;
+        let menu_top = if above >= work_area.top + inset {
+            above
+        } else if below + menu_height <= work_area.bottom - inset {
+            below
         } else {
-            (bounds.bottom + metrics.px(10)).min(work_area.bottom - menu_height - inset)
+            let preferred = if bounds.top - work_area.top >= work_area.bottom - bounds.bottom {
+                above
+            } else {
+                below
+            };
+            clamp_coordinate(
+                preferred,
+                work_area.top + inset,
+                work_area.bottom - menu_height - inset,
+            )
         };
         let menu = UiRect {
             left: menu_left,
@@ -214,61 +316,33 @@ impl ToolbarLayout {
             right: menu_left + menu_width,
             bottom: menu_top + menu_height,
         };
+        let row_left = menu.left + metrics.px(6);
+        let row_right = menu.right - metrics.px(6);
         Self {
             bounds,
-            drag_handle: UiRect {
-                left: left + metrics.px(8),
-                top: top + metrics.px(10),
-                right: left + metrics.px(44),
-                bottom: top + metrics.px(72),
-            },
-            full_display: UiRect {
-                left: left + metrics.px(48),
-                top: top + metrics.px(10),
-                right: left + metrics.px(112),
-                bottom: top + metrics.px(72),
-            },
-            window: UiRect {
-                left: left + metrics.px(112),
-                top: top + metrics.px(10),
-                right: left + metrics.px(176),
-                bottom: top + metrics.px(72),
-            },
-            region: UiRect {
-                left: left + metrics.px(176),
-                top: top + metrics.px(10),
-                right: left + metrics.px(240),
-                bottom: top + metrics.px(72),
-            },
-            options: UiRect {
-                left: left + metrics.px(270),
-                top: top + metrics.px(10),
-                right: left + metrics.px(402),
-                bottom: top + metrics.px(72),
-            },
-            capture: UiRect {
-                left: left + metrics.px(418),
-                top: top + metrics.px(10),
-                right: left + metrics.px(584),
-                bottom: top + metrics.px(72),
-            },
+            drag_handle,
+            full_display,
+            window,
+            region,
+            options,
+            capture,
             dim_background: UiRect {
-                left: menu.left + metrics.px(6),
+                left: row_left,
                 top: menu.top + metrics.px(6),
-                right: menu.right - metrics.px(6),
-                bottom: menu.top + metrics.px(56),
+                right: row_right,
+                bottom: menu.top + metrics.px(46),
             },
             clipboard_destination: UiRect {
-                left: menu.left + metrics.px(6),
-                top: menu.top + metrics.px(56),
-                right: menu.right - metrics.px(6),
-                bottom: menu.top + metrics.px(106),
+                left: row_left,
+                top: menu.top + metrics.px(46),
+                right: row_right,
+                bottom: menu.top + metrics.px(86),
             },
             cancel: UiRect {
-                left: menu.left + metrics.px(6),
-                top: menu.top + metrics.px(106),
-                right: menu.right - metrics.px(6),
-                bottom: menu.bottom - metrics.px(6),
+                left: row_left,
+                top: menu.top + metrics.px(86),
+                right: row_right,
+                bottom: menu.top + metrics.px(126),
             },
             menu,
         }
@@ -675,6 +749,59 @@ mod tests {
         assert_eq!(UiMetrics::new(144).px(82), 123);
         assert_eq!(UiMetrics::new(192).px(82), 164);
     }
+    #[test]
+    fn compact_toolbar_scales_at_supported_dpi_levels() {
+        for (dpi, expected_width, expected_height) in [
+            (96, 418, 56),
+            (120, 523, 70),
+            (144, 627, 84),
+            (192, 836, 112),
+        ] {
+            let environment = DisplayEnvironment {
+                work_area: UiRect {
+                    left: 0,
+                    top: 0,
+                    right: 3840,
+                    bottom: 2160,
+                },
+                metrics: UiMetrics::new(dpi),
+            };
+            let layout =
+                ToolbarLayout::new(environment, ToolbarLayout::default_origin(environment));
+            assert_eq!(layout.bounds.width(), expected_width);
+            assert_eq!(layout.bounds.height(), expected_height);
+            assert_eq!(layout.full_display.width(), environment.metrics.px(44));
+            assert_eq!(layout.full_display.height(), environment.metrics.px(44));
+            assert!(layout.menu.left >= environment.work_area.left);
+            assert!(layout.menu.top >= environment.work_area.top);
+            assert!(layout.menu.right <= environment.work_area.right);
+            assert!(layout.menu.bottom <= environment.work_area.bottom);
+        }
+    }
+
+    #[test]
+    fn popup_chooses_the_available_side_and_stays_in_the_work_area() {
+        let environment = DisplayEnvironment {
+            work_area: UiRect {
+                left: -1200,
+                top: -100,
+                right: 720,
+                bottom: 940,
+            },
+            metrics: UiMetrics::new(144),
+        };
+        let top_layout = ToolbarLayout::new(environment, POINT { x: -1000, y: -80 });
+        assert!(top_layout.menu.top > top_layout.bounds.bottom);
+        let bottom_layout = ToolbarLayout::new(environment, POINT { x: -1000, y: 800 });
+        assert!(bottom_layout.menu.bottom < bottom_layout.bounds.top);
+        for layout in [top_layout, bottom_layout] {
+            assert!(layout.menu.left >= environment.work_area.left);
+            assert!(layout.menu.top >= environment.work_area.top);
+            assert!(layout.menu.right <= environment.work_area.right);
+            assert!(layout.menu.bottom <= environment.work_area.bottom);
+        }
+    }
+
     #[test]
     fn comfortable_region_keeps_dimensions_inside() {
         let layout = test_label_layout(

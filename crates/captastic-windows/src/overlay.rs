@@ -62,13 +62,9 @@ use crate::window_capture::{capture_window_thumbnail, capture_window_visual};
 const CLASS_NAME: PCWSTR = w!("CaptasticFrozenSelectionOverlay");
 const DRAG_THRESHOLD: i32 = 4;
 const DIM_ALPHA: u8 = 128;
-const HANDLE_HIT_RADIUS: i32 = 9;
-const HANDLE_OUTER_RADIUS: i32 = 6;
-const HANDLE_INNER_RADIUS: i32 = 3;
 const MIN_REGION_SIZE: i64 = 8;
 const REGION_CURSOR_SIZE: u32 = 64;
 const REGION_CURSOR_CENTER: i32 = REGION_CURSOR_SIZE as i32 / 2;
-const TOOLBAR_CORNER_RADIUS: i32 = 18;
 const WINDOW_THUMBNAIL_MAX_PIXELS: u64 = 1_200_000;
 const UI_FONT_HEIGHT: i32 = 21;
 const IOSKELEY_MONO_MEDIUM: &[u8] = include_bytes!("../assets/fonts/IoskeleyMono-Medium.ttf");
@@ -1263,9 +1259,9 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             } else if state.tool == CaptureTool::Region
                 && state.selection_kind == Some(SelectionKind::Region)
             {
-                state.hovered_handle = state
-                    .selection
-                    .and_then(|selection| hit_test_resize_handle(selection, point));
+                state.hovered_handle = state.selection.and_then(|selection| {
+                    hit_test_resize_handle(selection, point, state.display_environment.metrics)
+                });
                 state.hovered = None;
                 if state.hovered_handle.is_none()
                     && state
@@ -1380,8 +1376,9 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             let existing_region = (state.selection_kind == Some(SelectionKind::Region))
                 .then_some(state.selection)
                 .flatten();
-            let resize_handle =
-                existing_region.and_then(|selection| hit_test_resize_handle(selection, point));
+            let resize_handle = existing_region.and_then(|selection| {
+                hit_test_resize_handle(selection, point, state.display_environment.metrics)
+            });
             if let (Some(original), Some(handle)) = (existing_region, resize_handle) {
                 state.resizing = Some(ResizeDrag { handle, original });
                 state.moving_region = None;
@@ -1457,9 +1454,9 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             }
             state.dragging = false;
             state.hovered_handle = if state.selection_kind == Some(SelectionKind::Region) {
-                state
-                    .selection
-                    .and_then(|selection| hit_test_resize_handle(selection, point))
+                state.selection.and_then(|selection| {
+                    hit_test_resize_handle(selection, point, state.display_environment.metrics)
+                })
             } else {
                 None
             };
@@ -2108,6 +2105,7 @@ fn draw_outline_layer(
 }
 
 fn draw_resize_handles(device: HDC, source: Rect, rect: Rect, metrics: UiMetrics) {
+    let tokens = metrics.region_tokens();
     let left = rect.x - source.x;
     let top = rect.y - source.y;
     let right = left.saturating_add(rect.width as i32);
@@ -2132,8 +2130,8 @@ fn draw_resize_handles(device: HDC, source: Rect, rect: Rect, metrics: UiMetrics
         )
     };
     for (x, y) in points {
-        let outer_rect = centered_rect(x, y, metrics.px(HANDLE_OUTER_RADIUS));
-        let inner_rect = centered_rect(x, y, metrics.px(HANDLE_INNER_RADIUS));
+        let outer_rect = centered_rect(x, y, tokens.handle_outer_radius);
+        let inner_rect = centered_rect(x, y, tokens.handle_inner_radius);
         // SAFETY: The brushes and memory DC are live; GDI clips handles at display edges.
         unsafe {
             FillRect(device, &outer_rect, outer);
@@ -2642,6 +2640,7 @@ fn draw_surface_to_rect(device: HDC, surface: &FrozenSurface, destination: UiRec
 fn draw_toolbar(state: &OverlayState) {
     let device = state.back_buffer.device;
     let metrics = state.display_environment.metrics;
+    let tokens = metrics.toolbar_tokens();
     let layout = ToolbarLayout::new(state.display_environment, state.toolbar_position);
     if state.options_open {
         draw_options_menu(device, state, layout);
@@ -2651,19 +2650,19 @@ fn draw_toolbar(state: &OverlayState) {
         layout.bounds,
         rgb(38, 38, 41),
         rgb(92, 92, 98),
-        metrics.px(TOOLBAR_CORNER_RADIUS),
+        tokens.toolbar_corner_radius,
     );
-    for y in [
-        layout.drag_handle.top + metrics.px(17),
-        layout.drag_handle.top + metrics.px(31),
-        layout.drag_handle.top + metrics.px(45),
-    ] {
+    let grip_center_x = (layout.drag_handle.left + layout.drag_handle.right) / 2;
+    let grip_center_y = (layout.drag_handle.top + layout.drag_handle.bottom) / 2;
+    for offset in [-tokens.grip_dot_gap, 0, tokens.grip_dot_gap] {
+        let left = grip_center_x - tokens.grip_dot_size / 2;
+        let top = grip_center_y + offset - tokens.grip_dot_size / 2;
         draw_filled_ellipse(
             device,
-            layout.drag_handle.left + metrics.px(13),
-            y,
-            layout.drag_handle.left + metrics.px(18),
-            y + metrics.px(5),
+            left,
+            top,
+            left + tokens.grip_dot_size,
+            top + tokens.grip_dot_size,
             rgb(142, 142, 148),
         );
     }
@@ -2680,12 +2679,12 @@ fn draw_toolbar(state: &OverlayState) {
         device,
         &[
             (
-                layout.bounds.left + metrics.px(253),
-                layout.bounds.top + metrics.px(17),
+                (layout.region.right + layout.options.left) / 2,
+                layout.options.top + metrics.px(8),
             ),
             (
-                layout.bounds.left + metrics.px(253),
-                layout.bounds.bottom - metrics.px(17),
+                (layout.region.right + layout.options.left) / 2,
+                layout.options.bottom - metrics.px(8),
             ),
         ],
         rgb(92, 92, 98),
@@ -2699,41 +2698,41 @@ fn draw_toolbar(state: &OverlayState) {
             layout.options,
             rgb(65, 65, 70),
             rgb(65, 65, 70),
-            metrics.px(8),
+            tokens.control_corner_radius,
         );
     }
     draw_text(
         device,
         UiRect {
-            left: layout.options.left + metrics.px(4),
+            left: layout.options.left + tokens.text_padding,
             top: layout.options.top,
-            right: layout.options.right - metrics.px(34),
+            right: layout.options.right - tokens.icon_size,
             bottom: layout.options.bottom,
         },
         "Options",
         rgb(245, 245, 247),
         TextAlignment::Center,
-        metrics.px(UI_FONT_HEIGHT),
+        tokens.font_height,
     );
-    let chevron_y = layout.options.top + metrics.px(31);
+    let chevron_y = (layout.options.top + layout.options.bottom) / 2;
     draw_lines(
         device,
         &[
             (
-                layout.options.right - metrics.px(29),
+                layout.options.right - metrics.px(17),
                 chevron_y - metrics.px(3),
             ),
             (
-                layout.options.right - metrics.px(24),
+                layout.options.right - metrics.px(13),
                 chevron_y + metrics.px(2),
             ),
             (
-                layout.options.right - metrics.px(19),
+                layout.options.right - metrics.px(9),
                 chevron_y - metrics.px(3),
             ),
         ],
         rgb(220, 220, 224),
-        metrics.px(2).max(1),
+        tokens.icon_stroke,
     );
 
     let capture_enabled = state.selection.is_some();
@@ -2751,7 +2750,7 @@ fn draw_toolbar(state: &OverlayState) {
         layout.capture,
         capture_color,
         capture_color,
-        metrics.px(9),
+        tokens.control_corner_radius,
     );
     let capture_foreground = if capture_enabled {
         rgb(255, 255, 255)
@@ -2760,23 +2759,23 @@ fn draw_toolbar(state: &OverlayState) {
     };
     draw_camera_icon(
         device,
-        layout.capture.left + metrics.px(20),
-        layout.capture.top + metrics.px(18),
+        layout.capture.left + metrics.px(10),
+        (layout.capture.top + layout.capture.bottom - tokens.icon_size) / 2,
         capture_foreground,
         metrics,
     );
     draw_text(
         device,
         UiRect {
-            left: layout.capture.left + metrics.px(54),
+            left: layout.capture.left + tokens.icon_size + metrics.px(18),
             top: layout.capture.top,
-            right: layout.capture.right - metrics.px(8),
+            right: layout.capture.right - tokens.text_padding,
             bottom: layout.capture.bottom,
         },
         "Capture",
         capture_foreground,
         TextAlignment::Center,
-        metrics.px(UI_FONT_HEIGHT),
+        tokens.font_height,
     );
     draw_hover_tooltip(device, state, layout);
 }
@@ -2788,6 +2787,7 @@ fn draw_tool_button(
     state: &OverlayState,
     metrics: UiMetrics,
 ) {
+    let tokens = metrics.toolbar_tokens();
     let control = match tool {
         CaptureTool::FullDisplay => ToolbarControl::FullDisplay,
         CaptureTool::Window => ToolbarControl::Window,
@@ -2799,7 +2799,7 @@ fn draw_tool_button(
         } else {
             rgb(58, 58, 63)
         };
-        draw_round_box(device, bounds, color, color, metrics.px(8));
+        draw_round_box(device, bounds, color, color, tokens.control_corner_radius);
     }
     let color = rgb(245, 245, 247);
     match tool {
@@ -2831,22 +2831,25 @@ fn draw_hover_tooltip(device: HDC, state: &OverlayState, layout: ToolbarLayout) 
         _ => return,
     };
     let metrics = state.display_environment.metrics;
-    let font_height = metrics.px(UI_FONT_HEIGHT);
+    let tokens = metrics.toolbar_tokens();
+    let font_height = tokens.font_height;
     let measured = measure_ui_text(device, &value, font_height);
-    let width = (measured.cx + metrics.px(36))
-        .max(metrics.px(150))
+    let width = measured
+        .cx
+        .saturating_add(tokens.tooltip_padding_x.saturating_mul(2))
+        .max(metrics.px(120))
         .min((state.display_environment.work_area.width() - metrics.px(16)).max(1));
-    let height = (measured.cy + metrics.px(16)).max(metrics.px(38));
+    let height = (measured.cy + tokens.tooltip_padding_y * 2).max(metrics.px(32));
     let left = ((target.left + target.right - width) / 2).clamp(
         state.display_environment.work_area.left + metrics.px(8),
         (state.display_environment.work_area.right - width - metrics.px(8))
             .max(state.display_environment.work_area.left + metrics.px(8)),
     );
     let preferred_top =
-        if layout.bounds.top >= state.display_environment.work_area.top + height + metrics.px(18) {
-            layout.bounds.top - height - metrics.px(10)
+        if layout.bounds.top >= state.display_environment.work_area.top + height + metrics.px(16) {
+            layout.bounds.top - height - metrics.px(8)
         } else {
-            layout.bounds.bottom + metrics.px(10)
+            layout.bounds.bottom + metrics.px(8)
         };
     let top = preferred_top.clamp(
         state.display_environment.work_area.top + metrics.px(8),
@@ -2864,14 +2867,14 @@ fn draw_hover_tooltip(device: HDC, state: &OverlayState, layout: ToolbarLayout) 
         bounds,
         rgb(31, 31, 34),
         rgb(104, 104, 110),
-        metrics.px(9),
+        tokens.tooltip_corner_radius,
     );
     draw_text(
         device,
         UiRect {
-            left: bounds.left + metrics.px(16),
+            left: bounds.left + tokens.tooltip_padding_x,
             top: bounds.top,
-            right: bounds.right - metrics.px(16),
+            right: bounds.right - tokens.tooltip_padding_x,
             bottom: bounds.bottom,
         },
         &value,
@@ -2883,12 +2886,13 @@ fn draw_hover_tooltip(device: HDC, state: &OverlayState, layout: ToolbarLayout) 
 
 fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
     let metrics = state.display_environment.metrics;
+    let tokens = metrics.toolbar_tokens();
     draw_round_box(
         device,
         layout.menu,
         rgb(43, 43, 47),
         rgb(101, 101, 107),
-        metrics.px(12),
+        tokens.menu_corner_radius,
     );
     let rows = [
         (ToolbarControl::DimBackground, layout.dim_background),
@@ -2900,13 +2904,19 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
     ];
     for (control, row) in rows {
         if state.hovered_control == Some(control) {
-            draw_round_box(device, row, rgb(64, 64, 69), rgb(64, 64, 69), metrics.px(6));
+            draw_round_box(
+                device,
+                row,
+                rgb(64, 64, 69),
+                rgb(64, 64, 69),
+                tokens.control_corner_radius,
+            );
         }
     }
     if state.dim_background {
         draw_checkmark(
             device,
-            layout.dim_background.left + metrics.px(20),
+            layout.dim_background.left + tokens.menu_check_offset,
             (layout.dim_background.top + layout.dim_background.bottom) / 2,
             rgb(86, 156, 255),
             metrics,
@@ -2915,19 +2925,19 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
     draw_text(
         device,
         UiRect {
-            left: layout.dim_background.left + metrics.px(50),
+            left: layout.dim_background.left + tokens.menu_text_offset,
             top: layout.dim_background.top,
-            right: layout.dim_background.right - metrics.px(12),
+            right: layout.dim_background.right - tokens.text_padding,
             bottom: layout.dim_background.bottom,
         },
         "Dim Background",
         rgb(245, 245, 247),
         TextAlignment::Left,
-        metrics.px(UI_FONT_HEIGHT),
+        tokens.font_height,
     );
     draw_checkmark(
         device,
-        layout.clipboard_destination.left + metrics.px(20),
+        layout.clipboard_destination.left + tokens.menu_check_offset,
         (layout.clipboard_destination.top + layout.clipboard_destination.bottom) / 2,
         rgb(86, 156, 255),
         metrics,
@@ -2935,21 +2945,21 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
     draw_text(
         device,
         UiRect {
-            left: layout.clipboard_destination.left + metrics.px(50),
+            left: layout.clipboard_destination.left + tokens.menu_text_offset,
             top: layout.clipboard_destination.top,
-            right: layout.clipboard_destination.right - metrics.px(12),
+            right: layout.clipboard_destination.right - tokens.text_padding,
             bottom: layout.clipboard_destination.bottom,
         },
         "Copy to Clipboard",
         rgb(210, 210, 214),
         TextAlignment::Left,
-        metrics.px(UI_FONT_HEIGHT),
+        tokens.font_height,
     );
     draw_lines(
         device,
         &[
-            (layout.menu.left + metrics.px(12), layout.cancel.top),
-            (layout.menu.right - metrics.px(12), layout.cancel.top),
+            (layout.menu.left + tokens.text_padding, layout.cancel.top),
+            (layout.menu.right - tokens.text_padding, layout.cancel.top),
         ],
         rgb(76, 76, 81),
         1,
@@ -2957,80 +2967,85 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
     draw_text(
         device,
         UiRect {
-            left: layout.cancel.left + metrics.px(50),
+            left: layout.cancel.left + tokens.menu_text_offset,
             top: layout.cancel.top,
-            right: layout.cancel.right - metrics.px(12),
+            right: layout.cancel.right - tokens.text_padding,
             bottom: layout.cancel.bottom,
         },
         "Cancel Capture",
         rgb(255, 105, 97),
         TextAlignment::Left,
-        metrics.px(UI_FONT_HEIGHT),
+        tokens.font_height,
     );
 }
 
 fn draw_display_icon(device: HDC, bounds: UiRect, color: COLORREF, metrics: UiMetrics) {
-    let left = bounds.left + metrics.px(17);
-    let top = bounds.top + metrics.px(15);
+    let tokens = metrics.toolbar_tokens();
+    let left = (bounds.left + bounds.right - tokens.icon_size) / 2;
+    let top = (bounds.top + bounds.bottom - tokens.icon_size) / 2;
+    let body_height = tokens.icon_size * 2 / 3;
+    let center_x = left + tokens.icon_size / 2;
     draw_outline_rect(
         device,
         left,
         top,
-        left + metrics.px(30),
-        top + metrics.px(21),
+        left + tokens.icon_size,
+        top + body_height,
         color,
-        metrics.px(2).max(1),
+        tokens.icon_stroke,
     );
     draw_lines(
         device,
         &[
-            (left + metrics.px(15), top + metrics.px(21)),
-            (left + metrics.px(15), top + metrics.px(28)),
+            (center_x, top + body_height),
+            (center_x, top + tokens.icon_size),
         ],
         color,
-        metrics.px(2).max(1),
+        tokens.icon_stroke,
     );
     draw_lines(
         device,
         &[
-            (left + metrics.px(8), top + metrics.px(28)),
-            (left + metrics.px(22), top + metrics.px(28)),
+            (center_x - tokens.icon_size / 4, top + tokens.icon_size),
+            (center_x + tokens.icon_size / 4, top + tokens.icon_size),
         ],
         color,
-        metrics.px(2).max(1),
+        tokens.icon_stroke,
     );
 }
 
 fn draw_window_icon(device: HDC, bounds: UiRect, color: COLORREF, metrics: UiMetrics) {
-    let left = bounds.left + metrics.px(15);
-    let top = bounds.top + metrics.px(14);
-    let width = metrics.px(2).max(1);
+    let tokens = metrics.toolbar_tokens();
+    let left = (bounds.left + bounds.right - tokens.icon_size) / 2;
+    let top = (bounds.top + bounds.bottom - tokens.icon_size) / 2;
+    let offset = tokens.icon_size / 4;
     draw_outline_rect(
         device,
-        left + metrics.px(7),
+        left + offset,
         top,
-        left + metrics.px(34),
-        top + metrics.px(22),
+        left + tokens.icon_size,
+        top + tokens.icon_size - offset,
         color,
-        width,
+        tokens.icon_stroke,
     );
     draw_outline_rect(
         device,
         left,
-        top + metrics.px(8),
-        left + metrics.px(27),
-        top + metrics.px(30),
+        top + offset,
+        left + tokens.icon_size - offset,
+        top + tokens.icon_size,
         color,
-        width,
+        tokens.icon_stroke,
     );
 }
 
 fn draw_region_icon(device: HDC, bounds: UiRect, color: COLORREF, metrics: UiMetrics) {
-    let left = bounds.left + metrics.px(15);
-    let top = bounds.top + metrics.px(14);
-    let right = left + metrics.px(33);
-    let bottom = top + metrics.px(30);
-    let corner = metrics.px(9);
+    let tokens = metrics.toolbar_tokens();
+    let left = (bounds.left + bounds.right - tokens.icon_size) / 2;
+    let top = (bounds.top + bounds.bottom - tokens.icon_size) / 2;
+    let right = left + tokens.icon_size;
+    let bottom = top + tokens.icon_size;
+    let corner = tokens.icon_size / 3;
     for points in [
         [(left, top + corner), (left, top), (left + corner, top)],
         [(right - corner, top), (right, top), (right, top + corner)],
@@ -3045,40 +3060,41 @@ fn draw_region_icon(device: HDC, bounds: UiRect, color: COLORREF, metrics: UiMet
             (left, bottom - corner),
         ],
     ] {
-        draw_lines(device, &points, color, metrics.px(2).max(1));
+        draw_lines(device, &points, color, tokens.icon_stroke);
     }
 }
 
 fn draw_camera_icon(device: HDC, left: i32, top: i32, color: COLORREF, metrics: UiMetrics) {
-    let width = metrics.px(2).max(1);
+    let tokens = metrics.toolbar_tokens();
+    let body_top = top + tokens.icon_size / 4;
     draw_outline_rect(
         device,
         left,
-        top + metrics.px(6),
-        left + metrics.px(32),
-        top + metrics.px(28),
+        body_top,
+        left + tokens.icon_size,
+        top + tokens.icon_size,
         color,
-        width,
+        tokens.icon_stroke,
     );
     draw_lines(
         device,
         &[
-            (left + metrics.px(8), top + metrics.px(6)),
-            (left + metrics.px(12), top),
-            (left + metrics.px(20), top),
-            (left + metrics.px(24), top + metrics.px(6)),
+            (left + tokens.icon_size / 4, body_top),
+            (left + tokens.icon_size * 2 / 5, top),
+            (left + tokens.icon_size * 3 / 5, top),
+            (left + tokens.icon_size * 3 / 4, body_top),
         ],
         color,
-        width,
+        tokens.icon_stroke,
     );
     draw_ellipse(
         device,
-        left + metrics.px(11),
-        top + metrics.px(10),
-        left + metrics.px(23),
-        top + metrics.px(22),
+        left + tokens.icon_size / 3,
+        top + tokens.icon_size / 3,
+        left + tokens.icon_size * 2 / 3,
+        top + tokens.icon_size * 2 / 3,
         color,
-        width,
+        tokens.icon_stroke,
     );
 }
 
@@ -3619,14 +3635,14 @@ fn contains(rect: Rect, point: POINT) -> bool {
         && i64::from(point.y) < bottom
 }
 
-fn hit_test_resize_handle(rect: Rect, point: POINT) -> Option<ResizeHandle> {
+fn hit_test_resize_handle(rect: Rect, point: POINT, metrics: UiMetrics) -> Option<ResizeHandle> {
     let left = i64::from(rect.x);
     let top = i64::from(rect.y);
     let right = left + i64::from(rect.width);
     let bottom = top + i64::from(rect.height);
     let x = i64::from(point.x);
     let y = i64::from(point.y);
-    let radius = i64::from(HANDLE_HIT_RADIUS);
+    let radius = i64::from(metrics.region_tokens().handle_hit_radius);
     let near_left = (x - left).abs() <= radius;
     let near_right = (x - right).abs() <= radius;
     let near_top = (y - top).abs() <= radius;
@@ -4014,18 +4030,40 @@ mod tests {
             height: 200,
         };
         assert_eq!(
-            hit_test_resize_handle(rect, POINT { x: 104, y: 204 }),
+            hit_test_resize_handle(rect, POINT { x: 104, y: 204 }, UiMetrics::new(96)),
             Some(ResizeHandle::NorthWest)
         );
         assert_eq!(
-            hit_test_resize_handle(rect, POINT { x: 250, y: 203 }),
+            hit_test_resize_handle(rect, POINT { x: 250, y: 203 }, UiMetrics::new(96)),
             Some(ResizeHandle::North)
         );
         assert_eq!(
-            hit_test_resize_handle(rect, POINT { x: 397, y: 300 }),
+            hit_test_resize_handle(rect, POINT { x: 397, y: 300 }, UiMetrics::new(96)),
             Some(ResizeHandle::East)
         );
-        assert_eq!(hit_test_resize_handle(rect, POINT { x: 250, y: 300 }), None);
+        assert_eq!(
+            hit_test_resize_handle(rect, POINT { x: 250, y: 300 }, UiMetrics::new(96)),
+            None
+        );
+    }
+
+    #[test]
+    fn resize_handle_hit_target_scales_with_monitor_dpi() {
+        let rect = Rect {
+            x: 100,
+            y: 200,
+            width: 300,
+            height: 200,
+        };
+        let point = POINT { x: 250, y: 215 };
+        assert_eq!(
+            hit_test_resize_handle(rect, point, UiMetrics::new(96)),
+            None
+        );
+        assert_eq!(
+            hit_test_resize_handle(rect, point, UiMetrics::new(192)),
+            Some(ResizeHandle::North)
+        );
     }
 
     #[test]
@@ -4350,7 +4388,7 @@ mod tests {
         let environment = test_display_environment(1920, 1080, 1080, 96);
         assert_eq!(
             ToolbarLayout::clamp_origin(environment, POINT { x: -400, y: 2000 }),
-            POINT { x: 8, y: 990 }
+            POINT { x: 8, y: 1016 }
         );
     }
 
@@ -4358,17 +4396,17 @@ mod tests {
     fn toolbar_position_restores_from_normalized_work_area_coordinates() {
         let environment = test_display_environment(2560, 1440, 1400, 144);
         let layout = ToolbarLayout::new(environment, ToolbarLayout::default_origin(environment));
-        assert_eq!(layout.bounds.width(), 900);
-        assert_eq!(layout.bounds.height(), 123);
+        assert_eq!(layout.bounds.width(), 627);
+        assert_eq!(layout.bounds.height(), 84);
         assert!(layout.bounds.bottom <= environment.work_area.bottom);
         assert_eq!(
             remembered_toolbar_position(Some((0.5, 0.5)), None, environment),
-            Some(POINT { x: 830, y: 639 })
+            Some(POINT { x: 967, y: 658 })
         );
         let smaller = test_display_environment(1920, 1080, 1040, 96);
         assert_eq!(
             remembered_toolbar_position(Some((0.5, 0.5)), None, smaller),
-            Some(POINT { x: 660, y: 479 })
+            Some(POINT { x: 751, y: 492 })
         );
     }
 
@@ -4377,7 +4415,7 @@ mod tests {
         let environment = test_display_environment(1920, 1080, 1040, 96);
         assert_eq!(
             remembered_toolbar_position(None, Some((3700, 2000)), environment),
-            Some(POINT { x: 1312, y: 950 })
+            Some(POINT { x: 1494, y: 976 })
         );
     }
 
@@ -4655,6 +4693,71 @@ mod tests {
             String::from_utf16_lossy(&face_name[..length]),
             "Ioskeley Mono Medium"
         );
+    }
+
+    #[test]
+    fn compact_control_text_fits_at_supported_dpi_levels() {
+        let _font_resource =
+            PrivateFontResource::register().expect("register embedded IoskeleyMono font");
+        let surface = FrozenSurface::empty(8, 8).expect("text measurement surface");
+        for dpi in [96, 120, 144, 192] {
+            let metrics = UiMetrics::new(dpi);
+            let tokens = metrics.toolbar_tokens();
+            let environment = DisplayEnvironment {
+                work_area: UiRect {
+                    left: 0,
+                    top: 0,
+                    right: 3840,
+                    bottom: 2160,
+                },
+                metrics,
+            };
+            let layout =
+                ToolbarLayout::new(environment, ToolbarLayout::default_origin(environment));
+            let labels = [
+                (
+                    "Options",
+                    layout.options.width() - tokens.text_padding - tokens.icon_size,
+                    layout.options.height(),
+                ),
+                (
+                    "Capture",
+                    layout.capture.width()
+                        - tokens.icon_size
+                        - metrics.px(18)
+                        - tokens.text_padding,
+                    layout.capture.height(),
+                ),
+                (
+                    "Dim Background",
+                    layout.dim_background.width() - tokens.menu_text_offset - tokens.text_padding,
+                    layout.dim_background.height(),
+                ),
+                (
+                    "Copy to Clipboard",
+                    layout.clipboard_destination.width()
+                        - tokens.menu_text_offset
+                        - tokens.text_padding,
+                    layout.clipboard_destination.height(),
+                ),
+                (
+                    "Cancel Capture",
+                    layout.cancel.width() - tokens.menu_text_offset - tokens.text_padding,
+                    layout.cancel.height(),
+                ),
+            ];
+            for (label, available_width, available_height) in labels {
+                let measured = measure_ui_text(surface.device, label, tokens.font_height);
+                assert!(
+                    measured.cx <= available_width,
+                    "{label} is {measured:?} at {dpi} DPI but only {available_width} px are available"
+                );
+                assert!(
+                    measured.cy <= available_height,
+                    "{label} is {measured:?} at {dpi} DPI but only {available_height} px are available"
+                );
+            }
+        }
     }
 
     #[test]
