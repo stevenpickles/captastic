@@ -12,7 +12,7 @@ pub use capture::{
     BackendCapabilities, CaptureBackend, CaptureId, CaptureMode, CaptureOutcome, CaptureRequest,
     CaptureSource, CursorMode, NativeFrame,
 };
-pub use display::{DisplayId, DisplayInfo, Rect};
+pub use display::{DisplayId, DisplayInfo, DisplayTopology, DisplayTopologyError, Rect};
 pub use error::{CaptureError, CaptureErrorKind, FrameError, MetricsError, PipelineError};
 pub use fake::{FakeBackend, FakeBackendConfig};
 pub use frame::{

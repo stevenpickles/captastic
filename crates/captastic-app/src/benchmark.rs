@@ -18,6 +18,7 @@ pub struct BenchmarkOptions {
     pub warmup: usize,
     pub mode: CaptureMode,
     pub cpu_frame: bool,
+    pub display_id: DisplayId,
     pub trigger_queue_capacity: usize,
     pub metrics_capacity: usize,
     pub fake: FakeBackendConfig,
@@ -85,7 +86,12 @@ pub fn run_with_backend(
     }
     let mut warmup_recorder = EventRecorder::with_capacity(options.warmup.saturating_mul(10));
     for index in 0..options.warmup {
-        let request = request(index as u64, &options.mode, options.cpu_frame);
+        let request = request(
+            index as u64,
+            &options.display_id,
+            &options.mode,
+            options.cpu_frame,
+        );
         let _ = backend.capture(&request, &mut warmup_recorder);
     }
 
@@ -104,7 +110,12 @@ pub fn run_with_backend(
     for index in 0..options.iterations {
         let capture_id = CaptureId(index as u64 + 1);
         recorder.record(capture_id, PerfEventKind::HotkeyReceived, 0);
-        let request = request(capture_id.0, &options.mode, options.cpu_frame);
+        let request = request(
+            capture_id.0,
+            &options.display_id,
+            &options.mode,
+            options.cpu_frame,
+        );
         let triggered_at = request.triggered_at;
         trigger_queue.try_send(request)?;
         let enqueued_ns = duration_ns(triggered_at.elapsed());
@@ -246,11 +257,11 @@ pub fn write_json_lines(path: &Path, events: &[PerfEvent]) -> Result<(), AppErro
     })
 }
 
-fn request(id: u64, mode: &CaptureMode, cpu_frame: bool) -> CaptureRequest {
+fn request(id: u64, display_id: &DisplayId, mode: &CaptureMode, cpu_frame: bool) -> CaptureRequest {
     CaptureRequest {
         id: CaptureId(id),
         triggered_at: Instant::now(),
-        source: CaptureSource::Display(DisplayId::primary()),
+        source: CaptureSource::Display(display_id.clone()),
         mode: mode.clone(),
         cpu_frame,
         retain_native_frame: false,
@@ -284,6 +295,7 @@ mod tests {
                 max_age_ms: Some(25),
             },
             cpu_frame: true,
+            display_id: DisplayId::primary(),
             trigger_queue_capacity: 1,
             metrics_capacity: 100,
             fake: fake_config(0, 0, 1_000),

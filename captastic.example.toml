@@ -2,7 +2,10 @@ schema_version = 1
 
 [daemon]
 backend = "dxgi"
-display = "primary"
+display = "pointer"
+# Use "primary" to always target the Windows primary monitor.
+# To select one monitor, run `captastic displays --backend dxgi --json` and use:
+# display = "display:windows-monitor-0123456789abcdef"
 trigger_queue_capacity = 4
 
 [hotkey]
@@ -47,7 +50,8 @@ format = "compact"
 max_file_bytes = 5242880
 retained_files = 3
 
-# Captastic maintains these values as the overlay is used.
+# Legacy single-monitor values. Captastic still reads these as a fallback, but writes new state to
+# a persistent display-specific table like the example below.
 [ui]
 # overlay_x = 640
 # overlay_y = 920
@@ -58,3 +62,22 @@ retained_files = 3
 # y = 270
 # width = 960
 # height = 540
+
+# Captastic creates one of these tables for each monitor as the overlay is used. Toolbar and region
+# coordinates are local to the monitor, not the Windows virtual desktop. Toolbar center values are
+# normalized within the monitor work area so they survive DPI, taskbar, and resolution changes.
+# [ui.displays.windows-monitor-0123456789abcdef]
+# overlay_center_x = 0.5
+# overlay_center_y = 0.9
+# last_capture_tool = "region"
+
+# [ui.displays.windows-monitor-0123456789abcdef.last_region]
+# x = 480
+# y = 270
+# width = 960
+# height = 540
+
+# [ui.displays.windows-monitor-0123456789abcdef.last_region_source]
+# width = 1920
+# height = 1080
+# rotation_degrees = 0

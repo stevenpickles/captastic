@@ -10,11 +10,11 @@ The current capture path supports:
 - finite `AcquireNextFrame` waits;
 - OS presentation timestamps converted from QueryPerformanceCounter units;
 - rejection of frames presented before the trigger in `fresh` mode;
-- rolling acquisition into a retained GPU texture for immediate `latest` capture;
+- trigger-time acquisition into a retained GPU texture with no idle DXGI polling;
 - frame-age reporting for retained frames;
 - texture-type and non-empty-dimension validation;
 - exactly-once `ReleaseFrame` through an RAII guard;
-- typed timeout, access-loss, and device-loss errors with bounded full-backend reinitialization;
+- typed timeout, access-loss, and device-loss errors with drop-before-replace recovery and bounded same-capture retries;
 - native-frame latency records;
 - a preallocated D3D11 staging texture;
 - a three-slot preallocated CPU buffer pool;
@@ -30,7 +30,7 @@ The current path deliberately rejects:
 
 ## Resident hotkey path
 
-`captastic daemon` creates the DXGI backend on a dedicated capture thread. While idle, that thread drains Desktop Duplication into a retained GPU texture at a short polling interval. A second Windows thread owns `RegisterHotKey` and a Win32 message loop. The `WM_HOTKEY` branch timestamps immediately, constructs a fixed trigger record, attempts a nonblocking send into a four-entry queue, and returns. Capture and CPU readback occur on the capture thread; native selection and clipboard publication run on their own serialized workers after CPU readiness.
+`captastic daemon` creates the DXGI backend on a dedicated capture thread, then blocks on its command channel while idle. A second Windows thread owns `RegisterHotKey` and a Win32 message loop. The `WM_HOTKEY` branch timestamps immediately, constructs a fixed trigger record, attempts a nonblocking send into a four-entry queue, and returns. For `latest`, the capture thread performs one nonblocking Desktop Duplication drain at trigger time and reuses the retained image when the desktop has not changed; only the first capture may wait up to 100 ms for an initial frame. Capture and CPU readback occur on the capture thread; native selection and clipboard publication run on their own serialized workers after CPU readiness.
 
 The current binding is `Ctrl+Shift+F9` with `MOD_NOREPEAT`. Queue-full events are counted. The foreground prototype supports a maximum-capture limit, self-triggered lifecycle smoke mode, graceful Ctrl+C handling, and per-session `status`/`stop` commands through a named Windows event. Runtime TOML config controls backend, mode, freshness, clipboard/selection behavior, and queue capacities; explicit CLI values take precedence. Per-user configuration and overlay state share `%USERPROFILE%\.captastic\captastic.toml`, which is loaded automatically when `--config` is omitted. Logs remain under `%USERPROFILE%\.captastic\logs`.
 
@@ -54,11 +54,11 @@ Window mode confirms on click. A valid preview click requests a fresh full-resol
 
 The window renderer carries the DWM-derived physical corner radius beside each thumbnail and full-resolution preview. Clipboard frames remain straight-alpha, while private paint surfaces are premultiplied once. Since `AlphaBlend` ignores high-quality stretch modes and GDI HALFTONE drops the alpha byte, Captastic resamples all four premultiplied BGRA channels together into the exact layout dimensions: separable area filtering when reducing and center-aligned bilinear filtering when enlarging. The exact-sized result is then composited 1:1 with `AlphaBlend(AC_SRC_ALPHA)`. The hover ring is an outside-only concentric stroke calculated from the same fitted image rectangle and scaled radius. This avoids blurred/pixelated scaling, double clipping, black corner fringes, mismatched borders, and unwanted rounding of square windows. Corner coverage uses an 8x8 sampling grid until the Direct2D compositor replaces this fallback.
 
-Each short-lived `PrintWindow` worker explicitly enters the per-monitor-v2 DPI context before querying geometry. `GetWindowRect`, `DWMWA_EXTENDED_FRAME_BOUNDS`, and render-surface coordinates therefore remain physical and consistent even at 125/150/200 percent scaling. Captastic also queries `DWMWA_VISIBLE_FRAME_BORDER_THICKNESS`, safely insets that exact number of physical pixels on all sides, and reduces the corner radius by the same amount. Older Windows versions that do not expose the attribute retain the existing zero-inset behavior.
+Each short-lived window-render worker explicitly enters the per-monitor-v2 DPI context before querying geometry. `GetWindowRect`, `DWMWA_EXTENDED_FRAME_BOUNDS`, and render-surface coordinates therefore remain physical and consistent even at 125/150/200 percent scaling. Captastic also queries `DWMWA_VISIBLE_FRAME_BORDER_THICKNESS`, safely insets that exact number of physical pixels on all sides, and reduces the corner radius by the same amount. Older Windows versions that do not expose the attribute retain the existing zero-inset behavior.
 
 The overlay does not call `SetCapture`; this avoids displacing input ownership held by software KVM and mouse-sharing tools such as Synergy. Because the overlay covers the captured display, ordinary in-window mouse messages are sufficient while the pointer remains on that display. Captastic records the previous foreground window before showing the overlay and restores that window plus the standard arrow cursor after every normal or error exit.
 
-Confirmed regions use absolute physical screen coordinates and are checked before a tight BGRA crop is allocated. Window candidates retain their native `HWND`; `PrintWindow(PW_RENDERFULLCONTENT)` rendering is isolated behind a 350 ms response timeout with at most two timed-out native calls left in flight. Failed windows are omitted and Captastic never substitutes an occluded desktop crop. Windows Graphics Capture remains the planned compatibility path for GPU-heavy, protected, or unsupported windows.
+Confirmed regions use absolute physical screen coordinates and are checked before a tight BGRA crop is allocated. Window candidates retain their native `HWND`. Captastic first attempts `PrintWindow(PW_RENDERFULLCONTENT)` and falls back to programmatic Windows Graphics Capture when that API is denied, including across the normal-to-elevated integrity boundary. WGC creates a free-threaded frame pool, waits up to 300 ms for the first window-compositor frame, performs bounded D3D11 staging readback, and then feeds the same clean-border and rounded-alpha pipeline used by `PrintWindow`. The complete renderer remains isolated behind a 700 ms response timeout with at most two timed-out native calls left in flight. A window rejected by both backends is omitted; Captastic never substitutes an occluded desktop crop.
 
 DXGI selection requests additionally retain an immutable default-usage D3D11 texture. The native
 frame is type-erased at the shared-core boundary and is handed back only to `captastic-windows`.

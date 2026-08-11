@@ -10,6 +10,12 @@ use captastic_core::{
     PixelFormat, Rect, TimingProvenance,
 };
 use windows::core::{ComInterface, Error as WindowsError};
+use windows::Win32::Devices::Display::{
+    DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
+    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+    DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
+    DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS,
+};
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
@@ -32,8 +38,13 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
+const INITIAL_LATEST_FRAME_TIMEOUT: Duration = Duration::from_millis(100);
 const GPU_MAP_TIMEOUT: Duration = Duration::from_millis(250);
 const GPU_MAP_RETRY_DELAY: Duration = Duration::from_millis(1);
+
+pub fn enumerate_displays() -> Result<Vec<DisplayInfo>, CaptureError> {
+    enumerate_outputs().map(|outputs| outputs.into_iter().map(|output| output.info).collect())
+}
 
 pub struct DxgiBackend {
     _com: ComApartment,
@@ -53,23 +64,31 @@ pub struct DxgiBackend {
 
 impl DxgiBackend {
     pub fn new_primary() -> Result<Self, CaptureError> {
+        Self::new(&DisplayId::primary())
+    }
+
+    pub fn new(display_id: &DisplayId) -> Result<Self, CaptureError> {
         let com = ComApartment::initialize()?;
         let outputs = enumerate_outputs()?;
-        let selected_output = outputs
-            .iter()
-            .position(|output| output.info.is_primary)
-            .or_else(|| (!outputs.is_empty()).then_some(0))
-            .ok_or_else(|| {
-                capture_error(
-                    CaptureErrorKind::SourceUnavailable,
-                    "enumerate_outputs",
-                    "no attached desktop outputs were found",
-                    false,
-                    None,
-                )
-            })?;
+        let displays: Vec<_> = outputs.iter().map(|output| output.info.clone()).collect();
+        let selected_output = select_display_index(&displays, display_id).ok_or_else(|| {
+            let available = displays
+                .iter()
+                .map(|display| display.id.0.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            capture_error(
+                CaptureErrorKind::SourceUnavailable,
+                "enumerate_outputs",
+                format!(
+                    "configured display {} is not attached; available displays: [{}]",
+                    display_id.0, available
+                ),
+                false,
+                None,
+            )
+        })?;
 
-        let displays = outputs.iter().map(|output| output.info.clone()).collect();
         let selected_record = &outputs[selected_output];
         let adapter: IDXGIAdapter = selected_record
             .adapter
@@ -116,16 +135,7 @@ impl DxgiBackend {
         let duplication = unsafe { selected_record.output.DuplicateOutput(&device) }
             .map_err(|error| map_windows_error("duplicate_output", error))?;
         let qpc_frequency = query_performance_frequency()?;
-        let initial_desc = staging_desc(
-            selected_record.info.bounds.width,
-            selected_record.info.bounds.height,
-            DXGI_FORMAT_B8G8R8A8_UNORM,
-            DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-        );
-        let staging = Some(StagingTexture::create(&device, initial_desc)?);
+        let staging = None;
         let retained = RetainedTexture::create(
             &device,
             retained_desc(
@@ -138,13 +148,9 @@ impl DxgiBackend {
                 },
             ),
         )?;
-        let cpu_buffer_len = frame_byte_len(
-            selected_record.info.bounds.width,
-            selected_record.info.bounds.height,
-        )?;
-        let cpu_pool = CpuBufferPool::new(3, cpu_buffer_len);
+        let cpu_pool = CpuBufferPool::new(3);
 
-        let mut backend = Self {
+        let backend = Self {
             _com: com,
             device,
             context: Arc::new(Mutex::new(context)),
@@ -164,16 +170,11 @@ impl DxgiBackend {
                 cursor_control: false,
                 hdr: false,
                 presentation_time: true,
-                warm_stream: true,
+                warm_stream: false,
             },
             qpc_frequency,
             _thread_affine: PhantomData,
         };
-        match backend.refresh_latest(100) {
-            Ok(_) => {}
-            Err(error) if error.kind == CaptureErrorKind::Timeout => {}
-            Err(error) => return Err(error),
-        }
         Ok(backend)
     }
 }
@@ -347,14 +348,6 @@ impl CaptureBackend for DxgiBackend {
             });
         }
     }
-
-    fn poll(&mut self) -> Result<(), CaptureError> {
-        match self.refresh_latest(0) {
-            Ok(_) => Ok(()),
-            Err(error) if error.kind == CaptureErrorKind::Timeout => Ok(()),
-            Err(error) => Err(error),
-        }
-    }
 }
 
 impl DxgiBackend {
@@ -364,9 +357,7 @@ impl DxgiBackend {
         max_age_ms: Option<u64>,
         recorder: &mut EventRecorder,
     ) -> Result<CaptureOutcome, CaptureError> {
-        if self.latest.is_none() {
-            self.refresh_latest(100)?;
-        }
+        self.refresh_latest_on_demand()?;
         let latest = self.latest.ok_or_else(|| {
             capture_error(
                 CaptureErrorKind::SourceUnavailable,
@@ -461,6 +452,37 @@ impl DxgiBackend {
             native_frame,
             backend_duration: request.triggered_at.elapsed(),
         })
+    }
+
+    fn refresh_latest_on_demand(&mut self) -> Result<(), CaptureError> {
+        match self.refresh_latest(0) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) if error.kind == CaptureErrorKind::Timeout => {}
+            Err(error) => return Err(error),
+        }
+        if self.latest.is_some() {
+            return Ok(());
+        }
+
+        let deadline = Instant::now() + INITIAL_LATEST_FRAME_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(capture_error(
+                    CaptureErrorKind::Timeout,
+                    "capture_latest",
+                    "no desktop frame was available before the initial capture timeout",
+                    true,
+                    Some(i64::from(DXGI_ERROR_WAIT_TIMEOUT.0)),
+                ));
+            }
+            match self.refresh_latest(duration_to_timeout_ms(remaining)) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     fn refresh_latest(&mut self, timeout_ms: u32) -> Result<bool, CaptureError> {
@@ -592,8 +614,12 @@ impl DxgiBackend {
         let tight_stride_usize = tight_stride as usize;
         let source_stride = mapped.data.RowPitch as usize;
         {
-            let pixels = Arc::get_mut(&mut self.cpu_pool.slots[slot_index])
-                .expect("available slot has exactly one owner");
+            let pixels = Arc::get_mut(
+                self.cpu_pool.slots[slot_index]
+                    .as_mut()
+                    .expect("available slot is initialized"),
+            )
+            .expect("available slot has exactly one owner");
             if source_stride == tight_stride_usize {
                 // SAFETY: Equal source/destination strides make the complete mapped texture one
                 // contiguous initialized byte range valid until the matching Unmap.
@@ -617,7 +643,10 @@ impl DxgiBackend {
             }
         }
         drop(mapped);
-        let pixels = self.cpu_pool.slots[slot_index].clone();
+        let pixels = self.cpu_pool.slots[slot_index]
+            .as_ref()
+            .expect("available slot is initialized")
+            .clone();
         let cpu_ready_ns = duration_ns_u64(triggered_at.elapsed());
         metadata.cpu_ready_offset_ns = Some(cpu_ready_ns);
         metadata.copy_count = metadata.copy_count.saturating_add(2);
@@ -667,8 +696,7 @@ impl DxgiBackend {
                     source_desc.SampleDesc,
                 ),
             )?);
-            self.cpu_pool =
-                CpuBufferPool::new(3, frame_byte_len(source_desc.Width, source_desc.Height)?);
+            self.cpu_pool = CpuBufferPool::new(3);
         }
         Ok(self
             .staging
@@ -998,26 +1026,31 @@ impl StagingTexture {
 }
 
 struct CpuBufferPool {
-    slots: Vec<Arc<[u8]>>,
+    slots: Vec<Option<Arc<[u8]>>>,
     cursor: usize,
 }
 
 impl CpuBufferPool {
-    fn new(slot_count: usize, bytes_per_slot: usize) -> Self {
-        let slots = (0..slot_count)
-            .map(|_| Arc::from(vec![0_u8; bytes_per_slot]))
-            .collect();
+    fn new(slot_count: usize) -> Self {
+        let slots = vec![None; slot_count];
         Self { slots, cursor: 0 }
     }
 
     fn available_index(&mut self, required_len: usize) -> Option<usize> {
         for offset in 0..self.slots.len() {
             let index = (self.cursor + offset) % self.slots.len();
-            if self.slots[index].len() == required_len && Arc::strong_count(&self.slots[index]) == 1
-            {
-                self.cursor = (index + 1) % self.slots.len();
-                return Some(index);
+            match self.slots[index].as_ref() {
+                None => self.slots[index] = Some(Arc::from(vec![0_u8; required_len])),
+                Some(slot) if Arc::strong_count(slot) == 1 && slot.len() != required_len => {
+                    self.slots[index] = Some(Arc::from(vec![0_u8; required_len]));
+                }
+                Some(slot) if Arc::strong_count(slot) != 1 || slot.len() != required_len => {
+                    continue;
+                }
+                Some(_) => {}
             }
+            self.cursor = (index + 1) % self.slots.len();
+            return Some(index);
         }
         None
     }
@@ -1164,10 +1197,39 @@ struct OutputRecord {
     info: DisplayInfo,
 }
 
+fn select_display_index(displays: &[DisplayInfo], display_id: &DisplayId) -> Option<usize> {
+    if display_id.is_primary_alias() {
+        displays
+            .iter()
+            .position(|display| display.is_primary)
+            .or_else(|| (!displays.is_empty()).then_some(0))
+    } else {
+        displays
+            .iter()
+            .position(|display| display.id == *display_id)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DisplayConfigIdentity {
+    gdi_name: String,
+    persistent_id: DisplayId,
+    friendly_name: String,
+}
+
 fn enumerate_outputs() -> Result<Vec<OutputRecord>, CaptureError> {
     // SAFETY: The generic result is a supported DXGI factory interface and Windows initializes it.
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }
         .map_err(|error| map_windows_error("create_dxgi_factory", error))?;
+    let identities = match display_config_identities() {
+        Ok(identities) => identities,
+        Err(error) => {
+            log::warn!(
+                "persistent display identity query failed; using session-local output names: {error}"
+            );
+            Vec::new()
+        }
+    };
     let mut records = Vec::new();
     let mut adapter_index = 0_u32;
     loop {
@@ -1198,8 +1260,17 @@ fn enumerate_outputs() -> Result<Vec<OutputRecord>, CaptureError> {
                 .map_err(|error| map_windows_error("output_desc", error))?;
             if desc.AttachedToDesktop.as_bool() {
                 let bounds = rect_from_windows(desc.DesktopCoordinates)?;
-                let name = wide_array_to_string(&desc.DeviceName);
-                let id = DisplayId(format!("dxgi:{}:{}:{}", adapter_index, output_index, name));
+                let gdi_name = wide_array_to_string(&desc.DeviceName);
+                let identity = identities
+                    .iter()
+                    .find(|identity| identity.gdi_name.eq_ignore_ascii_case(&gdi_name));
+                let id = identity
+                    .map(|identity| identity.persistent_id.clone())
+                    .unwrap_or_else(|| persistent_display_id(&gdi_name));
+                let name = identity
+                    .filter(|identity| !identity.friendly_name.is_empty())
+                    .map(|identity| identity.friendly_name.clone())
+                    .unwrap_or(gdi_name);
                 records.push(OutputRecord {
                     adapter: adapter.clone(),
                     output: output1,
@@ -1219,6 +1290,123 @@ fn enumerate_outputs() -> Result<Vec<OutputRecord>, CaptureError> {
         adapter_index = adapter_index.saturating_add(1);
     }
     Ok(records)
+}
+
+fn display_config_identities() -> Result<Vec<DisplayConfigIdentity>, CaptureError> {
+    const MAX_ATTEMPTS: usize = 3;
+    for attempt in 0..MAX_ATTEMPTS {
+        let mut path_count = 0_u32;
+        let mut mode_count = 0_u32;
+        // SAFETY: Both counts are valid writable values and the query flag requests active paths.
+        unsafe {
+            GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count)
+        }
+        .map_err(|error| map_windows_error("display_config_buffer_sizes", error))?;
+        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
+        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
+        // SAFETY: The arrays have the capacities reported immediately above. The mutable counts
+        // describe their current lengths and are updated by Windows to the number of valid items.
+        let result = unsafe {
+            QueryDisplayConfig(
+                QDC_ONLY_ACTIVE_PATHS,
+                &mut path_count,
+                paths.as_mut_ptr(),
+                &mut mode_count,
+                modes.as_mut_ptr(),
+                None,
+            )
+        };
+        match result {
+            Ok(()) => {
+                paths.truncate(path_count as usize);
+                let mut identities = Vec::with_capacity(paths.len());
+                for path in paths {
+                    let source_name = display_config_source_name(&path)?;
+                    let target_name = display_config_target_name(&path)?;
+                    let monitor_path = wide_array_to_string(&target_name.monitorDevicePath);
+                    let friendly_name =
+                        wide_array_to_string(&target_name.monitorFriendlyDeviceName);
+                    let identity_material = if monitor_path.is_empty() {
+                        source_name.clone()
+                    } else {
+                        monitor_path
+                    };
+                    identities.push(DisplayConfigIdentity {
+                        gdi_name: source_name,
+                        persistent_id: persistent_display_id(&identity_material),
+                        friendly_name,
+                    });
+                }
+                return Ok(identities);
+            }
+            Err(error) if attempt + 1 < MAX_ATTEMPTS => {
+                log::debug!(
+                    "display identity query raced or failed transiently; retrying: {error}"
+                );
+            }
+            Err(error) => return Err(map_windows_error("query_display_config", error)),
+        }
+    }
+    unreachable!("display identity query loop always returns")
+}
+
+fn display_config_source_name(path: &DISPLAYCONFIG_PATH_INFO) -> Result<String, CaptureError> {
+    let mut name = DISPLAYCONFIG_SOURCE_DEVICE_NAME {
+        header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+            r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+            size: std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32,
+            adapterId: path.sourceInfo.adapterId,
+            id: path.sourceInfo.id,
+        },
+        ..Default::default()
+    };
+    // SAFETY: The packet header identifies the concrete structure and its exact initialized size.
+    let result = unsafe { DisplayConfigGetDeviceInfo(&mut name.header) };
+    if result != 0 {
+        return Err(display_config_error("display_config_source_name", result));
+    }
+    Ok(wide_array_to_string(&name.viewGdiDeviceName))
+}
+
+fn display_config_target_name(
+    path: &DISPLAYCONFIG_PATH_INFO,
+) -> Result<DISPLAYCONFIG_TARGET_DEVICE_NAME, CaptureError> {
+    let mut name = DISPLAYCONFIG_TARGET_DEVICE_NAME {
+        header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+            r#type: DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+            size: std::mem::size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32,
+            adapterId: path.targetInfo.adapterId,
+            id: path.targetInfo.id,
+        },
+        ..Default::default()
+    };
+    // SAFETY: The packet header identifies the concrete structure and its exact initialized size.
+    let result = unsafe { DisplayConfigGetDeviceInfo(&mut name.header) };
+    if result != 0 {
+        return Err(display_config_error("display_config_target_name", result));
+    }
+    Ok(name)
+}
+
+fn display_config_error(operation: &'static str, result: i32) -> CaptureError {
+    capture_error(
+        CaptureErrorKind::NativeFailure,
+        operation,
+        format!("Windows display configuration query failed with status {result}"),
+        true,
+        Some(i64::from(result)),
+    )
+}
+
+fn persistent_display_id(identity: &str) -> DisplayId {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in identity.bytes().map(|byte| byte.to_ascii_lowercase()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    DisplayId(format!("windows-monitor-{hash:016x}"))
 }
 
 struct AcquiredFrame {
@@ -1469,19 +1657,79 @@ mod tests {
     }
 
     #[test]
+    fn persistent_display_ids_are_case_insensitive_and_device_specific() {
+        assert_eq!(
+            persistent_display_id(r"\\?\DISPLAY#DEL40A9#first"),
+            persistent_display_id(r"\\?\display#del40a9#FIRST")
+        );
+        assert_ne!(
+            persistent_display_id(r"\\?\DISPLAY#DEL40A9#first"),
+            persistent_display_id(r"\\?\DISPLAY#DEL40A9#second")
+        );
+        assert!(persistent_display_id("monitor")
+            .0
+            .starts_with("windows-monitor-"));
+    }
+
+    #[test]
+    fn configured_display_selection_prefers_identity_over_enumeration_order() {
+        let displays = [
+            test_display("secondary", false),
+            test_display("primary-id", true),
+        ];
+        assert_eq!(
+            select_display_index(&displays, &DisplayId::primary()),
+            Some(1)
+        );
+        assert_eq!(
+            select_display_index(&displays, &DisplayId("secondary".to_owned())),
+            Some(0)
+        );
+        assert_eq!(
+            select_display_index(&displays, &DisplayId("missing".to_owned())),
+            None
+        );
+    }
+
+    fn test_display(id: &str, is_primary: bool) -> DisplayInfo {
+        DisplayInfo {
+            id: DisplayId(id.to_owned()),
+            name: id.to_owned(),
+            bounds: Rect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            scale_factor: 1.0,
+            rotation_degrees: 0,
+            is_primary,
+        }
+    }
+
+    #[test]
     fn timeout_rounds_up_to_one_millisecond() {
         assert_eq!(duration_to_timeout_ms(Duration::from_micros(1)), 1);
     }
 
     #[test]
     fn cpu_pool_does_not_reuse_a_leased_slot() {
-        let mut pool = CpuBufferPool::new(2, 16);
+        let mut pool = CpuBufferPool::new(2);
         let first = pool.available_index(16).expect("first slot");
-        let lease = pool.slots[first].clone();
+        let lease = pool.slots[first].as_ref().expect("initialized").clone();
         let second = pool.available_index(16).expect("second slot");
         assert_ne!(first, second);
         drop(lease);
         assert!(pool.available_index(16).is_some());
+    }
+
+    #[test]
+    fn cpu_pool_allocates_slots_only_when_requested() {
+        let mut pool = CpuBufferPool::new(3);
+        assert!(pool.slots.iter().all(Option::is_none));
+        let first = pool.available_index(64).expect("first slot");
+        assert_eq!(pool.slots[first].as_ref().map(|slot| slot.len()), Some(64));
+        assert_eq!(pool.slots.iter().flatten().count(), 1);
     }
 
     #[test]
@@ -1539,6 +1787,10 @@ mod tests {
     #[ignore = "requires an interactive Windows desktop and DXGI duplication access"]
     fn native_gpu_region_matches_the_frozen_cpu_frame() {
         let mut backend = DxgiBackend::new_primary().expect("DXGI backend");
+        assert!(
+            backend.latest.is_none(),
+            "backend initialization must not acquire a desktop frame"
+        );
         let source = backend.selected.bounds;
         let capture_started = Instant::now();
         let outcome = loop {

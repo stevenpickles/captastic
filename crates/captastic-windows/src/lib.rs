@@ -5,6 +5,8 @@ mod console;
 #[cfg(windows)]
 mod daemon_control;
 #[cfg(windows)]
+mod display_manager;
+#[cfg(windows)]
 mod dxgi;
 #[cfg(windows)]
 mod hotkey;
@@ -16,6 +18,8 @@ mod startup;
 mod tray;
 #[cfg(windows)]
 mod window_capture;
+#[cfg(windows)]
+mod window_capture_wgc;
 
 #[cfg(windows)]
 pub use clipboard::{ClipboardPublishReport, ClipboardPublisher};
@@ -24,7 +28,9 @@ pub use console::ConsoleShutdown;
 #[cfg(windows)]
 pub use daemon_control::DaemonControl;
 #[cfg(windows)]
-pub use dxgi::{materialize_native_region, DxgiBackend, GpuMaterialization};
+pub use display_manager::{display_containing_pointer, DxgiDisplayManager};
+#[cfg(windows)]
+pub use dxgi::{enumerate_displays, materialize_native_region, DxgiBackend, GpuMaterialization};
 #[cfg(windows)]
 pub use hotkey::{HotkeyListener, HotkeySpec};
 #[cfg(windows)]

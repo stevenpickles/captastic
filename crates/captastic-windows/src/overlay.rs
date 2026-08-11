@@ -1,12 +1,13 @@
 use std::cell::RefCell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
 use captastic_core::{
-    CaptureError, CaptureErrorKind, CpuFrame, FrameMetadata, FrameOrigin, PixelFormat, Rect,
+    CaptureError, CaptureErrorKind, CpuFrame, DisplayId, DisplayInfo, FrameMetadata, FrameOrigin,
+    PixelFormat, Rect,
 };
 use windows::core::{w, Error as WindowsError, PCWSTR};
 use windows::Win32::Foundation::{
@@ -18,17 +19,19 @@ use windows::Win32::Graphics::Gdi::GetTextFaceW;
 use windows::Win32::Graphics::Gdi::{
     AddFontMemResourceEx, AlphaBlend, BeginPaint, BitBlt, CreateBitmap, CreateCompatibleDC,
     CreateDIBSection, CreateFontW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW,
-    Ellipse, EndPaint, FillRect, GetStockObject, GetTextExtentPoint32W, InvalidateRect, LineTo,
-    MoveToEx, Rectangle, RemoveFontMemResourceEx, RoundRect, SelectObject, SetBkMode,
-    SetStretchBltMode, SetTextColor, StretchBlt, UpdateWindow, AC_SRC_ALPHA, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_PITCH,
-    DIB_RGB_COLORS, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_MEDIUM,
-    HALFTONE, HBITMAP, HDC, HFONT, HGDIOBJ, NULL_BRUSH, PAINTSTRUCT, PS_SOLID, RGBQUAD, SRCCOPY,
-    TRANSPARENT,
+    Ellipse, EndPaint, FillRect, GetMonitorInfoW, GetStockObject, GetTextExtentPoint32W,
+    InvalidateRect, LineTo, MonitorFromRect, MonitorFromWindow, MoveToEx, Rectangle,
+    RemoveFontMemResourceEx, RoundRect, SelectObject, SetBkMode, SetStretchBltMode, SetTextColor,
+    StretchBlt, UpdateWindow, AC_SRC_ALPHA, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
+    CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CENTER, DT_LEFT,
+    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_MEDIUM, HALFTONE, HBITMAP, HDC, HFONT, HGDIOBJ,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL, NULL_BRUSH, PAINTSTRUCT,
+    PS_SOLID, RGBQUAD, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
-    SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    GetDpiForMonitor, SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, MDT_EFFECTIVE_DPI,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -67,17 +70,7 @@ const WINDOW_THUMBNAIL_MAX_PIXELS: u64 = 1_200_000;
 const UI_FONT_HEIGHT: i32 = 21;
 const MENU_WIDTH: i32 = 320;
 const MENU_HEIGHT: i32 = 164;
-const NO_TOOLBAR_POSITION: u64 = u64::MAX;
-const CAPTURE_TOOL_FULL_DISPLAY: u8 = 0;
-const CAPTURE_TOOL_WINDOW: u8 = 1;
-const CAPTURE_TOOL_REGION: u8 = 2;
 const IOSKELEY_MONO_MEDIUM: &[u8] = include_bytes!("../assets/fonts/IoskeleyMono-Medium.ttf");
-
-static LAST_TOOLBAR_POSITION: AtomicU64 = AtomicU64::new(NO_TOOLBAR_POSITION);
-static TOOLBAR_POSITION_LOADED: AtomicBool = AtomicBool::new(false);
-static CAPTURE_HISTORY_LOADED: AtomicBool = AtomicBool::new(false);
-static LAST_CAPTURE_TOOL: AtomicU8 = AtomicU8::new(CAPTURE_TOOL_REGION);
-static LAST_CAPTURED_REGION: Mutex<Option<Rect>> = Mutex::new(None);
 
 thread_local! {
     static OVERLAY_RESOURCE_CACHE: RefCell<Option<OverlayResourceCache>> = const { RefCell::new(None) };
@@ -194,11 +187,28 @@ pub fn select_from_frozen_frame_with_controller(
             PrivateFontResource::register()?,
         )
     };
-    let toolbar_position = remembered_toolbar_position(surface.width, surface.height)
-        .unwrap_or_else(|| ToolbarLayout::default_origin(surface.width, surface.height));
-    let last_region =
-        Some(remembered_last_region(source).unwrap_or_else(|| default_region_for_source(source)));
-    let tool = remembered_capture_tool();
+    let display_environment = query_display_environment(source);
+    let remembered_ui = load_display_ui_state(&frame.metadata.display_id);
+    let toolbar_position = remembered_toolbar_position(
+        remembered_ui.overlay_center,
+        remembered_ui.overlay_position,
+        display_environment,
+    )
+    .unwrap_or_else(|| ToolbarLayout::default_origin(display_environment));
+    let last_region = Some(
+        remembered_last_region(
+            remembered_ui.region,
+            remembered_ui.region_source,
+            remembered_ui.region_is_display_local,
+            source,
+            frame.metadata.rotation_degrees,
+        )
+        .unwrap_or_else(|| default_region_for_source(source)),
+    );
+    let tool = remembered_ui
+        .tool
+        .map(CaptureTool::from_config)
+        .unwrap_or(CaptureTool::Region);
     let (selection, selection_kind) = initial_selection(tool, last_region, source);
     let mut state = Box::new(OverlayState {
         source,
@@ -226,6 +236,7 @@ pub fn select_from_frozen_frame_with_controller(
         hovered_control: None,
         toolbar_position,
         toolbar_drag: None,
+        display_environment,
         reference_metadata: frame.metadata.clone(),
         window_preview: None,
         window_thumbnails: Vec::new(),
@@ -270,6 +281,81 @@ impl Drop for ThreadDpiContext {
     }
 }
 
+fn query_display_environment(source: Rect) -> DisplayEnvironment {
+    let full_area = UiRect {
+        left: 0,
+        top: 0,
+        right: i32::try_from(source.width).unwrap_or(i32::MAX),
+        bottom: i32::try_from(source.height).unwrap_or(i32::MAX),
+    };
+    let native_source = RECT {
+        left: source.x,
+        top: source.y,
+        right: source
+            .right()
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        bottom: source
+            .bottom()
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+    };
+    // SAFETY: native_source is a valid physical desktop rectangle and the returned monitor handle
+    // is used only for synchronous information queries.
+    let monitor = unsafe { MonitorFromRect(&native_source, MONITOR_DEFAULTTONEAREST) };
+    if monitor.0 == 0 {
+        log::warn!(
+            "monitor work area unavailable for display bounds={}x{}{:+}{:+}; using full display at 96 DPI",
+            source.width,
+            source.height,
+            source.x,
+            source.y
+        );
+        return DisplayEnvironment {
+            work_area: full_area,
+            metrics: UiMetrics::new(UiMetrics::BASE_DPI),
+        };
+    }
+
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..MONITORINFO::default()
+    };
+    // SAFETY: info is initialized with the required size and remains writable for the call.
+    let work_area = if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        UiRect {
+            left: info.rcWork.left.saturating_sub(source.x),
+            top: info.rcWork.top.saturating_sub(source.y),
+            right: info.rcWork.right.saturating_sub(source.x),
+            bottom: info.rcWork.bottom.saturating_sub(source.y),
+        }
+    } else {
+        log::warn!(
+            "monitor work area query failed for display bounds={}x{}{:+}{:+}; using full display",
+            source.width,
+            source.height,
+            source.x,
+            source.y
+        );
+        full_area
+    };
+
+    let mut dpi_x = UiMetrics::BASE_DPI;
+    let mut dpi_y = UiMetrics::BASE_DPI;
+    // SAFETY: dpi_x and dpi_y are writable values and monitor is a live handle from the query.
+    let dpi_result =
+        unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) };
+    if let Err(error) = dpi_result {
+        log::warn!("effective monitor DPI query failed: {error}; using 96 DPI");
+        dpi_x = UiMetrics::BASE_DPI;
+    } else if dpi_x != dpi_y {
+        log::debug!("monitor reports asymmetric DPI x={dpi_x} y={dpi_y}; using x-axis DPI");
+    }
+
+    DisplayEnvironment {
+        work_area,
+        metrics: UiMetrics::new(dpi_x),
+    }
+}
+
 struct OverlayState {
     source: Rect,
     surface: FrozenSurface,
@@ -296,6 +382,7 @@ struct OverlayState {
     hovered_control: Option<ToolbarControl>,
     toolbar_position: POINT,
     toolbar_drag: Option<ToolbarDrag>,
+    display_environment: DisplayEnvironment,
     reference_metadata: FrameMetadata,
     window_preview: Option<WindowPreviewState>,
     window_thumbnails: Vec<WindowThumbnail>,
@@ -378,14 +465,6 @@ impl CaptureTool {
         }
     }
 
-    const fn code(self) -> u8 {
-        match self {
-            Self::FullDisplay => CAPTURE_TOOL_FULL_DISPLAY,
-            Self::Window => CAPTURE_TOOL_WINDOW,
-            Self::Region => CAPTURE_TOOL_REGION,
-        }
-    }
-
     const fn from_config(tool: captastic_config::CaptureTool) -> Self {
         match tool {
             captastic_config::CaptureTool::FullDisplay => Self::FullDisplay,
@@ -434,6 +513,48 @@ impl UiRect {
     fn contains(self, point: POINT) -> bool {
         point.x >= self.left && point.x < self.right && point.y >= self.top && point.y < self.bottom
     }
+
+    fn width(self) -> i32 {
+        (self.right - self.left).max(1)
+    }
+
+    fn height(self) -> i32 {
+        (self.bottom - self.top).max(1)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UiMetrics {
+    dpi: u32,
+}
+
+impl UiMetrics {
+    const BASE_DPI: u32 = 96;
+
+    const fn new(dpi: u32) -> Self {
+        Self {
+            dpi: if dpi == 0 { Self::BASE_DPI } else { dpi },
+        }
+    }
+
+    fn px(self, dip: i32) -> i32 {
+        let scaled = i64::from(dip) * i64::from(self.dpi) + i64::from(Self::BASE_DPI / 2);
+        i32::try_from(scaled / i64::from(Self::BASE_DPI)).unwrap_or(i32::MAX)
+    }
+
+    fn toolbar_width(self) -> i32 {
+        self.px(TOOLBAR_WIDTH)
+    }
+
+    fn toolbar_height(self) -> i32 {
+        self.px(TOOLBAR_HEIGHT)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DisplayEnvironment {
+    work_area: UiRect,
+    metrics: UiMetrics,
 }
 
 #[derive(Clone, Copy)]
@@ -795,104 +916,119 @@ struct MoveDrag {
 }
 
 impl ToolbarLayout {
-    fn default_origin(client_width: i32, client_height: i32) -> POINT {
+    fn default_origin(environment: DisplayEnvironment) -> POINT {
+        let work_area = environment.work_area;
+        let metrics = environment.metrics;
         Self::clamp_origin(
-            client_width,
-            client_height,
+            environment,
             POINT {
-                x: (client_width - TOOLBAR_WIDTH) / 2,
-                y: client_height - TOOLBAR_HEIGHT - TOOLBAR_BOTTOM_MARGIN,
+                x: work_area.left + (work_area.width() - metrics.toolbar_width()) / 2,
+                y: work_area.bottom - metrics.toolbar_height() - metrics.px(TOOLBAR_BOTTOM_MARGIN),
             },
         )
     }
 
-    fn clamp_origin(client_width: i32, client_height: i32, origin: POINT) -> POINT {
+    fn clamp_origin(environment: DisplayEnvironment, origin: POINT) -> POINT {
+        let work_area = environment.work_area;
+        let metrics = environment.metrics;
+        let inset = metrics.px(8);
         POINT {
-            x: origin.x.clamp(8, (client_width - TOOLBAR_WIDTH - 8).max(8)),
-            y: origin
-                .y
-                .clamp(8, (client_height - TOOLBAR_HEIGHT - 8).max(8)),
+            x: origin.x.clamp(
+                work_area.left + inset,
+                (work_area.right - metrics.toolbar_width() - inset).max(work_area.left + inset),
+            ),
+            y: origin.y.clamp(
+                work_area.top + inset,
+                (work_area.bottom - metrics.toolbar_height() - inset).max(work_area.top + inset),
+            ),
         }
     }
 
-    fn new(client_width: i32, client_height: i32, origin: POINT) -> Self {
-        let origin = Self::clamp_origin(client_width, client_height, origin);
+    fn new(environment: DisplayEnvironment, origin: POINT) -> Self {
+        let metrics = environment.metrics;
+        let work_area = environment.work_area;
+        let origin = Self::clamp_origin(environment, origin);
         let left = origin.x;
         let top = origin.y;
         let bounds = UiRect {
             left,
             top,
-            right: left + TOOLBAR_WIDTH,
-            bottom: top + TOOLBAR_HEIGHT,
+            right: left + metrics.toolbar_width(),
+            bottom: top + metrics.toolbar_height(),
         };
-        let menu_left =
-            (bounds.right - MENU_WIDTH - 12).clamp(8, (client_width - MENU_WIDTH - 8).max(8));
-        let menu_top = if top >= MENU_HEIGHT + 16 {
-            top - MENU_HEIGHT - 10
+        let menu_width = metrics.px(MENU_WIDTH);
+        let menu_height = metrics.px(MENU_HEIGHT);
+        let inset = metrics.px(8);
+        let menu_left = (bounds.right - menu_width - metrics.px(12)).clamp(
+            work_area.left + inset,
+            (work_area.right - menu_width - inset).max(work_area.left + inset),
+        );
+        let menu_top = if top >= work_area.top + menu_height + metrics.px(16) {
+            top - menu_height - metrics.px(10)
         } else {
-            bounds.bottom + 10
+            (bounds.bottom + metrics.px(10)).min(work_area.bottom - menu_height - inset)
         };
         let menu = UiRect {
             left: menu_left,
             top: menu_top,
-            right: menu_left + MENU_WIDTH,
-            bottom: menu_top + MENU_HEIGHT,
+            right: menu_left + menu_width,
+            bottom: menu_top + menu_height,
         };
         Self {
             bounds,
             drag_handle: UiRect {
-                left: left + 8,
-                top: top + 10,
-                right: left + 44,
-                bottom: top + 72,
+                left: left + metrics.px(8),
+                top: top + metrics.px(10),
+                right: left + metrics.px(44),
+                bottom: top + metrics.px(72),
             },
             full_display: UiRect {
-                left: left + 48,
-                top: top + 10,
-                right: left + 112,
-                bottom: top + 72,
+                left: left + metrics.px(48),
+                top: top + metrics.px(10),
+                right: left + metrics.px(112),
+                bottom: top + metrics.px(72),
             },
             window: UiRect {
-                left: left + 112,
-                top: top + 10,
-                right: left + 176,
-                bottom: top + 72,
+                left: left + metrics.px(112),
+                top: top + metrics.px(10),
+                right: left + metrics.px(176),
+                bottom: top + metrics.px(72),
             },
             region: UiRect {
-                left: left + 176,
-                top: top + 10,
-                right: left + 240,
-                bottom: top + 72,
+                left: left + metrics.px(176),
+                top: top + metrics.px(10),
+                right: left + metrics.px(240),
+                bottom: top + metrics.px(72),
             },
             options: UiRect {
-                left: left + 270,
-                top: top + 10,
-                right: left + 402,
-                bottom: top + 72,
+                left: left + metrics.px(270),
+                top: top + metrics.px(10),
+                right: left + metrics.px(402),
+                bottom: top + metrics.px(72),
             },
             capture: UiRect {
-                left: left + 418,
-                top: top + 10,
-                right: left + 584,
-                bottom: top + 72,
+                left: left + metrics.px(418),
+                top: top + metrics.px(10),
+                right: left + metrics.px(584),
+                bottom: top + metrics.px(72),
             },
             dim_background: UiRect {
-                left: menu.left + 6,
-                top: menu.top + 6,
-                right: menu.right - 6,
-                bottom: menu.top + 56,
+                left: menu.left + metrics.px(6),
+                top: menu.top + metrics.px(6),
+                right: menu.right - metrics.px(6),
+                bottom: menu.top + metrics.px(56),
             },
             clipboard_destination: UiRect {
-                left: menu.left + 6,
-                top: menu.top + 56,
-                right: menu.right - 6,
-                bottom: menu.top + 106,
+                left: menu.left + metrics.px(6),
+                top: menu.top + metrics.px(56),
+                right: menu.right - metrics.px(6),
+                bottom: menu.top + metrics.px(106),
             },
             cancel: UiRect {
-                left: menu.left + 6,
-                top: menu.top + 106,
-                right: menu.right - 6,
-                bottom: menu.bottom - 6,
+                left: menu.left + metrics.px(6),
+                top: menu.top + metrics.px(106),
+                right: menu.right - metrics.px(6),
+                bottom: menu.bottom - metrics.px(6),
             },
             menu,
         }
@@ -930,26 +1066,26 @@ impl ToolbarLayout {
     }
 }
 
-fn remembered_toolbar_position(client_width: i32, client_height: i32) -> Option<POINT> {
-    let mut packed = LAST_TOOLBAR_POSITION.load(Ordering::Acquire);
-    if packed == NO_TOOLBAR_POSITION && !TOOLBAR_POSITION_LOADED.swap(true, Ordering::AcqRel) {
-        if let Some(position) = load_toolbar_position_from_disk() {
-            packed = pack_toolbar_position(position);
-            LAST_TOOLBAR_POSITION.store(packed, Ordering::Release);
-        }
-    }
-    (packed != NO_TOOLBAR_POSITION).then(|| {
-        ToolbarLayout::clamp_origin(client_width, client_height, unpack_toolbar_position(packed))
-    })
-}
-
-fn remembered_capture_tool() -> CaptureTool {
-    ensure_capture_history_loaded();
-    match LAST_CAPTURE_TOOL.load(Ordering::Acquire) {
-        CAPTURE_TOOL_FULL_DISPLAY => CaptureTool::FullDisplay,
-        CAPTURE_TOOL_WINDOW => CaptureTool::Window,
-        _ => CaptureTool::Region,
-    }
+fn remembered_toolbar_position(
+    normalized_center: Option<(f64, f64)>,
+    position: Option<(i32, i32)>,
+    environment: DisplayEnvironment,
+) -> Option<POINT> {
+    normalized_center
+        .map(|(center_x, center_y)| {
+            let work_area = environment.work_area;
+            let metrics = environment.metrics;
+            POINT {
+                x: work_area.left
+                    + (center_x.clamp(0.0, 1.0) * f64::from(work_area.width())).round() as i32
+                    - metrics.toolbar_width() / 2,
+                y: work_area.top
+                    + (center_y.clamp(0.0, 1.0) * f64::from(work_area.height())).round() as i32
+                    - metrics.toolbar_height() / 2,
+            }
+        })
+        .or_else(|| position.map(|(x, y)| POINT { x, y }))
+        .map(|origin| ToolbarLayout::clamp_origin(environment, origin))
 }
 
 fn initial_selection(
@@ -969,55 +1105,110 @@ fn initial_selection(
     }
 }
 
-fn remembered_last_region(source: Rect) -> Option<Rect> {
-    ensure_capture_history_loaded();
-    LAST_CAPTURED_REGION
-        .lock()
-        .ok()
-        .and_then(|region| region.as_ref().copied())
-        .map(|region| fit_region_to_source(region, source))
+fn remembered_last_region(
+    region: Option<captastic_config::CaptureRegion>,
+    previous_source: Option<captastic_config::CaptureRegionSource>,
+    display_local: bool,
+    source: Rect,
+    current_rotation_degrees: u16,
+) -> Option<Rect> {
+    region.map(|region| {
+        if display_local {
+            if let Some(previous_source) = previous_source {
+                return restore_region_for_display_change(
+                    region,
+                    previous_source,
+                    source,
+                    current_rotation_degrees,
+                );
+            }
+        }
+        let x = if display_local {
+            source.x.saturating_add(region.x)
+        } else {
+            region.x
+        };
+        let y = if display_local {
+            source.y.saturating_add(region.y)
+        } else {
+            region.y
+        };
+        fit_region_to_source(
+            Rect {
+                x,
+                y,
+                width: region.width,
+                height: region.height,
+            },
+            source,
+        )
+    })
 }
 
-fn remember_capture_history(kind: SelectionKind, confirmed_region: Option<Rect>) {
+fn restore_region_for_display_change(
+    region: captastic_config::CaptureRegion,
+    previous_source: captastic_config::CaptureRegionSource,
+    source: Rect,
+    current_rotation_degrees: u16,
+) -> Rect {
+    let center_x = (f64::from(region.x) + f64::from(region.width) / 2.0)
+        / f64::from(previous_source.width.max(1));
+    let center_y = (f64::from(region.y) + f64::from(region.height) / 2.0)
+        / f64::from(previous_source.height.max(1));
+    let rotation_delta = (u32::from(current_rotation_degrees) + 360
+        - u32::from(previous_source.rotation_degrees))
+        % 360;
+    let (center_x, center_y, width, height) = match rotation_delta {
+        90 => (1.0 - center_y, center_x, region.height, region.width),
+        180 => (1.0 - center_x, 1.0 - center_y, region.width, region.height),
+        270 => (center_y, 1.0 - center_x, region.height, region.width),
+        _ => (center_x, center_y, region.width, region.height),
+    };
+    let width = width.min(source.width);
+    let height = height.min(source.height);
+    let local_x =
+        (center_x.clamp(0.0, 1.0) * f64::from(source.width) - f64::from(width) / 2.0).round();
+    let local_y =
+        (center_y.clamp(0.0, 1.0) * f64::from(source.height) - f64::from(height) / 2.0).round();
+    fit_region_to_source(
+        Rect {
+            x: source.x.saturating_add(local_x as i32),
+            y: source.y.saturating_add(local_y as i32),
+            width,
+            height,
+        },
+        source,
+    )
+}
+
+fn remember_capture_history(
+    display_id: &DisplayId,
+    source: Rect,
+    kind: SelectionKind,
+    confirmed_region: Option<Rect>,
+    rotation_degrees: u16,
+) {
     let tool = CaptureTool::from_selection_kind(kind);
-    LAST_CAPTURE_TOOL.store(tool.code(), Ordering::Release);
-    if let Some(region) = confirmed_region {
-        if let Ok(mut remembered) = LAST_CAPTURED_REGION.lock() {
-            *remembered = Some(region);
-        }
-    }
     let persisted_region = confirmed_region.map(|region| captastic_config::CaptureRegion {
-        x: region.x,
-        y: region.y,
+        x: region.x.saturating_sub(source.x),
+        y: region.y.saturating_sub(source.y),
         width: region.width,
         height: region.height,
     });
-    if let Err(error) = captastic_config::save_capture_history(tool.to_config(), persisted_region) {
-        log::warn!("failed to save capture history: {error}");
-    }
-}
-
-fn ensure_capture_history_loaded() {
-    if CAPTURE_HISTORY_LOADED.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    match captastic_config::load_capture_history() {
-        Ok(history) => {
-            if let Some(tool) = history.tool {
-                LAST_CAPTURE_TOOL.store(CaptureTool::from_config(tool).code(), Ordering::Release);
-            }
-            if let Some(region) = history.region {
-                if let Ok(mut remembered) = LAST_CAPTURED_REGION.lock() {
-                    *remembered = Some(Rect {
-                        x: region.x,
-                        y: region.y,
-                        width: region.width,
-                        height: region.height,
-                    });
-                }
-            }
-        }
-        Err(error) => log::warn!("failed to load capture history: {error}"),
+    if let Err(error) = captastic_config::save_display_capture_history(
+        &display_id.0,
+        tool.to_config(),
+        persisted_region,
+        confirmed_region.map(|_| captastic_config::CaptureRegionSource {
+            width: source.width,
+            height: source.height,
+            rotation_degrees,
+        }),
+    ) {
+        log::warn!(
+            "failed to save capture history for display {}: {error}",
+            display_id.0
+        );
     }
 }
 
@@ -1051,31 +1242,38 @@ fn fit_region_to_source(region: Rect, source: Rect) -> Rect {
     }
 }
 
-fn remember_toolbar_position(position: POINT) {
-    TOOLBAR_POSITION_LOADED.store(true, Ordering::Release);
-    LAST_TOOLBAR_POSITION.store(pack_toolbar_position(position), Ordering::Release);
-    if let Err(error) = captastic_config::save_overlay_position(position.x, position.y) {
-        log::warn!("failed to save overlay position: {error}");
+fn remember_toolbar_position(
+    display_id: &DisplayId,
+    position: POINT,
+    environment: DisplayEnvironment,
+) {
+    let metrics = environment.metrics;
+    let work_area = environment.work_area;
+    let center_x = f64::from(position.x + metrics.toolbar_width() / 2 - work_area.left)
+        / f64::from(work_area.width());
+    let center_y = f64::from(position.y + metrics.toolbar_height() / 2 - work_area.top)
+        / f64::from(work_area.height());
+    if let Err(error) = captastic_config::save_display_overlay_center(
+        &display_id.0,
+        center_x.clamp(0.0, 1.0),
+        center_y.clamp(0.0, 1.0),
+    ) {
+        log::warn!(
+            "failed to save toolbar position for display {}: {error}",
+            display_id.0
+        );
     }
 }
 
-fn pack_toolbar_position(position: POINT) -> u64 {
-    (u64::from(position.x as u32) << 32) | u64::from(position.y as u32)
-}
-
-fn unpack_toolbar_position(packed: u64) -> POINT {
-    POINT {
-        x: (packed >> 32) as u32 as i32,
-        y: packed as u32 as i32,
-    }
-}
-
-fn load_toolbar_position_from_disk() -> Option<POINT> {
-    match captastic_config::load_overlay_position() {
-        Ok(position) => position.map(|(x, y)| POINT { x, y }),
+fn load_display_ui_state(display_id: &DisplayId) -> captastic_config::DisplayUiState {
+    match captastic_config::load_display_ui_state(&display_id.0) {
+        Ok(state) => state,
         Err(error) => {
-            log::warn!("failed to load overlay position: {error}");
-            None
+            log::warn!(
+                "failed to load UI state for display {}: {error}",
+                display_id.0
+            );
+            captastic_config::DisplayUiState::default()
         }
     }
 }
@@ -1240,8 +1438,7 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             let previous_control = state.hovered_control;
             if let Some(drag) = state.toolbar_drag {
                 state.toolbar_position = ToolbarLayout::clamp_origin(
-                    state.surface.width,
-                    state.surface.height,
+                    state.display_environment,
                     POINT {
                         x: local.x.saturating_sub(drag.pointer_offset.x),
                         y: local.y.saturating_sub(drag.pointer_offset.y),
@@ -1254,11 +1451,7 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                 invalidate(hwnd);
                 return LRESULT(0);
             }
-            let layout = ToolbarLayout::new(
-                state.surface.width,
-                state.surface.height,
-                state.toolbar_position,
-            );
+            let layout = ToolbarLayout::new(state.display_environment, state.toolbar_position);
             let region_drag_active =
                 state.resizing.is_some() || state.moving_region.is_some() || state.anchor.is_some();
             state.hovered_control = (!region_drag_active)
@@ -1349,11 +1542,7 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
         WM_LBUTTONDOWN => {
             let point = screen_point(state.source, lparam);
             let local = local_point(state.source, point);
-            let layout = ToolbarLayout::new(
-                state.surface.width,
-                state.surface.height,
-                state.toolbar_position,
-            );
+            let layout = ToolbarLayout::new(state.display_environment, state.toolbar_position);
             if let Some(control) = layout.hit_test(local, state.options_open) {
                 state.anchor = None;
                 state.dragging = false;
@@ -1456,7 +1645,11 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
         WM_LBUTTONUP => {
             let point = screen_point(state.source, lparam);
             if state.toolbar_drag.take().is_some() {
-                remember_toolbar_position(state.toolbar_position);
+                remember_toolbar_position(
+                    &state.reference_metadata.display_id,
+                    state.toolbar_position,
+                    state.display_environment,
+                );
                 state.hovered_control = Some(ToolbarControl::Background);
                 set_arrow_cursor();
                 invalidate(hwnd);
@@ -1513,11 +1706,7 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
         WM_LBUTTONDBLCLK => {
             let point = screen_point(state.source, lparam);
             let local = local_point(state.source, point);
-            let layout = ToolbarLayout::new(
-                state.surface.width,
-                state.surface.height,
-                state.toolbar_position,
-            );
+            let layout = ToolbarLayout::new(state.display_environment, state.toolbar_position);
             if layout.hit_test(local, state.options_open).is_none() {
                 confirm_and_close(hwnd, state);
             }
@@ -1564,7 +1753,13 @@ fn confirm_and_close(hwnd: HWND, state: &mut OverlayState) {
             .map(|frame| frame.metadata.source_rect)
             .unwrap_or(rect);
         let confirmed_region = (kind == SelectionKind::Region).then_some(rect);
-        remember_capture_history(kind, confirmed_region);
+        remember_capture_history(
+            &state.reference_metadata.display_id,
+            state.source,
+            kind,
+            confirmed_region,
+            state.reference_metadata.rotation_degrees,
+        );
         if confirmed_region.is_some() {
             state.last_region = Some(rect);
         }
@@ -1664,8 +1859,18 @@ fn paint(hwnd: HWND, state: &mut OverlayState) {
             restore_highlight(state, rect);
             draw_outline(state.back_buffer.device, state.source, rect);
             if state.selection_kind == Some(SelectionKind::Region) {
-                draw_resize_handles(state.back_buffer.device, state.source, rect);
-                draw_region_dimensions(state.back_buffer.device, state.source, rect);
+                draw_resize_handles(
+                    state.back_buffer.device,
+                    state.source,
+                    rect,
+                    state.display_environment.metrics,
+                );
+                draw_region_dimensions(
+                    state.back_buffer.device,
+                    state.source,
+                    rect,
+                    state.display_environment.metrics,
+                );
             }
         }
     }
@@ -1772,11 +1977,59 @@ fn ensure_window_mode_assets(state: &mut OverlayState) {
         return;
     }
     if state.windows.is_none() {
-        state.windows = Some(enumerate_visible_windows(state.source).unwrap_or_default());
+        let displays = match crate::dxgi::enumerate_displays() {
+            Ok(displays)
+                if displays
+                    .iter()
+                    .any(|display| display.id == state.reference_metadata.display_id) =>
+            {
+                displays
+            }
+            Ok(_) => {
+                log::warn!(
+                    "captured display {} is absent from the window-mode topology snapshot; using captured bounds only",
+                    state.reference_metadata.display_id.0
+                );
+                vec![fallback_display_info(state)]
+            }
+            Err(error) => {
+                log::warn!(
+                    "window-mode display discovery failed: {error}; using captured bounds only"
+                );
+                vec![fallback_display_info(state)]
+            }
+        };
+        state.windows = Some(
+            match enumerate_visible_windows(
+                state.source,
+                &state.reference_metadata.display_id,
+                displays,
+            ) {
+                Ok(windows) => windows,
+                Err(error) => {
+                    log::warn!(
+                        "window-mode enumeration failed for display {}: {error}",
+                        state.reference_metadata.display_id.0
+                    );
+                    Vec::new()
+                }
+            },
+        );
     }
     let reusable = state.cached_blurred_background.take();
     state.blurred_background = build_blurred_background(&state.surface, 24, reusable).ok();
     state.window_assets_ready = true;
+}
+
+fn fallback_display_info(state: &OverlayState) -> DisplayInfo {
+    DisplayInfo {
+        id: state.reference_metadata.display_id.clone(),
+        name: state.reference_metadata.display_id.0.clone(),
+        bounds: state.source,
+        scale_factor: state.display_environment.metrics.dpi as f32 / UiMetrics::BASE_DPI as f32,
+        rotation_degrees: state.reference_metadata.rotation_degrees,
+        is_primary: false,
+    }
 }
 
 fn build_window_overview(state: &mut OverlayState) {
@@ -2087,7 +2340,7 @@ fn draw_outline_layer(
     }
 }
 
-fn draw_resize_handles(device: HDC, source: Rect, rect: Rect) {
+fn draw_resize_handles(device: HDC, source: Rect, rect: Rect, metrics: UiMetrics) {
     let left = rect.x - source.x;
     let top = rect.y - source.y;
     let right = left.saturating_add(rect.width as i32);
@@ -2112,8 +2365,8 @@ fn draw_resize_handles(device: HDC, source: Rect, rect: Rect) {
         )
     };
     for (x, y) in points {
-        let outer_rect = centered_rect(x, y, HANDLE_OUTER_RADIUS);
-        let inner_rect = centered_rect(x, y, HANDLE_INNER_RADIUS);
+        let outer_rect = centered_rect(x, y, metrics.px(HANDLE_OUTER_RADIUS));
+        let inner_rect = centered_rect(x, y, metrics.px(HANDLE_INNER_RADIUS));
         // SAFETY: The brushes and memory DC are live; GDI clips handles at display edges.
         unsafe {
             FillRect(device, &outer_rect, outer);
@@ -2127,47 +2380,58 @@ fn draw_resize_handles(device: HDC, source: Rect, rect: Rect) {
     }
 }
 
-fn draw_region_dimensions(device: HDC, source: Rect, rect: Rect) {
+fn draw_region_dimensions(device: HDC, source: Rect, rect: Rect, metrics: UiMetrics) {
     let value = format!("{} × {} px", rect.width, rect.height);
-    let available_width = (source.width as i32 - 16).max(1);
-    let label_width = ((value.chars().count() as i32 * 12) + 28)
-        .max(150)
+    let available_width = (source.width as i32 - metrics.px(16)).max(1);
+    let label_width = ((value.chars().count() as i32 * metrics.px(12)) + metrics.px(28))
+        .max(metrics.px(150))
         .min(available_width);
     let selection_left = rect.x - source.x;
     let selection_top = rect.y - source.y;
     let selection_bottom = selection_top.saturating_add(rect.height as i32);
     let centered_left = selection_left
         .saturating_add((rect.width as i32 - label_width) / 2)
-        .clamp(8, (source.width as i32 - label_width - 8).max(8));
-    let preferred_top = if rect.height as i32 >= DIMENSION_LABEL_HEIGHT + 28 {
-        selection_top + 14
-    } else if selection_top >= DIMENSION_LABEL_HEIGHT + 12 {
-        selection_top - DIMENSION_LABEL_HEIGHT - 10
+        .clamp(
+            metrics.px(8),
+            (source.width as i32 - label_width - metrics.px(8)).max(metrics.px(8)),
+        );
+    let label_height = metrics.px(DIMENSION_LABEL_HEIGHT);
+    let preferred_top = if rect.height as i32 >= label_height + metrics.px(28) {
+        selection_top + metrics.px(14)
+    } else if selection_top >= label_height + metrics.px(12) {
+        selection_top - label_height - metrics.px(10)
     } else {
-        selection_bottom + 10
+        selection_bottom + metrics.px(10)
     };
     let top = preferred_top.clamp(
-        8,
-        (source.height as i32 - DIMENSION_LABEL_HEIGHT - 8).max(8),
+        metrics.px(8),
+        (source.height as i32 - label_height - metrics.px(8)).max(metrics.px(8)),
     );
     let bounds = UiRect {
         left: centered_left,
         top,
         right: centered_left + label_width,
-        bottom: top + DIMENSION_LABEL_HEIGHT,
+        bottom: top + label_height,
     };
-    draw_round_box(device, bounds, rgb(31, 31, 34), rgb(104, 104, 110), 10);
+    draw_round_box(
+        device,
+        bounds,
+        rgb(31, 31, 34),
+        rgb(104, 104, 110),
+        metrics.px(10),
+    );
     draw_text(
         device,
         UiRect {
-            left: bounds.left + 10,
+            left: bounds.left + metrics.px(10),
             top: bounds.top,
-            right: bounds.right - 10,
+            right: bounds.right - metrics.px(10),
             bottom: bounds.bottom,
         },
         &value,
         rgb(248, 248, 250),
         TextAlignment::Center,
+        metrics.px(UI_FONT_HEIGHT),
     );
 }
 
@@ -2193,6 +2457,7 @@ fn draw_window_overview_static(destination: &FrozenSurface, state: &OverlayState
             "No capturable application windows",
             rgb(220, 220, 224),
             TextAlignment::Center,
+            state.display_environment.metrics.px(UI_FONT_HEIGHT),
         );
         return;
     }
@@ -2585,11 +2850,8 @@ fn draw_surface_to_rect(device: HDC, surface: &FrozenSurface, destination: UiRec
 
 fn draw_toolbar(state: &OverlayState) {
     let device = state.back_buffer.device;
-    let layout = ToolbarLayout::new(
-        state.surface.width,
-        state.surface.height,
-        state.toolbar_position,
-    );
+    let metrics = state.display_environment.metrics;
+    let layout = ToolbarLayout::new(state.display_environment, state.toolbar_position);
     if state.options_open {
         draw_options_menu(device, state, layout);
     }
@@ -2598,30 +2860,42 @@ fn draw_toolbar(state: &OverlayState) {
         layout.bounds,
         rgb(38, 38, 41),
         rgb(92, 92, 98),
-        TOOLBAR_CORNER_RADIUS,
+        metrics.px(TOOLBAR_CORNER_RADIUS),
     );
     for y in [
-        layout.drag_handle.top + 17,
-        layout.drag_handle.top + 31,
-        layout.drag_handle.top + 45,
+        layout.drag_handle.top + metrics.px(17),
+        layout.drag_handle.top + metrics.px(31),
+        layout.drag_handle.top + metrics.px(45),
     ] {
         draw_filled_ellipse(
             device,
-            layout.drag_handle.left + 13,
+            layout.drag_handle.left + metrics.px(13),
             y,
-            layout.drag_handle.left + 18,
-            y + 5,
+            layout.drag_handle.left + metrics.px(18),
+            y + metrics.px(5),
             rgb(142, 142, 148),
         );
     }
-    draw_tool_button(device, layout.full_display, CaptureTool::FullDisplay, state);
-    draw_tool_button(device, layout.window, CaptureTool::Window, state);
-    draw_tool_button(device, layout.region, CaptureTool::Region, state);
+    draw_tool_button(
+        device,
+        layout.full_display,
+        CaptureTool::FullDisplay,
+        state,
+        metrics,
+    );
+    draw_tool_button(device, layout.window, CaptureTool::Window, state, metrics);
+    draw_tool_button(device, layout.region, CaptureTool::Region, state, metrics);
     draw_lines(
         device,
         &[
-            (layout.bounds.left + 253, layout.bounds.top + 17),
-            (layout.bounds.left + 253, layout.bounds.bottom - 17),
+            (
+                layout.bounds.left + metrics.px(253),
+                layout.bounds.top + metrics.px(17),
+            ),
+            (
+                layout.bounds.left + metrics.px(253),
+                layout.bounds.bottom - metrics.px(17),
+            ),
         ],
         rgb(92, 92, 98),
         1,
@@ -2629,30 +2903,46 @@ fn draw_toolbar(state: &OverlayState) {
 
     let options_hovered = state.hovered_control == Some(ToolbarControl::Options);
     if state.options_open || options_hovered {
-        draw_round_box(device, layout.options, rgb(65, 65, 70), rgb(65, 65, 70), 8);
+        draw_round_box(
+            device,
+            layout.options,
+            rgb(65, 65, 70),
+            rgb(65, 65, 70),
+            metrics.px(8),
+        );
     }
     draw_text(
         device,
         UiRect {
-            left: layout.options.left + 4,
+            left: layout.options.left + metrics.px(4),
             top: layout.options.top,
-            right: layout.options.right - 34,
+            right: layout.options.right - metrics.px(34),
             bottom: layout.options.bottom,
         },
         "Options",
         rgb(245, 245, 247),
         TextAlignment::Center,
+        metrics.px(UI_FONT_HEIGHT),
     );
-    let chevron_y = layout.options.top + 31;
+    let chevron_y = layout.options.top + metrics.px(31);
     draw_lines(
         device,
         &[
-            (layout.options.right - 29, chevron_y - 3),
-            (layout.options.right - 24, chevron_y + 2),
-            (layout.options.right - 19, chevron_y - 3),
+            (
+                layout.options.right - metrics.px(29),
+                chevron_y - metrics.px(3),
+            ),
+            (
+                layout.options.right - metrics.px(24),
+                chevron_y + metrics.px(2),
+            ),
+            (
+                layout.options.right - metrics.px(19),
+                chevron_y - metrics.px(3),
+            ),
         ],
         rgb(220, 220, 224),
-        2,
+        metrics.px(2).max(1),
     );
 
     let capture_enabled = state.selection.is_some();
@@ -2665,7 +2955,13 @@ fn draw_toolbar(state: &OverlayState) {
     } else {
         rgb(82, 82, 87)
     };
-    draw_round_box(device, layout.capture, capture_color, capture_color, 9);
+    draw_round_box(
+        device,
+        layout.capture,
+        capture_color,
+        capture_color,
+        metrics.px(9),
+    );
     let capture_foreground = if capture_enabled {
         rgb(255, 255, 255)
     } else {
@@ -2673,26 +2969,34 @@ fn draw_toolbar(state: &OverlayState) {
     };
     draw_camera_icon(
         device,
-        layout.capture.left + 20,
-        layout.capture.top + 18,
+        layout.capture.left + metrics.px(20),
+        layout.capture.top + metrics.px(18),
         capture_foreground,
+        metrics,
     );
     draw_text(
         device,
         UiRect {
-            left: layout.capture.left + 54,
+            left: layout.capture.left + metrics.px(54),
             top: layout.capture.top,
-            right: layout.capture.right - 8,
+            right: layout.capture.right - metrics.px(8),
             bottom: layout.capture.bottom,
         },
         "Capture",
         capture_foreground,
         TextAlignment::Center,
+        metrics.px(UI_FONT_HEIGHT),
     );
     draw_hover_tooltip(device, state, layout);
 }
 
-fn draw_tool_button(device: HDC, bounds: UiRect, tool: CaptureTool, state: &OverlayState) {
+fn draw_tool_button(
+    device: HDC,
+    bounds: UiRect,
+    tool: CaptureTool,
+    state: &OverlayState,
+    metrics: UiMetrics,
+) {
     let control = match tool {
         CaptureTool::FullDisplay => ToolbarControl::FullDisplay,
         CaptureTool::Window => ToolbarControl::Window,
@@ -2704,13 +3008,13 @@ fn draw_tool_button(device: HDC, bounds: UiRect, tool: CaptureTool, state: &Over
         } else {
             rgb(58, 58, 63)
         };
-        draw_round_box(device, bounds, color, color, 8);
+        draw_round_box(device, bounds, color, color, metrics.px(8));
     }
     let color = rgb(245, 245, 247);
     match tool {
-        CaptureTool::FullDisplay => draw_display_icon(device, bounds, color),
-        CaptureTool::Window => draw_window_icon(device, bounds, color),
-        CaptureTool::Region => draw_region_icon(device, bounds, color),
+        CaptureTool::FullDisplay => draw_display_icon(device, bounds, color, metrics),
+        CaptureTool::Window => draw_window_icon(device, bounds, color, metrics),
+        CaptureTool::Region => draw_region_icon(device, bounds, color, metrics),
     }
 }
 
@@ -2735,42 +3039,66 @@ fn draw_hover_tooltip(device: HDC, state: &OverlayState, layout: ToolbarLayout) 
         }
         _ => return,
     };
-    let measured = measure_ui_text(device, &value);
-    let width = (measured.cx + 36)
-        .max(150)
-        .min((state.surface.width - 16).max(1));
-    let height = (measured.cy + 16).max(38);
-    let left = ((target.left + target.right - width) / 2)
-        .clamp(8, (state.surface.width - width - 8).max(8));
-    let preferred_top = if layout.bounds.top >= height + 18 {
-        layout.bounds.top - height - 10
-    } else {
-        layout.bounds.bottom + 10
-    };
-    let top = preferred_top.clamp(8, (state.surface.height - height - 8).max(8));
+    let metrics = state.display_environment.metrics;
+    let font_height = metrics.px(UI_FONT_HEIGHT);
+    let measured = measure_ui_text(device, &value, font_height);
+    let width = (measured.cx + metrics.px(36))
+        .max(metrics.px(150))
+        .min((state.display_environment.work_area.width() - metrics.px(16)).max(1));
+    let height = (measured.cy + metrics.px(16)).max(metrics.px(38));
+    let left = ((target.left + target.right - width) / 2).clamp(
+        state.display_environment.work_area.left + metrics.px(8),
+        (state.display_environment.work_area.right - width - metrics.px(8))
+            .max(state.display_environment.work_area.left + metrics.px(8)),
+    );
+    let preferred_top =
+        if layout.bounds.top >= state.display_environment.work_area.top + height + metrics.px(18) {
+            layout.bounds.top - height - metrics.px(10)
+        } else {
+            layout.bounds.bottom + metrics.px(10)
+        };
+    let top = preferred_top.clamp(
+        state.display_environment.work_area.top + metrics.px(8),
+        (state.display_environment.work_area.bottom - height - metrics.px(8))
+            .max(state.display_environment.work_area.top + metrics.px(8)),
+    );
     let bounds = UiRect {
         left,
         top,
         right: left + width,
         bottom: top + height,
     };
-    draw_round_box(device, bounds, rgb(31, 31, 34), rgb(104, 104, 110), 9);
+    draw_round_box(
+        device,
+        bounds,
+        rgb(31, 31, 34),
+        rgb(104, 104, 110),
+        metrics.px(9),
+    );
     draw_text(
         device,
         UiRect {
-            left: bounds.left + 16,
+            left: bounds.left + metrics.px(16),
             top: bounds.top,
-            right: bounds.right - 16,
+            right: bounds.right - metrics.px(16),
             bottom: bounds.bottom,
         },
         &value,
         rgb(248, 248, 250),
         TextAlignment::Center,
+        font_height,
     );
 }
 
 fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
-    draw_round_box(device, layout.menu, rgb(43, 43, 47), rgb(101, 101, 107), 12);
+    let metrics = state.display_environment.metrics;
+    draw_round_box(
+        device,
+        layout.menu,
+        rgb(43, 43, 47),
+        rgb(101, 101, 107),
+        metrics.px(12),
+    );
     let rows = [
         (ToolbarControl::DimBackground, layout.dim_background),
         (
@@ -2781,52 +3109,56 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
     ];
     for (control, row) in rows {
         if state.hovered_control == Some(control) {
-            draw_round_box(device, row, rgb(64, 64, 69), rgb(64, 64, 69), 6);
+            draw_round_box(device, row, rgb(64, 64, 69), rgb(64, 64, 69), metrics.px(6));
         }
     }
     if state.dim_background {
         draw_checkmark(
             device,
-            layout.dim_background.left + 20,
+            layout.dim_background.left + metrics.px(20),
             (layout.dim_background.top + layout.dim_background.bottom) / 2,
             rgb(86, 156, 255),
+            metrics,
         );
     }
     draw_text(
         device,
         UiRect {
-            left: layout.dim_background.left + 50,
+            left: layout.dim_background.left + metrics.px(50),
             top: layout.dim_background.top,
-            right: layout.dim_background.right - 12,
+            right: layout.dim_background.right - metrics.px(12),
             bottom: layout.dim_background.bottom,
         },
         "Dim Background",
         rgb(245, 245, 247),
         TextAlignment::Left,
+        metrics.px(UI_FONT_HEIGHT),
     );
     draw_checkmark(
         device,
-        layout.clipboard_destination.left + 20,
+        layout.clipboard_destination.left + metrics.px(20),
         (layout.clipboard_destination.top + layout.clipboard_destination.bottom) / 2,
         rgb(86, 156, 255),
+        metrics,
     );
     draw_text(
         device,
         UiRect {
-            left: layout.clipboard_destination.left + 50,
+            left: layout.clipboard_destination.left + metrics.px(50),
             top: layout.clipboard_destination.top,
-            right: layout.clipboard_destination.right - 12,
+            right: layout.clipboard_destination.right - metrics.px(12),
             bottom: layout.clipboard_destination.bottom,
         },
         "Copy to Clipboard",
         rgb(210, 210, 214),
         TextAlignment::Left,
+        metrics.px(UI_FONT_HEIGHT),
     );
     draw_lines(
         device,
         &[
-            (layout.menu.left + 12, layout.cancel.top),
-            (layout.menu.right - 12, layout.cancel.top),
+            (layout.menu.left + metrics.px(12), layout.cancel.top),
+            (layout.menu.right - metrics.px(12), layout.cancel.top),
         ],
         rgb(76, 76, 81),
         1,
@@ -2834,79 +3166,141 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
     draw_text(
         device,
         UiRect {
-            left: layout.cancel.left + 50,
+            left: layout.cancel.left + metrics.px(50),
             top: layout.cancel.top,
-            right: layout.cancel.right - 12,
+            right: layout.cancel.right - metrics.px(12),
             bottom: layout.cancel.bottom,
         },
         "Cancel Capture",
         rgb(255, 105, 97),
         TextAlignment::Left,
+        metrics.px(UI_FONT_HEIGHT),
     );
 }
 
-fn draw_display_icon(device: HDC, bounds: UiRect, color: COLORREF) {
-    let left = bounds.left + 17;
-    let top = bounds.top + 15;
-    draw_outline_rect(device, left, top, left + 30, top + 21, color, 2);
-    draw_lines(
+fn draw_display_icon(device: HDC, bounds: UiRect, color: COLORREF, metrics: UiMetrics) {
+    let left = bounds.left + metrics.px(17);
+    let top = bounds.top + metrics.px(15);
+    draw_outline_rect(
         device,
-        &[(left + 15, top + 21), (left + 15, top + 28)],
+        left,
+        top,
+        left + metrics.px(30),
+        top + metrics.px(21),
         color,
-        2,
+        metrics.px(2).max(1),
     );
-    draw_lines(
-        device,
-        &[(left + 8, top + 28), (left + 22, top + 28)],
-        color,
-        2,
-    );
-}
-
-fn draw_window_icon(device: HDC, bounds: UiRect, color: COLORREF) {
-    let left = bounds.left + 15;
-    let top = bounds.top + 14;
-    draw_outline_rect(device, left + 7, top, left + 34, top + 22, color, 2);
-    draw_outline_rect(device, left, top + 8, left + 27, top + 30, color, 2);
-}
-
-fn draw_region_icon(device: HDC, bounds: UiRect, color: COLORREF) {
-    let left = bounds.left + 15;
-    let top = bounds.top + 14;
-    let right = left + 33;
-    let bottom = top + 30;
-    for points in [
-        [(left, top + 9), (left, top), (left + 9, top)],
-        [(right - 9, top), (right, top), (right, top + 9)],
-        [(right, bottom - 9), (right, bottom), (right - 9, bottom)],
-        [(left + 9, bottom), (left, bottom), (left, bottom - 9)],
-    ] {
-        draw_lines(device, &points, color, 2);
-    }
-}
-
-fn draw_camera_icon(device: HDC, left: i32, top: i32, color: COLORREF) {
-    draw_outline_rect(device, left, top + 6, left + 32, top + 28, color, 2);
     draw_lines(
         device,
         &[
-            (left + 8, top + 6),
-            (left + 12, top),
-            (left + 20, top),
-            (left + 24, top + 6),
+            (left + metrics.px(15), top + metrics.px(21)),
+            (left + metrics.px(15), top + metrics.px(28)),
         ],
         color,
-        2,
+        metrics.px(2).max(1),
     );
-    draw_ellipse(device, left + 11, top + 10, left + 23, top + 22, color, 2);
-}
-
-fn draw_checkmark(device: HDC, x: i32, y: i32, color: COLORREF) {
     draw_lines(
         device,
-        &[(x - 5, y), (x - 1, y + 4), (x + 6, y - 5)],
+        &[
+            (left + metrics.px(8), top + metrics.px(28)),
+            (left + metrics.px(22), top + metrics.px(28)),
+        ],
         color,
-        2,
+        metrics.px(2).max(1),
+    );
+}
+
+fn draw_window_icon(device: HDC, bounds: UiRect, color: COLORREF, metrics: UiMetrics) {
+    let left = bounds.left + metrics.px(15);
+    let top = bounds.top + metrics.px(14);
+    let width = metrics.px(2).max(1);
+    draw_outline_rect(
+        device,
+        left + metrics.px(7),
+        top,
+        left + metrics.px(34),
+        top + metrics.px(22),
+        color,
+        width,
+    );
+    draw_outline_rect(
+        device,
+        left,
+        top + metrics.px(8),
+        left + metrics.px(27),
+        top + metrics.px(30),
+        color,
+        width,
+    );
+}
+
+fn draw_region_icon(device: HDC, bounds: UiRect, color: COLORREF, metrics: UiMetrics) {
+    let left = bounds.left + metrics.px(15);
+    let top = bounds.top + metrics.px(14);
+    let right = left + metrics.px(33);
+    let bottom = top + metrics.px(30);
+    let corner = metrics.px(9);
+    for points in [
+        [(left, top + corner), (left, top), (left + corner, top)],
+        [(right - corner, top), (right, top), (right, top + corner)],
+        [
+            (right, bottom - corner),
+            (right, bottom),
+            (right - corner, bottom),
+        ],
+        [
+            (left + corner, bottom),
+            (left, bottom),
+            (left, bottom - corner),
+        ],
+    ] {
+        draw_lines(device, &points, color, metrics.px(2).max(1));
+    }
+}
+
+fn draw_camera_icon(device: HDC, left: i32, top: i32, color: COLORREF, metrics: UiMetrics) {
+    let width = metrics.px(2).max(1);
+    draw_outline_rect(
+        device,
+        left,
+        top + metrics.px(6),
+        left + metrics.px(32),
+        top + metrics.px(28),
+        color,
+        width,
+    );
+    draw_lines(
+        device,
+        &[
+            (left + metrics.px(8), top + metrics.px(6)),
+            (left + metrics.px(12), top),
+            (left + metrics.px(20), top),
+            (left + metrics.px(24), top + metrics.px(6)),
+        ],
+        color,
+        width,
+    );
+    draw_ellipse(
+        device,
+        left + metrics.px(11),
+        top + metrics.px(10),
+        left + metrics.px(23),
+        top + metrics.px(22),
+        color,
+        width,
+    );
+}
+
+fn draw_checkmark(device: HDC, x: i32, y: i32, color: COLORREF, metrics: UiMetrics) {
+    draw_lines(
+        device,
+        &[
+            (x - metrics.px(5), y),
+            (x - metrics.px(1), y + metrics.px(4)),
+            (x + metrics.px(6), y - metrics.px(5)),
+        ],
+        color,
+        metrics.px(2).max(1),
     );
 }
 
@@ -3020,7 +3414,14 @@ fn draw_lines(device: HDC, points: &[(i32, i32)], color: COLORREF, width: i32) {
     }
 }
 
-fn draw_text(device: HDC, bounds: UiRect, value: &str, color: COLORREF, alignment: TextAlignment) {
+fn draw_text(
+    device: HDC,
+    bounds: UiRect,
+    value: &str,
+    color: COLORREF,
+    alignment: TextAlignment,
+    font_height: i32,
+) {
     let mut text: Vec<u16> = value.encode_utf16().collect();
     let mut native_bounds = RECT {
         left: bounds.left,
@@ -3035,7 +3436,7 @@ fn draw_text(device: HDC, bounds: UiRect, value: &str, color: COLORREF, alignmen
     let format = windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT(
         DT_SINGLELINE.0 | DT_VCENTER.0 | DT_NOPREFIX.0 | horizontal.0,
     );
-    let font = create_ui_font();
+    let font = create_ui_font(font_height);
     // SAFETY: The DC/font and bounds are live and text is valid writable UTF-16 storage.
     unsafe {
         let old_font = SelectObject(device, font);
@@ -3047,9 +3448,9 @@ fn draw_text(device: HDC, bounds: UiRect, value: &str, color: COLORREF, alignmen
     }
 }
 
-fn measure_ui_text(device: HDC, value: &str) -> SIZE {
+fn measure_ui_text(device: HDC, value: &str, font_height: i32) -> SIZE {
     let text: Vec<u16> = value.encode_utf16().collect();
-    let font = create_ui_font();
+    let font = create_ui_font(font_height);
     let mut measured = SIZE::default();
     // SAFETY: device/font are live, text is valid UTF-16, and measured is writable storage.
     let succeeded = unsafe {
@@ -3063,17 +3464,17 @@ fn measure_ui_text(device: HDC, value: &str) -> SIZE {
         measured
     } else {
         SIZE {
-            cx: value.chars().count() as i32 * (UI_FONT_HEIGHT / 2),
-            cy: UI_FONT_HEIGHT,
+            cx: value.chars().count() as i32 * (font_height / 2),
+            cy: font_height,
         }
     }
 }
 
-fn create_ui_font() -> HFONT {
+fn create_ui_font(font_height: i32) -> HFONT {
     // SAFETY: Creates a ClearType font from the registered process-private IoskeleyMono face.
     unsafe {
         CreateFontW(
-            -UI_FONT_HEIGHT,
+            -font_height,
             0,
             0,
             0,
@@ -3095,9 +3496,15 @@ const fn rgb(red: u8, green: u8, blue: u8) -> COLORREF {
     COLORREF((red as u32) | ((green as u32) << 8) | ((blue as u32) << 16))
 }
 
-fn enumerate_visible_windows(source: Rect) -> Result<Vec<WindowCandidate>, CaptureError> {
+fn enumerate_visible_windows(
+    source: Rect,
+    target_display_id: &DisplayId,
+    displays: Vec<DisplayInfo>,
+) -> Result<Vec<WindowCandidate>, CaptureError> {
     let mut collector = WindowCollector {
         source,
+        target_display_id: target_display_id.clone(),
+        displays,
         windows: Vec::with_capacity(32),
         callback_failed: false,
     };
@@ -3124,6 +3531,8 @@ fn enumerate_visible_windows(source: Rect) -> Result<Vec<WindowCandidate>, Captu
 
 struct WindowCollector {
     source: Rect,
+    target_display_id: DisplayId,
+    displays: Vec<DisplayInfo>,
     windows: Vec<WindowCandidate>,
     callback_failed: bool,
 }
@@ -3169,7 +3578,16 @@ fn collect_window(hwnd: HWND, collector: &mut WindowCollector) {
     if unsafe { GetWindowRect(hwnd, &mut native) }.is_err() {
         return;
     }
-    if rect_from_native(native).is_some() {
+    if let Some(window_bounds) = rect_from_native(native) {
+        let native_display_id = native_window_display_id(hwnd, &collector.displays);
+        if owning_display_id(
+            window_bounds,
+            native_display_id.as_ref(),
+            &collector.displays,
+        ) != Some(&collector.target_display_id)
+        {
+            return;
+        }
         let Some(visible_bounds) = intersect_with_source(native, collector.source) else {
             return;
         };
@@ -3179,6 +3597,57 @@ fn collect_window(hwnd: HWND, collector: &mut WindowCollector) {
             });
         }
     }
+}
+
+fn owning_display_id<'a>(
+    window_bounds: Rect,
+    native_display_id: Option<&DisplayId>,
+    displays: &'a [DisplayInfo],
+) -> Option<&'a DisplayId> {
+    let mut candidates: Vec<(&DisplayInfo, u64)> = displays
+        .iter()
+        .filter_map(|display| {
+            display
+                .bounds
+                .intersection(window_bounds)
+                .map(|intersection| (display, intersection.area()))
+        })
+        .collect();
+    let maximum_area = candidates.iter().map(|(_, area)| *area).max()?;
+    candidates.retain(|(_, area)| *area == maximum_area);
+    if let Some(native_display_id) = native_display_id {
+        if let Some((display, _)) = candidates
+            .iter()
+            .find(|(display, _)| display.id == *native_display_id)
+        {
+            return Some(&display.id);
+        }
+    }
+    candidates
+        .into_iter()
+        .min_by(|(left, _), (right, _)| left.id.0.cmp(&right.id.0))
+        .map(|(display, _)| &display.id)
+}
+
+fn native_window_display_id(hwnd: HWND, displays: &[DisplayInfo]) -> Option<DisplayId> {
+    // SAFETY: hwnd is the live top-level window currently supplied by EnumWindows.
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL) };
+    if monitor.0 == 0 {
+        return None;
+    }
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..MONITORINFO::default()
+    };
+    // SAFETY: info has the required size and is writable for this synchronous monitor query.
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return None;
+    }
+    let bounds = rect_from_native(info.rcMonitor)?;
+    displays
+        .iter()
+        .find(|display| display.bounds == bounds)
+        .map(|display| display.id.clone())
 }
 
 fn is_cloaked_window(hwnd: HWND) -> bool {
@@ -4038,8 +4507,9 @@ mod tests {
 
     #[test]
     fn toolbar_controls_have_stable_hit_targets() {
-        let origin = ToolbarLayout::default_origin(1920, 1080);
-        let layout = ToolbarLayout::new(1920, 1080, origin);
+        let environment = test_display_environment(1920, 1080, 1080, 96);
+        let origin = ToolbarLayout::default_origin(environment);
+        let layout = ToolbarLayout::new(environment, origin);
         assert_eq!(
             layout.hit_test(
                 POINT {
@@ -4085,18 +4555,150 @@ mod tests {
 
     #[test]
     fn dragged_toolbar_is_clamped_inside_the_display() {
+        let environment = test_display_environment(1920, 1080, 1080, 96);
         assert_eq!(
-            ToolbarLayout::clamp_origin(1920, 1080, POINT { x: -400, y: 2000 }),
+            ToolbarLayout::clamp_origin(environment, POINT { x: -400, y: 2000 }),
             POINT { x: 8, y: 990 }
         );
     }
 
     #[test]
-    fn toolbar_position_round_trips_through_persistent_representation() {
-        let position = POINT { x: 731, y: 944 };
+    fn toolbar_position_restores_from_normalized_work_area_coordinates() {
+        let environment = test_display_environment(2560, 1440, 1400, 144);
+        let layout = ToolbarLayout::new(environment, ToolbarLayout::default_origin(environment));
+        assert_eq!(layout.bounds.width(), 900);
+        assert_eq!(layout.bounds.height(), 123);
+        assert!(layout.bounds.bottom <= environment.work_area.bottom);
         assert_eq!(
-            unpack_toolbar_position(pack_toolbar_position(position)),
-            position
+            remembered_toolbar_position(Some((0.5, 0.5)), None, environment),
+            Some(POINT { x: 830, y: 639 })
+        );
+        let smaller = test_display_environment(1920, 1080, 1040, 96);
+        assert_eq!(
+            remembered_toolbar_position(Some((0.5, 0.5)), None, smaller),
+            Some(POINT { x: 660, y: 479 })
+        );
+    }
+
+    #[test]
+    fn legacy_toolbar_pixels_are_clamped_to_the_monitor_work_area() {
+        let environment = test_display_environment(1920, 1080, 1040, 96);
+        assert_eq!(
+            remembered_toolbar_position(None, Some((3700, 2000)), environment),
+            Some(POINT { x: 1312, y: 950 })
+        );
+    }
+
+    fn test_display_environment(
+        width: i32,
+        height: i32,
+        work_bottom: i32,
+        dpi: u32,
+    ) -> DisplayEnvironment {
+        DisplayEnvironment {
+            work_area: UiRect {
+                left: 0,
+                top: 0,
+                right: width,
+                bottom: work_bottom.min(height),
+            },
+            metrics: UiMetrics::new(dpi),
+        }
+    }
+
+    #[test]
+    fn monitor_local_region_restores_against_a_negative_display_origin() {
+        let source = Rect {
+            x: -1920,
+            y: -200,
+            width: 1920,
+            height: 1200,
+        };
+        assert_eq!(
+            remembered_last_region(
+                Some(captastic_config::CaptureRegion {
+                    x: 200,
+                    y: 100,
+                    width: 800,
+                    height: 600,
+                }),
+                None,
+                true,
+                source,
+                0,
+            ),
+            Some(Rect {
+                x: -1720,
+                y: -100,
+                width: 800,
+                height: 600,
+            })
+        );
+    }
+
+    #[test]
+    fn saved_region_keeps_pixel_size_and_relative_center_after_resolution_change() {
+        let restored = restore_region_for_display_change(
+            captastic_config::CaptureRegion {
+                x: 560,
+                y: 240,
+                width: 800,
+                height: 600,
+            },
+            captastic_config::CaptureRegionSource {
+                width: 1920,
+                height: 1080,
+                rotation_degrees: 0,
+            },
+            Rect {
+                x: -3840,
+                y: 100,
+                width: 3840,
+                height: 2160,
+            },
+            0,
+        );
+        assert_eq!(
+            restored,
+            Rect {
+                x: -2320,
+                y: 880,
+                width: 800,
+                height: 600,
+            }
+        );
+    }
+
+    #[test]
+    fn saved_region_rotates_its_center_and_dimensions_with_the_display() {
+        let restored = restore_region_for_display_change(
+            captastic_config::CaptureRegion {
+                x: 100,
+                y: 200,
+                width: 400,
+                height: 300,
+            },
+            captastic_config::CaptureRegionSource {
+                width: 1920,
+                height: 1080,
+                rotation_degrees: 0,
+            },
+            Rect {
+                x: 1920,
+                y: -400,
+                width: 1080,
+                height: 1920,
+            },
+            90,
+        );
+        assert_eq!(
+            restored,
+            Rect {
+                x: 2500,
+                y: -300,
+                width: 300,
+                height: 400,
+            }
         );
     }
 
@@ -4150,6 +4752,71 @@ mod tests {
     }
 
     #[test]
+    fn spanning_window_belongs_only_to_the_display_with_most_visible_area() {
+        let displays = ownership_test_displays();
+        let bounds = Rect {
+            x: 1500,
+            y: 100,
+            width: 1800,
+            height: 900,
+        };
+        assert_eq!(
+            owning_display_id(bounds, Some(&displays[0].id), &displays),
+            Some(&displays[1].id)
+        );
+    }
+
+    #[test]
+    fn exact_window_ownership_tie_prefers_native_monitor_then_stable_id() {
+        let displays = ownership_test_displays();
+        let bounds = Rect {
+            x: 1720,
+            y: 100,
+            width: 400,
+            height: 800,
+        };
+        assert_eq!(
+            owning_display_id(bounds, Some(&displays[1].id), &displays),
+            Some(&displays[1].id)
+        );
+        assert_eq!(
+            owning_display_id(bounds, None, &displays),
+            Some(&displays[0].id)
+        );
+    }
+
+    fn ownership_test_displays() -> Vec<DisplayInfo> {
+        vec![
+            DisplayInfo {
+                id: DisplayId("display-a".to_owned()),
+                name: "Laptop".to_owned(),
+                bounds: Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+                scale_factor: 1.0,
+                rotation_degrees: 0,
+                is_primary: true,
+            },
+            DisplayInfo {
+                id: DisplayId("display-b".to_owned()),
+                name: "External".to_owned(),
+                bounds: Rect {
+                    x: 1920,
+                    y: 0,
+                    width: 2560,
+                    height: 1440,
+                },
+                scale_factor: 1.5,
+                rotation_degrees: 0,
+                is_primary: false,
+            },
+        ]
+    }
+
+    #[test]
     fn rounded_corner_coverage_has_antialiased_edge_pixels() {
         assert_eq!(rounded_rect_coverage(100, 60, 11.0, 0, 0), 0);
         assert!((0..11).any(|y| {
@@ -4176,7 +4843,7 @@ mod tests {
         let _font_resource =
             PrivateFontResource::register().expect("register embedded IoskeleyMono font");
         let surface = FrozenSurface::empty(8, 8).expect("font test surface");
-        let font = create_ui_font();
+        let font = create_ui_font(UI_FONT_HEIGHT);
         assert_ne!(font.0, 0);
         let mut face_name = [0_u16; 64];
         // SAFETY: The font and DC are live; the previous object is restored before deletion.

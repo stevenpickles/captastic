@@ -43,6 +43,23 @@ jobs:
       - name: Build release workspace
         run: cargo build --release --workspace
 
+      - name: Validate Windows and Chocolatey packages
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = "$($metadata.packages[0].version)-ci.${{ github.run_number }}"
+          $outputDirectory = Join-Path $PWD 'dist/ci'
+          $archive = ./scripts/package-windows.ps1 `
+            -Version $version `
+            -BinariesDirectory target/release `
+            -OutputDirectory $outputDirectory
+          ./scripts/package-chocolatey.ps1 `
+            -Version $version `
+            -ArchivePath $archive `
+            -OutputDirectory $outputDirectory `
+            -SourceUrl "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
   coverage:
     name: Windows HTML coverage
     runs-on: windows-latest
