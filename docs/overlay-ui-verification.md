@@ -92,6 +92,8 @@ The test suite proves that:
 - toolbar, menu, controls, and hit targets scale at 96, 120, 144, and 192 DPI;
 - the popup chooses an available side and remains in a signed work area;
 - toolbar persistence restores and clamps with compact bounds;
+- switching away from Region and back restores the latest adjusted rectangle;
+- cancellation persists the selected tool and latest region for the next overlay;
 - resize-handle hit targets scale with monitor DPI;
 - actual Ioskeley Mono glyph measurements fit Options, Capture, and every
   dropdown row at all four target DPI levels.
@@ -106,6 +108,9 @@ toolbar drag, capture confirmation, Escape cancellation, and right-click
 cancellation. In Region mode, draw a large rectangle, draw one smaller than the
 badge, resize through the inside/outside threshold one pixel at a time, move the
 pointer around every side, touch all display edges, and use all eight handles.
+Move or resize the region, switch to Window and Full Display and back, and verify
+the exact live rectangle returns. Select Region, cancel without capturing, then
+reopen the overlay and verify both Region and that rectangle are restored.
 
 | Display configuration | Scaling | Required checks |
 | --- | --- | --- |

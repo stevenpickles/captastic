@@ -46,9 +46,11 @@ against so stale work can be rejected after a display change.
 
 Each physical display independently remembers:
 
-- last capture tool;
-- last partial-region rectangle;
+- last selected capture tool, including a selection followed by cancellation;
+- last adjusted partial-region rectangle, whether or not it was captured;
 - toolbar placement.
+
+Tool and region interaction state is saved on both confirmation and cancellation.
 
 Regions are stored in monitor-local physical pixels. Toolbar placement is stored
 as its normalized center within the display work area so it survives DPI and

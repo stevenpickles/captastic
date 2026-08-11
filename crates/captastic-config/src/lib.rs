@@ -420,7 +420,7 @@ fn update_display_overlay_position(
     Ok(document.to_string())
 }
 
-pub fn save_display_capture_history(
+pub fn save_display_interaction_state(
     display_id: &str,
     tool: CaptureTool,
     region: Option<CaptureRegion>,
@@ -428,11 +428,12 @@ pub fn save_display_capture_history(
 ) -> Result<(), ConfigError> {
     let path = default_config_path().ok_or(ConfigError::HomeDirectoryUnavailable)?;
     let source = read_optional_config_source(&path)?;
-    let updated = update_display_capture_history(&source, display_id, tool, region, region_source)?;
+    let updated =
+        update_display_interaction_state(&source, display_id, tool, region, region_source)?;
     write_config_source(&path, updated)
 }
 
-fn update_display_capture_history(
+fn update_display_interaction_state(
     source: &str,
     display_id: &str,
     tool: CaptureTool,
@@ -874,11 +875,46 @@ mod tests {
     }
 
     #[test]
+    fn display_history_records_a_cancelled_region_interaction() {
+        let source = "[ui.displays.main]\nlast_capture_tool = \"window\"\n";
+        let region = CaptureRegion {
+            x: 420,
+            y: 260,
+            width: 800,
+            height: 450,
+        };
+        let region_source = CaptureRegionSource {
+            width: 1_920,
+            height: 1_080,
+            rotation_degrees: 0,
+        };
+        let updated = update_display_interaction_state(
+            source,
+            "main",
+            CaptureTool::Region,
+            Some(region),
+            Some(region_source),
+        )
+        .expect("cancelled interaction state");
+        let config: AppConfig = toml::from_str(&updated).expect("valid Captastic config");
+        assert_eq!(
+            resolve_display_ui_state(&config.ui, "main"),
+            DisplayUiState {
+                tool: Some(CaptureTool::Region),
+                region: Some(region),
+                region_source: Some(region_source),
+                region_is_display_local: true,
+                ..DisplayUiState::default()
+            }
+        );
+    }
+
+    #[test]
     fn display_ui_state_is_independent_and_survives_serialization() {
         let source = "# preserve me\n[ui]\nlast_capture_tool = \"full_display\"\noverlay_x = 40\noverlay_y = 50\n";
         let updated =
             update_display_overlay_center(source, "laptop", 0.25, 0.75).expect("laptop toolbar");
-        let updated = update_display_capture_history(
+        let updated = update_display_interaction_state(
             &updated,
             "laptop",
             CaptureTool::Region,
@@ -897,7 +933,7 @@ mod tests {
         .expect("laptop history");
         let updated = update_display_overlay_center(&updated, "external", 0.8, 0.2)
             .expect("external toolbar");
-        let updated = update_display_capture_history(
+        let updated = update_display_interaction_state(
             &updated,
             "external",
             CaptureTool::Window,

@@ -871,6 +871,19 @@ fn initial_selection(
     }
 }
 
+fn latest_interaction_region(
+    tool: CaptureTool,
+    selection: Option<Rect>,
+    selection_kind: Option<SelectionKind>,
+    last_region: Option<Rect>,
+) -> Option<Rect> {
+    if tool == CaptureTool::Region && selection_kind == Some(SelectionKind::Region) {
+        selection.or(last_region)
+    } else {
+        last_region
+    }
+}
+
 fn remembered_last_region(
     region: Option<captastic_config::CaptureRegion>,
     previous_source: Option<captastic_config::CaptureRegionSource>,
@@ -947,32 +960,31 @@ fn restore_region_for_display_change(
     )
 }
 
-fn remember_capture_history(
+fn remember_overlay_interaction(
     display_id: &DisplayId,
     source: Rect,
-    kind: SelectionKind,
-    confirmed_region: Option<Rect>,
+    tool: CaptureTool,
+    region: Option<Rect>,
     rotation_degrees: u16,
 ) {
-    let tool = CaptureTool::from_selection_kind(kind);
-    let persisted_region = confirmed_region.map(|region| captastic_config::CaptureRegion {
+    let persisted_region = region.map(|region| captastic_config::CaptureRegion {
         x: region.x.saturating_sub(source.x),
         y: region.y.saturating_sub(source.y),
         width: region.width,
         height: region.height,
     });
-    if let Err(error) = captastic_config::save_display_capture_history(
+    if let Err(error) = captastic_config::save_display_interaction_state(
         &display_id.0,
         tool.to_config(),
         persisted_region,
-        confirmed_region.map(|_| captastic_config::CaptureRegionSource {
+        region.map(|_| captastic_config::CaptureRegionSource {
             width: source.width,
             height: source.height,
             rotation_degrees,
         }),
     ) {
         log::warn!(
-            "failed to save capture history for display {}: {error}",
+            "failed to save overlay interaction state for display {}: {error}",
             display_id.0
         );
     }
@@ -1342,7 +1354,7 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                     }
                     ToolbarControl::ClipboardDestination => {}
                     ToolbarControl::Cancel => {
-                        cancel_and_close(hwnd);
+                        cancel_and_close(hwnd, state);
                         return LRESULT(0);
                     }
                 }
@@ -1486,11 +1498,11 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             LRESULT(0)
         }
         WM_KEYDOWN if wparam.0 == usize::from(VK_ESCAPE.0) => {
-            cancel_and_close(hwnd);
+            cancel_and_close(hwnd, state);
             LRESULT(0)
         }
         WM_RBUTTONDOWN | WM_CLOSE => {
-            cancel_and_close(hwnd);
+            cancel_and_close(hwnd, state);
             LRESULT(0)
         }
         WM_PAINT => {
@@ -1510,6 +1522,23 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
     }
 }
 
+fn remember_overlay_state(state: &mut OverlayState) {
+    let region = latest_interaction_region(
+        state.tool,
+        state.selection,
+        state.selection_kind,
+        state.last_region,
+    );
+    remember_overlay_interaction(
+        &state.reference_metadata.display_id,
+        state.source,
+        state.tool,
+        region,
+        state.reference_metadata.rotation_degrees,
+    );
+    state.last_region = region;
+}
+
 fn confirm_and_close(hwnd: HWND, state: &mut OverlayState) {
     if let (Some(rect), Some(kind)) = (state.selection, state.selection_kind) {
         let window_frame = if kind == SelectionKind::Window {
@@ -1521,17 +1550,8 @@ fn confirm_and_close(hwnd: HWND, state: &mut OverlayState) {
             .as_ref()
             .map(|frame| frame.metadata.source_rect)
             .unwrap_or(rect);
-        let confirmed_region = (kind == SelectionKind::Region).then_some(rect);
-        remember_capture_history(
-            &state.reference_metadata.display_id,
-            state.source,
-            kind,
-            confirmed_region,
-            state.reference_metadata.rotation_degrees,
-        );
-        if confirmed_region.is_some() {
-            state.last_region = Some(rect);
-        }
+        debug_assert_eq!(state.tool, CaptureTool::from_selection_kind(kind));
+        remember_overlay_state(state);
         state.result = Some(OverlaySelection {
             rect,
             kind,
@@ -1552,7 +1572,8 @@ fn confirm_and_close(hwnd: HWND, state: &mut OverlayState) {
     }
 }
 
-fn cancel_and_close(hwnd: HWND) {
+fn cancel_and_close(hwnd: HWND, state: &mut OverlayState) {
+    remember_overlay_state(state);
     // SAFETY: hwnd is the live overlay window and this function runs on its owner thread.
     let _ = unsafe { DestroyWindow(hwnd) };
 }
@@ -3585,6 +3606,12 @@ fn activate_tool(state: &mut OverlayState, tool: CaptureTool) {
     state.moving_region = None;
     let tool_changed = state.tool != tool;
     if tool_changed {
+        state.last_region = latest_interaction_region(
+            state.tool,
+            state.selection,
+            state.selection_kind,
+            state.last_region,
+        );
         state.dimension_label_placement = None;
         state.selection = None;
         state.selection_kind = None;
@@ -4275,7 +4302,44 @@ mod tests {
     }
 
     #[test]
-    fn region_mode_restores_the_last_confirmed_rectangle() {
+    fn tool_switching_restores_the_latest_interaction_region() {
+        let source = Rect {
+            x: 0,
+            y: 0,
+            width: 1_920,
+            height: 1_080,
+        };
+        let previously_captured = Rect {
+            x: 120,
+            y: 80,
+            width: 640,
+            height: 360,
+        };
+        let moved_without_capture = Rect {
+            x: 420,
+            y: 260,
+            width: 800,
+            height: 450,
+        };
+        let latest = latest_interaction_region(
+            CaptureTool::Region,
+            Some(moved_without_capture),
+            Some(SelectionKind::Region),
+            Some(previously_captured),
+        );
+        assert_eq!(latest, Some(moved_without_capture));
+        assert_eq!(
+            latest_interaction_region(CaptureTool::Window, None, None, latest),
+            Some(moved_without_capture)
+        );
+        assert_eq!(
+            initial_selection(CaptureTool::Region, latest, source),
+            (Some(moved_without_capture), Some(SelectionKind::Region))
+        );
+    }
+
+    #[test]
+    fn region_mode_restores_the_last_adjusted_rectangle() {
         let source = Rect {
             x: 0,
             y: 0,
