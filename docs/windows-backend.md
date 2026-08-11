@@ -34,6 +34,68 @@ The current path deliberately rejects:
 
 The current binding is `Ctrl+Shift+F9` with `MOD_NOREPEAT`. Queue-full events are counted. The foreground prototype supports a maximum-capture limit, self-triggered lifecycle smoke mode, graceful Ctrl+C handling, and per-session `status`/`stop` commands through a named Windows event. Runtime TOML config controls backend, mode, freshness, clipboard/selection behavior, and queue capacities; explicit CLI values take precedence. Per-user configuration and overlay state share `%USERPROFILE%\.captastic\captastic.toml`, which is loaded automatically when `--config` is omitted. Logs remain under `%USERPROFILE%\.captastic\logs`.
 
+## CPU readback retention
+
+Each retained `DxgiBackend` owns one persistent staging texture and a bounded pool of three
+lazily allocated CPU readback buffers. Pool selection first reuses a correctly sized buffer that
+has no outstanding `CpuFrame` lease. It initializes another slot only when every compatible
+allocation is leased, so repeated non-overlapping captures stabilize at one CPU allocation while
+genuine overlap can expand through all three slots. A fourth simultaneous lease preserves the
+existing `BufferExhausted` result.
+
+The pool owns one `Arc<[u8]>` reference per initialized slot. Selection, crop, and clipboard jobs
+hold additional references while they consume a frame; a slot is writable only when the pool is
+again its sole owner. An incompatible allocation is never reused as storage for a differently
+sized frame. Staging-texture dimension or format changes reset the pool before readback, and a
+free incompatible slot is replaced only when no empty slot remains.
+
+A 3840 by 2160 tight BGRA frame is 33,177,600 bytes (about 31.64 MiB). Sequential captures
+therefore retain one such CPU allocation rather than three, reducing expected private bytes by
+about 63.3 MiB. Allocator bookkeeping and working-set residency can make process counters differ
+slightly. The display manager retains a separate backend for every usable output, so this bound
+applies per display session.
+
+The 30-second selection-worker timeout releases the separate overlay surface cache. It does not
+shrink the CPU pool or release the persistent staging texture. Captastic deliberately keeps those
+resources warm: adding idle shrinking would require separately measuring the memory benefit
+against allocation and D3D resource creation latency on the first capture after idle.
+
+## Reproducible memory measurement
+
+Use the same build, interactive Windows session, display topology, and DXGI options for both
+samples. For the 4K reference case, use the 3840 by 2160 primary display with `latest`, CPU
+frames, selection, and clipboard enabled.
+
+1. Stop any existing daemon, start a fresh release daemon, and record its PID and command line.
+2. Before triggering capture, record private bytes, working set, handle count, thread count, and
+   the Windows `GPU Process Memory` dedicated/shared counters for that PID.
+3. Perform at least five captures or cancellations strictly sequentially. Confirm in the log that
+   each selection completed or cancelled before triggering the next so the test does not
+   intentionally exercise overlapping ownership.
+4. Wait at least 35 seconds after the final selection to cross the overlay's 30-second idle
+   timeout.
+5. Take at least three process samples one second apart. Confirm private bytes, handles, and
+   threads stabilize instead of continuing to grow.
+6. If VMMap is available, compare the count of heap allocations near the full-frame byte size.
+   Treat anonymous graphics allocations as unattributed unless an allocation stack or API trace
+   identifies their owning D3D resource.
+7. Exercise two and three simultaneous frame leases with the deterministic CPU-pool tests. The UI
+   does not need to manufacture overlap for the steady-state measurement.
+8. Repeat a representative run on a lower-resolution display when one is available.
+
+PowerShell's `Get-Process` exposes the core process counters:
+
+```powershell
+$captasticProcess = Get-Process -Id <pid>
+$captasticProcess | Select-Object Id, PrivateMemorySize64, WorkingSet64, HandleCount,
+    @{Name = 'ThreadCount'; Expression = { $_.Threads.Count }}
+```
+
+Use `Get-Counter '\GPU Process Memory(*)\Dedicated Usage'` and filter the returned instance
+name for `pid_<pid>_` when the GPU Process Memory counter set is available. GPU usage is recorded
+for regression detection, but a CPU-pool policy change is not expected to reduce persistent D3D
+allocations.
+
 ## Clipboard path
 
 The daemon enables clipboard publication by default. A configurable bounded queue connects the capture thread to a serialized clipboard worker. The worker creates a hidden message-only owner window, prepares top-down CF_DIBV5 and registered PNG representations, retries `OpenClipboard` for at most 50 ms, empties the clipboard, and transfers both movable allocations to Windows. Opaque DXGI frames omit the DIB alpha mask; deliberate native-window alpha advertises it. PNG improves transparent-corner interoperability.
