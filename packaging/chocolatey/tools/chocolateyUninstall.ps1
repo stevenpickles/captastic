@@ -15,6 +15,7 @@ if (Test-Path -LiteralPath $cli -PathType Leaf) {
 }
 
 Uninstall-BinFile -Name 'captastic'
+Uninstall-BinFile -Name 'captastic-desktop'
 
 $shortcutPath = Join-Path ([Environment]::GetFolderPath('CommonPrograms')) 'Captastic.lnk'
 if (Test-Path -LiteralPath $shortcutPath) {

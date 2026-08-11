@@ -95,10 +95,11 @@ choco install captastic
 choco upgrade captastic
 ```
 
-The Chocolatey package adds the `captastic` CLI to `PATH` and creates a Start Menu shortcut without
-launching the desktop application during first install. It preserves `~/.captastic` on upgrades and
-uninstall. See [Chocolatey packaging](docs/chocolatey.md) for local package testing, portable-install
-migration behavior, and the manual community publishing procedure.
+The Chocolatey package adds `captastic` and the console-free `captastic-desktop` launcher to `PATH`
+and creates a Start Menu shortcut without launching the desktop application during first install. It
+preserves `~/.captastic` on upgrades and uninstall. See
+[Chocolatey packaging](docs/chocolatey.md) for local package testing, portable-install migration
+behavior, and the manual community publishing procedure.
 
 When `--config` is omitted, the daemon automatically loads
 `%USERPROFILE%\.captastic\captastic.toml` if it exists. The same file stores Captastic-managed UI

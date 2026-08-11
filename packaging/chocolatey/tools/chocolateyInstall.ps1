@@ -34,8 +34,9 @@ if ((Test-Path -LiteralPath $legacyCli -PathType Leaf) -and
 }
 
 # Suppression files in the generated package prevent Chocolatey's automatic shim
-# behavior; only the console CLI should be exposed on PATH.
+# behavior so both public commands can be exposed explicitly and predictably.
 Install-BinFile -Name 'captastic' -Path $cli
+Install-BinFile -Name 'captastic-desktop' -Path $desktop
 
 $shortcutPath = Join-Path ([Environment]::GetFolderPath('CommonPrograms')) 'Captastic.lnk'
 Install-ChocolateyShortcut `

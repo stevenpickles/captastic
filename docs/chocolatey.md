@@ -2,14 +2,15 @@
 
 Captastic's Chocolatey package is self-contained: the release executables, licenses,
 documentation, and example configuration are embedded in the `.nupkg`. Installation and
-upgrades therefore do not download or execute a second installer. The package exposes only
-`captastic.exe` on `PATH` and adds the console-free desktop launcher to the Start Menu.
+upgrades therefore do not download or execute a second installer. The package exposes both
+`captastic.exe` and `captastic-desktop.exe` on `PATH` and adds the console-free desktop launcher
+to the Start Menu.
 
 The package intentionally does not launch Captastic on its first installation. Start it from
 the Start Menu, then use the tray menu or `captastic startup enable` if it should start with
 Windows. When upgrading a running installation, the Chocolatey hook stops the daemon before
 replacing its files; reopen Captastic from the Start Menu after the upgrade. The package never
-starts an elevated tray process from Chocolatey. Uninstall removes the command shim and shortcut
+starts an elevated tray process from Chocolatey. Uninstall removes both command shims and the shortcut
 but preserves configuration and logs under `~/.captastic`.
 
 If the current user installed Captastic previously with the portable package's `install.ps1`,
@@ -32,6 +33,7 @@ test the package from that directory:
 ```powershell
 choco install captastic --version 0.1.0 --source ./dist --yes
 captastic doctor
+Get-Command captastic, captastic-desktop
 choco upgrade captastic --version 0.1.0 --source ./dist --yes --force
 choco uninstall captastic --yes
 ```
