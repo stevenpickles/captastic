@@ -109,6 +109,38 @@ after cancellation. Region coordinates are monitor-local, so negative origins do
 preserve the rest of the TOML document and its comments. Existing global `[ui]` values remain a
 backward-compatible fallback until that monitor records its own state.
 
+## Configurable hotkeys
+
+The canonical format keeps bindings under `[hotkey.bindings]`. Only `last_workflow` is enabled by
+default, preserving the existing `Ctrl+Shift+F9` behavior; omit any other action to keep it disabled:
+
+```toml
+[hotkey]
+repeat = "ignore"
+
+[hotkey.bindings]
+last_workflow = "Ctrl+Shift+F9"
+region = "Ctrl+Shift+R"
+window = "Ctrl+Shift+W"
+full_display = "Ctrl+Shift+F10"
+repeat_last_region = "Ctrl+Shift+F11"
+```
+
+Bindings are case-insensitive on input and logged canonically. A chord is `+`-separated, may use
+`Ctrl`/`Control`, `Alt`, `Shift`, and `Win`/`Windows`, and must contain exactly one key from `A-Z`,
+`0-9`, or `F1-F24`. Duplicate modifiers, empty tokens, multiple keys, unsupported keys, empty
+action bindings, and one chord assigned to multiple actions are errors. Existing
+`[hotkey] binding = "Ctrl+Shift+F9"` remains a compatibility alias for `last_workflow`; defining
+both forms for that action is rejected as ambiguous.
+
+`last_workflow`, `region`, and `window` open the frozen-frame overlay with the remembered, Region,
+or Window tool respectively. `full_display` publishes the resolved display directly without
+constructing overlay resources. `repeat_last_region` uses only that display's last confirmed Region
+selection, validates its persistent display identity and source geometry, and uses GPU region
+materialization with checked CPU fallback. Missing, stale, or invalid confirmed state opens Region
+mode from daemon-cached restored/default UI state and logs a structured fallback reason; it never
+captures unrelated state or reads TOML after the trigger. All actions retain the configured display
+policy and `latest`/`fresh` mode and pass through the same bounded trigger and output queues.
 Captastic writes operational output through Rust's `log` facade to both stderr and a persistent file.
 Capture, selection, clipboard, recovery, and daemon lifecycle messages therefore share one format
 and filtering policy. The default compact format uses an RFC 3339 UTC timestamp with microsecond

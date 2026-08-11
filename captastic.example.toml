@@ -9,8 +9,15 @@ display = "pointer"
 trigger_queue_capacity = 4
 
 [hotkey]
-binding = "Ctrl+Shift+F9"
 repeat = "ignore"
+
+# Omit an action to leave it disabled. The default registers only last_workflow.
+[hotkey.bindings]
+last_workflow = "Ctrl+Shift+F9"
+# region = "Ctrl+Shift+R"
+# window = "Ctrl+Shift+W"
+# full_display = "Ctrl+Shift+F10"
+# repeat_last_region = "Ctrl+Shift+F11"
 
 [capture]
 mode = "latest"
@@ -78,6 +85,19 @@ retained_files = 3
 # height = 540
 
 # [ui.displays.windows-monitor-0123456789abcdef.last_region_source]
+# width = 1920
+# height = 1080
+# rotation_degrees = 0
+
+# Confirmed regions are separate from cancellation-restored interaction regions and are managed by
+# Captastic for repeat_last_region. Do not copy these values between displays.
+# [ui.displays.windows-monitor-0123456789abcdef.last_confirmed_region]
+# x = 480
+# y = 270
+# width = 960
+# height = 540
+#
+# [ui.displays.windows-monitor-0123456789abcdef.last_confirmed_region_source]
 # width = 1920
 # height = 1080
 # rotation_degrees = 0

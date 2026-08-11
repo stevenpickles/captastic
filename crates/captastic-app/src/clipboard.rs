@@ -2,6 +2,7 @@ use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use captastic_config::{HotkeyAction, HotkeyChord};
 use captastic_core::{validate_event_order, CaptureId, CpuFrame, EventRecorder, PerfEventKind};
 use serde_json::json;
 
@@ -76,6 +77,8 @@ impl ClipboardWorker {
                                     json!({
                                         "schema_version": 1,
                                         "event": "clipboard_complete",
+                                        "action": job.action,
+                                        "chord": job.chord.map(|chord| chord.to_string()),
                                         "capture_id": job.capture_id,
                                         "source": job.source,
                                         "total_offset_ns": total_offset_ns,
@@ -115,6 +118,7 @@ impl ClipboardWorker {
                                         "event": "clipboard_failed",
                                         "capture_id": job.capture_id,
                                         "source": job.source,
+                                        "action": job.action,
                                         "error": error.to_string(),
                                         "native_code": error.native_code,
                                         "retryable": error.retryable,
@@ -174,6 +178,8 @@ impl Drop for ClipboardWorker {
 pub struct ClipboardJob {
     pub capture_id: CaptureId,
     pub triggered_at: Instant,
+    pub action: HotkeyAction,
+    pub chord: Option<HotkeyChord>,
     pub cpu_ready_offset_ns: u64,
     pub source: &'static str,
     pub frame: CpuFrame,

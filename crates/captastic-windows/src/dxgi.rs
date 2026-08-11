@@ -1,5 +1,6 @@
 use std::marker::PhantomData;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -35,12 +36,28 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_ERROR_WAIT_TIMEOUT, DXGI_ERROR_WAS_STILL_DRAWING, DXGI_OUTDUPL_FRAME_INFO,
     DXGI_OUTPUT_DESC,
 };
+use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 
 const INITIAL_LATEST_FRAME_TIMEOUT: Duration = Duration::from_millis(100);
 const GPU_MAP_TIMEOUT: Duration = Duration::from_millis(250);
 const GPU_MAP_RETRY_DELAY: Duration = Duration::from_millis(1);
+const BASE_DPI: u32 = 96;
+
+static DISPLAY_CONFIGURATION_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn mark_display_configuration_changed(reason: &'static str) {
+    let generation = DISPLAY_CONFIGURATION_GENERATION
+        .fetch_add(1, Ordering::AcqRel)
+        .saturating_add(1);
+    log::info!("display configuration invalidated generation={generation} reason={reason}");
+}
+
+fn display_configuration_generation() -> u64 {
+    DISPLAY_CONFIGURATION_GENERATION.load(Ordering::Acquire)
+}
 
 pub fn enumerate_displays() -> Result<Vec<DisplayInfo>, CaptureError> {
     enumerate_outputs().map(|outputs| outputs.into_iter().map(|output| output.info).collect())
@@ -59,6 +76,7 @@ pub struct DxgiBackend {
     selected: DisplayInfo,
     capabilities: BackendCapabilities,
     qpc_frequency: i64,
+    display_configuration_generation: u64,
     _thread_affine: PhantomData<Rc<()>>,
 }
 
@@ -173,6 +191,7 @@ impl DxgiBackend {
                 warm_stream: false,
             },
             qpc_frequency,
+            display_configuration_generation: display_configuration_generation(),
             _thread_affine: PhantomData,
         };
         Ok(backend)
@@ -197,6 +216,19 @@ impl CaptureBackend for DxgiBackend {
         request: &CaptureRequest,
         recorder: &mut EventRecorder,
     ) -> Result<CaptureOutcome, CaptureError> {
+        let current_generation = display_configuration_generation();
+        if self.display_configuration_generation != current_generation {
+            return Err(capture_error(
+                CaptureErrorKind::TopologyChanged,
+                "capture",
+                format!(
+                    "display configuration changed from generation {} to {}; recreate the capture backend",
+                    self.display_configuration_generation, current_generation
+                ),
+                true,
+                None,
+            ));
+        }
         if request.cursor == CursorMode::Include {
             return Err(capture_error(
                 CaptureErrorKind::Unsupported,
@@ -1282,6 +1314,7 @@ fn enumerate_outputs() -> Result<Vec<OutputRecord>, CaptureError> {
             if desc.AttachedToDesktop.as_bool() {
                 let bounds = rect_from_windows(desc.DesktopCoordinates)?;
                 let gdi_name = wide_array_to_string(&desc.DeviceName);
+                let scale_factor = effective_monitor_scale(desc.Monitor, &gdi_name);
                 let identity = identities
                     .iter()
                     .find(|identity| identity.gdi_name.eq_ignore_ascii_case(&gdi_name));
@@ -1299,7 +1332,7 @@ fn enumerate_outputs() -> Result<Vec<OutputRecord>, CaptureError> {
                         id,
                         name,
                         bounds,
-                        scale_factor: 1.0,
+                        scale_factor,
                         rotation_degrees: rotation_degrees(desc.Rotation),
                         is_primary: desc.DesktopCoordinates.left == 0
                             && desc.DesktopCoordinates.top == 0,
@@ -1311,6 +1344,26 @@ fn enumerate_outputs() -> Result<Vec<OutputRecord>, CaptureError> {
         adapter_index = adapter_index.saturating_add(1);
     }
     Ok(records)
+}
+
+fn effective_monitor_scale(monitor: HMONITOR, display_name: &str) -> f32 {
+    let mut dpi_x = BASE_DPI;
+    let mut dpi_y = BASE_DPI;
+    // SAFETY: dpi_x and dpi_y are writable values and monitor comes from a live DXGI output.
+    let dpi_result =
+        unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) };
+    if let Err(error) = dpi_result {
+        log::warn!(
+            "effective DPI query failed display={display_name:?}: {error}; reporting 100% scaling"
+        );
+        return 1.0;
+    }
+    if dpi_x != dpi_y {
+        log::debug!(
+            "display {display_name:?} reports asymmetric DPI x={dpi_x} y={dpi_y}; using x-axis DPI"
+        );
+    }
+    dpi_x as f32 / BASE_DPI as f32
 }
 
 fn display_config_identities() -> Result<Vec<DisplayConfigIdentity>, CaptureError> {

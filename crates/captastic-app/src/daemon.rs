@@ -1,20 +1,25 @@
 #[cfg(windows)]
+use std::collections::BTreeMap;
+#[cfg(windows)]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(windows)]
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 #[cfg(windows)]
 use std::thread;
 #[cfg(windows)]
 use std::time::{Duration, Instant};
 
 #[cfg(windows)]
-use captastic_config::AppConfig;
+use captastic_config::{
+    AppConfig, ConfirmedRegion, HotkeyAction, HotkeyBinding, HotkeyChord, UiConfig,
+};
 #[cfg(all(windows, test))]
 use captastic_core::DisplayId;
 #[cfg(windows)]
 use captastic_core::{
     validate_event_order, CaptureError, CaptureErrorKind, CaptureId, CaptureMode, CaptureRequest,
-    CaptureSource, CpuFrame, CursorMode, EventRecorder, NativeFrame, PerfEventKind,
+    CaptureSource, CpuFrame, CursorMode, EventRecorder, FrameMetadata, NativeFrame, PerfEventKind,
+    Rect,
 };
 #[cfg(windows)]
 use serde_json::json;
@@ -38,6 +43,9 @@ struct ResolvedDaemonArgs {
     clipboard: bool,
     selection: bool,
     trigger_queue_capacity: usize,
+    hotkey_bindings: Vec<HotkeyBinding>,
+    confirmed_regions: BTreeMap<String, ConfirmedRegion>,
+    ui: UiConfig,
     clipboard_queue_capacity: usize,
     selection_queue_capacity: usize,
     max_captures: Option<usize>,
@@ -52,6 +60,8 @@ fn resolve_daemon_args(args: DaemonArgs) -> Result<ResolvedDaemonArgs, AppError>
         None => AppConfig::load_default()?,
     };
     config.validate()?;
+    let hotkey_bindings = config.hotkey.resolved_bindings()?;
+    let confirmed_regions = config.confirmed_regions();
     let mode = args.mode.unwrap_or(match config.capture.mode.as_str() {
         "fresh" => ModeArg::Fresh,
         _ => ModeArg::Latest,
@@ -81,6 +91,9 @@ fn resolve_daemon_args(args: DaemonArgs) -> Result<ResolvedDaemonArgs, AppError>
         selection: args.selection.unwrap_or(config.selection.enabled),
         trigger_queue_capacity: config.daemon.trigger_queue_capacity,
         clipboard_queue_capacity: config.clipboard.queue_capacity,
+        hotkey_bindings,
+        confirmed_regions,
+        ui: config.ui.clone(),
         selection_queue_capacity: config.selection.queue_capacity,
         max_captures: args.max_captures,
         self_trigger: args.self_trigger,
@@ -116,10 +129,23 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             "native selection currently requires --clipboard true".to_owned(),
         ));
     }
+    if !args.selection {
+        if let Some(binding) = args
+            .hotkey_bindings
+            .iter()
+            .find(|binding| action_requires_selection(binding.action))
+        {
+            return Err(AppError::InvalidArgument(format!(
+                "hotkey action {} requires selection.enabled = true",
+                binding.action
+            )));
+        }
+    }
     let clipboard_worker = args
         .clipboard
         .then(|| crate::clipboard::ClipboardWorker::start(args.json, args.clipboard_queue_capacity))
         .transpose()?;
+    let confirmed_regions = Arc::new(Mutex::new(args.confirmed_regions.clone()));
     let selection_worker = args
         .selection
         .then(|| {
@@ -130,19 +156,16 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                     .submitter(),
                 args.json,
                 args.selection_queue_capacity,
+                confirmed_regions.clone(),
             )
         })
         .transpose()?;
     let selection_sender = selection_worker
         .as_ref()
         .map(crate::selection::SelectionWorker::submitter);
-    let clipboard_sender = if args.selection {
-        None
-    } else {
-        clipboard_worker
-            .as_ref()
-            .map(crate::clipboard::ClipboardWorker::submitter)
-    };
+    let clipboard_sender = clipboard_worker
+        .as_ref()
+        .map(crate::clipboard::ClipboardWorker::submitter);
     let (command_sender, command_receiver) = mpsc::sync_channel(args.trigger_queue_capacity);
     let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
     let (done_sender, done_receiver) = mpsc::sync_channel::<Result<(), AppError>>(1);
@@ -150,9 +173,11 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let display_policy = args.display_policy.clone();
     let mode = args.mode.clone();
     let cpu_frame = args.cpu_frame;
-    let retain_native_frame = args.selection;
+    let selection_enabled = args.selection;
     let max_captures = args.max_captures;
     let json_output = args.json;
+    let capture_confirmed_regions = confirmed_regions.clone();
+    let cached_ui = args.ui.clone();
 
     let capture_join = thread::Builder::new()
         .name("captastic-capture".to_owned())
@@ -241,8 +266,9 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                             )
                             .and_then(|display_id| {
                                 log::debug!(
-                                    "capture {} resolved display={}",
+                                    "capture {} action={} resolved display={}",
                                     capture_id.0,
+                                    trigger.action,
                                     display_id.0
                                 );
                                 let request = CaptureRequest {
@@ -251,7 +277,8 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                     source: CaptureSource::Display(display_id),
                                     mode: mode.clone(),
                                     cpu_frame,
-                                    retain_native_frame,
+                                    retain_native_frame: selection_enabled
+                                        && trigger.action != HotkeyAction::FullDisplay,
                                     cursor: CursorMode::Exclude,
                                 };
                                 active_backend.capture(&request, &mut recorder)
@@ -313,6 +340,12 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                     capture_id,
                                     trigger.received_at,
                                     trigger.source,
+                                    trigger.action,
+                                    trigger.chord,
+                                    &outcome.metadata,
+                                    &capture_confirmed_regions,
+                                    &cached_ui,
+                                    json_output,
                                     outcome.metadata.cpu_ready_offset_ns,
                                     outcome.frame,
                                     outcome.native_frame,
@@ -325,8 +358,9 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                     }
                                 };
                                 log::info!(
-                                    "capture {}: native {:.3} ms, CPU {} output={} bytes={:?}",
+                                    "capture {} action={}: native {:.3} ms, CPU {} output={} bytes={:?}",
                                     capture_id.0,
+                                    trigger.action,
                                     ns_to_ms(outcome.metadata.native_ready_offset_ns),
                                     outcome
                                         .metadata
@@ -341,6 +375,8 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                         "schema_version": 1,
                                         "event": "capture_complete",
                                         "source": trigger.source,
+                                        "action": trigger.action,
+                                        "chord": trigger.chord.map(|chord| chord.to_string()),
                                         "metadata": outcome.metadata,
                                         "cpu_frame_bytes": frame_bytes,
                                         "native_frame_retained": native_frame_retained,
@@ -357,8 +393,9 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                     break;
                                 }
                                 crate::logging::error(format_args!(
-                                    "capture {} failed: {error}",
-                                    capture_id.0
+                                    "capture {} action={} failed: {error}",
+                                    capture_id.0,
+                                    trigger.action
                                 ));
                                 if requires_backend_recovery(&error) && recovery.is_none() {
                                     backend.take();
@@ -389,16 +426,17 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let callback_dropped = dropped.clone();
     let callback_paused = paused.clone();
     let hotkey = match captastic_windows::HotkeyListener::start(
-        captastic_windows::HotkeySpec::ctrl_shift_f9(),
-        move |received_at| {
+        &args.hotkey_bindings,
+        move |action, chord, received_at| {
             if callback_paused.load(Ordering::Acquire) {
-                log::debug!("capture hotkey ignored while Captastic is paused");
                 return;
             }
             let trigger = TriggerEvent {
                 received_at,
                 enqueued_at: Instant::now(),
                 source: "hotkey",
+                action,
+                chord: Some(chord),
             };
             if callback_sender
                 .try_send(CaptureCommand::Trigger(trigger))
@@ -443,10 +481,22 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         }
     };
 
+    let active_hotkeys = args
+        .hotkey_bindings
+        .iter()
+        .map(|binding| json!({"action": binding.action, "chord": binding.chord.to_string()}))
+        .collect::<Vec<_>>();
+    let active_hotkey_labels = args
+        .hotkey_bindings
+        .iter()
+        .map(|binding| format!("{}={}", binding.action, binding.chord))
+        .collect::<Vec<_>>()
+        .join(", ");
+
     let ready_value = json!({
         "schema_version": 1,
         "event": "ready",
-        "hotkey": captastic_windows::HotkeySpec::ctrl_shift_f9().label(),
+        "hotkeys": active_hotkeys,
         "capture": ready,
         "queue_capacity": args.trigger_queue_capacity,
         "clipboard": args.clipboard,
@@ -460,8 +510,8 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         println!("{ready_value}");
     } else {
         log::info!(
-            "Captastic is ready: {} using {}, selection {}, clipboard {} (press Ctrl+C to stop)",
-            captastic_windows::HotkeySpec::ctrl_shift_f9().label(),
+            "Captastic is ready: hotkeys [{}] using {}, selection {}, clipboard {} (press Ctrl+C to stop)",
+            active_hotkey_labels,
             args.backend,
             if args.selection {
                 "enabled"
@@ -485,6 +535,8 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                 received_at: Instant::now(),
                 enqueued_at: Instant::now(),
                 source: "self_test",
+                action: HotkeyAction::LastWorkflow,
+                chord: None,
             }))
             .map_err(|error| AppError::InvalidArgument(error.to_string()))?;
     }
@@ -507,6 +559,8 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                     received_at,
                                     enqueued_at: Instant::now(),
                                     source: "tray",
+                                    action: HotkeyAction::LastWorkflow,
+                                    chord: None,
                                 };
                                 if command_sender
                                     .try_send(CaptureCommand::Trigger(trigger))
@@ -681,6 +735,39 @@ fn requires_backend_recovery(error: &CaptureError) -> bool {
 }
 
 #[cfg(windows)]
+fn action_requires_selection(action: HotkeyAction) -> bool {
+    matches!(
+        action,
+        HotkeyAction::Region | HotkeyAction::Window | HotkeyAction::RepeatLastRegion
+    )
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActionRoute {
+    Overlay(captastic_windows::InitialSelectionTool),
+    FullDisplay,
+    RepeatLastRegion,
+}
+
+#[cfg(windows)]
+fn action_route(action: HotkeyAction) -> ActionRoute {
+    match action {
+        HotkeyAction::LastWorkflow => {
+            ActionRoute::Overlay(captastic_windows::InitialSelectionTool::Remembered)
+        }
+        HotkeyAction::Region => {
+            ActionRoute::Overlay(captastic_windows::InitialSelectionTool::Region)
+        }
+        HotkeyAction::Window => {
+            ActionRoute::Overlay(captastic_windows::InitialSelectionTool::Window)
+        }
+        HotkeyAction::FullDisplay => ActionRoute::FullDisplay,
+        HotkeyAction::RepeatLastRegion => ActionRoute::RepeatLastRegion,
+    }
+}
+
+#[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 fn dispatch_output(
     selection_sender: Option<&mpsc::SyncSender<crate::selection::SelectionJob>>,
@@ -688,28 +775,120 @@ fn dispatch_output(
     capture_id: CaptureId,
     triggered_at: Instant,
     source: &'static str,
+    action: HotkeyAction,
+    chord: Option<HotkeyChord>,
+    metadata: &FrameMetadata,
+    confirmed_regions: &crate::selection::ConfirmedRegionCache,
+    cached_ui: &UiConfig,
+    json_output: bool,
     cpu_ready_offset_ns: Option<u64>,
     frame: Option<CpuFrame>,
     native_frame: Option<Arc<dyn NativeFrame>>,
     recorder: EventRecorder,
 ) -> Result<&'static str, AppError> {
-    if let Some(sender) = selection_sender {
-        return dispatch_selection(
-            sender,
-            capture_id,
-            triggered_at,
-            source,
-            cpu_ready_offset_ns,
-            frame,
-            native_frame,
-            recorder,
-        );
+    let route = action_route(action);
+    if let ActionRoute::Overlay(initial_tool) = route {
+        if let Some(sender) = selection_sender {
+            return dispatch_selection(
+                sender,
+                capture_id,
+                triggered_at,
+                source,
+                action,
+                chord,
+                initial_tool,
+                None,
+                cpu_ready_offset_ns,
+                frame,
+                native_frame,
+                recorder,
+            );
+        }
+        if action != HotkeyAction::LastWorkflow {
+            return Err(AppError::InvalidArgument(format!(
+                "hotkey action {action} requires selection.enabled = true"
+            )));
+        }
     }
+
+    if route == ActionRoute::RepeatLastRegion {
+        let confirmed = confirmed_regions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&metadata.display_id.0)
+            .copied();
+        match repeat_region_rect(confirmed, metadata) {
+            Ok(rect) => {
+                return dispatch_repeat_region(
+                    clipboard_sender,
+                    capture_id,
+                    triggered_at,
+                    source,
+                    action,
+                    chord,
+                    cpu_ready_offset_ns,
+                    frame,
+                    native_frame,
+                    rect,
+                    recorder,
+                    json_output,
+                );
+            }
+            Err(reason) => {
+                crate::logging::warn(format_args!(
+                    "capture {} action={} repeat_region_validation={} route=region_overlay display={}",
+                    capture_id.0,
+                    action,
+                    reason,
+                    metadata.display_id.0
+                ));
+                if json_output {
+                    println!(
+                        "{}",
+                        json!({
+                            "schema_version": 1,
+                            "event": "repeat_region_fallback",
+                            "capture_id": capture_id,
+                            "action": action,
+                            "display_id": metadata.display_id,
+                            "reason": reason,
+                            "route": "region_overlay",
+                        })
+                    );
+                }
+                let sender = selection_sender.ok_or_else(|| {
+                    AppError::InvalidArgument(
+                        "repeat_last_region fallback requires selection.enabled = true".to_owned(),
+                    )
+                })?;
+                return dispatch_selection(
+                    sender,
+                    capture_id,
+                    triggered_at,
+                    source,
+                    action,
+                    chord,
+                    captastic_windows::InitialSelectionTool::Region,
+                    Some(captastic_config::resolve_display_ui_state(
+                        cached_ui,
+                        &metadata.display_id.0,
+                    )),
+                    cpu_ready_offset_ns,
+                    frame,
+                    native_frame,
+                    recorder,
+                );
+            }
+        }
+    }
+
     dispatch_clipboard(
         clipboard_sender,
         capture_id,
         triggered_at,
         source,
+        action,
+        chord,
         cpu_ready_offset_ns,
         frame,
         recorder,
@@ -723,6 +902,10 @@ fn dispatch_selection(
     capture_id: CaptureId,
     triggered_at: Instant,
     source: &'static str,
+    action: HotkeyAction,
+    chord: Option<HotkeyChord>,
+    initial_tool: captastic_windows::InitialSelectionTool,
+    remembered_ui: Option<captastic_config::DisplayUiState>,
     cpu_ready_offset_ns: Option<u64>,
     frame: Option<CpuFrame>,
     native_frame: Option<Arc<dyn NativeFrame>>,
@@ -741,6 +924,10 @@ fn dispatch_selection(
     let job = crate::selection::SelectionJob {
         capture_id,
         triggered_at,
+        action,
+        chord,
+        initial_tool,
+        remembered_ui,
         cpu_ready_offset_ns,
         source,
         frame,
@@ -769,11 +956,141 @@ fn dispatch_selection(
 }
 
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn dispatch_repeat_region(
+    clipboard_sender: Option<&mpsc::SyncSender<crate::clipboard::ClipboardJob>>,
+    capture_id: CaptureId,
+    triggered_at: Instant,
+    source: &'static str,
+    action: HotkeyAction,
+    chord: Option<HotkeyChord>,
+    cpu_ready_offset_ns: Option<u64>,
+    frame: Option<CpuFrame>,
+    native_frame: Option<Arc<dyn NativeFrame>>,
+    rect: Rect,
+    mut recorder: EventRecorder,
+    json_output: bool,
+) -> Result<&'static str, AppError> {
+    let frame = frame.ok_or_else(|| {
+        AppError::BackendUnavailable(
+            "repeat_last_region requires a CPU frame for checked fallback".to_owned(),
+        )
+    })?;
+    let materialize_started = Instant::now();
+    let mut materialization = "cpu_region";
+    let mut gpu_fallback_error = None;
+    let gpu_result = native_frame
+        .as_deref()
+        .map(|native| captastic_windows::materialize_native_region(native, rect))
+        .transpose();
+    let selected_frame = match gpu_result {
+        Ok(Some(Some(result))) => {
+            materialization = "dxgi_gpu_region";
+            result.frame
+        }
+        Ok(Some(None)) | Ok(None) => frame
+            .crop(rect)
+            .map_err(|error| AppError::BackendUnavailable(error.to_string()))?,
+        Err(error) => {
+            gpu_fallback_error = Some(error.to_string());
+            crate::logging::warn(format_args!(
+                "capture {} action={} GPU repeat-region materialization failed; using CPU crop: {error}",
+                capture_id.0,
+                action
+            ));
+            frame
+                .crop(rect)
+                .map_err(|error| AppError::BackendUnavailable(error.to_string()))?
+        }
+    };
+    let materialization_ns = duration_ns(materialize_started, Instant::now());
+    recorder.record(capture_id, PerfEventKind::CropFinished, materialization_ns);
+    log::info!(
+        "capture {} action={} route=direct materialization={} rect={}x{} at ({}, {})",
+        capture_id.0,
+        action,
+        materialization,
+        rect.width,
+        rect.height,
+        rect.x,
+        rect.y
+    );
+    if json_output {
+        println!(
+            "{}",
+            json!({
+                "schema_version": 1,
+                "event": "repeat_region_materialized",
+                "capture_id": capture_id,
+                "action": action,
+                "route": "direct",
+                "rect": rect,
+                "materialization": materialization,
+                "materialization_ns": materialization_ns,
+                "gpu_fallback_error": gpu_fallback_error,
+            })
+        );
+    }
+    dispatch_clipboard(
+        clipboard_sender,
+        capture_id,
+        triggered_at,
+        source,
+        action,
+        chord,
+        cpu_ready_offset_ns,
+        Some(selected_frame),
+        recorder,
+    )
+}
+
+#[cfg(windows)]
+fn repeat_region_rect(
+    confirmed: Option<ConfirmedRegion>,
+    metadata: &FrameMetadata,
+) -> Result<Rect, &'static str> {
+    let confirmed = confirmed.ok_or("missing_confirmed_region")?;
+    let source = metadata.source_rect;
+    if confirmed.source.width != source.width
+        || confirmed.source.height != source.height
+        || confirmed.source.rotation_degrees != metadata.rotation_degrees
+    {
+        return Err("source_geometry_changed");
+    }
+    let region = confirmed.region;
+    if region.x < 0 || region.y < 0 || region.width == 0 || region.height == 0 {
+        return Err("invalid_region_bounds");
+    }
+    let right = i64::from(region.x) + i64::from(region.width);
+    let bottom = i64::from(region.y) + i64::from(region.height);
+    if right > i64::from(source.width) || bottom > i64::from(source.height) {
+        return Err("invalid_region_bounds");
+    }
+    let x = source
+        .x
+        .checked_add(region.x)
+        .ok_or("invalid_region_bounds")?;
+    let y = source
+        .y
+        .checked_add(region.y)
+        .ok_or("invalid_region_bounds")?;
+    Ok(Rect {
+        x,
+        y,
+        width: region.width,
+        height: region.height,
+    })
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 fn dispatch_clipboard(
     sender: Option<&mpsc::SyncSender<crate::clipboard::ClipboardJob>>,
     capture_id: CaptureId,
     triggered_at: Instant,
     source: &'static str,
+    action: HotkeyAction,
+    chord: Option<HotkeyChord>,
     cpu_ready_offset_ns: Option<u64>,
     frame: Option<CpuFrame>,
     mut recorder: EventRecorder,
@@ -800,6 +1117,8 @@ fn dispatch_clipboard(
     let job = crate::clipboard::ClipboardJob {
         capture_id,
         triggered_at,
+        action,
+        chord,
         cpu_ready_offset_ns,
         source,
         frame,
@@ -846,6 +1165,8 @@ struct TriggerEvent {
     received_at: Instant,
     enqueued_at: Instant,
     source: &'static str,
+    action: HotkeyAction,
+    chord: Option<HotkeyChord>,
 }
 
 #[cfg(windows)]
@@ -963,11 +1284,140 @@ mod tests {
             capture_id,
             triggered_at,
             "test",
+            HotkeyAction::FullDisplay,
+            None,
             Some(2),
             Some(frame),
             recorder,
         )
         .expect("capture remains successful");
         assert_eq!(status, "worker_disconnected");
+    }
+    #[test]
+    fn every_hotkey_action_has_exactly_one_route() {
+        assert_eq!(
+            action_route(HotkeyAction::LastWorkflow),
+            ActionRoute::Overlay(captastic_windows::InitialSelectionTool::Remembered)
+        );
+        assert_eq!(
+            action_route(HotkeyAction::Region),
+            ActionRoute::Overlay(captastic_windows::InitialSelectionTool::Region)
+        );
+        assert_eq!(
+            action_route(HotkeyAction::Window),
+            ActionRoute::Overlay(captastic_windows::InitialSelectionTool::Window)
+        );
+        assert_eq!(
+            action_route(HotkeyAction::FullDisplay),
+            ActionRoute::FullDisplay
+        );
+        assert_eq!(
+            action_route(HotkeyAction::RepeatLastRegion),
+            ActionRoute::RepeatLastRegion
+        );
+        assert!(!action_requires_selection(HotkeyAction::LastWorkflow));
+        assert!(!action_requires_selection(HotkeyAction::FullDisplay));
+        assert!(action_requires_selection(HotkeyAction::Region));
+        assert!(action_requires_selection(HotkeyAction::Window));
+        assert!(action_requires_selection(HotkeyAction::RepeatLastRegion));
+    }
+
+    fn repeat_metadata(source_rect: Rect) -> FrameMetadata {
+        FrameMetadata {
+            capture_id: CaptureId(42),
+            backend: "test".to_owned(),
+            display_id: DisplayId("display-a".to_owned()),
+            source_rect,
+            rotation_degrees: 0,
+            capture_mode: CaptureMode::Latest { max_age_ms: None },
+            presentation_offset_ns: Some(0),
+            timing_provenance: TimingProvenance::Synthetic,
+            native_ready_offset_ns: 1,
+            cpu_ready_offset_ns: Some(2),
+            frame_age_ns: Some(0),
+            frame_generation: Some(1),
+            copy_count: 1,
+            pool_slot: Some(0),
+        }
+    }
+
+    #[test]
+    fn repeat_region_validates_source_and_preserves_negative_display_origins() {
+        let metadata = repeat_metadata(Rect {
+            x: -1920,
+            y: -240,
+            width: 3840,
+            height: 2160,
+        });
+        let confirmed = ConfirmedRegion {
+            region: captastic_config::CaptureRegion {
+                x: 40,
+                y: 20,
+                width: 800,
+                height: 600,
+            },
+            source: captastic_config::CaptureRegionSource {
+                width: 3840,
+                height: 2160,
+                rotation_degrees: 0,
+            },
+        };
+        assert_eq!(
+            repeat_region_rect(Some(confirmed), &metadata),
+            Ok(Rect {
+                x: -1880,
+                y: -220,
+                width: 800,
+                height: 600,
+            })
+        );
+    }
+
+    #[test]
+    fn missing_stale_and_out_of_bounds_repeat_regions_fall_back() {
+        let metadata = repeat_metadata(Rect {
+            x: 0,
+            y: 0,
+            width: 3840,
+            height: 2160,
+        });
+        assert_eq!(
+            repeat_region_rect(None, &metadata),
+            Err("missing_confirmed_region")
+        );
+        let stale = ConfirmedRegion {
+            region: captastic_config::CaptureRegion {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+            source: captastic_config::CaptureRegionSource {
+                width: 1920,
+                height: 1080,
+                rotation_degrees: 0,
+            },
+        };
+        assert_eq!(
+            repeat_region_rect(Some(stale), &metadata),
+            Err("source_geometry_changed")
+        );
+        let outside = ConfirmedRegion {
+            region: captastic_config::CaptureRegion {
+                x: 3800,
+                y: 2100,
+                width: 100,
+                height: 100,
+            },
+            source: captastic_config::CaptureRegionSource {
+                width: 3840,
+                height: 2160,
+                rotation_degrees: 0,
+            },
+        };
+        assert_eq!(
+            repeat_region_rect(Some(outside), &metadata),
+            Err("invalid_region_bounds")
+        );
     }
 }
