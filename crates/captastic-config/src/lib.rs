@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::ErrorKind;
@@ -93,6 +94,15 @@ pub struct CaptureRegion {
 pub struct CaptureHistory {
     pub tool: Option<CaptureTool>,
     pub region: Option<CaptureRegion>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DisplayUiState {
+    pub overlay_position: Option<(i32, i32)>,
+    pub tool: Option<CaptureTool>,
+    pub region: Option<CaptureRegion>,
+    /// Per-display regions are monitor-local. A legacy global fallback remains desktop-absolute.
+    pub region_is_display_local: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -255,12 +265,132 @@ impl AppConfig {
                 "ui.last_region width and height must be greater than zero".to_owned(),
             ));
         }
+        for (display_id, state) in &self.ui.displays {
+            if display_id.trim().is_empty() {
+                return Err(ConfigError::InvalidValue(
+                    "ui.displays keys must not be empty".to_owned(),
+                ));
+            }
+            if state.overlay_x.is_some() != state.overlay_y.is_some() {
+                return Err(ConfigError::InvalidValue(format!(
+                    "ui.displays.{display_id}.overlay_x and overlay_y must either both be set or both be omitted"
+                )));
+            }
+            if state
+                .last_region
+                .is_some_and(|region| region.width == 0 || region.height == 0)
+            {
+                return Err(ConfigError::InvalidValue(format!(
+                    "ui.displays.{display_id}.last_region width and height must be greater than zero"
+                )));
+            }
+        }
         Ok(())
     }
 
     pub fn to_toml_pretty(&self) -> Result<String, ConfigError> {
         toml::to_string_pretty(self).map_err(ConfigError::Serialize)
     }
+}
+
+pub fn load_display_ui_state(display_id: &str) -> Result<DisplayUiState, ConfigError> {
+    let config = AppConfig::load_default()?;
+    Ok(resolve_display_ui_state(&config.ui, display_id))
+}
+
+fn resolve_display_ui_state(ui: &UiConfig, display_id: &str) -> DisplayUiState {
+    let display = ui.displays.get(display_id);
+    let display_region = display.and_then(|state| state.last_region);
+    DisplayUiState {
+        overlay_position: display
+            .and_then(|state| state.overlay_x.zip(state.overlay_y))
+            .or_else(|| ui.overlay_x.zip(ui.overlay_y)),
+        tool: display
+            .and_then(|state| state.last_capture_tool)
+            .or(ui.last_capture_tool),
+        region: display_region.or(ui.last_region),
+        region_is_display_local: display_region.is_some(),
+    }
+}
+
+pub fn save_display_overlay_position(display_id: &str, x: i32, y: i32) -> Result<(), ConfigError> {
+    let path = default_config_path().ok_or(ConfigError::HomeDirectoryUnavailable)?;
+    let source = read_optional_config_source(&path)?;
+    let updated = update_display_overlay_position(&source, display_id, x, y)?;
+    write_config_source(&path, updated)
+}
+
+fn update_display_overlay_position(
+    source: &str,
+    display_id: &str,
+    x: i32,
+    y: i32,
+) -> Result<String, ConfigError> {
+    let mut document = editable_document(source)?;
+    document["ui"]["displays"][display_id]["overlay_x"] = toml_edit::value(i64::from(x));
+    document["ui"]["displays"][display_id]["overlay_y"] = toml_edit::value(i64::from(y));
+    Ok(document.to_string())
+}
+
+pub fn save_display_capture_history(
+    display_id: &str,
+    tool: CaptureTool,
+    region: Option<CaptureRegion>,
+) -> Result<(), ConfigError> {
+    let path = default_config_path().ok_or(ConfigError::HomeDirectoryUnavailable)?;
+    let source = read_optional_config_source(&path)?;
+    let updated = update_display_capture_history(&source, display_id, tool, region)?;
+    write_config_source(&path, updated)
+}
+
+fn update_display_capture_history(
+    source: &str,
+    display_id: &str,
+    tool: CaptureTool,
+    region: Option<CaptureRegion>,
+) -> Result<String, ConfigError> {
+    let mut document = editable_document(source)?;
+    let state = &mut document["ui"]["displays"][display_id];
+    state["last_capture_tool"] = toml_edit::value(tool.as_str());
+    if let Some(region) = region {
+        state["last_region"]["x"] = toml_edit::value(i64::from(region.x));
+        state["last_region"]["y"] = toml_edit::value(i64::from(region.y));
+        state["last_region"]["width"] = toml_edit::value(i64::from(region.width));
+        state["last_region"]["height"] = toml_edit::value(i64::from(region.height));
+    }
+    Ok(document.to_string())
+}
+
+fn editable_document(source: &str) -> Result<toml_edit::Document, ConfigError> {
+    if source.trim().is_empty() {
+        Ok(toml_edit::Document::new())
+    } else {
+        source.parse::<toml_edit::Document>().map_err(Into::into)
+    }
+}
+
+fn read_optional_config_source(path: &Path) -> Result<String, ConfigError> {
+    match fs::read_to_string(path) {
+        Ok(source) => Ok(source),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(String::new()),
+        Err(source) => Err(ConfigError::Read {
+            path: path.display().to_string(),
+            source,
+        }),
+    }
+}
+
+fn write_config_source(path: &Path, source: String) -> Result<(), ConfigError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+    fs::write(path, source).map_err(|source| ConfigError::Write {
+        path: path.display().to_string(),
+        source,
+    })
 }
 
 pub fn load_overlay_position() -> Result<Option<(i32, i32)>, ConfigError> {
@@ -501,6 +631,21 @@ pub struct UiConfig {
     pub last_capture_tool: Option<CaptureTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_region: Option<CaptureRegion>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub displays: BTreeMap<String, DisplayUiConfig>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DisplayUiConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overlay_x: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overlay_y: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_capture_tool: Option<CaptureTool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_region: Option<CaptureRegion>,
 }
 
 impl Default for LoggingConfig {
@@ -624,6 +769,122 @@ mod tests {
         let config: AppConfig = toml::from_str(&updated).expect("valid Captastic config");
         assert_eq!(config.ui.last_capture_tool, Some(CaptureTool::Region));
         assert_eq!(config.ui.last_region, Some(region));
+    }
+
+    #[test]
+    fn display_ui_state_is_independent_and_survives_serialization() {
+        let source = "# preserve me\n[ui]\nlast_capture_tool = \"full_display\"\noverlay_x = 40\noverlay_y = 50\n";
+        let updated =
+            update_display_overlay_position(source, "laptop", 120, 900).expect("laptop toolbar");
+        let updated = update_display_capture_history(
+            &updated,
+            "laptop",
+            CaptureTool::Region,
+            Some(CaptureRegion {
+                x: 100,
+                y: 80,
+                width: 960,
+                height: 540,
+            }),
+        )
+        .expect("laptop history");
+        let updated = update_display_overlay_position(&updated, "external", 700, 1200)
+            .expect("external toolbar");
+        let updated = update_display_capture_history(
+            &updated,
+            "external",
+            CaptureTool::Window,
+            Some(CaptureRegion {
+                x: 300,
+                y: 200,
+                width: 1280,
+                height: 720,
+            }),
+        )
+        .expect("external history");
+        assert!(updated.contains("# preserve me"));
+
+        let config: AppConfig = toml::from_str(&updated).expect("serialized config reloads");
+        config.validate().expect("display UI state validates");
+        assert_eq!(
+            resolve_display_ui_state(&config.ui, "laptop"),
+            DisplayUiState {
+                overlay_position: Some((120, 900)),
+                tool: Some(CaptureTool::Region),
+                region: Some(CaptureRegion {
+                    x: 100,
+                    y: 80,
+                    width: 960,
+                    height: 540,
+                }),
+                region_is_display_local: true,
+            }
+        );
+        assert_eq!(
+            resolve_display_ui_state(&config.ui, "external"),
+            DisplayUiState {
+                overlay_position: Some((700, 1200)),
+                tool: Some(CaptureTool::Window),
+                region: Some(CaptureRegion {
+                    x: 300,
+                    y: 200,
+                    width: 1280,
+                    height: 720,
+                }),
+                region_is_display_local: true,
+            }
+        );
+    }
+
+    #[test]
+    fn display_ui_state_falls_back_to_legacy_global_values() {
+        let config: AppConfig = toml::from_str(
+            "[ui]\noverlay_x = 40\noverlay_y = 50\nlast_capture_tool = \"region\"\n\n[ui.last_region]\nx = -100\ny = 25\nwidth = 640\nheight = 360\n",
+        )
+        .expect("legacy config");
+        assert_eq!(
+            resolve_display_ui_state(&config.ui, "new-display"),
+            DisplayUiState {
+                overlay_position: Some((40, 50)),
+                tool: Some(CaptureTool::Region),
+                region: Some(CaptureRegion {
+                    x: -100,
+                    y: 25,
+                    width: 640,
+                    height: 360,
+                }),
+                region_is_display_local: false,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_or_empty_per_display_state() {
+        let mut config = AppConfig::default();
+        config.ui.displays.insert(
+            "external".to_owned(),
+            DisplayUiConfig {
+                overlay_x: Some(10),
+                ..DisplayUiConfig::default()
+            },
+        );
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidValue(_))
+        ));
+        config.ui.displays.clear();
+        config.ui.displays.insert(
+            String::new(),
+            DisplayUiConfig {
+                overlay_x: Some(10),
+                overlay_y: Some(10),
+                ..DisplayUiConfig::default()
+            },
+        );
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidValue(_))
+        ));
     }
 
     #[test]
