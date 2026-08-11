@@ -7,7 +7,10 @@ use std::time::Instant;
 
 mod layout;
 
-use layout::{DisplayEnvironment, ToolbarControl, ToolbarLayout, UiMetrics, UiRect};
+use layout::{
+    layout_dimension_label, DimensionLabelPlacement, DisplayEnvironment, ToolbarControl,
+    ToolbarLayout, UiMetrics, UiRect, UiSize,
+};
 
 use captastic_core::{
     CaptureError, CaptureErrorKind, CpuFrame, DisplayId, DisplayInfo, FrameMetadata, FrameOrigin,
@@ -63,7 +66,6 @@ const HANDLE_HIT_RADIUS: i32 = 9;
 const HANDLE_OUTER_RADIUS: i32 = 6;
 const HANDLE_INNER_RADIUS: i32 = 3;
 const MIN_REGION_SIZE: i64 = 8;
-const DIMENSION_LABEL_HEIGHT: i32 = 34;
 const REGION_CURSOR_SIZE: u32 = 64;
 const REGION_CURSOR_CENTER: i32 = REGION_CURSOR_SIZE as i32 / 2;
 const TOOLBAR_CORNER_RADIUS: i32 = 18;
@@ -219,6 +221,8 @@ pub fn select_from_frozen_frame_with_controller(
         window_assets_ready: false,
         windows: None,
         hovered: None,
+        pointer_local: None,
+        dimension_label_placement: None,
         anchor: None,
         dragging: false,
         selection,
@@ -365,6 +369,8 @@ struct OverlayState {
     window_assets_ready: bool,
     windows: Option<Vec<WindowCandidate>>,
     hovered: Option<WindowCandidate>,
+    pointer_local: Option<POINT>,
+    dimension_label_placement: Option<DimensionLabelPlacement>,
     anchor: Option<POINT>,
     dragging: bool,
     selection: Option<Rect>,
@@ -1198,6 +1204,7 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
         WM_MOUSEMOVE => {
             let point = screen_point(state.source, lparam);
             let local = local_point(state.source, point);
+            state.pointer_local = Some(local);
             let previous_hovered = state.hovered.map(|candidate| candidate.handle);
             let previous_control = state.hovered_control;
             if let Some(drag) = state.toolbar_drag {
@@ -1401,6 +1408,7 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                 state.selected_window = None;
                 state.hovered_handle = None;
                 state.hovered = None;
+                state.dimension_label_placement = None;
                 update_cursor(None, &state.region_cursor);
             }
             invalidate(hwnd);
@@ -1629,12 +1637,7 @@ fn paint(hwnd: HWND, state: &mut OverlayState) {
                     rect,
                     state.display_environment.metrics,
                 );
-                draw_region_dimensions(
-                    state.back_buffer.device,
-                    state.source,
-                    rect,
-                    state.display_environment.metrics,
-                );
+                draw_region_dimensions(state, rect);
             }
         }
     }
@@ -2144,58 +2147,82 @@ fn draw_resize_handles(device: HDC, source: Rect, rect: Rect, metrics: UiMetrics
     }
 }
 
-fn draw_region_dimensions(device: HDC, source: Rect, rect: Rect, metrics: UiMetrics) {
+fn draw_region_dimensions(state: &mut OverlayState, rect: Rect) {
+    let device = state.back_buffer.device;
+    let source = state.source;
+    let metrics = state.display_environment.metrics;
+    let tokens = metrics.region_tokens();
+    // Region width and height remain the exact physical-pixel values from the selection rectangle.
     let value = format!("{} × {} px", rect.width, rect.height);
-    let available_width = (source.width as i32 - metrics.px(16)).max(1);
-    let label_width = ((value.chars().count() as i32 * metrics.px(12)) + metrics.px(28))
-        .max(metrics.px(150))
-        .min(available_width);
-    let selection_left = rect.x - source.x;
-    let selection_top = rect.y - source.y;
-    let selection_bottom = selection_top.saturating_add(rect.height as i32);
-    let centered_left = selection_left
-        .saturating_add((rect.width as i32 - label_width) / 2)
-        .clamp(
-            metrics.px(8),
-            (source.width as i32 - label_width - metrics.px(8)).max(metrics.px(8)),
-        );
-    let label_height = metrics.px(DIMENSION_LABEL_HEIGHT);
-    let preferred_top = if rect.height as i32 >= label_height + metrics.px(28) {
-        selection_top + metrics.px(14)
-    } else if selection_top >= label_height + metrics.px(12) {
-        selection_top - label_height - metrics.px(10)
-    } else {
-        selection_bottom + metrics.px(10)
+    let measured = measure_ui_text(device, &value, tokens.label_font_height);
+    let label_size = UiSize {
+        width: measured
+            .cx
+            .saturating_add(tokens.label_padding_x.saturating_mul(2)),
+        height: measured
+            .cy
+            .max(tokens.label_font_height)
+            .saturating_add(tokens.label_padding_y.saturating_mul(2)),
     };
-    let top = preferred_top.clamp(
-        metrics.px(8),
-        (source.height as i32 - label_height - metrics.px(8)).max(metrics.px(8)),
+    let selection_left = rect.x.saturating_sub(source.x);
+    let selection_top = rect.y.saturating_sub(source.y);
+    let selection = UiRect {
+        left: selection_left,
+        top: selection_top,
+        right: selection_left.saturating_add(rect.width as i32),
+        bottom: selection_top.saturating_add(rect.height as i32),
+    };
+    let toolbar = ToolbarLayout::new(state.display_environment, state.toolbar_position);
+    let mut reserved = vec![toolbar.bounds];
+    if state.options_open {
+        reserved.push(toolbar.menu);
+    }
+    let pointer_exclusion = state.pointer_local.map(|pointer| UiRect {
+        left: pointer.x.saturating_sub(REGION_CURSOR_CENTER),
+        top: pointer.y.saturating_sub(REGION_CURSOR_CENTER),
+        right: pointer
+            .x
+            .saturating_add(REGION_CURSOR_CENTER)
+            .saturating_add(1),
+        bottom: pointer
+            .y
+            .saturating_add(REGION_CURSOR_CENTER)
+            .saturating_add(1),
+    });
+    let layout = layout_dimension_label(
+        UiRect {
+            left: 0,
+            top: 0,
+            right: state.surface.width,
+            bottom: state.surface.height,
+        },
+        selection,
+        label_size,
+        &reserved,
+        pointer_exclusion,
+        state.dimension_label_placement,
+        tokens,
     );
-    let bounds = UiRect {
-        left: centered_left,
-        top,
-        right: centered_left + label_width,
-        bottom: top + label_height,
-    };
+    state.dimension_label_placement = Some(layout.placement);
     draw_round_box(
         device,
-        bounds,
+        layout.bounds,
         rgb(31, 31, 34),
         rgb(104, 104, 110),
-        metrics.px(10),
+        tokens.label_corner_radius,
     );
     draw_text(
         device,
         UiRect {
-            left: bounds.left + metrics.px(10),
-            top: bounds.top,
-            right: bounds.right - metrics.px(10),
-            bottom: bounds.bottom,
+            left: layout.bounds.left.saturating_add(tokens.label_padding_x),
+            top: layout.bounds.top,
+            right: layout.bounds.right.saturating_sub(tokens.label_padding_x),
+            bottom: layout.bounds.bottom,
         },
         &value,
         rgb(248, 248, 250),
         TextAlignment::Center,
-        metrics.px(UI_FONT_HEIGHT),
+        tokens.label_font_height,
     );
 }
 
@@ -3542,6 +3569,7 @@ fn activate_tool(state: &mut OverlayState, tool: CaptureTool) {
     state.moving_region = None;
     let tool_changed = state.tool != tool;
     if tool_changed {
+        state.dimension_label_placement = None;
         state.selection = None;
         state.selection_kind = None;
         state.selected_window = None;
