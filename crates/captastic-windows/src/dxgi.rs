@@ -1037,22 +1037,43 @@ impl CpuBufferPool {
     }
 
     fn available_index(&mut self, required_len: usize) -> Option<usize> {
-        for offset in 0..self.slots.len() {
-            let index = (self.cursor + offset) % self.slots.len();
-            match self.slots[index].as_ref() {
-                None => self.slots[index] = Some(Arc::from(vec![0_u8; required_len])),
-                Some(slot) if Arc::strong_count(slot) == 1 && slot.len() != required_len => {
-                    self.slots[index] = Some(Arc::from(vec![0_u8; required_len]));
-                }
-                Some(slot) if Arc::strong_count(slot) != 1 || slot.len() != required_len => {
-                    continue;
-                }
-                Some(_) => {}
-            }
-            self.cursor = (index + 1) % self.slots.len();
+        if let Some(index) = self.index_from_cursor(|slot| {
+            slot.as_ref()
+                .is_some_and(|slot| Arc::strong_count(slot) == 1 && slot.len() == required_len)
+        }) {
+            self.advance_cursor(index);
             return Some(index);
         }
-        None
+
+        if let Some(index) = self.index_from_cursor(Option::is_none) {
+            self.slots[index] = Some(Arc::from(vec![0_u8; required_len]));
+            self.advance_cursor(index);
+            return Some(index);
+        }
+
+        let index = self.index_from_cursor(|slot| {
+            slot.as_ref()
+                .is_some_and(|slot| Arc::strong_count(slot) == 1)
+        })?;
+        self.slots[index] = Some(Arc::from(vec![0_u8; required_len]));
+        self.advance_cursor(index);
+        Some(index)
+    }
+
+    fn index_from_cursor(
+        &self,
+        mut predicate: impl FnMut(&Option<Arc<[u8]>>) -> bool,
+    ) -> Option<usize> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        (0..self.slots.len())
+            .map(|offset| (self.cursor + offset) % self.slots.len())
+            .find(|&index| predicate(&self.slots[index]))
+    }
+
+    fn advance_cursor(&mut self, index: usize) {
+        self.cursor = (index + 1) % self.slots.len();
     }
 }
 
@@ -1712,15 +1733,103 @@ mod tests {
         assert_eq!(duration_to_timeout_ms(Duration::from_micros(1)), 1);
     }
 
+    fn initialized_cpu_slot_count(pool: &CpuBufferPool) -> usize {
+        pool.slots.iter().flatten().count()
+    }
+
+    fn lease_cpu_slot(pool: &CpuBufferPool, index: usize) -> Arc<[u8]> {
+        pool.slots[index]
+            .as_ref()
+            .expect("CPU slot is initialized")
+            .clone()
+    }
+
+    #[test]
+    fn cpu_pool_reuses_one_allocation_for_many_sequential_acquisitions() {
+        let mut pool = CpuBufferPool::new(3);
+
+        for _ in 0..100 {
+            let index = pool.available_index(64).expect("available slot");
+            let lease = lease_cpu_slot(&pool, index);
+            drop(lease);
+        }
+
+        assert_eq!(initialized_cpu_slot_count(&pool), 1);
+    }
+
     #[test]
     fn cpu_pool_does_not_reuse_a_leased_slot() {
-        let mut pool = CpuBufferPool::new(2);
+        let mut pool = CpuBufferPool::new(3);
         let first = pool.available_index(16).expect("first slot");
-        let lease = pool.slots[first].as_ref().expect("initialized").clone();
+        let lease = lease_cpu_slot(&pool, first);
         let second = pool.available_index(16).expect("second slot");
         assert_ne!(first, second);
+        Arc::get_mut(
+            pool.slots[second]
+                .as_mut()
+                .expect("second CPU slot is initialized"),
+        )
+        .expect("second CPU slot is not leased")
+        .fill(0xa5);
+        assert!(lease.iter().all(|&byte| byte == 0));
+        assert_eq!(initialized_cpu_slot_count(&pool), 2);
         drop(lease);
-        assert!(pool.available_index(16).is_some());
+    }
+
+    #[test]
+    fn cpu_pool_allocates_a_second_slot_for_an_overlapping_lease() {
+        let mut pool = CpuBufferPool::new(3);
+        let first = pool.available_index(16).expect("first slot");
+        let first_lease = lease_cpu_slot(&pool, first);
+        let second = pool.available_index(16).expect("second slot");
+        let second_lease = lease_cpu_slot(&pool, second);
+        assert_ne!(first, second);
+        assert_eq!(initialized_cpu_slot_count(&pool), 2);
+        drop((first_lease, second_lease));
+    }
+
+    #[test]
+    fn cpu_pool_uses_all_three_slots_and_reports_exhaustion() {
+        let mut pool = CpuBufferPool::new(3);
+        let mut leases = Vec::new();
+        for _ in 0..3 {
+            let index = pool.available_index(16).expect("available slot");
+            leases.push(lease_cpu_slot(&pool, index));
+        }
+        assert_eq!(initialized_cpu_slot_count(&pool), 3);
+        assert_eq!(pool.available_index(16), None);
+        drop(leases);
+    }
+
+    #[test]
+    fn cpu_pool_prefers_a_released_allocation_over_an_unused_slot() {
+        let mut pool = CpuBufferPool::new(3);
+        let first = pool.available_index(16).expect("first slot");
+        let first_lease = lease_cpu_slot(&pool, first);
+        let second = pool.available_index(16).expect("second slot");
+        let second_lease = lease_cpu_slot(&pool, second);
+        drop(first_lease);
+        assert_eq!(pool.available_index(16), Some(first));
+        assert_eq!(initialized_cpu_slot_count(&pool), 2);
+        drop(second_lease);
+    }
+
+    #[test]
+    fn cpu_pool_size_change_does_not_reuse_an_incompatible_allocation() {
+        let mut pool = CpuBufferPool::new(2);
+        let first = pool.available_index(16).expect("first slot");
+        let second = pool.available_index(32).expect("second slot");
+        assert_ne!(first, second);
+        assert_eq!(pool.slots[first].as_ref().map(|slot| slot.len()), Some(16));
+        assert_eq!(pool.slots[second].as_ref().map(|slot| slot.len()), Some(32));
+    }
+
+    #[test]
+    fn cpu_pool_replaces_a_free_incompatible_allocation_when_full() {
+        let mut pool = CpuBufferPool::new(1);
+        let index = pool.available_index(16).expect("first allocation");
+        assert_eq!(pool.available_index(32), Some(index));
+        assert_eq!(pool.slots[index].as_ref().map(|slot| slot.len()), Some(32));
     }
 
     #[test]
@@ -1729,7 +1838,7 @@ mod tests {
         assert!(pool.slots.iter().all(Option::is_none));
         let first = pool.available_index(64).expect("first slot");
         assert_eq!(pool.slots[first].as_ref().map(|slot| slot.len()), Some(64));
-        assert_eq!(pool.slots.iter().flatten().count(), 1);
+        assert_eq!(initialized_cpu_slot_count(&pool), 1);
     }
 
     #[test]
