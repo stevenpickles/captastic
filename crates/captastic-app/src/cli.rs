@@ -69,7 +69,7 @@ pub struct DaemonArgs {
     pub config: Option<PathBuf>,
     #[arg(long)]
     pub backend: Option<String>,
-    /// Display policy: primary or display:<persistent-id>.
+    /// Display policy: pointer, primary, or display:<persistent-id>.
     #[arg(long)]
     pub display: Option<String>,
     #[arg(long, value_enum)]
@@ -102,7 +102,7 @@ pub enum ModeArg {
 pub struct CaptureArgs {
     #[arg(long, default_value = "fake")]
     pub backend: String,
-    /// Display policy: primary or display:<persistent-id>.
+    /// Display policy: pointer, primary, or display:<persistent-id>.
     #[arg(long, default_value = "primary")]
     pub display: String,
     #[arg(long, value_enum, default_value_t = ModeArg::Latest)]
@@ -121,7 +121,7 @@ pub struct CaptureArgs {
 pub struct BenchmarkArgs {
     #[arg(long, default_value = "fake")]
     pub backend: String,
-    /// Display policy: primary or display:<persistent-id>.
+    /// Display policy: pointer, primary, or display:<persistent-id>.
     #[arg(long, default_value = "primary")]
     pub display: String,
     #[arg(long, value_enum, default_value_t = ModeArg::Latest)]

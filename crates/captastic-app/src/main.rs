@@ -23,6 +23,23 @@ use cli::{BenchmarkArgs, Cli, Command, ConfigCommand, ModeArg, StartupCommand};
 use error::AppError;
 use serde_json::json;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DisplayPolicy {
+    Pointer,
+    Primary,
+    Fixed(DisplayId),
+}
+
+impl DisplayPolicy {
+    fn as_config_value(&self) -> String {
+        match self {
+            Self::Pointer => "pointer".to_owned(),
+            Self::Primary => "primary".to_owned(),
+            Self::Fixed(id) => format!("display:{}", id.0),
+        }
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     let logging_config = resolve_logging_config(&cli);
@@ -184,8 +201,9 @@ fn capture(args: cli::CaptureArgs) -> Result<(), AppError> {
             "selection and clipboard output require --cpu-frame true".to_owned(),
         ));
     }
-    let display_id = resolve_display_id(&args.display)?;
-    let mut backend = create_backend(&args.backend, &display_id)?;
+    let display_policy = resolve_display_policy(&args.display)?;
+    let mut backend = create_backend(&args.backend, &display_policy)?;
+    let display_id = resolve_capture_display(&display_policy, backend.displays())?;
     let mut recorder = EventRecorder::with_capacity(16);
     let request = CaptureRequest {
         id: CaptureId(1),
@@ -367,7 +385,25 @@ fn capture(args: cli::CaptureArgs) -> Result<(), AppError> {
 }
 
 fn benchmark(args: BenchmarkArgs) -> Result<(), AppError> {
-    let display_id = resolve_display_id(&args.display)?;
+    let display_policy = resolve_display_policy(&args.display)?;
+    let mut native_backend = if args.backend == "fake" {
+        None
+    } else {
+        Some(create_backend(&args.backend, &display_policy)?)
+    };
+    let display_id = match native_backend.as_deref() {
+        Some(backend) => resolve_capture_display(&display_policy, backend.displays())?,
+        None => match &display_policy {
+            DisplayPolicy::Primary => DisplayId::primary(),
+            DisplayPolicy::Fixed(id) => id.clone(),
+            DisplayPolicy::Pointer => {
+                return Err(AppError::InvalidArgument(
+                    "the fake benchmark backend does not support pointer display selection"
+                        .to_owned(),
+                ));
+            }
+        },
+    };
     let options = benchmark::BenchmarkOptions {
         iterations: args.iterations,
         warmup: args.warmup,
@@ -385,8 +421,12 @@ fn benchmark(args: BenchmarkArgs) -> Result<(), AppError> {
     let run = if args.backend == "fake" {
         benchmark::run(&options)?
     } else {
-        let mut backend = create_backend(&args.backend, &display_id)?;
-        benchmark::run_with_backend(backend.as_mut(), &options)?
+        benchmark::run_with_backend(
+            native_backend
+                .as_deref_mut()
+                .expect("non-fake backend initialized above"),
+            &options,
+        )?
     };
     if let Some(path) = args.output_results.as_deref() {
         benchmark::write_json(path, &run.report)?;
@@ -454,21 +494,55 @@ fn capture_mode(mode: ModeArg) -> CaptureMode {
     }
 }
 
-fn resolve_display_id(value: &str) -> Result<DisplayId, AppError> {
+fn resolve_display_policy(value: &str) -> Result<DisplayPolicy, AppError> {
     let value = value.trim();
+    if value == "pointer" {
+        return Ok(DisplayPolicy::Pointer);
+    }
     if value == "primary" {
-        return Ok(DisplayId::primary());
+        return Ok(DisplayPolicy::Primary);
     }
     if let Some(id) = value.strip_prefix("display:") {
         let id = id.trim();
         if !id.is_empty() {
-            return Ok(DisplayId(id.to_owned()));
+            return Ok(DisplayPolicy::Fixed(DisplayId(id.to_owned())));
         }
     }
     Err(AppError::InvalidArgument(
-        "display must be primary or display:<persistent-id>; pointer and virtual_desktop are not implemented yet"
+        "display must be pointer, primary, or display:<persistent-id>; virtual_desktop is not implemented yet"
             .to_owned(),
     ))
+}
+
+#[cfg(windows)]
+fn resolve_capture_display(
+    policy: &DisplayPolicy,
+    displays: &[captastic_core::DisplayInfo],
+) -> Result<DisplayId, captastic_core::CaptureError> {
+    match policy {
+        DisplayPolicy::Pointer => captastic_windows::display_containing_pointer(displays),
+        DisplayPolicy::Primary => Ok(DisplayId::primary()),
+        DisplayPolicy::Fixed(id) => Ok(id.clone()),
+    }
+}
+
+#[cfg(not(windows))]
+fn resolve_capture_display(
+    policy: &DisplayPolicy,
+    _displays: &[captastic_core::DisplayInfo],
+) -> Result<DisplayId, captastic_core::CaptureError> {
+    match policy {
+        DisplayPolicy::Primary => Ok(DisplayId::primary()),
+        DisplayPolicy::Fixed(id) => Ok(id.clone()),
+        DisplayPolicy::Pointer => Err(captastic_core::CaptureError {
+            kind: captastic_core::CaptureErrorKind::Unsupported,
+            backend: "platform",
+            operation: "resolve_pointer_display",
+            message: "pointer display selection is currently available only on Windows".to_owned(),
+            retryable: false,
+            native_code: None,
+        }),
+    }
 }
 
 fn enumerate_displays(backend: &str) -> Result<Vec<captastic_core::DisplayInfo>, AppError> {
@@ -496,12 +570,15 @@ fn enumerate_dxgi_displays() -> Result<Vec<captastic_core::DisplayInfo>, AppErro
     ))
 }
 
-fn create_backend(name: &str, display_id: &DisplayId) -> Result<Box<dyn CaptureBackend>, AppError> {
+fn create_backend(
+    name: &str,
+    display_policy: &DisplayPolicy,
+) -> Result<Box<dyn CaptureBackend>, AppError> {
     match name {
         "fake" => Ok(Box::new(captastic_core::FakeBackend::new(
             Default::default(),
         ))),
-        "auto" | "dxgi" => create_dxgi_backend(display_id),
+        "auto" | "dxgi" => create_dxgi_backend(display_policy),
         other => Err(AppError::BackendUnavailable(format!(
             "unknown backend {other}; available backends: fake, dxgi"
         ))),
@@ -509,19 +586,30 @@ fn create_backend(name: &str, display_id: &DisplayId) -> Result<Box<dyn CaptureB
 }
 
 #[cfg(windows)]
-fn create_dxgi_backend(display_id: &DisplayId) -> Result<Box<dyn CaptureBackend>, AppError> {
-    Ok(Box::new(captastic_windows::DxgiBackend::new(display_id)?))
+fn create_dxgi_backend(
+    display_policy: &DisplayPolicy,
+) -> Result<Box<dyn CaptureBackend>, AppError> {
+    match display_policy {
+        DisplayPolicy::Pointer => Ok(Box::new(captastic_windows::DxgiDisplayManager::new()?)),
+        DisplayPolicy::Primary => Ok(Box::new(captastic_windows::DxgiBackend::new(
+            &DisplayId::primary(),
+        )?)),
+        DisplayPolicy::Fixed(id) => Ok(Box::new(captastic_windows::DxgiBackend::new(id)?)),
+    }
 }
 
 #[cfg(not(windows))]
-fn create_dxgi_backend(_display_id: &DisplayId) -> Result<Box<dyn CaptureBackend>, AppError> {
+fn create_dxgi_backend(
+    _display_policy: &DisplayPolicy,
+) -> Result<Box<dyn CaptureBackend>, AppError> {
     Err(AppError::BackendUnavailable(
         "DXGI is available only on Windows".to_owned(),
     ))
 }
 
 fn doctor(json_output: bool) -> Result<(), AppError> {
-    let (native_status, native_error, displays) = match create_dxgi_backend(&DisplayId::primary()) {
+    let (native_status, native_error, displays) = match create_dxgi_backend(&DisplayPolicy::Primary)
+    {
         Ok(backend) => ("available", None, Some(backend.displays().to_vec())),
         Err(error) => ("unavailable", Some(error.to_string()), None),
     };
@@ -579,23 +667,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn display_policy_resolves_primary_and_fixed_ids() {
-        assert!(resolve_display_id("primary")
-            .expect("primary")
-            .is_primary_alias());
+    fn display_policy_resolves_pointer_primary_and_fixed_ids() {
         assert_eq!(
-            resolve_display_id("display:windows-monitor-0123456789abcdef")
-                .expect("fixed display")
-                .0,
-            "windows-monitor-0123456789abcdef"
+            resolve_display_policy("pointer").expect("pointer"),
+            DisplayPolicy::Pointer
+        );
+        assert_eq!(
+            resolve_display_policy("primary").expect("primary"),
+            DisplayPolicy::Primary
+        );
+        assert_eq!(
+            resolve_display_policy("display:windows-monitor-0123456789abcdef")
+                .expect("fixed display"),
+            DisplayPolicy::Fixed(DisplayId("windows-monitor-0123456789abcdef".to_owned()))
         );
     }
 
     #[test]
     fn unresolved_display_policies_fail_before_backend_initialization() {
-        for value in ["pointer", "virtual_desktop", "display:", "unexpected"] {
+        for value in ["virtual_desktop", "display:", "unexpected"] {
             assert!(matches!(
-                resolve_display_id(value),
+                resolve_display_policy(value),
                 Err(AppError::InvalidArgument(_))
             ));
         }

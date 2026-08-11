@@ -9,10 +9,12 @@ use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use captastic_config::AppConfig;
+#[cfg(all(windows, test))]
+use captastic_core::DisplayId;
 #[cfg(windows)]
 use captastic_core::{
     validate_event_order, CaptureError, CaptureErrorKind, CaptureId, CaptureMode, CaptureRequest,
-    CaptureSource, CpuFrame, CursorMode, DisplayId, EventRecorder, NativeFrame, PerfEventKind,
+    CaptureSource, CpuFrame, CursorMode, EventRecorder, NativeFrame, PerfEventKind,
 };
 #[cfg(windows)]
 use serde_json::json;
@@ -21,11 +23,13 @@ use crate::cli::DaemonArgs;
 #[cfg(windows)]
 use crate::cli::ModeArg;
 use crate::error::AppError;
+#[cfg(windows)]
+use crate::DisplayPolicy;
 
 #[cfg(windows)]
 struct ResolvedDaemonArgs {
     backend: String,
-    display_id: DisplayId,
+    display_policy: DisplayPolicy,
     mode: CaptureMode,
     cpu_frame: bool,
     clipboard: bool,
@@ -65,7 +69,7 @@ fn resolve_daemon_args(args: DaemonArgs) -> Result<ResolvedDaemonArgs, AppError>
     };
     Ok(ResolvedDaemonArgs {
         backend: args.backend.unwrap_or(config.daemon.backend),
-        display_id: super::resolve_display_id(
+        display_policy: super::resolve_display_policy(
             args.display.as_deref().unwrap_or(&config.daemon.display),
         )?,
         mode,
@@ -87,7 +91,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     log::info!(
         "starting daemon backend={} display={} mode={:?} cpu_frame={} selection={} clipboard={}",
         args.backend,
-        args.display_id.0,
+        args.display_policy.as_config_value(),
         args.mode,
         args.cpu_frame,
         args.selection,
@@ -140,7 +144,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
     let (done_sender, done_receiver) = mpsc::sync_channel::<Result<(), AppError>>(1);
     let backend_name = args.backend.clone();
-    let display_id = args.display_id.clone();
+    let display_policy = args.display_policy.clone();
     let mode = args.mode.clone();
     let cpu_frame = args.cpu_frame;
     let retain_native_frame = args.selection;
@@ -150,7 +154,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let capture_join = thread::Builder::new()
         .name("captastic-capture".to_owned())
         .spawn(move || {
-            let mut backend = match super::create_backend(&backend_name, &display_id) {
+            let mut backend = match super::create_backend(&backend_name, &display_policy) {
                 Ok(backend) => backend,
                 Err(error) => {
                     let _ = ready_sender.send(Err(error));
@@ -159,7 +163,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             };
             let ready = json!({
                 "backend": backend.name(),
-                "configured_display": display_id,
+                "configured_display": display_policy.as_config_value(),
                 "displays": backend.displays(),
             });
             if ready_sender.send(Ok(ready)).is_err() {
@@ -177,7 +181,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                             .as_ref()
                             .is_some_and(|state| Instant::now() >= state.next_attempt)
                         {
-                            match super::create_backend(&backend_name, &display_id) {
+                            match super::create_backend(&backend_name, &display_policy) {
                                 Ok(replacement) => {
                                     backend = replacement;
                                     recovery = None;
@@ -230,16 +234,28 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                             PerfEventKind::TriggerDequeued,
                             duration_ns(trigger.received_at, Instant::now()),
                         );
-                        let request = CaptureRequest {
-                            id: capture_id,
-                            triggered_at: trigger.received_at,
-                            source: CaptureSource::Display(display_id.clone()),
-                            mode: mode.clone(),
-                            cpu_frame,
-                            retain_native_frame,
-                            cursor: CursorMode::Exclude,
-                        };
-                        match backend.capture(&request, &mut recorder) {
+                        let capture_result = super::resolve_capture_display(
+                            &display_policy,
+                            backend.displays(),
+                        )
+                        .and_then(|display_id| {
+                            log::debug!(
+                                "capture {} resolved display={}",
+                                capture_id.0,
+                                display_id.0
+                            );
+                            let request = CaptureRequest {
+                                id: capture_id,
+                                triggered_at: trigger.received_at,
+                                source: CaptureSource::Display(display_id),
+                                mode: mode.clone(),
+                                cpu_frame,
+                                retain_native_frame,
+                                cursor: CursorMode::Exclude,
+                            };
+                            backend.capture(&request, &mut recorder)
+                        });
+                        match capture_result {
                             Ok(outcome) => {
                                 let frame_bytes = outcome
                                     .frame
