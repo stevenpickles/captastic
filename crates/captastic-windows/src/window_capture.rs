@@ -91,6 +91,55 @@ pub(crate) struct CapturedWindow {
     pub corner_radius_px: f32,
 }
 
+pub(crate) fn capture_window_from_desktop(
+    handle: NativeWindowHandle,
+    frozen_desktop: &CpuFrame,
+    visible_bounds: Rect,
+) -> Result<CapturedWindow, CaptureError> {
+    let cropped = frozen_desktop.crop(visible_bounds).map_err(|error| {
+        capture_error(
+            CaptureErrorKind::InvalidFrame,
+            "crop_visible_window_fallback",
+            error.to_string(),
+            false,
+            None,
+        )
+    })?;
+    let mut pixels = cropped.pixels.to_vec();
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel[3] = 255;
+    }
+    let corner_radius_px = window_corner_radius(HWND(handle.raw()));
+    apply_window_alpha(&mut pixels, cropped.width, cropped.height, corner_radius_px);
+    let mut metadata = cropped.metadata.clone();
+    metadata.backend = "windows-visible-desktop-fallback".to_owned();
+    metadata.pool_slot = None;
+    let frame = CpuFrame::new(
+        Arc::from(pixels),
+        cropped.width,
+        cropped.height,
+        cropped.width.saturating_mul(4),
+        cropped.format,
+        cropped.origin,
+        cropped.color_space,
+        metadata,
+    )
+    .map(|frame| frame.with_alpha(FrameAlpha::Straight))
+    .map_err(|error| {
+        capture_error(
+            CaptureErrorKind::InvalidFrame,
+            "build_visible_window_fallback",
+            error.to_string(),
+            false,
+            None,
+        )
+    })?;
+    Ok(CapturedWindow {
+        frame,
+        corner_radius_px,
+    })
+}
+
 fn capture_window_bounded(
     handle: NativeWindowHandle,
     reference_metadata: &FrameMetadata,
@@ -980,6 +1029,34 @@ mod tests {
         .expect_err("a missing HWND must not produce the desktop crop");
         assert_eq!(error.kind, CaptureErrorKind::SourceUnavailable);
         assert_eq!(error.operation, "resolve_selected_window");
+    }
+
+    #[test]
+    fn frozen_desktop_fallback_produces_a_selectable_window_frame() {
+        let captured = capture_window_from_desktop(
+            NativeWindowHandle::from_raw(0),
+            &test_desktop(),
+            Rect {
+                x: 1,
+                y: 0,
+                width: 1,
+                height: 2,
+            },
+        )
+        .expect("visible desktop window fallback");
+        assert_eq!(captured.frame.width, 1);
+        assert_eq!(captured.frame.height, 2);
+        assert_eq!(
+            captured.frame.metadata.backend,
+            "windows-visible-desktop-fallback"
+        );
+        assert_eq!(captured.frame.metadata.source_rect.x, 1);
+        assert_eq!(captured.frame.alpha, FrameAlpha::Straight);
+        assert!(captured
+            .frame
+            .pixels
+            .chunks_exact(4)
+            .all(|pixel| pixel[3] == 255));
     }
 
     #[test]
