@@ -13,9 +13,7 @@ use windows::core::{w, Error as WindowsError, PCWSTR};
 use windows::Win32::Foundation::{
     BOOL, COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
-use windows::Win32::Graphics::Dwm::{
-    DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
-};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 #[cfg(test)]
 use windows::Win32::Graphics::Gdi::GetTextFaceW;
 use windows::Win32::Graphics::Gdi::{
@@ -50,9 +48,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
-use crate::window_capture::{
-    capture_window_from_desktop, capture_window_thumbnail, capture_window_visual, scaled_dimensions,
-};
+#[cfg(test)]
+use crate::window_capture::scaled_dimensions;
+use crate::window_capture::{capture_window_thumbnail, capture_window_visual};
 
 const CLASS_NAME: PCWSTR = w!("CaptasticFrozenSelectionOverlay");
 const DRAG_THRESHOLD: i32 = 4;
@@ -214,7 +212,6 @@ pub fn select_from_frozen_frame_with_controller(
     let (selection, selection_kind) = initial_selection(tool, last_region, source);
     let mut state = Box::new(OverlayState {
         source,
-        frozen_frame: frame.clone(),
         surface,
         back_buffer,
         dimmer,
@@ -361,7 +358,6 @@ fn query_display_environment(source: Rect) -> DisplayEnvironment {
 
 struct OverlayState {
     source: Rect,
-    frozen_frame: CpuFrame,
     surface: FrozenSurface,
     back_buffer: FrozenSurface,
     dimmer: FrozenSurface,
@@ -597,7 +593,6 @@ struct WindowThumbnail {
     handle: NativeWindowHandle,
     surface: FrozenSurface,
     corner_radius_px: f32,
-    fallback_frame: Option<CpuFrame>,
 }
 
 struct WindowOverviewCache {
@@ -894,7 +889,6 @@ impl Drop for FrozenSurface {
 #[derive(Clone, Copy)]
 struct WindowCandidate {
     handle: NativeWindowHandle,
-    visible_bounds: Rect,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1936,7 +1930,6 @@ fn update_window_preview(state: &mut OverlayState, target: Option<NativeWindowHa
     {
         return;
     }
-    let fallback = fallback_window_preview(state, handle);
     state.window_preview = match capture_window_visual(handle, &state.reference_metadata) {
         Ok(capture) => match FrozenSurface::from_straight_alpha(
             capture.frame.width,
@@ -1949,35 +1942,10 @@ fn update_window_preview(state: &mut OverlayState, target: Option<NativeWindowHa
                 surface,
                 corner_radius_px: capture.corner_radius_px,
             }))),
-            Err(_) => fallback.or(Some(WindowPreviewState::Unavailable(handle))),
+            Err(_) => Some(WindowPreviewState::Unavailable(handle)),
         },
-        Err(error) => {
-            log::debug!(
-                "window handle=0x{:X} still rejects PrintWindow; using the frozen desktop fallback: {error}",
-                handle.raw()
-            );
-            fallback.or(Some(WindowPreviewState::Unavailable(handle)))
-        }
+        Err(_) => Some(WindowPreviewState::Unavailable(handle)),
     };
-}
-
-fn fallback_window_preview(
-    state: &OverlayState,
-    handle: NativeWindowHandle,
-) -> Option<WindowPreviewState> {
-    let thumbnail = state
-        .window_thumbnails
-        .iter()
-        .find(|thumbnail| thumbnail.handle == handle)?;
-    let frame = thumbnail.fallback_frame.clone()?;
-    let surface =
-        FrozenSurface::from_straight_alpha(frame.width, frame.height, &frame.pixels).ok()?;
-    Some(WindowPreviewState::Ready(Box::new(WindowPreview {
-        handle,
-        frame,
-        surface,
-        corner_radius_px: thumbnail.corner_radius_px,
-    })))
 }
 
 fn build_blurred_background(
@@ -2078,7 +2046,7 @@ fn build_window_overview(state: &mut OverlayState) {
                         let metadata = &state.reference_metadata;
                         scope.spawn(move || {
                             (
-                                candidate,
+                                candidate.handle,
                                 capture_window_thumbnail(
                                     candidate.handle,
                                     metadata,
@@ -2093,32 +2061,9 @@ fn build_window_overview(state: &mut OverlayState) {
                     .filter_map(|worker| worker.join().ok())
                     .collect::<Vec<_>>()
             });
-            for (candidate, capture) in rendered {
-                let (capture, fallback_frame) = match capture {
-                    Ok(capture) => (capture, None),
-                    Err(error) => {
-                        log::debug!(
-                            "window handle=0x{:X} rejected PrintWindow; using its visible frozen desktop pixels in Window mode: {error}",
-                            candidate.handle.raw()
-                        );
-                        match capture_window_from_desktop(
-                            candidate.handle,
-                            &state.frozen_frame,
-                            candidate.visible_bounds,
-                        ) {
-                            Ok(capture) => {
-                                let frame = Some(capture.frame.clone());
-                                (capture, frame)
-                            }
-                            Err(fallback_error) => {
-                                log::warn!(
-                                    "window handle=0x{:X} could not be rendered by PrintWindow or the frozen desktop fallback: print_window_error={error}; fallback_error={fallback_error}",
-                                    candidate.handle.raw()
-                                );
-                                continue;
-                            }
-                        }
-                    }
+            for (handle, capture) in rendered {
+                let Ok(capture) = capture else {
+                    continue;
                 };
                 let Ok(surface) = FrozenSurface::from_straight_alpha(
                     capture.frame.width,
@@ -2127,32 +2072,10 @@ fn build_window_overview(state: &mut OverlayState) {
                 ) else {
                     continue;
                 };
-                let (surface, corner_radius_px) = if fallback_frame.is_some() {
-                    let (width, height) = scaled_dimensions(
-                        capture.frame.width,
-                        capture.frame.height,
-                        WINDOW_THUMBNAIL_MAX_PIXELS,
-                    );
-                    if width != capture.frame.width || height != capture.frame.height {
-                        let Ok(scaled) = scale_premultiplied_surface(&surface, width, height)
-                        else {
-                            continue;
-                        };
-                        (
-                            scaled,
-                            capture.corner_radius_px * width as f32 / capture.frame.width as f32,
-                        )
-                    } else {
-                        (surface, capture.corner_radius_px)
-                    }
-                } else {
-                    (surface, capture.corner_radius_px)
-                };
                 state.window_thumbnails.push(WindowThumbnail {
-                    handle: candidate.handle,
+                    handle,
                     surface,
-                    corner_radius_px,
-                    fallback_frame,
+                    corner_radius_px: capture.corner_radius_px,
                 });
             }
         }
@@ -3665,36 +3588,15 @@ fn collect_window(hwnd: HWND, collector: &mut WindowCollector) {
         {
             return;
         }
-        let Some(visible_bounds) = visible_window_bounds(hwnd, native, collector.source) else {
+        let Some(visible_bounds) = intersect_with_source(native, collector.source) else {
             return;
         };
         if visible_bounds.width >= 16 && visible_bounds.height >= 16 {
             collector.windows.push(WindowCandidate {
                 handle: NativeWindowHandle(hwnd.0),
-                visible_bounds,
             });
         }
     }
-}
-
-fn visible_window_bounds(hwnd: HWND, fallback: RECT, source: Rect) -> Option<Rect> {
-    let mut frame = RECT::default();
-    // SAFETY: hwnd is the live enumerated top-level window and frame is writable for a RECT.
-    let frame = if unsafe {
-        DwmGetWindowAttribute(
-            hwnd,
-            DWMWA_EXTENDED_FRAME_BOUNDS,
-            (&mut frame as *mut RECT).cast(),
-            std::mem::size_of::<RECT>() as u32,
-        )
-    }
-    .is_ok()
-    {
-        frame
-    } else {
-        fallback
-    };
-    intersect_with_source(frame, source)
 }
 
 fn owning_display_id<'a>(

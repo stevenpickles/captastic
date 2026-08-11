@@ -24,9 +24,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, GetWindowRect, IsZoomed, GWL_STYLE, PW_RENDERFULLCONTENT, WS_CAPTION,
 };
 
+use crate::window_capture_wgc::capture_window as capture_window_wgc_frame;
 use crate::{NativeWindowHandle, OverlaySelection, SelectionKind};
 
-const WINDOW_RENDER_TIMEOUT: Duration = Duration::from_millis(350);
+const WINDOW_RENDER_TIMEOUT: Duration = Duration::from_millis(700);
 const MAX_IN_FLIGHT_WINDOW_RENDERS: usize = 2;
 const WINDOW_BORDER_BGRA: [u8; 3] = [188, 180, 176];
 static IN_FLIGHT_WINDOW_RENDERS: AtomicUsize = AtomicUsize::new(0);
@@ -89,55 +90,6 @@ pub(crate) fn capture_window_thumbnail(
 pub(crate) struct CapturedWindow {
     pub frame: CpuFrame,
     pub corner_radius_px: f32,
-}
-
-pub(crate) fn capture_window_from_desktop(
-    handle: NativeWindowHandle,
-    frozen_desktop: &CpuFrame,
-    visible_bounds: Rect,
-) -> Result<CapturedWindow, CaptureError> {
-    let cropped = frozen_desktop.crop(visible_bounds).map_err(|error| {
-        capture_error(
-            CaptureErrorKind::InvalidFrame,
-            "crop_visible_window_fallback",
-            error.to_string(),
-            false,
-            None,
-        )
-    })?;
-    let mut pixels = cropped.pixels.to_vec();
-    for pixel in pixels.chunks_exact_mut(4) {
-        pixel[3] = 255;
-    }
-    let corner_radius_px = window_corner_radius(HWND(handle.raw()));
-    apply_window_alpha(&mut pixels, cropped.width, cropped.height, corner_radius_px);
-    let mut metadata = cropped.metadata.clone();
-    metadata.backend = "windows-visible-desktop-fallback".to_owned();
-    metadata.pool_slot = None;
-    let frame = CpuFrame::new(
-        Arc::from(pixels),
-        cropped.width,
-        cropped.height,
-        cropped.width.saturating_mul(4),
-        cropped.format,
-        cropped.origin,
-        cropped.color_space,
-        metadata,
-    )
-    .map(|frame| frame.with_alpha(FrameAlpha::Straight))
-    .map_err(|error| {
-        capture_error(
-            CaptureErrorKind::InvalidFrame,
-            "build_visible_window_fallback",
-            error.to_string(),
-            false,
-            None,
-        )
-    })?;
-    Ok(CapturedWindow {
-        frame,
-        corner_radius_px,
-    })
 }
 
 fn capture_window_bounded(
@@ -225,13 +177,11 @@ fn capture_window_inner(
         )
     };
     if !rendered.as_bool() {
-        return Err(capture_error(
-            CaptureErrorKind::NativeFailure,
-            "print_selected_window",
-            "the selected window did not provide an off-screen rendering",
-            true,
-            None,
-        ));
+        log::debug!(
+            "window handle=0x{:X} rejected PrintWindow; trying Windows Graphics Capture",
+            handle.raw()
+        );
+        return capture_window_with_wgc(hwnd, reference_metadata, max_pixels, &visible_frame);
     }
     let (pixels, content_width, content_height, radius_scale) = if let Some(max_pixels) = max_pixels
     {
@@ -333,6 +283,118 @@ fn capture_window_inner(
     Ok(CapturedWindow {
         frame,
         corner_radius_px: corner_radius,
+    })
+}
+
+fn capture_window_with_wgc(
+    hwnd: HWND,
+    reference_metadata: &FrameMetadata,
+    max_pixels: Option<u64>,
+    visible_frame: &VisibleFrame,
+) -> Result<CapturedWindow, CaptureError> {
+    let raw = capture_window_wgc_frame(hwnd)?;
+    let source_bounds = Rect {
+        x: 0,
+        y: 0,
+        width: raw.width,
+        height: raw.height,
+    };
+    let border_thickness = visible_frame
+        .border_thickness
+        .min(raw.width / 4)
+        .min(raw.height / 4);
+    let content_bounds = inset_rect(source_bounds, border_thickness).unwrap_or(source_bounds);
+    let content = crop_bgra(&raw.pixels, source_bounds, content_bounds)?;
+    let (pixels, content_width, content_height, radius_scale) = if let Some(max_pixels) = max_pixels
+    {
+        let (width, height) =
+            scaled_dimensions(content_bounds.width, content_bounds.height, max_pixels);
+        if width != content_bounds.width || height != content_bounds.height {
+            let mut source = DibSurface::new(content_bounds.width, content_bounds.height)?;
+            source.write_pixels(&content)?;
+            let scaled = DibSurface::new(width, height)?;
+            // SAFETY: Both DIBs are live and the source/destination rectangles cover them exactly.
+            let scaled_rendered = unsafe {
+                SetStretchBltMode(scaled.device, HALFTONE);
+                StretchBlt(
+                    scaled.device,
+                    0,
+                    0,
+                    width as i32,
+                    height as i32,
+                    source.device,
+                    0,
+                    0,
+                    content_bounds.width as i32,
+                    content_bounds.height as i32,
+                    SRCCOPY,
+                )
+            };
+            if !scaled_rendered.as_bool() {
+                return Err(last_error("scale_wgc_window_thumbnail"));
+            }
+            (
+                scaled.copy_pixels(),
+                width,
+                height,
+                width as f32 / content_bounds.width as f32,
+            )
+        } else {
+            (content, width, height, 1.0)
+        }
+    } else {
+        (content, content_bounds.width, content_bounds.height, 1.0)
+    };
+    let inner_corner_radius =
+        (window_corner_radius(hwnd) - border_thickness as f32).max(0.0) * radius_scale;
+    let border_width = scaled_border_width(border_thickness, radius_scale);
+    let (pixels, output_width, output_height) = add_clean_window_border(
+        pixels,
+        content_width,
+        content_height,
+        border_width,
+        inner_corner_radius,
+    )?;
+    let corner_radius_px = inner_corner_radius + border_width as f32;
+    let mut metadata = reference_metadata.clone();
+    metadata.backend = "windows-graphics-capture".to_owned();
+    metadata.source_rect = Rect {
+        x: visible_frame
+            .bounds
+            .x
+            .saturating_sub(visible_frame.border_thickness as i32),
+        y: visible_frame
+            .bounds
+            .y
+            .saturating_sub(visible_frame.border_thickness as i32),
+        width: output_width,
+        height: output_height,
+    };
+    metadata.copy_count = metadata.copy_count.saturating_add(2);
+    metadata.pool_slot = None;
+    let frame = CpuFrame::new(
+        Arc::from(pixels),
+        output_width,
+        output_height,
+        output_width.saturating_mul(4),
+        frozen_format(),
+        captastic_core::FrameOrigin::TopLeft,
+        captastic_core::ColorSpace::Srgb,
+        metadata,
+    )
+    .map(|frame| frame.with_alpha(FrameAlpha::Straight))
+    .map_err(|error| {
+        capture_error(
+            CaptureErrorKind::InvalidFrame,
+            "build_wgc_window_frame",
+            error.to_string(),
+            false,
+            None,
+        )
+    })?;
+    Ok(CapturedWindow {
+        frame,
+        corner_radius_px,
     })
 }
 
@@ -759,6 +821,15 @@ impl DibSurface {
         unsafe { std::ptr::write_bytes(self.bits, 0, self.byte_length) };
     }
 
+    fn write_pixels(&mut self, pixels: &[u8]) -> Result<(), CaptureError> {
+        if pixels.len() != self.byte_length {
+            return Err(invalid_frame("window DIB pixel buffer length is invalid"));
+        }
+        // SAFETY: bits addresses exactly byte_length writable bytes owned by this selected DIB.
+        unsafe { std::ptr::copy_nonoverlapping(pixels.as_ptr(), self.bits, self.byte_length) };
+        Ok(())
+    }
+
     fn copy_pixels(&self) -> Vec<u8> {
         // SAFETY: The DIB owns byte_length initialized bytes and stays alive through this copy.
         unsafe { std::slice::from_raw_parts(self.bits, self.byte_length) }.to_vec()
@@ -1029,34 +1100,6 @@ mod tests {
         .expect_err("a missing HWND must not produce the desktop crop");
         assert_eq!(error.kind, CaptureErrorKind::SourceUnavailable);
         assert_eq!(error.operation, "resolve_selected_window");
-    }
-
-    #[test]
-    fn frozen_desktop_fallback_produces_a_selectable_window_frame() {
-        let captured = capture_window_from_desktop(
-            NativeWindowHandle::from_raw(0),
-            &test_desktop(),
-            Rect {
-                x: 1,
-                y: 0,
-                width: 1,
-                height: 2,
-            },
-        )
-        .expect("visible desktop window fallback");
-        assert_eq!(captured.frame.width, 1);
-        assert_eq!(captured.frame.height, 2);
-        assert_eq!(
-            captured.frame.metadata.backend,
-            "windows-visible-desktop-fallback"
-        );
-        assert_eq!(captured.frame.metadata.source_rect.x, 1);
-        assert_eq!(captured.frame.alpha, FrameAlpha::Straight);
-        assert!(captured
-            .frame
-            .pixels
-            .chunks_exact(4)
-            .all(|pixel| pixel[3] == 255));
     }
 
     #[test]

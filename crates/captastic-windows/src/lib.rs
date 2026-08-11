@@ -18,6 +18,8 @@ mod startup;
 mod tray;
 #[cfg(windows)]
 mod window_capture;
+#[cfg(windows)]
+mod window_capture_wgc;
 
 #[cfg(windows)]
 pub use clipboard::{ClipboardPublishReport, ClipboardPublisher};
