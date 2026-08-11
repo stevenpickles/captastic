@@ -14,7 +14,7 @@ The current capture path supports:
 - frame-age reporting for retained frames;
 - texture-type and non-empty-dimension validation;
 - exactly-once `ReleaseFrame` through an RAII guard;
-- typed timeout, access-loss, and device-loss errors with bounded full-backend reinitialization;
+- typed timeout, access-loss, and device-loss errors with drop-before-replace recovery and bounded same-capture retries;
 - native-frame latency records;
 - a preallocated D3D11 staging texture;
 - a three-slot preallocated CPU buffer pool;
