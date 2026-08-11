@@ -49,9 +49,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostQuitMessage, RegisterClassW, SetCursor, SetForegroundWindow, SetWindowLongPtrW, ShowWindow,
     TranslateMessage, UnregisterClassW, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
     GA_ROOTOWNER, GWLP_USERDATA, GWL_EXSTYLE, HCURSOR, ICONINFO, IDC_ARROW, IDC_CROSS, IDC_SIZEALL,
-    IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, MSG, SW_SHOW, WM_CLOSE, WM_DESTROY,
-    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WNDCLASSW, WS_EX_APPWINDOW,
+    IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, MSG, SPI_SETLOGICALDPIOVERRIDE,
+    SPI_SETWORKAREA, SW_SHOW, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND,
+    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
+    WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WM_SETTINGCHANGE, WNDCLASSW, WS_EX_APPWINDOW,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
@@ -76,6 +77,13 @@ thread_local! {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SelectionKind {
     Display,
+    Region,
+    Window,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InitialSelectionTool {
+    Remembered,
     Region,
     Window,
 }
@@ -143,6 +151,23 @@ pub fn select_from_frozen_frame_with_controller(
     frame: &CpuFrame,
     controller: &OverlayController,
 ) -> Result<Option<OverlaySelection>, CaptureError> {
+    select_from_frozen_frame_with_initial_tool(frame, controller, InitialSelectionTool::Remembered)
+}
+
+pub fn select_from_frozen_frame_with_initial_tool(
+    frame: &CpuFrame,
+    controller: &OverlayController,
+    initial_tool: InitialSelectionTool,
+) -> Result<Option<OverlaySelection>, CaptureError> {
+    select_from_frozen_frame_with_initial_tool_and_ui(frame, controller, initial_tool, None)
+}
+
+pub fn select_from_frozen_frame_with_initial_tool_and_ui(
+    frame: &CpuFrame,
+    controller: &OverlayController,
+    initial_tool: InitialSelectionTool,
+    remembered_ui: Option<captastic_config::DisplayUiState>,
+) -> Result<Option<OverlaySelection>, CaptureError> {
     let preparation_started = Instant::now();
     if controller.inner.cancelled.load(Ordering::Acquire) {
         return Ok(None);
@@ -185,7 +210,8 @@ pub fn select_from_frozen_frame_with_controller(
         )
     };
     let display_environment = query_display_environment(source);
-    let remembered_ui = load_display_ui_state(&frame.metadata.display_id);
+    let remembered_ui =
+        remembered_ui.unwrap_or_else(|| load_display_ui_state(&frame.metadata.display_id));
     let toolbar_position = remembered_toolbar_position(
         remembered_ui.overlay_center,
         remembered_ui.overlay_position,
@@ -202,10 +228,15 @@ pub fn select_from_frozen_frame_with_controller(
         )
         .unwrap_or_else(|| default_region_for_source(source)),
     );
-    let tool = remembered_ui
+    let remembered_tool = remembered_ui
         .tool
         .map(CaptureTool::from_config)
         .unwrap_or(CaptureTool::Region);
+    let tool = match initial_tool {
+        InitialSelectionTool::Remembered => remembered_tool,
+        InitialSelectionTool::Region => CaptureTool::Region,
+        InitialSelectionTool::Window => CaptureTool::Window,
+    };
     let (selection, selection_kind) = initial_selection(tool, last_region, source);
     let mut state = Box::new(OverlayState {
         source,
@@ -1209,6 +1240,21 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
     // SAFETY: The Box remains alive for the full message loop and callbacks are serialized here.
     let state = unsafe { &mut *state_pointer };
     match message {
+        WM_DPICHANGED => {
+            display_configuration_changed_and_close(hwnd, "overlay_dpi_changed");
+            LRESULT(0)
+        }
+        WM_DISPLAYCHANGE => {
+            display_configuration_changed_and_close(hwnd, "overlay_display_changed");
+            LRESULT(0)
+        }
+        WM_SETTINGCHANGE
+            if wparam.0 == SPI_SETWORKAREA.0 as usize
+                || wparam.0 == SPI_SETLOGICALDPIOVERRIDE.0 as usize =>
+        {
+            display_configuration_changed_and_close(hwnd, "overlay_display_setting_changed");
+            LRESULT(0)
+        }
         WM_MOUSEMOVE => {
             let point = screen_point(state.source, lparam);
             let local = local_point(state.source, point);
@@ -1574,6 +1620,13 @@ fn confirm_and_close(hwnd: HWND, state: &mut OverlayState) {
 
 fn cancel_and_close(hwnd: HWND, state: &mut OverlayState) {
     remember_overlay_state(state);
+    // SAFETY: hwnd is the live overlay window and this function runs on its owner thread.
+    let _ = unsafe { DestroyWindow(hwnd) };
+}
+
+fn display_configuration_changed_and_close(hwnd: HWND, reason: &'static str) {
+    crate::dxgi::mark_display_configuration_changed(reason);
+    // Do not persist geometry from a display configuration that is no longer current.
     // SAFETY: hwnd is the live overlay window and this function runs on its owner thread.
     let _ = unsafe { DestroyWindow(hwnd) };
 }

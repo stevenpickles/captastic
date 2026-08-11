@@ -1,16 +1,23 @@
+use std::collections::BTreeMap;
 use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use captastic_config::{
+    CaptureRegion, CaptureRegionSource, ConfirmedRegion, HotkeyAction, HotkeyChord,
+};
 use captastic_core::{
     validate_event_order, CaptureId, CpuFrame, EventRecorder, NativeFrame, PerfEventKind,
 };
 use serde_json::json;
+use std::sync::Mutex;
 
 use crate::error::AppError;
 
 const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const WORKER_STOP_POLL: Duration = Duration::from_millis(5);
+
+pub type ConfirmedRegionCache = Arc<Mutex<BTreeMap<String, ConfirmedRegion>>>;
 
 pub struct SelectionWorker {
     sender: Option<mpsc::SyncSender<SelectionJob>>,
@@ -23,6 +30,7 @@ impl SelectionWorker {
         clipboard_sender: mpsc::SyncSender<crate::clipboard::ClipboardJob>,
         json_output: bool,
         queue_capacity: usize,
+        confirmed_regions: ConfirmedRegionCache,
     ) -> Result<Self, AppError> {
         let (sender, receiver) = mpsc::sync_channel::<SelectionJob>(queue_capacity);
         let controller = captastic_windows::OverlayController::new();
@@ -43,12 +51,17 @@ impl SelectionWorker {
                     PerfEventKind::SelectionStarted,
                     offset_after_cpu(&job),
                 );
-                let selection = captastic_windows::select_from_frozen_frame_with_controller(
+                let selection = captastic_windows::select_from_frozen_frame_with_initial_tool_and_ui(
                     &job.frame,
                     &worker_controller,
+                    job.initial_tool,
+                    job.remembered_ui,
                 );
                 match selection {
                     Ok(Some(selection)) => {
+                        if selection.kind == captastic_windows::SelectionKind::Region {
+                            remember_confirmed_region(&confirmed_regions, &job.frame.metadata, selection.rect);
+                        }
                         let selection_offset_ns = duration_ns(job.triggered_at.elapsed());
                         job.recorder.record(
                             job.capture_id,
@@ -146,6 +159,8 @@ impl SelectionWorker {
                                     "kind": selection_kind(selection.kind),
                                     "rect": selection.rect,
                                     "selection_offset_ns": selection_offset_ns,
+                                    "action": job.action,
+                                    "chord": job.chord.map(|chord| chord.to_string()),
                                     "selection_interaction_ns": selection.selection_ns,
                                     "overlay_preparation_ns": selection.preparation_ns,
                                         "window_overview_ns": selection.window_overview_ns,
@@ -162,6 +177,8 @@ impl SelectionWorker {
                         let clipboard_job = crate::clipboard::ClipboardJob {
                             capture_id: job.capture_id,
                             triggered_at: job.triggered_at,
+                            action: job.action,
+                            chord: job.chord,
                             cpu_ready_offset_ns: job.cpu_ready_offset_ns,
                             source: job.source,
                             frame: selected_frame,
@@ -247,7 +264,11 @@ impl Drop for SelectionWorker {
 pub struct SelectionJob {
     pub capture_id: CaptureId,
     pub triggered_at: Instant,
+    pub action: HotkeyAction,
+    pub chord: Option<HotkeyChord>,
+    pub initial_tool: captastic_windows::InitialSelectionTool,
     pub cpu_ready_offset_ns: u64,
+    pub remembered_ui: Option<captastic_config::DisplayUiState>,
     pub source: &'static str,
     pub frame: CpuFrame,
     pub native_frame: Option<Arc<dyn NativeFrame>>,
@@ -365,4 +386,55 @@ fn duration_ns(duration: std::time::Duration) -> u64 {
 
 fn ns_to_ms(ns: u64) -> f64 {
     ns as f64 / 1_000_000.0
+}
+
+fn remember_confirmed_region(
+    cache: &ConfirmedRegionCache,
+    metadata: &captastic_core::FrameMetadata,
+    rect: captastic_core::Rect,
+) {
+    let source = metadata.source_rect;
+    let local_x = i64::from(rect.x) - i64::from(source.x);
+    let local_y = i64::from(rect.y) - i64::from(source.y);
+    let Some(local_x) = i32::try_from(local_x).ok() else {
+        crate::logging::warn(format_args!(
+            "confirmed region x coordinate is out of range"
+        ));
+        return;
+    };
+    let Some(local_y) = i32::try_from(local_y).ok() else {
+        crate::logging::warn(format_args!(
+            "confirmed region y coordinate is out of range"
+        ));
+        return;
+    };
+    let confirmed = ConfirmedRegion {
+        region: CaptureRegion {
+            x: local_x,
+            y: local_y,
+            width: rect.width,
+            height: rect.height,
+        },
+        source: CaptureRegionSource {
+            width: source.width,
+            height: source.height,
+            rotation_degrees: metadata.rotation_degrees,
+        },
+    };
+    {
+        let mut state = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.insert(metadata.display_id.0.clone(), confirmed);
+    }
+    if let Err(error) = captastic_config::save_display_confirmed_region(
+        &metadata.display_id.0,
+        confirmed.region,
+        confirmed.source,
+    ) {
+        crate::logging::warn(format_args!(
+            "failed to persist confirmed region for display {}: {error}",
+            metadata.display_id.0
+        ));
+    }
 }

@@ -20,9 +20,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostQuitMessage, PostThreadMessageW, RegisterClassW, RegisterWindowMessageW,
     SetForegroundWindow, SetWindowLongPtrW, TrackPopupMenu, TranslateMessage, UnregisterClassW,
     CREATESTRUCTW, GWLP_USERDATA, HMENU, HWND_MESSAGE, MB_ICONERROR, MB_OK, MF_CHECKED, MF_GRAYED,
-    MF_SEPARATOR, MF_STRING, MSG, SW_SHOWNORMAL, TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, WM_APP,
-    WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NCCREATE, WM_NCDESTROY, WM_NULL,
-    WM_QUIT, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
+    MF_SEPARATOR, MF_STRING, MSG, SPI_SETLOGICALDPIOVERRIDE, SPI_SETWORKAREA, SW_SHOWNORMAL,
+    TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, WM_APP, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY,
+    WM_DISPLAYCHANGE, WM_LBUTTONDBLCLK, WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_QUIT, WM_RBUTTONUP,
+    WM_SETTINGCHANGE, WNDCLASSW, WS_OVERLAPPED,
 };
 
 const CLASS_NAME: PCWSTR = w!("CaptasticTrayWindow-v1");
@@ -330,6 +331,17 @@ fn tray_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPAR
         return LRESULT(0);
     }
     match message {
+        WM_DISPLAYCHANGE => {
+            crate::dxgi::mark_display_configuration_changed("tray_display_changed");
+            LRESULT(0)
+        }
+        WM_SETTINGCHANGE
+            if wparam.0 == SPI_SETWORKAREA.0 as usize
+                || wparam.0 == SPI_SETLOGICALDPIOVERRIDE.0 as usize =>
+        {
+            crate::dxgi::mark_display_configuration_changed("tray_display_setting_changed");
+            LRESULT(0)
+        }
         TRAY_CALLBACK => {
             let notification = lparam.0 as u32;
             if notification == WM_LBUTTONDBLCLK && !state.paused {

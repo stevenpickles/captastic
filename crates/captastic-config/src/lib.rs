@@ -2,10 +2,12 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::ErrorKind;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -13,6 +15,215 @@ use thiserror::Error;
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
 pub const CONFIG_FILE_NAME: &str = "captastic.toml";
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[repr(u8)]
+#[serde(rename_all = "snake_case")]
+pub enum HotkeyAction {
+    LastWorkflow,
+    Region,
+    Window,
+    FullDisplay,
+    RepeatLastRegion,
+}
+
+impl HotkeyAction {
+    pub const ALL: [Self; 5] = [
+        Self::LastWorkflow,
+        Self::Region,
+        Self::Window,
+        Self::FullDisplay,
+        Self::RepeatLastRegion,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LastWorkflow => "last_workflow",
+            Self::Region => "region",
+            Self::Window => "window",
+            Self::FullDisplay => "full_display",
+            Self::RepeatLastRegion => "repeat_last_region",
+        }
+    }
+
+    pub const fn registration_index(self) -> i32 {
+        self as i32
+    }
+}
+
+impl fmt::Display for HotkeyAction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum HotkeyKey {
+    Letter(u8),
+    Digit(u8),
+    Function(u8),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct HotkeyModifiers(u8);
+
+impl HotkeyModifiers {
+    const CTRL: u8 = 1 << 0;
+    const ALT: u8 = 1 << 1;
+    const SHIFT: u8 = 1 << 2;
+    const WIN: u8 = 1 << 3;
+
+    pub const fn ctrl(self) -> bool {
+        self.0 & Self::CTRL != 0
+    }
+    pub const fn alt(self) -> bool {
+        self.0 & Self::ALT != 0
+    }
+    pub const fn shift(self) -> bool {
+        self.0 & Self::SHIFT != 0
+    }
+    pub const fn win(self) -> bool {
+        self.0 & Self::WIN != 0
+    }
+
+    fn insert(&mut self, flag: u8, label: &str) -> Result<(), HotkeyParseError> {
+        if self.0 & flag != 0 {
+            return Err(HotkeyParseError::DuplicateModifier(label.to_owned()));
+        }
+        self.0 |= flag;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct HotkeyChord {
+    modifiers: HotkeyModifiers,
+    key: HotkeyKey,
+}
+
+impl HotkeyChord {
+    pub const fn modifiers(self) -> HotkeyModifiers {
+        self.modifiers
+    }
+    pub const fn key(self) -> HotkeyKey {
+        self.key
+    }
+}
+
+impl FromStr for HotkeyChord {
+    type Err = HotkeyParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(HotkeyParseError::Empty);
+        }
+        let mut modifiers = HotkeyModifiers::default();
+        let mut key = None;
+        for token in value.split('+') {
+            let token = token.trim();
+            if token.is_empty() {
+                return Err(HotkeyParseError::EmptyToken);
+            }
+            let modifier = if token.eq_ignore_ascii_case("ctrl")
+                || token.eq_ignore_ascii_case("control")
+            {
+                Some((HotkeyModifiers::CTRL, "Ctrl"))
+            } else if token.eq_ignore_ascii_case("alt") {
+                Some((HotkeyModifiers::ALT, "Alt"))
+            } else if token.eq_ignore_ascii_case("shift") {
+                Some((HotkeyModifiers::SHIFT, "Shift"))
+            } else if token.eq_ignore_ascii_case("win") || token.eq_ignore_ascii_case("windows") {
+                Some((HotkeyModifiers::WIN, "Win"))
+            } else {
+                None
+            };
+            if let Some((flag, label)) = modifier {
+                modifiers.insert(flag, label)?;
+                continue;
+            }
+            if key.is_some() {
+                return Err(HotkeyParseError::MultipleKeys);
+            }
+            key = Some(parse_hotkey_key(token)?);
+        }
+        Ok(Self {
+            modifiers,
+            key: key.ok_or(HotkeyParseError::MissingKey)?,
+        })
+    }
+}
+
+impl fmt::Display for HotkeyChord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut first = true;
+        for (enabled, label) in [
+            (self.modifiers.ctrl(), "Ctrl"),
+            (self.modifiers.alt(), "Alt"),
+            (self.modifiers.shift(), "Shift"),
+            (self.modifiers.win(), "Win"),
+        ] {
+            if enabled {
+                if !first {
+                    formatter.write_str("+")?;
+                }
+                formatter.write_str(label)?;
+                first = false;
+            }
+        }
+        if !first {
+            formatter.write_str("+")?;
+        }
+        match self.key {
+            HotkeyKey::Letter(letter) | HotkeyKey::Digit(letter) => {
+                formatter.write_str(&char::from(letter).to_string())
+            }
+            HotkeyKey::Function(number) => write!(formatter, "F{number}"),
+        }
+    }
+}
+
+fn parse_hotkey_key(token: &str) -> Result<HotkeyKey, HotkeyParseError> {
+    let bytes = token.as_bytes();
+    if bytes.len() == 1 && bytes[0].is_ascii_alphabetic() {
+        return Ok(HotkeyKey::Letter(bytes[0].to_ascii_uppercase()));
+    }
+    if bytes.len() == 1 && bytes[0].is_ascii_digit() {
+        return Ok(HotkeyKey::Digit(bytes[0]));
+    }
+    if token.len() >= 2 && token.as_bytes()[0].eq_ignore_ascii_case(&b'f') {
+        let number_text = &token[1..];
+        if number_text.len() <= 2 && !number_text.starts_with('0') {
+            if let Ok(number) = number_text.parse::<u8>() {
+                if (1..=24).contains(&number) {
+                    return Ok(HotkeyKey::Function(number));
+                }
+            }
+        }
+    }
+    Err(HotkeyParseError::UnsupportedKey(token.to_owned()))
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum HotkeyParseError {
+    #[error("hotkey binding must not be empty")]
+    Empty,
+    #[error("hotkey binding contains an empty token")]
+    EmptyToken,
+    #[error("hotkey binding repeats modifier {0}")]
+    DuplicateModifier(String),
+    #[error("hotkey binding must contain exactly one non-modifier key")]
+    MissingKey,
+    #[error("hotkey binding contains multiple non-modifier keys")]
+    MultipleKeys,
+    #[error("unsupported hotkey key {0:?}; use A-Z, 0-9, or F1-F24")]
+    UnsupportedKey(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HotkeyBinding {
+    pub action: HotkeyAction,
+    pub chord: HotkeyChord,
+}
 /// Returns the per-user directory for Captastic configuration, state, and logs.
 pub fn storage_directory() -> Option<PathBuf> {
     storage_directory_from(
@@ -98,6 +309,12 @@ pub struct CaptureRegionSource {
     pub rotation_degrees: u16,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConfirmedRegion {
+    pub region: CaptureRegion,
+    pub source: CaptureRegionSource,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CaptureHistory {
     pub tool: Option<CaptureTool>,
@@ -114,6 +331,7 @@ pub struct DisplayUiState {
     pub region: Option<CaptureRegion>,
     pub region_source: Option<CaptureRegionSource>,
     /// Per-display regions are monitor-local. A legacy global fallback remains desktop-absolute.
+    pub confirmed_region: Option<ConfirmedRegion>,
     pub region_is_display_local: bool,
 }
 
@@ -166,11 +384,27 @@ impl AppConfig {
         };
         match Self::load(&path) {
             Ok(config) => Ok(config),
+
             Err(ConfigError::Read { source, .. }) if source.kind() == ErrorKind::NotFound => {
                 Ok(Self::default())
             }
             Err(error) => Err(error),
         }
+    }
+
+    pub fn confirmed_regions(&self) -> BTreeMap<String, ConfirmedRegion> {
+        self.ui
+            .displays
+            .iter()
+            .filter_map(|(display_id, state)| {
+                state
+                    .last_confirmed_region
+                    .zip(state.last_confirmed_region_source)
+                    .map(|(region, source)| {
+                        (display_id.clone(), ConfirmedRegion { region, source })
+                    })
+            })
+            .collect()
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -224,11 +458,7 @@ impl AppConfig {
                 "hotkey.repeat must be ignore or coalesce".to_owned(),
             ));
         }
-        if self.hotkey.binding != "Ctrl+Shift+F9" {
-            return Err(ConfigError::InvalidValue(
-                "hotkey.binding currently supports only Ctrl+Shift+F9".to_owned(),
-            ));
-        }
+        self.hotkey.resolved_bindings()?;
         if !matches!(self.logging.format.as_str(), "compact" | "json") {
             return Err(ConfigError::InvalidValue(
                 "logging.format must be compact or json".to_owned(),
@@ -332,6 +562,39 @@ impl AppConfig {
                     )));
                 }
             }
+            match (
+                state.last_confirmed_region,
+                state.last_confirmed_region_source,
+            ) {
+                (Some(region), Some(source)) => {
+                    let right = i64::from(region.x) + i64::from(region.width);
+                    let bottom = i64::from(region.y) + i64::from(region.height);
+                    if region.x < 0
+                        || region.y < 0
+                        || region.width == 0
+                        || region.height == 0
+                        || source.width == 0
+                        || source.height == 0
+                        || right > i64::from(source.width)
+                        || bottom > i64::from(source.height)
+                    {
+                        return Err(ConfigError::InvalidValue(format!(
+                            "ui.displays.{display_id}.last_confirmed_region must fit its source geometry"
+                        )));
+                    }
+                    if !matches!(source.rotation_degrees, 0 | 90 | 180 | 270) {
+                        return Err(ConfigError::InvalidValue(format!(
+                            "ui.displays.{display_id}.last_confirmed_region_source rotation must be 0, 90, 180, or 270 degrees"
+                        )));
+                    }
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(ConfigError::InvalidValue(format!(
+                        "ui.displays.{display_id} confirmed region and source must both be set or both be omitted"
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -346,7 +609,7 @@ pub fn load_display_ui_state(display_id: &str) -> Result<DisplayUiState, ConfigE
     Ok(resolve_display_ui_state(&config.ui, display_id))
 }
 
-fn resolve_display_ui_state(ui: &UiConfig, display_id: &str) -> DisplayUiState {
+pub fn resolve_display_ui_state(ui: &UiConfig, display_id: &str) -> DisplayUiState {
     let display = ui.displays.get(display_id);
     let display_region = display.and_then(|state| state.last_region);
     DisplayUiState {
@@ -361,6 +624,13 @@ fn resolve_display_ui_state(ui: &UiConfig, display_id: &str) -> DisplayUiState {
         region: display_region.or(ui.last_region),
         region_source: display.and_then(|state| state.last_region_source),
         region_is_display_local: display_region.is_some(),
+        confirmed_region: display
+            .and_then(|state| {
+                state
+                    .last_confirmed_region
+                    .zip(state.last_confirmed_region_source)
+            })
+            .map(|(region, source)| ConfirmedRegion { region, source }),
     }
 }
 
@@ -507,6 +777,7 @@ pub fn save_overlay_position(x: i32, y: i32) -> Result<(), ConfigError> {
             });
         }
     };
+
     let updated = update_overlay_position(&source, x, y)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
@@ -514,6 +785,7 @@ pub fn save_overlay_position(x: i32, y: i32) -> Result<(), ConfigError> {
             source,
         })?;
     }
+
     fs::write(&path, updated).map_err(|source| ConfigError::Write {
         path: path.display().to_string(),
         source,
@@ -528,6 +800,41 @@ fn update_overlay_position(source: &str, x: i32, y: i32) -> Result<String, Confi
     };
     document["ui"]["overlay_x"] = toml_edit::value(i64::from(x));
     document["ui"]["overlay_y"] = toml_edit::value(i64::from(y));
+    Ok(document.to_string())
+}
+
+pub fn save_display_confirmed_region(
+    display_id: &str,
+    region: CaptureRegion,
+    source: CaptureRegionSource,
+) -> Result<(), ConfigError> {
+    let path = default_config_path().ok_or(ConfigError::HomeDirectoryUnavailable)?;
+    let current = read_optional_config_source(&path)?;
+    let updated = update_display_confirmed_region(&current, display_id, region, source)?;
+    write_config_source(&path, updated)
+}
+
+fn update_display_confirmed_region(
+    source_text: &str,
+    display_id: &str,
+    region: CaptureRegion,
+    source: CaptureRegionSource,
+) -> Result<String, ConfigError> {
+    if region.width == 0 || region.height == 0 || source.width == 0 || source.height == 0 {
+        return Err(ConfigError::InvalidValue(
+            "confirmed region and source dimensions must be greater than zero".to_owned(),
+        ));
+    }
+    let mut document = editable_document(source_text)?;
+    let state = &mut document["ui"]["displays"][display_id];
+    state["last_confirmed_region"]["x"] = toml_edit::value(i64::from(region.x));
+    state["last_confirmed_region"]["y"] = toml_edit::value(i64::from(region.y));
+    state["last_confirmed_region"]["width"] = toml_edit::value(i64::from(region.width));
+    state["last_confirmed_region"]["height"] = toml_edit::value(i64::from(region.height));
+    state["last_confirmed_region_source"]["width"] = toml_edit::value(i64::from(source.width));
+    state["last_confirmed_region_source"]["height"] = toml_edit::value(i64::from(source.height));
+    state["last_confirmed_region_source"]["rotation_degrees"] =
+        toml_edit::value(i64::from(source.rotation_degrees));
     Ok(document.to_string())
 }
 
@@ -608,15 +915,108 @@ impl Default for DaemonConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HotkeyConfig {
-    pub binding: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding: Option<String>,
     pub repeat: String,
+    #[serde(
+        default = "HotkeyBindingsConfig::disabled",
+        skip_serializing_if = "HotkeyBindingsConfig::is_empty"
+    )]
+    pub bindings: HotkeyBindingsConfig,
 }
 
 impl Default for HotkeyConfig {
     fn default() -> Self {
         Self {
-            binding: "Ctrl+Shift+F9".to_owned(),
+            binding: None,
             repeat: "ignore".to_owned(),
+            bindings: HotkeyBindingsConfig {
+                last_workflow: Some("Ctrl+Shift+F9".to_owned()),
+                ..HotkeyBindingsConfig::disabled()
+            },
+        }
+    }
+}
+
+impl HotkeyConfig {
+    pub fn resolved_bindings(&self) -> Result<Vec<HotkeyBinding>, ConfigError> {
+        if self.binding.is_some() && self.bindings.last_workflow.is_some() {
+            return Err(ConfigError::InvalidValue(
+                "hotkey.binding and hotkey.bindings.last_workflow define the same action; remove one"
+                    .to_owned(),
+            ));
+        }
+
+        let mut bindings = Vec::with_capacity(HotkeyAction::ALL.len());
+        let mut chords = BTreeMap::new();
+        for action in HotkeyAction::ALL {
+            let value = if action == HotkeyAction::LastWorkflow {
+                self.bindings
+                    .last_workflow
+                    .as_deref()
+                    .or(self.binding.as_deref())
+            } else {
+                self.bindings.value(action)
+            };
+            let Some(value) = value else { continue };
+            let chord = value.parse::<HotkeyChord>().map_err(|error| {
+                ConfigError::InvalidValue(format!(
+                    "hotkey.bindings.{} is invalid: {error}",
+                    action.as_str()
+                ))
+            })?;
+            if let Some(previous) = chords.insert(chord, action) {
+                return Err(ConfigError::InvalidValue(format!(
+                    "hotkey chord {chord} is assigned to both {previous} and {action}"
+                )));
+            }
+            bindings.push(HotkeyBinding { action, chord });
+        }
+        Ok(bindings)
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HotkeyBindingsConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_workflow: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full_display: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repeat_last_region: Option<String>,
+}
+
+impl HotkeyBindingsConfig {
+    const fn disabled() -> Self {
+        Self {
+            last_workflow: None,
+            region: None,
+            window: None,
+            full_display: None,
+            repeat_last_region: None,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.last_workflow.is_none()
+            && self.region.is_none()
+            && self.window.is_none()
+            && self.full_display.is_none()
+            && self.repeat_last_region.is_none()
+    }
+
+    fn value(&self, action: HotkeyAction) -> Option<&str> {
+        match action {
+            HotkeyAction::LastWorkflow => self.last_workflow.as_deref(),
+            HotkeyAction::Region => self.region.as_deref(),
+            HotkeyAction::Window => self.window.as_deref(),
+            HotkeyAction::FullDisplay => self.full_display.as_deref(),
+            HotkeyAction::RepeatLastRegion => self.repeat_last_region.as_deref(),
         }
     }
 }
@@ -749,6 +1149,10 @@ pub struct DisplayUiConfig {
     pub last_region: Option<CaptureRegion>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_region_source: Option<CaptureRegionSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_confirmed_region: Option<CaptureRegion>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_confirmed_region_source: Option<CaptureRegionSource>,
 }
 
 impl Default for LoggingConfig {
@@ -971,6 +1375,7 @@ mod tests {
                     height: 1080,
                     rotation_degrees: 0,
                 }),
+                confirmed_region: None,
                 region_is_display_local: true,
             }
         );
@@ -991,6 +1396,7 @@ mod tests {
                     height: 2160,
                     rotation_degrees: 0,
                 }),
+                confirmed_region: None,
                 region_is_display_local: true,
             }
         );
@@ -1015,6 +1421,7 @@ mod tests {
                     height: 360,
                 }),
                 region_source: None,
+                confirmed_region: None,
                 region_is_display_local: false,
             }
         );
@@ -1154,5 +1561,136 @@ mod tests {
             config.validate(),
             Err(ConfigError::InvalidValue(_))
         ));
+    }
+    #[test]
+    fn legacy_binding_resolves_to_last_workflow() {
+        let config: AppConfig =
+            toml::from_str("[hotkey]\nbinding = \"ctrl + shift + f9\"\nrepeat = \"ignore\"\n")
+                .expect("legacy config");
+        let bindings = config.hotkey.resolved_bindings().expect("legacy binding");
+        assert_eq!(
+            bindings,
+            vec![HotkeyBinding {
+                action: HotkeyAction::LastWorkflow,
+                chord: "Ctrl+Shift+F9".parse().expect("chord"),
+            }]
+        );
+    }
+
+    #[test]
+    fn hotkey_grammar_canonicalizes_supported_modifiers_and_keys() {
+        for (input, expected) in [
+            ("control+windows+alt+shift+a", "Ctrl+Alt+Shift+Win+A"),
+            ("ALT+0", "Alt+0"),
+            ("win+f1", "Win+F1"),
+            ("Ctrl+F24", "Ctrl+F24"),
+            ("z", "Z"),
+        ] {
+            let chord: HotkeyChord = input.parse().expect(input);
+            assert_eq!(chord.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn malformed_hotkeys_are_rejected_without_reinterpretation() {
+        for input in [
+            "",
+            "Ctrl++F9",
+            "Ctrl+Control+F9",
+            "Ctrl+Shift",
+            "Ctrl+A+B",
+            "Ctrl+F25",
+            "Ctrl+F01",
+            "Ctrl+Space",
+        ] {
+            assert!(input.parse::<HotkeyChord>().is_err(), "accepted {input:?}");
+        }
+    }
+
+    #[test]
+    fn duplicate_chords_across_actions_are_rejected_after_canonicalization() {
+        let mut config = AppConfig::default();
+        config.hotkey.bindings.region = Some("alt+r".to_owned());
+        config.hotkey.bindings.window = Some("ALT+R".to_owned());
+        let error = config.validate().expect_err("duplicate chord");
+        assert!(error.to_string().contains("region"));
+        assert!(error.to_string().contains("window"));
+        assert!(error.to_string().contains("Alt+R"));
+    }
+
+    #[test]
+    fn omitted_actions_are_disabled_and_empty_actions_are_invalid() {
+        let config: AppConfig = toml::from_str(
+            "[hotkey]\nrepeat = \"ignore\"\n[hotkey.bindings]\nfull_display = \"Win+F12\"\n",
+        )
+        .expect("config");
+        let bindings = config.hotkey.resolved_bindings().expect("one binding");
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].action, HotkeyAction::FullDisplay);
+
+        let mut invalid = config;
+        invalid.hotkey.bindings.region = Some(String::new());
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn legacy_and_canonical_last_workflow_are_ambiguous() {
+        let config: AppConfig = toml::from_str(
+            "[hotkey]\nbinding = \"Ctrl+Shift+F9\"\nrepeat = \"ignore\"\n[hotkey.bindings]\nlast_workflow = \"Alt+F9\"\n",
+        )
+        .expect("syntax is valid");
+        let error = config.validate().expect_err("ambiguous action");
+        assert!(error.to_string().contains("define the same action"));
+    }
+
+    #[test]
+    fn canonical_bindings_round_trip_and_ui_updates_preserve_them_and_comments() {
+        let source = "# keep this comment\n[daemon]\ntrigger_queue_capacity = 9\n\n[hotkey]\nrepeat = \"ignore\"\n\n[hotkey.bindings]\nlast_workflow = \"Ctrl+Shift+F9\"\nregion = \"Alt+R\"\nfull_display = \"Win+F12\"\n";
+        let config: AppConfig = toml::from_str(source).expect("canonical config");
+        config.validate().expect("valid bindings");
+        let serialized = config.to_toml_pretty().expect("serialize");
+        let reloaded: AppConfig = toml::from_str(&serialized).expect("reload");
+        assert_eq!(
+            reloaded.hotkey.resolved_bindings().expect("bindings"),
+            config.hotkey.resolved_bindings().expect("bindings")
+        );
+        assert_eq!(reloaded.daemon.trigger_queue_capacity, 9);
+
+        let updated = update_display_confirmed_region(
+            source,
+            "display-a",
+            CaptureRegion {
+                x: 10,
+                y: 20,
+                width: 300,
+                height: 200,
+            },
+            CaptureRegionSource {
+                width: 3840,
+                height: 2160,
+                rotation_degrees: 0,
+            },
+        )
+        .expect("UI update");
+        assert!(updated.contains("# keep this comment"));
+        assert!(updated.contains("full_display = \"Win+F12\""));
+        assert!(updated.contains("trigger_queue_capacity = 9"));
+        let updated: AppConfig = toml::from_str(&updated).expect("updated config reloads");
+        assert_eq!(
+            updated.confirmed_regions().get("display-a"),
+            Some(&ConfirmedRegion {
+                region: CaptureRegion {
+                    x: 10,
+                    y: 20,
+                    width: 300,
+                    height: 200,
+                },
+                source: CaptureRegionSource {
+                    width: 3840,
+                    height: 2160,
+                    rotation_degrees: 0,
+                },
+            })
+        );
     }
 }
