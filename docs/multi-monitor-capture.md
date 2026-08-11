@@ -46,9 +46,11 @@ against so stale work can be rejected after a display change.
 
 Each physical display independently remembers:
 
-- last capture tool;
-- last partial-region rectangle;
+- last selected capture tool, including a selection followed by cancellation;
+- last adjusted partial-region rectangle, whether or not it was captured;
 - toolbar placement.
+
+Tool and region interaction state is saved on both confirmation and cancellation.
 
 Regions are stored in monitor-local physical pixels. Toolbar placement is stored
 as its normalized center within the display work area so it survives DPI and
@@ -65,6 +67,17 @@ The toolbar behavior is:
 4. Clamp the toolbar fully inside the target work area.
 5. Do not allow dragging it onto a different display during the same invocation.
 6. Retain saved state for a disconnected display so reconnecting restores it.
+
+Region dimension placement also uses display-local physical coordinates and the
+target display's DPI. The measured badge remains inside a comfortable region;
+small regions use a stable outside side selected from the space available on
+that display. The badge is clamped to the display bounds and avoids the pointer,
+resize handles, toolbar, and open menu where practical. Exact region dimensions
+are never converted to DIPs.
+
+The compact toolbar uses a 418 x 56 DIP shell with 44 x 44 DIP tool hit targets
+and a 248 x 132 DIP Options menu. Painting, hit testing, popup placement, and
+work-area clamping share the same per-monitor metrics.
 
 For virtual-desktop capture, use one overlay window per display in a shared
 overlay session. Show one toolbar on the display that contained the pointer at
