@@ -1,12 +1,13 @@
 use std::cell::RefCell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
 use captastic_core::{
-    CaptureError, CaptureErrorKind, CpuFrame, FrameMetadata, FrameOrigin, PixelFormat, Rect,
+    CaptureError, CaptureErrorKind, CpuFrame, DisplayId, FrameMetadata, FrameOrigin, PixelFormat,
+    Rect,
 };
 use windows::core::{w, Error as WindowsError, PCWSTR};
 use windows::Win32::Foundation::{
@@ -67,17 +68,7 @@ const WINDOW_THUMBNAIL_MAX_PIXELS: u64 = 1_200_000;
 const UI_FONT_HEIGHT: i32 = 21;
 const MENU_WIDTH: i32 = 320;
 const MENU_HEIGHT: i32 = 164;
-const NO_TOOLBAR_POSITION: u64 = u64::MAX;
-const CAPTURE_TOOL_FULL_DISPLAY: u8 = 0;
-const CAPTURE_TOOL_WINDOW: u8 = 1;
-const CAPTURE_TOOL_REGION: u8 = 2;
 const IOSKELEY_MONO_MEDIUM: &[u8] = include_bytes!("../assets/fonts/IoskeleyMono-Medium.ttf");
-
-static LAST_TOOLBAR_POSITION: AtomicU64 = AtomicU64::new(NO_TOOLBAR_POSITION);
-static TOOLBAR_POSITION_LOADED: AtomicBool = AtomicBool::new(false);
-static CAPTURE_HISTORY_LOADED: AtomicBool = AtomicBool::new(false);
-static LAST_CAPTURE_TOOL: AtomicU8 = AtomicU8::new(CAPTURE_TOOL_REGION);
-static LAST_CAPTURED_REGION: Mutex<Option<Rect>> = Mutex::new(None);
 
 thread_local! {
     static OVERLAY_RESOURCE_CACHE: RefCell<Option<OverlayResourceCache>> = const { RefCell::new(None) };
@@ -194,11 +185,25 @@ pub fn select_from_frozen_frame_with_controller(
             PrivateFontResource::register()?,
         )
     };
-    let toolbar_position = remembered_toolbar_position(surface.width, surface.height)
-        .unwrap_or_else(|| ToolbarLayout::default_origin(surface.width, surface.height));
-    let last_region =
-        Some(remembered_last_region(source).unwrap_or_else(|| default_region_for_source(source)));
-    let tool = remembered_capture_tool();
+    let remembered_ui = load_display_ui_state(&frame.metadata.display_id);
+    let toolbar_position = remembered_toolbar_position(
+        remembered_ui.overlay_position,
+        surface.width,
+        surface.height,
+    )
+    .unwrap_or_else(|| ToolbarLayout::default_origin(surface.width, surface.height));
+    let last_region = Some(
+        remembered_last_region(
+            remembered_ui.region,
+            remembered_ui.region_is_display_local,
+            source,
+        )
+        .unwrap_or_else(|| default_region_for_source(source)),
+    );
+    let tool = remembered_ui
+        .tool
+        .map(CaptureTool::from_config)
+        .unwrap_or(CaptureTool::Region);
     let (selection, selection_kind) = initial_selection(tool, last_region, source);
     let mut state = Box::new(OverlayState {
         source,
@@ -375,14 +380,6 @@ impl CaptureTool {
             SelectionKind::Display => Self::FullDisplay,
             SelectionKind::Region => Self::Region,
             SelectionKind::Window => Self::Window,
-        }
-    }
-
-    const fn code(self) -> u8 {
-        match self {
-            Self::FullDisplay => CAPTURE_TOOL_FULL_DISPLAY,
-            Self::Window => CAPTURE_TOOL_WINDOW,
-            Self::Region => CAPTURE_TOOL_REGION,
         }
     }
 
@@ -930,26 +927,12 @@ impl ToolbarLayout {
     }
 }
 
-fn remembered_toolbar_position(client_width: i32, client_height: i32) -> Option<POINT> {
-    let mut packed = LAST_TOOLBAR_POSITION.load(Ordering::Acquire);
-    if packed == NO_TOOLBAR_POSITION && !TOOLBAR_POSITION_LOADED.swap(true, Ordering::AcqRel) {
-        if let Some(position) = load_toolbar_position_from_disk() {
-            packed = pack_toolbar_position(position);
-            LAST_TOOLBAR_POSITION.store(packed, Ordering::Release);
-        }
-    }
-    (packed != NO_TOOLBAR_POSITION).then(|| {
-        ToolbarLayout::clamp_origin(client_width, client_height, unpack_toolbar_position(packed))
-    })
-}
-
-fn remembered_capture_tool() -> CaptureTool {
-    ensure_capture_history_loaded();
-    match LAST_CAPTURE_TOOL.load(Ordering::Acquire) {
-        CAPTURE_TOOL_FULL_DISPLAY => CaptureTool::FullDisplay,
-        CAPTURE_TOOL_WINDOW => CaptureTool::Window,
-        _ => CaptureTool::Region,
-    }
+fn remembered_toolbar_position(
+    position: Option<(i32, i32)>,
+    client_width: i32,
+    client_height: i32,
+) -> Option<POINT> {
+    position.map(|(x, y)| ToolbarLayout::clamp_origin(client_width, client_height, POINT { x, y }))
 }
 
 fn initial_selection(
@@ -969,55 +952,56 @@ fn initial_selection(
     }
 }
 
-fn remembered_last_region(source: Rect) -> Option<Rect> {
-    ensure_capture_history_loaded();
-    LAST_CAPTURED_REGION
-        .lock()
-        .ok()
-        .and_then(|region| region.as_ref().copied())
-        .map(|region| fit_region_to_source(region, source))
+fn remembered_last_region(
+    region: Option<captastic_config::CaptureRegion>,
+    display_local: bool,
+    source: Rect,
+) -> Option<Rect> {
+    region.map(|region| {
+        let x = if display_local {
+            source.x.saturating_add(region.x)
+        } else {
+            region.x
+        };
+        let y = if display_local {
+            source.y.saturating_add(region.y)
+        } else {
+            region.y
+        };
+        fit_region_to_source(
+            Rect {
+                x,
+                y,
+                width: region.width,
+                height: region.height,
+            },
+            source,
+        )
+    })
 }
 
-fn remember_capture_history(kind: SelectionKind, confirmed_region: Option<Rect>) {
+fn remember_capture_history(
+    display_id: &DisplayId,
+    source: Rect,
+    kind: SelectionKind,
+    confirmed_region: Option<Rect>,
+) {
     let tool = CaptureTool::from_selection_kind(kind);
-    LAST_CAPTURE_TOOL.store(tool.code(), Ordering::Release);
-    if let Some(region) = confirmed_region {
-        if let Ok(mut remembered) = LAST_CAPTURED_REGION.lock() {
-            *remembered = Some(region);
-        }
-    }
     let persisted_region = confirmed_region.map(|region| captastic_config::CaptureRegion {
-        x: region.x,
-        y: region.y,
+        x: region.x.saturating_sub(source.x),
+        y: region.y.saturating_sub(source.y),
         width: region.width,
         height: region.height,
     });
-    if let Err(error) = captastic_config::save_capture_history(tool.to_config(), persisted_region) {
-        log::warn!("failed to save capture history: {error}");
-    }
-}
-
-fn ensure_capture_history_loaded() {
-    if CAPTURE_HISTORY_LOADED.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    match captastic_config::load_capture_history() {
-        Ok(history) => {
-            if let Some(tool) = history.tool {
-                LAST_CAPTURE_TOOL.store(CaptureTool::from_config(tool).code(), Ordering::Release);
-            }
-            if let Some(region) = history.region {
-                if let Ok(mut remembered) = LAST_CAPTURED_REGION.lock() {
-                    *remembered = Some(Rect {
-                        x: region.x,
-                        y: region.y,
-                        width: region.width,
-                        height: region.height,
-                    });
-                }
-            }
-        }
-        Err(error) => log::warn!("failed to load capture history: {error}"),
+    if let Err(error) = captastic_config::save_display_capture_history(
+        &display_id.0,
+        tool.to_config(),
+        persisted_region,
+    ) {
+        log::warn!(
+            "failed to save capture history for display {}: {error}",
+            display_id.0
+        );
     }
 }
 
@@ -1051,31 +1035,26 @@ fn fit_region_to_source(region: Rect, source: Rect) -> Rect {
     }
 }
 
-fn remember_toolbar_position(position: POINT) {
-    TOOLBAR_POSITION_LOADED.store(true, Ordering::Release);
-    LAST_TOOLBAR_POSITION.store(pack_toolbar_position(position), Ordering::Release);
-    if let Err(error) = captastic_config::save_overlay_position(position.x, position.y) {
-        log::warn!("failed to save overlay position: {error}");
+fn remember_toolbar_position(display_id: &DisplayId, position: POINT) {
+    if let Err(error) =
+        captastic_config::save_display_overlay_position(&display_id.0, position.x, position.y)
+    {
+        log::warn!(
+            "failed to save toolbar position for display {}: {error}",
+            display_id.0
+        );
     }
 }
 
-fn pack_toolbar_position(position: POINT) -> u64 {
-    (u64::from(position.x as u32) << 32) | u64::from(position.y as u32)
-}
-
-fn unpack_toolbar_position(packed: u64) -> POINT {
-    POINT {
-        x: (packed >> 32) as u32 as i32,
-        y: packed as u32 as i32,
-    }
-}
-
-fn load_toolbar_position_from_disk() -> Option<POINT> {
-    match captastic_config::load_overlay_position() {
-        Ok(position) => position.map(|(x, y)| POINT { x, y }),
+fn load_display_ui_state(display_id: &DisplayId) -> captastic_config::DisplayUiState {
+    match captastic_config::load_display_ui_state(&display_id.0) {
+        Ok(state) => state,
         Err(error) => {
-            log::warn!("failed to load overlay position: {error}");
-            None
+            log::warn!(
+                "failed to load UI state for display {}: {error}",
+                display_id.0
+            );
+            captastic_config::DisplayUiState::default()
         }
     }
 }
@@ -1456,7 +1435,10 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
         WM_LBUTTONUP => {
             let point = screen_point(state.source, lparam);
             if state.toolbar_drag.take().is_some() {
-                remember_toolbar_position(state.toolbar_position);
+                remember_toolbar_position(
+                    &state.reference_metadata.display_id,
+                    state.toolbar_position,
+                );
                 state.hovered_control = Some(ToolbarControl::Background);
                 set_arrow_cursor();
                 invalidate(hwnd);
@@ -1564,7 +1546,12 @@ fn confirm_and_close(hwnd: HWND, state: &mut OverlayState) {
             .map(|frame| frame.metadata.source_rect)
             .unwrap_or(rect);
         let confirmed_region = (kind == SelectionKind::Region).then_some(rect);
-        remember_capture_history(kind, confirmed_region);
+        remember_capture_history(
+            &state.reference_metadata.display_id,
+            state.source,
+            kind,
+            confirmed_region,
+        );
         if confirmed_region.is_some() {
             state.last_region = Some(rect);
         }
@@ -4092,11 +4079,42 @@ mod tests {
     }
 
     #[test]
-    fn toolbar_position_round_trips_through_persistent_representation() {
-        let position = POINT { x: 731, y: 944 };
+    fn toolbar_position_restores_and_clamps_in_monitor_local_coordinates() {
         assert_eq!(
-            unpack_toolbar_position(pack_toolbar_position(position)),
-            position
+            remembered_toolbar_position(Some((731, 944)), 1920, 1080),
+            Some(POINT { x: 731, y: 944 })
+        );
+        assert_eq!(
+            remembered_toolbar_position(Some((3700, 2000)), 1920, 1080),
+            Some(POINT { x: 1312, y: 990 })
+        );
+    }
+
+    #[test]
+    fn monitor_local_region_restores_against_a_negative_display_origin() {
+        let source = Rect {
+            x: -1920,
+            y: -200,
+            width: 1920,
+            height: 1200,
+        };
+        assert_eq!(
+            remembered_last_region(
+                Some(captastic_config::CaptureRegion {
+                    x: 200,
+                    y: 100,
+                    width: 800,
+                    height: 600,
+                }),
+                true,
+                source,
+            ),
+            Some(Rect {
+                x: -1720,
+                y: -100,
+                width: 800,
+                height: 600,
+            })
         );
     }
 

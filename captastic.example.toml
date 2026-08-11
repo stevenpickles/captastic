@@ -50,13 +50,27 @@ format = "compact"
 max_file_bytes = 5242880
 retained_files = 3
 
-# Captastic maintains these values as the overlay is used.
+# Legacy single-monitor values. Captastic still reads these as a fallback, but writes new state to
+# a persistent display-specific table like the example below.
 [ui]
 # overlay_x = 640
 # overlay_y = 920
 # last_capture_tool = "region"
 
 # [ui.last_region]
+# x = 480
+# y = 270
+# width = 960
+# height = 540
+
+# Captastic creates one of these tables for each monitor as the overlay is used. Toolbar and region
+# coordinates are local to the monitor, not the Windows virtual desktop.
+# [ui.displays.windows-monitor-0123456789abcdef]
+# overlay_x = 640
+# overlay_y = 920
+# last_capture_tool = "region"
+
+# [ui.displays.windows-monitor-0123456789abcdef.last_region]
 # x = 480
 # y = 270
 # width = 960
