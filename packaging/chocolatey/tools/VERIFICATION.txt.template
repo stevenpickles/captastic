@@ -1,0 +1,15 @@
+VERIFICATION
+
+The executables in this package are taken from the official Captastic Windows
+release archive built by the project's GitHub Actions release workflow.
+
+Release archive: {{SOURCE_URL}}
+Archive SHA-256: {{ARCHIVE_SHA256}}
+
+Embedded files:
+  captastic.exe SHA-256: {{CLI_SHA256}}
+  captastic-desktop.exe SHA-256: {{DESKTOP_SHA256}}
+
+To verify the package contents, download the release archive, calculate its hash
+with `Get-FileHash -Algorithm SHA256`, extract it, and compare the two executable
+hashes with the values above.
