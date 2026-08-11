@@ -64,10 +64,11 @@ retained_files = 3
 # height = 540
 
 # Captastic creates one of these tables for each monitor as the overlay is used. Toolbar and region
-# coordinates are local to the monitor, not the Windows virtual desktop.
+# coordinates are local to the monitor, not the Windows virtual desktop. Toolbar center values are
+# normalized within the monitor work area so they survive DPI, taskbar, and resolution changes.
 # [ui.displays.windows-monitor-0123456789abcdef]
-# overlay_x = 640
-# overlay_y = 920
+# overlay_center_x = 0.5
+# overlay_center_y = 0.9
 # last_capture_tool = "region"
 
 # [ui.displays.windows-monitor-0123456789abcdef.last_region]

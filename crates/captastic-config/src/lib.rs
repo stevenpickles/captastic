@@ -96,8 +96,11 @@ pub struct CaptureHistory {
     pub region: Option<CaptureRegion>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DisplayUiState {
+    /// Normalized toolbar center within the display work area.
+    pub overlay_center: Option<(f64, f64)>,
+    /// Backward-compatible monitor-local origin written by earlier alpha builds.
     pub overlay_position: Option<(i32, i32)>,
     pub tool: Option<CaptureTool>,
     pub region: Option<CaptureRegion>,
@@ -276,6 +279,25 @@ impl AppConfig {
                     "ui.displays.{display_id}.overlay_x and overlay_y must either both be set or both be omitted"
                 )));
             }
+            if state.overlay_center_x.is_some() != state.overlay_center_y.is_some() {
+                return Err(ConfigError::InvalidValue(format!(
+                    "ui.displays.{display_id}.overlay_center_x and overlay_center_y must either both be set or both be omitted"
+                )));
+            }
+            if state
+                .overlay_center_x
+                .zip(state.overlay_center_y)
+                .is_some_and(|(x, y)| {
+                    !x.is_finite()
+                        || !y.is_finite()
+                        || !(0.0..=1.0).contains(&x)
+                        || !(0.0..=1.0).contains(&y)
+                })
+            {
+                return Err(ConfigError::InvalidValue(format!(
+                    "ui.displays.{display_id} overlay center coordinates must be finite values between 0 and 1"
+                )));
+            }
             if state
                 .last_region
                 .is_some_and(|region| region.width == 0 || region.height == 0)
@@ -302,6 +324,8 @@ fn resolve_display_ui_state(ui: &UiConfig, display_id: &str) -> DisplayUiState {
     let display = ui.displays.get(display_id);
     let display_region = display.and_then(|state| state.last_region);
     DisplayUiState {
+        overlay_center: display
+            .and_then(|state| state.overlay_center_x.zip(state.overlay_center_y)),
         overlay_position: display
             .and_then(|state| state.overlay_x.zip(state.overlay_y))
             .or_else(|| ui.overlay_x.zip(ui.overlay_y)),
@@ -311,6 +335,43 @@ fn resolve_display_ui_state(ui: &UiConfig, display_id: &str) -> DisplayUiState {
         region: display_region.or(ui.last_region),
         region_is_display_local: display_region.is_some(),
     }
+}
+
+pub fn save_display_overlay_center(
+    display_id: &str,
+    center_x: f64,
+    center_y: f64,
+) -> Result<(), ConfigError> {
+    let path = default_config_path().ok_or(ConfigError::HomeDirectoryUnavailable)?;
+    let source = read_optional_config_source(&path)?;
+    let updated = update_display_overlay_center(&source, display_id, center_x, center_y)?;
+    write_config_source(&path, updated)
+}
+
+fn update_display_overlay_center(
+    source: &str,
+    display_id: &str,
+    center_x: f64,
+    center_y: f64,
+) -> Result<String, ConfigError> {
+    if !center_x.is_finite()
+        || !center_y.is_finite()
+        || !(0.0..=1.0).contains(&center_x)
+        || !(0.0..=1.0).contains(&center_y)
+    {
+        return Err(ConfigError::InvalidValue(
+            "display overlay center coordinates must be finite values between 0 and 1".to_owned(),
+        ));
+    }
+    let mut document = editable_document(source)?;
+    let state = &mut document["ui"]["displays"][display_id];
+    state["overlay_center_x"] = toml_edit::value(center_x);
+    state["overlay_center_y"] = toml_edit::value(center_y);
+    if let Some(table) = state.as_table_like_mut() {
+        table.remove("overlay_x");
+        table.remove("overlay_y");
+    }
+    Ok(document.to_string())
 }
 
 pub fn save_display_overlay_position(display_id: &str, x: i32, y: i32) -> Result<(), ConfigError> {
@@ -639,6 +700,10 @@ pub struct UiConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct DisplayUiConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub overlay_center_x: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overlay_center_y: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub overlay_x: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overlay_y: Option<i32>,
@@ -775,7 +840,7 @@ mod tests {
     fn display_ui_state_is_independent_and_survives_serialization() {
         let source = "# preserve me\n[ui]\nlast_capture_tool = \"full_display\"\noverlay_x = 40\noverlay_y = 50\n";
         let updated =
-            update_display_overlay_position(source, "laptop", 120, 900).expect("laptop toolbar");
+            update_display_overlay_center(source, "laptop", 0.25, 0.75).expect("laptop toolbar");
         let updated = update_display_capture_history(
             &updated,
             "laptop",
@@ -788,7 +853,7 @@ mod tests {
             }),
         )
         .expect("laptop history");
-        let updated = update_display_overlay_position(&updated, "external", 700, 1200)
+        let updated = update_display_overlay_center(&updated, "external", 0.8, 0.2)
             .expect("external toolbar");
         let updated = update_display_capture_history(
             &updated,
@@ -809,7 +874,8 @@ mod tests {
         assert_eq!(
             resolve_display_ui_state(&config.ui, "laptop"),
             DisplayUiState {
-                overlay_position: Some((120, 900)),
+                overlay_center: Some((0.25, 0.75)),
+                overlay_position: Some((40, 50)),
                 tool: Some(CaptureTool::Region),
                 region: Some(CaptureRegion {
                     x: 100,
@@ -823,7 +889,8 @@ mod tests {
         assert_eq!(
             resolve_display_ui_state(&config.ui, "external"),
             DisplayUiState {
-                overlay_position: Some((700, 1200)),
+                overlay_center: Some((0.8, 0.2)),
+                overlay_position: Some((40, 50)),
                 tool: Some(CaptureTool::Window),
                 region: Some(CaptureRegion {
                     x: 300,
@@ -845,6 +912,7 @@ mod tests {
         assert_eq!(
             resolve_display_ui_state(&config.ui, "new-display"),
             DisplayUiState {
+                overlay_center: None,
                 overlay_position: Some((40, 50)),
                 tool: Some(CaptureTool::Region),
                 region: Some(CaptureRegion {
@@ -885,6 +953,32 @@ mod tests {
             config.validate(),
             Err(ConfigError::InvalidValue(_))
         ));
+        config.ui.displays.clear();
+        config.ui.displays.insert(
+            "external".to_owned(),
+            DisplayUiConfig {
+                overlay_center_x: Some(1.5),
+                overlay_center_y: Some(0.5),
+                ..DisplayUiConfig::default()
+            },
+        );
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidValue(_))
+        ));
+    }
+
+    #[test]
+    fn normalized_overlay_update_replaces_display_pixel_coordinates() {
+        let source = "[ui.displays.external]\noverlay_x = 700\noverlay_y = 1200\n";
+        let updated = update_display_overlay_center(source, "external", 0.625, 0.875)
+            .expect("normalized toolbar position");
+        let config: AppConfig = toml::from_str(&updated).expect("updated config reloads");
+        let state = config.ui.displays.get("external").expect("display state");
+        assert_eq!(state.overlay_center_x, Some(0.625));
+        assert_eq!(state.overlay_center_y, Some(0.875));
+        assert_eq!(state.overlay_x, None);
+        assert_eq!(state.overlay_y, None);
     }
 
     #[test]
