@@ -30,24 +30,28 @@ jobs:
         run: cargo build --locked --profile dist --workspace
 
       - name: Assemble portable package
+        id: portable
         shell: pwsh
         run: |
           $version = "${{ github.ref_name }}" -replace '[^A-Za-z0-9._-]', '-'
-          $packageName = "captastic-$version-windows-x86_64"
-          $packageDirectory = Join-Path $PWD "dist/$packageName"
-          New-Item -ItemType Directory -Path $packageDirectory -Force | Out-Null
-          Copy-Item target/dist/captastic.exe $packageDirectory
-          Copy-Item target/dist/captastic-desktop.exe $packageDirectory
-          Copy-Item captastic.example.toml $packageDirectory
-          Copy-Item README.md $packageDirectory
-          Copy-Item LICENSE-MIT $packageDirectory
-          Copy-Item LICENSE-APACHE $packageDirectory
-          Copy-Item scripts/install.ps1 $packageDirectory
-          Copy-Item scripts/uninstall.ps1 $packageDirectory
-          $archive = Join-Path $PWD "dist/$packageName.zip"
-          Compress-Archive -Path $packageDirectory -DestinationPath $archive -Force
-          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
-          "$hash  $packageName.zip" | Set-Content -Encoding ascii "$archive.sha256"
+          $archive = ./scripts/package-windows.ps1 -Version $version
+          "archive=$archive" >> $env:GITHUB_OUTPUT
+
+      - name: Build Chocolatey package
+        shell: pwsh
+        run: |
+          if ("${{ github.ref }}" -like 'refs/tags/v*') {
+            $packageVersion = "${{ github.ref_name }}".TrimStart('v')
+            $sourceUrl = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$(Split-Path -Leaf '${{ steps.portable.outputs.archive }}')"
+          } else {
+            $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+            $packageVersion = "$($metadata.workspace_packages[0].version)-ci.${{ github.run_number }}"
+            $sourceUrl = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          }
+          ./scripts/package-chocolatey.ps1 `
+            -Version $packageVersion `
+            -ArchivePath '${{ steps.portable.outputs.archive }}' `
+            -SourceUrl $sourceUrl
 
       - name: Upload portable package
         uses: actions/upload-artifact@v7
@@ -56,6 +60,7 @@ jobs:
           path: |
             dist/*.zip
             dist/*.sha256
+            dist/*.nupkg
           if-no-files-found: error
           retention-days: 30
 
@@ -67,3 +72,4 @@ jobs:
           files: |
             dist/*.zip
             dist/*.sha256
+            dist/*.nupkg

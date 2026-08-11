@@ -72,8 +72,9 @@ captastic startup disable
 ## Install and release packages
 
 Tagged releases and manually dispatched release workflows produce a
-`captastic-<version>-windows-x86_64.zip` archive plus a SHA-256 checksum. Extract the archive and
-run the current-user installer from PowerShell:
+`captastic-<version>-windows-x86_64.zip` archive, its SHA-256 checksum, and a self-contained
+`captastic.<version>.nupkg` Chocolatey package. Extract the portable archive and run its current-user
+installer from PowerShell:
 
 ```powershell
 .\install.ps1
@@ -85,6 +86,19 @@ The installer copies the CLI and console-free desktop launcher to
 It does not require administrator privileges. Run the installed `uninstall.ps1` to stop Captastic,
 remove login startup and installed files, and preserve `~/.captastic` by default. Pass
 `-RemoveSettings` only when configuration and logs should also be deleted.
+
+After the package has been accepted by the Chocolatey community repository, install and update it
+from an elevated PowerShell prompt with:
+
+```powershell
+choco install captastic
+choco upgrade captastic
+```
+
+The Chocolatey package adds the `captastic` CLI to `PATH` and creates a Start Menu shortcut without
+launching the desktop application during first install. It preserves `~/.captastic` on upgrades and
+uninstall. See [Chocolatey packaging](docs/chocolatey.md) for local package testing, portable-install
+migration behavior, and the manual community publishing procedure.
 
 When `--config` is omitted, the daemon automatically loads
 `%USERPROFILE%\.captastic\captastic.toml` if it exists. The same file stores Captastic-managed UI
