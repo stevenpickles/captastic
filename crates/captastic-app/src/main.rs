@@ -31,6 +31,7 @@ enum DisplayPolicy {
 }
 
 impl DisplayPolicy {
+    #[cfg(windows)]
     fn as_config_value(&self) -> String {
         match self {
             Self::Pointer => "pointer".to_owned(),

@@ -45,7 +45,7 @@ jobs:
             $sourceUrl = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$(Split-Path -Leaf '${{ steps.portable.outputs.archive }}')"
           } else {
             $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
-            $packageVersion = "$($metadata.workspace_packages[0].version)-ci.${{ github.run_number }}"
+            $packageVersion = "$($metadata.packages[0].version)-ci.${{ github.run_number }}"
             $sourceUrl = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           }
           ./scripts/package-chocolatey.ps1 `

@@ -48,7 +48,7 @@ jobs:
         shell: pwsh
         run: |
           $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
-          $version = "$($metadata.workspace_packages[0].version)-ci.${{ github.run_number }}"
+          $version = "$($metadata.packages[0].version)-ci.${{ github.run_number }}"
           $outputDirectory = Join-Path $PWD 'dist/ci'
           $archive = ./scripts/package-windows.ps1 `
             -Version $version `
