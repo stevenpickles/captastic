@@ -90,6 +90,14 @@ pub struct CaptureRegion {
     pub height: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureRegionSource {
+    pub width: u32,
+    pub height: u32,
+    pub rotation_degrees: u16,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CaptureHistory {
     pub tool: Option<CaptureTool>,
@@ -104,6 +112,7 @@ pub struct DisplayUiState {
     pub overlay_position: Option<(i32, i32)>,
     pub tool: Option<CaptureTool>,
     pub region: Option<CaptureRegion>,
+    pub region_source: Option<CaptureRegionSource>,
     /// Per-display regions are monitor-local. A legacy global fallback remains desktop-absolute.
     pub region_is_display_local: bool,
 }
@@ -306,6 +315,23 @@ impl AppConfig {
                     "ui.displays.{display_id}.last_region width and height must be greater than zero"
                 )));
             }
+            if let Some(source) = state.last_region_source {
+                if source.width == 0 || source.height == 0 {
+                    return Err(ConfigError::InvalidValue(format!(
+                        "ui.displays.{display_id}.last_region_source dimensions must be greater than zero"
+                    )));
+                }
+                if !matches!(source.rotation_degrees, 0 | 90 | 180 | 270) {
+                    return Err(ConfigError::InvalidValue(format!(
+                        "ui.displays.{display_id}.last_region_source rotation must be 0, 90, 180, or 270 degrees"
+                    )));
+                }
+                if state.last_region.is_none() {
+                    return Err(ConfigError::InvalidValue(format!(
+                        "ui.displays.{display_id}.last_region_source requires last_region"
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -333,6 +359,7 @@ fn resolve_display_ui_state(ui: &UiConfig, display_id: &str) -> DisplayUiState {
             .and_then(|state| state.last_capture_tool)
             .or(ui.last_capture_tool),
         region: display_region.or(ui.last_region),
+        region_source: display.and_then(|state| state.last_region_source),
         region_is_display_local: display_region.is_some(),
     }
 }
@@ -397,10 +424,11 @@ pub fn save_display_capture_history(
     display_id: &str,
     tool: CaptureTool,
     region: Option<CaptureRegion>,
+    region_source: Option<CaptureRegionSource>,
 ) -> Result<(), ConfigError> {
     let path = default_config_path().ok_or(ConfigError::HomeDirectoryUnavailable)?;
     let source = read_optional_config_source(&path)?;
-    let updated = update_display_capture_history(&source, display_id, tool, region)?;
+    let updated = update_display_capture_history(&source, display_id, tool, region, region_source)?;
     write_config_source(&path, updated)
 }
 
@@ -409,6 +437,7 @@ fn update_display_capture_history(
     display_id: &str,
     tool: CaptureTool,
     region: Option<CaptureRegion>,
+    region_source: Option<CaptureRegionSource>,
 ) -> Result<String, ConfigError> {
     let mut document = editable_document(source)?;
     let state = &mut document["ui"]["displays"][display_id];
@@ -418,6 +447,12 @@ fn update_display_capture_history(
         state["last_region"]["y"] = toml_edit::value(i64::from(region.y));
         state["last_region"]["width"] = toml_edit::value(i64::from(region.width));
         state["last_region"]["height"] = toml_edit::value(i64::from(region.height));
+        if let Some(source) = region_source {
+            state["last_region_source"]["width"] = toml_edit::value(i64::from(source.width));
+            state["last_region_source"]["height"] = toml_edit::value(i64::from(source.height));
+            state["last_region_source"]["rotation_degrees"] =
+                toml_edit::value(i64::from(source.rotation_degrees));
+        }
     }
     Ok(document.to_string())
 }
@@ -711,6 +746,8 @@ pub struct DisplayUiConfig {
     pub last_capture_tool: Option<CaptureTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_region: Option<CaptureRegion>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_region_source: Option<CaptureRegionSource>,
 }
 
 impl Default for LoggingConfig {
@@ -851,6 +888,11 @@ mod tests {
                 width: 960,
                 height: 540,
             }),
+            Some(CaptureRegionSource {
+                width: 1920,
+                height: 1080,
+                rotation_degrees: 0,
+            }),
         )
         .expect("laptop history");
         let updated = update_display_overlay_center(&updated, "external", 0.8, 0.2)
@@ -864,6 +906,11 @@ mod tests {
                 y: 200,
                 width: 1280,
                 height: 720,
+            }),
+            Some(CaptureRegionSource {
+                width: 3840,
+                height: 2160,
+                rotation_degrees: 0,
             }),
         )
         .expect("external history");
@@ -883,6 +930,11 @@ mod tests {
                     width: 960,
                     height: 540,
                 }),
+                region_source: Some(CaptureRegionSource {
+                    width: 1920,
+                    height: 1080,
+                    rotation_degrees: 0,
+                }),
                 region_is_display_local: true,
             }
         );
@@ -897,6 +949,11 @@ mod tests {
                     y: 200,
                     width: 1280,
                     height: 720,
+                }),
+                region_source: Some(CaptureRegionSource {
+                    width: 3840,
+                    height: 2160,
+                    rotation_degrees: 0,
                 }),
                 region_is_display_local: true,
             }
@@ -921,6 +978,7 @@ mod tests {
                     width: 640,
                     height: 360,
                 }),
+                region_source: None,
                 region_is_display_local: false,
             }
         );

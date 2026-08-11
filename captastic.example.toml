@@ -76,3 +76,8 @@ retained_files = 3
 # y = 270
 # width = 960
 # height = 540
+
+# [ui.displays.windows-monitor-0123456789abcdef.last_region_source]
+# width = 1920
+# height = 1080
+# rotation_degrees = 0

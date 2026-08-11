@@ -197,8 +197,10 @@ pub fn select_from_frozen_frame_with_controller(
     let last_region = Some(
         remembered_last_region(
             remembered_ui.region,
+            remembered_ui.region_source,
             remembered_ui.region_is_display_local,
             source,
+            frame.metadata.rotation_degrees,
         )
         .unwrap_or_else(|| default_region_for_source(source)),
     );
@@ -1104,10 +1106,22 @@ fn initial_selection(
 
 fn remembered_last_region(
     region: Option<captastic_config::CaptureRegion>,
+    previous_source: Option<captastic_config::CaptureRegionSource>,
     display_local: bool,
     source: Rect,
+    current_rotation_degrees: u16,
 ) -> Option<Rect> {
     region.map(|region| {
+        if display_local {
+            if let Some(previous_source) = previous_source {
+                return restore_region_for_display_change(
+                    region,
+                    previous_source,
+                    source,
+                    current_rotation_degrees,
+                );
+            }
+        }
         let x = if display_local {
             source.x.saturating_add(region.x)
         } else {
@@ -1130,11 +1144,48 @@ fn remembered_last_region(
     })
 }
 
+fn restore_region_for_display_change(
+    region: captastic_config::CaptureRegion,
+    previous_source: captastic_config::CaptureRegionSource,
+    source: Rect,
+    current_rotation_degrees: u16,
+) -> Rect {
+    let center_x = (f64::from(region.x) + f64::from(region.width) / 2.0)
+        / f64::from(previous_source.width.max(1));
+    let center_y = (f64::from(region.y) + f64::from(region.height) / 2.0)
+        / f64::from(previous_source.height.max(1));
+    let rotation_delta = (u32::from(current_rotation_degrees) + 360
+        - u32::from(previous_source.rotation_degrees))
+        % 360;
+    let (center_x, center_y, width, height) = match rotation_delta {
+        90 => (1.0 - center_y, center_x, region.height, region.width),
+        180 => (1.0 - center_x, 1.0 - center_y, region.width, region.height),
+        270 => (center_y, 1.0 - center_x, region.height, region.width),
+        _ => (center_x, center_y, region.width, region.height),
+    };
+    let width = width.min(source.width);
+    let height = height.min(source.height);
+    let local_x =
+        (center_x.clamp(0.0, 1.0) * f64::from(source.width) - f64::from(width) / 2.0).round();
+    let local_y =
+        (center_y.clamp(0.0, 1.0) * f64::from(source.height) - f64::from(height) / 2.0).round();
+    fit_region_to_source(
+        Rect {
+            x: source.x.saturating_add(local_x as i32),
+            y: source.y.saturating_add(local_y as i32),
+            width,
+            height,
+        },
+        source,
+    )
+}
+
 fn remember_capture_history(
     display_id: &DisplayId,
     source: Rect,
     kind: SelectionKind,
     confirmed_region: Option<Rect>,
+    rotation_degrees: u16,
 ) {
     let tool = CaptureTool::from_selection_kind(kind);
     let persisted_region = confirmed_region.map(|region| captastic_config::CaptureRegion {
@@ -1147,6 +1198,11 @@ fn remember_capture_history(
         &display_id.0,
         tool.to_config(),
         persisted_region,
+        confirmed_region.map(|_| captastic_config::CaptureRegionSource {
+            width: source.width,
+            height: source.height,
+            rotation_degrees,
+        }),
     ) {
         log::warn!(
             "failed to save capture history for display {}: {error}",
@@ -1701,6 +1757,7 @@ fn confirm_and_close(hwnd: HWND, state: &mut OverlayState) {
             state.source,
             kind,
             confirmed_region,
+            state.reference_metadata.rotation_degrees,
         );
         if confirmed_region.is_some() {
             state.last_region = Some(rect);
@@ -4448,8 +4505,10 @@ mod tests {
                     width: 800,
                     height: 600,
                 }),
+                None,
                 true,
                 source,
+                0,
             ),
             Some(Rect {
                 x: -1720,
@@ -4457,6 +4516,72 @@ mod tests {
                 width: 800,
                 height: 600,
             })
+        );
+    }
+
+    #[test]
+    fn saved_region_keeps_pixel_size_and_relative_center_after_resolution_change() {
+        let restored = restore_region_for_display_change(
+            captastic_config::CaptureRegion {
+                x: 560,
+                y: 240,
+                width: 800,
+                height: 600,
+            },
+            captastic_config::CaptureRegionSource {
+                width: 1920,
+                height: 1080,
+                rotation_degrees: 0,
+            },
+            Rect {
+                x: -3840,
+                y: 100,
+                width: 3840,
+                height: 2160,
+            },
+            0,
+        );
+        assert_eq!(
+            restored,
+            Rect {
+                x: -2320,
+                y: 880,
+                width: 800,
+                height: 600,
+            }
+        );
+    }
+
+    #[test]
+    fn saved_region_rotates_its_center_and_dimensions_with_the_display() {
+        let restored = restore_region_for_display_change(
+            captastic_config::CaptureRegion {
+                x: 100,
+                y: 200,
+                width: 400,
+                height: 300,
+            },
+            captastic_config::CaptureRegionSource {
+                width: 1920,
+                height: 1080,
+                rotation_degrees: 0,
+            },
+            Rect {
+                x: 1920,
+                y: -400,
+                width: 1080,
+                height: 1920,
+            },
+            90,
+        );
+        assert_eq!(
+            restored,
+            Rect {
+                x: 2500,
+                y: -300,
+                width: 300,
+                height: 400,
+            }
         );
     }
 
