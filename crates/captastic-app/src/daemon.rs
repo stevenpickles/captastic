@@ -174,48 +174,43 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             let mut next_capture_id = 1_u64;
             let mut recovery: Option<BackendRecovery> = None;
             loop {
-                let command = match command_receiver.recv_timeout(Duration::from_millis(8)) {
-                    Ok(command) => command,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if recovery
-                            .as_ref()
-                            .is_some_and(|state| Instant::now() >= state.next_attempt)
-                        {
-                            match super::create_backend(&backend_name, &display_policy) {
-                                Ok(replacement) => {
-                                    backend = replacement;
-                                    recovery = None;
-                                    log::info!("capture engine recovered and resumed acquisition");
-                                }
-                                Err(error) => {
-                                    let state = recovery
-                                        .as_mut()
-                                        .expect("recovery state exists while retrying");
-                                    state.failed_attempts = state.failed_attempts.saturating_add(1);
-                                    state.next_attempt = Instant::now()
-                                        + recovery_delay(state.failed_attempts);
-                                    crate::logging::warn(format_args!(
-                                        "capture engine reinitialization failed; retrying in {:.0} ms: {error}",
-                                        recovery_delay(state.failed_attempts).as_secs_f64()
-                                            * 1_000.0
-                                    ));
-                                }
-                            }
+                if recovery
+                    .as_ref()
+                    .is_some_and(|state| Instant::now() >= state.next_attempt)
+                {
+                    match super::create_backend(&backend_name, &display_policy) {
+                        Ok(replacement) => {
+                            backend = replacement;
+                            recovery = None;
+                            log::info!("capture engine recovered and is ready for capture");
                         }
-                        if recovery.is_some() {
-                            continue;
-                        }
-                        if let Err(error) = backend.poll() {
+                        Err(error) => {
+                            let state = recovery
+                                .as_mut()
+                                .expect("recovery state exists while retrying");
+                            state.failed_attempts = state.failed_attempts.saturating_add(1);
+                            state.next_attempt =
+                                Instant::now() + recovery_delay(state.failed_attempts);
                             crate::logging::warn(format_args!(
-                                "capture engine refresh failed: {error}"
+                                "capture engine reinitialization failed; retrying in {:.0} ms: {error}",
+                                recovery_delay(state.failed_attempts).as_secs_f64() * 1_000.0
                             ));
-                            if requires_backend_recovery(&error) {
-                                recovery = Some(BackendRecovery::immediate());
-                            }
                         }
-                        continue;
                     }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+
+                let command = if let Some(state) = recovery.as_ref() {
+                    let wait = state.next_attempt.saturating_duration_since(Instant::now());
+                    match command_receiver.recv_timeout(wait) {
+                        Ok(command) => command,
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                } else {
+                    match command_receiver.recv() {
+                        Ok(command) => command,
+                        Err(mpsc::RecvError) => break,
+                    }
                 };
                 match command {
                     CaptureCommand::Trigger(trigger) => {

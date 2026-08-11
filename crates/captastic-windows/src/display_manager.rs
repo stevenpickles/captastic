@@ -133,19 +133,6 @@ impl CaptureBackend for DxgiDisplayManager {
         })?;
         self.sessions[index].backend.capture(request, recorder)
     }
-
-    fn poll(&mut self) -> Result<(), CaptureError> {
-        let mut first_error = None;
-        for session in &mut self.sessions {
-            if let Err(mut error) = session.backend.poll() {
-                error.message = format!("display {}: {}", session.display_id.0, error.message);
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
-        first_error.map_or(Ok(()), Err)
-    }
 }
 
 /// Resolves the pointer once. This function does not poll or retain any input hooks.

@@ -92,8 +92,4 @@ pub trait CaptureBackend {
         request: &CaptureRequest,
         recorder: &mut EventRecorder,
     ) -> Result<CaptureOutcome, CaptureError>;
-
-    fn poll(&mut self) -> Result<(), CaptureError> {
-        Ok(())
-    }
 }

@@ -10,7 +10,7 @@ The current capture path supports:
 - finite `AcquireNextFrame` waits;
 - OS presentation timestamps converted from QueryPerformanceCounter units;
 - rejection of frames presented before the trigger in `fresh` mode;
-- rolling acquisition into a retained GPU texture for immediate `latest` capture;
+- trigger-time acquisition into a retained GPU texture with no idle DXGI polling;
 - frame-age reporting for retained frames;
 - texture-type and non-empty-dimension validation;
 - exactly-once `ReleaseFrame` through an RAII guard;
@@ -30,7 +30,7 @@ The current path deliberately rejects:
 
 ## Resident hotkey path
 
-`captastic daemon` creates the DXGI backend on a dedicated capture thread. While idle, that thread drains Desktop Duplication into a retained GPU texture at a short polling interval. A second Windows thread owns `RegisterHotKey` and a Win32 message loop. The `WM_HOTKEY` branch timestamps immediately, constructs a fixed trigger record, attempts a nonblocking send into a four-entry queue, and returns. Capture and CPU readback occur on the capture thread; native selection and clipboard publication run on their own serialized workers after CPU readiness.
+`captastic daemon` creates the DXGI backend on a dedicated capture thread, then blocks on its command channel while idle. A second Windows thread owns `RegisterHotKey` and a Win32 message loop. The `WM_HOTKEY` branch timestamps immediately, constructs a fixed trigger record, attempts a nonblocking send into a four-entry queue, and returns. For `latest`, the capture thread performs one nonblocking Desktop Duplication drain at trigger time and reuses the retained image when the desktop has not changed; only the first capture may wait up to 100 ms for an initial frame. Capture and CPU readback occur on the capture thread; native selection and clipboard publication run on their own serialized workers after CPU readiness.
 
 The current binding is `Ctrl+Shift+F9` with `MOD_NOREPEAT`. Queue-full events are counted. The foreground prototype supports a maximum-capture limit, self-triggered lifecycle smoke mode, graceful Ctrl+C handling, and per-session `status`/`stop` commands through a named Windows event. Runtime TOML config controls backend, mode, freshness, clipboard/selection behavior, and queue capacities; explicit CLI values take precedence. Per-user configuration and overlay state share `%USERPROFILE%\.captastic\captastic.toml`, which is loaded automatically when `--config` is omitted. Logs remain under `%USERPROFILE%\.captastic\logs`.
 

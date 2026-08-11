@@ -38,6 +38,7 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
+const INITIAL_LATEST_FRAME_TIMEOUT: Duration = Duration::from_millis(100);
 const GPU_MAP_TIMEOUT: Duration = Duration::from_millis(250);
 const GPU_MAP_RETRY_DELAY: Duration = Duration::from_millis(1);
 
@@ -149,7 +150,7 @@ impl DxgiBackend {
         )?;
         let cpu_pool = CpuBufferPool::new(3);
 
-        let mut backend = Self {
+        let backend = Self {
             _com: com,
             device,
             context: Arc::new(Mutex::new(context)),
@@ -169,16 +170,11 @@ impl DxgiBackend {
                 cursor_control: false,
                 hdr: false,
                 presentation_time: true,
-                warm_stream: true,
+                warm_stream: false,
             },
             qpc_frequency,
             _thread_affine: PhantomData,
         };
-        match backend.refresh_latest(100) {
-            Ok(_) => {}
-            Err(error) if error.kind == CaptureErrorKind::Timeout => {}
-            Err(error) => return Err(error),
-        }
         Ok(backend)
     }
 }
@@ -352,14 +348,6 @@ impl CaptureBackend for DxgiBackend {
             });
         }
     }
-
-    fn poll(&mut self) -> Result<(), CaptureError> {
-        match self.refresh_latest(0) {
-            Ok(_) => Ok(()),
-            Err(error) if error.kind == CaptureErrorKind::Timeout => Ok(()),
-            Err(error) => Err(error),
-        }
-    }
 }
 
 impl DxgiBackend {
@@ -369,9 +357,7 @@ impl DxgiBackend {
         max_age_ms: Option<u64>,
         recorder: &mut EventRecorder,
     ) -> Result<CaptureOutcome, CaptureError> {
-        if self.latest.is_none() {
-            self.refresh_latest(100)?;
-        }
+        self.refresh_latest_on_demand()?;
         let latest = self.latest.ok_or_else(|| {
             capture_error(
                 CaptureErrorKind::SourceUnavailable,
@@ -466,6 +452,37 @@ impl DxgiBackend {
             native_frame,
             backend_duration: request.triggered_at.elapsed(),
         })
+    }
+
+    fn refresh_latest_on_demand(&mut self) -> Result<(), CaptureError> {
+        match self.refresh_latest(0) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) if error.kind == CaptureErrorKind::Timeout => {}
+            Err(error) => return Err(error),
+        }
+        if self.latest.is_some() {
+            return Ok(());
+        }
+
+        let deadline = Instant::now() + INITIAL_LATEST_FRAME_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(capture_error(
+                    CaptureErrorKind::Timeout,
+                    "capture_latest",
+                    "no desktop frame was available before the initial capture timeout",
+                    true,
+                    Some(i64::from(DXGI_ERROR_WAIT_TIMEOUT.0)),
+                ));
+            }
+            match self.refresh_latest(duration_to_timeout_ms(remaining)) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     fn refresh_latest(&mut self, timeout_ms: u32) -> Result<bool, CaptureError> {
@@ -1770,6 +1787,10 @@ mod tests {
     #[ignore = "requires an interactive Windows desktop and DXGI duplication access"]
     fn native_gpu_region_matches_the_frozen_cpu_frame() {
         let mut backend = DxgiBackend::new_primary().expect("DXGI backend");
+        assert!(
+            backend.latest.is_none(),
+            "backend initialization must not acquire a desktop frame"
+        );
         let source = backend.selected.bounds;
         let capture_started = Instant::now();
         let outcome = loop {
