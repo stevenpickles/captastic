@@ -134,16 +134,7 @@ impl DxgiBackend {
         let duplication = unsafe { selected_record.output.DuplicateOutput(&device) }
             .map_err(|error| map_windows_error("duplicate_output", error))?;
         let qpc_frequency = query_performance_frequency()?;
-        let initial_desc = staging_desc(
-            selected_record.info.bounds.width,
-            selected_record.info.bounds.height,
-            DXGI_FORMAT_B8G8R8A8_UNORM,
-            DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-        );
-        let staging = Some(StagingTexture::create(&device, initial_desc)?);
+        let staging = None;
         let retained = RetainedTexture::create(
             &device,
             retained_desc(
@@ -156,11 +147,7 @@ impl DxgiBackend {
                 },
             ),
         )?;
-        let cpu_buffer_len = frame_byte_len(
-            selected_record.info.bounds.width,
-            selected_record.info.bounds.height,
-        )?;
-        let cpu_pool = CpuBufferPool::new(3, cpu_buffer_len);
+        let cpu_pool = CpuBufferPool::new(3);
 
         let mut backend = Self {
             _com: com,
@@ -610,8 +597,12 @@ impl DxgiBackend {
         let tight_stride_usize = tight_stride as usize;
         let source_stride = mapped.data.RowPitch as usize;
         {
-            let pixels = Arc::get_mut(&mut self.cpu_pool.slots[slot_index])
-                .expect("available slot has exactly one owner");
+            let pixels = Arc::get_mut(
+                self.cpu_pool.slots[slot_index]
+                    .as_mut()
+                    .expect("available slot is initialized"),
+            )
+            .expect("available slot has exactly one owner");
             if source_stride == tight_stride_usize {
                 // SAFETY: Equal source/destination strides make the complete mapped texture one
                 // contiguous initialized byte range valid until the matching Unmap.
@@ -635,7 +626,10 @@ impl DxgiBackend {
             }
         }
         drop(mapped);
-        let pixels = self.cpu_pool.slots[slot_index].clone();
+        let pixels = self.cpu_pool.slots[slot_index]
+            .as_ref()
+            .expect("available slot is initialized")
+            .clone();
         let cpu_ready_ns = duration_ns_u64(triggered_at.elapsed());
         metadata.cpu_ready_offset_ns = Some(cpu_ready_ns);
         metadata.copy_count = metadata.copy_count.saturating_add(2);
@@ -685,8 +679,7 @@ impl DxgiBackend {
                     source_desc.SampleDesc,
                 ),
             )?);
-            self.cpu_pool =
-                CpuBufferPool::new(3, frame_byte_len(source_desc.Width, source_desc.Height)?);
+            self.cpu_pool = CpuBufferPool::new(3);
         }
         Ok(self
             .staging
@@ -1016,26 +1009,31 @@ impl StagingTexture {
 }
 
 struct CpuBufferPool {
-    slots: Vec<Arc<[u8]>>,
+    slots: Vec<Option<Arc<[u8]>>>,
     cursor: usize,
 }
 
 impl CpuBufferPool {
-    fn new(slot_count: usize, bytes_per_slot: usize) -> Self {
-        let slots = (0..slot_count)
-            .map(|_| Arc::from(vec![0_u8; bytes_per_slot]))
-            .collect();
+    fn new(slot_count: usize) -> Self {
+        let slots = vec![None; slot_count];
         Self { slots, cursor: 0 }
     }
 
     fn available_index(&mut self, required_len: usize) -> Option<usize> {
         for offset in 0..self.slots.len() {
             let index = (self.cursor + offset) % self.slots.len();
-            if self.slots[index].len() == required_len && Arc::strong_count(&self.slots[index]) == 1
-            {
-                self.cursor = (index + 1) % self.slots.len();
-                return Some(index);
+            match self.slots[index].as_ref() {
+                None => self.slots[index] = Some(Arc::from(vec![0_u8; required_len])),
+                Some(slot) if Arc::strong_count(slot) == 1 && slot.len() != required_len => {
+                    self.slots[index] = Some(Arc::from(vec![0_u8; required_len]));
+                }
+                Some(slot) if Arc::strong_count(slot) != 1 || slot.len() != required_len => {
+                    continue;
+                }
+                Some(_) => {}
             }
+            self.cursor = (index + 1) % self.slots.len();
+            return Some(index);
         }
         None
     }
@@ -1699,13 +1697,22 @@ mod tests {
 
     #[test]
     fn cpu_pool_does_not_reuse_a_leased_slot() {
-        let mut pool = CpuBufferPool::new(2, 16);
+        let mut pool = CpuBufferPool::new(2);
         let first = pool.available_index(16).expect("first slot");
-        let lease = pool.slots[first].clone();
+        let lease = pool.slots[first].as_ref().expect("initialized").clone();
         let second = pool.available_index(16).expect("second slot");
         assert_ne!(first, second);
         drop(lease);
         assert!(pool.available_index(16).is_some());
+    }
+
+    #[test]
+    fn cpu_pool_allocates_slots_only_when_requested() {
+        let mut pool = CpuBufferPool::new(3);
+        assert!(pool.slots.iter().all(Option::is_none));
+        let first = pool.available_index(64).expect("first slot");
+        assert_eq!(pool.slots[first].as_ref().map(|slot| slot.len()), Some(64));
+        assert_eq!(pool.slots.iter().flatten().count(), 1);
     }
 
     #[test]
