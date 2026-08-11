@@ -6,8 +6,8 @@ use std::thread;
 use std::time::Instant;
 
 use captastic_core::{
-    CaptureError, CaptureErrorKind, CpuFrame, DisplayId, FrameMetadata, FrameOrigin, PixelFormat,
-    Rect,
+    CaptureError, CaptureErrorKind, CpuFrame, DisplayId, DisplayInfo, FrameMetadata, FrameOrigin,
+    PixelFormat, Rect,
 };
 use windows::core::{w, Error as WindowsError, PCWSTR};
 use windows::Win32::Foundation::{
@@ -20,12 +20,13 @@ use windows::Win32::Graphics::Gdi::{
     AddFontMemResourceEx, AlphaBlend, BeginPaint, BitBlt, CreateBitmap, CreateCompatibleDC,
     CreateDIBSection, CreateFontW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW,
     Ellipse, EndPaint, FillRect, GetMonitorInfoW, GetStockObject, GetTextExtentPoint32W,
-    InvalidateRect, LineTo, MonitorFromRect, MoveToEx, Rectangle, RemoveFontMemResourceEx,
-    RoundRect, SelectObject, SetBkMode, SetStretchBltMode, SetTextColor, StretchBlt, UpdateWindow,
-    AC_SRC_ALPHA, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, CLEARTYPE_QUALITY,
-    DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
-    DT_VCENTER, FW_MEDIUM, HALFTONE, HBITMAP, HDC, HFONT, HGDIOBJ, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST, NULL_BRUSH, PAINTSTRUCT, PS_SOLID, RGBQUAD, SRCCOPY, TRANSPARENT,
+    InvalidateRect, LineTo, MonitorFromRect, MonitorFromWindow, MoveToEx, Rectangle,
+    RemoveFontMemResourceEx, RoundRect, SelectObject, SetBkMode, SetStretchBltMode, SetTextColor,
+    StretchBlt, UpdateWindow, AC_SRC_ALPHA, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
+    CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CENTER, DT_LEFT,
+    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_MEDIUM, HALFTONE, HBITMAP, HDC, HFONT, HGDIOBJ,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL, NULL_BRUSH, PAINTSTRUCT,
+    PS_SOLID, RGBQUAD, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
@@ -1976,11 +1977,59 @@ fn ensure_window_mode_assets(state: &mut OverlayState) {
         return;
     }
     if state.windows.is_none() {
-        state.windows = Some(enumerate_visible_windows(state.source).unwrap_or_default());
+        let displays = match crate::dxgi::enumerate_displays() {
+            Ok(displays)
+                if displays
+                    .iter()
+                    .any(|display| display.id == state.reference_metadata.display_id) =>
+            {
+                displays
+            }
+            Ok(_) => {
+                log::warn!(
+                    "captured display {} is absent from the window-mode topology snapshot; using captured bounds only",
+                    state.reference_metadata.display_id.0
+                );
+                vec![fallback_display_info(state)]
+            }
+            Err(error) => {
+                log::warn!(
+                    "window-mode display discovery failed: {error}; using captured bounds only"
+                );
+                vec![fallback_display_info(state)]
+            }
+        };
+        state.windows = Some(
+            match enumerate_visible_windows(
+                state.source,
+                &state.reference_metadata.display_id,
+                displays,
+            ) {
+                Ok(windows) => windows,
+                Err(error) => {
+                    log::warn!(
+                        "window-mode enumeration failed for display {}: {error}",
+                        state.reference_metadata.display_id.0
+                    );
+                    Vec::new()
+                }
+            },
+        );
     }
     let reusable = state.cached_blurred_background.take();
     state.blurred_background = build_blurred_background(&state.surface, 24, reusable).ok();
     state.window_assets_ready = true;
+}
+
+fn fallback_display_info(state: &OverlayState) -> DisplayInfo {
+    DisplayInfo {
+        id: state.reference_metadata.display_id.clone(),
+        name: state.reference_metadata.display_id.0.clone(),
+        bounds: state.source,
+        scale_factor: state.display_environment.metrics.dpi as f32 / UiMetrics::BASE_DPI as f32,
+        rotation_degrees: state.reference_metadata.rotation_degrees,
+        is_primary: false,
+    }
 }
 
 fn build_window_overview(state: &mut OverlayState) {
@@ -3447,9 +3496,15 @@ const fn rgb(red: u8, green: u8, blue: u8) -> COLORREF {
     COLORREF((red as u32) | ((green as u32) << 8) | ((blue as u32) << 16))
 }
 
-fn enumerate_visible_windows(source: Rect) -> Result<Vec<WindowCandidate>, CaptureError> {
+fn enumerate_visible_windows(
+    source: Rect,
+    target_display_id: &DisplayId,
+    displays: Vec<DisplayInfo>,
+) -> Result<Vec<WindowCandidate>, CaptureError> {
     let mut collector = WindowCollector {
         source,
+        target_display_id: target_display_id.clone(),
+        displays,
         windows: Vec::with_capacity(32),
         callback_failed: false,
     };
@@ -3476,6 +3531,8 @@ fn enumerate_visible_windows(source: Rect) -> Result<Vec<WindowCandidate>, Captu
 
 struct WindowCollector {
     source: Rect,
+    target_display_id: DisplayId,
+    displays: Vec<DisplayInfo>,
     windows: Vec<WindowCandidate>,
     callback_failed: bool,
 }
@@ -3521,7 +3578,16 @@ fn collect_window(hwnd: HWND, collector: &mut WindowCollector) {
     if unsafe { GetWindowRect(hwnd, &mut native) }.is_err() {
         return;
     }
-    if rect_from_native(native).is_some() {
+    if let Some(window_bounds) = rect_from_native(native) {
+        let native_display_id = native_window_display_id(hwnd, &collector.displays);
+        if owning_display_id(
+            window_bounds,
+            native_display_id.as_ref(),
+            &collector.displays,
+        ) != Some(&collector.target_display_id)
+        {
+            return;
+        }
         let Some(visible_bounds) = intersect_with_source(native, collector.source) else {
             return;
         };
@@ -3531,6 +3597,57 @@ fn collect_window(hwnd: HWND, collector: &mut WindowCollector) {
             });
         }
     }
+}
+
+fn owning_display_id<'a>(
+    window_bounds: Rect,
+    native_display_id: Option<&DisplayId>,
+    displays: &'a [DisplayInfo],
+) -> Option<&'a DisplayId> {
+    let mut candidates: Vec<(&DisplayInfo, u64)> = displays
+        .iter()
+        .filter_map(|display| {
+            display
+                .bounds
+                .intersection(window_bounds)
+                .map(|intersection| (display, intersection.area()))
+        })
+        .collect();
+    let maximum_area = candidates.iter().map(|(_, area)| *area).max()?;
+    candidates.retain(|(_, area)| *area == maximum_area);
+    if let Some(native_display_id) = native_display_id {
+        if let Some((display, _)) = candidates
+            .iter()
+            .find(|(display, _)| display.id == *native_display_id)
+        {
+            return Some(&display.id);
+        }
+    }
+    candidates
+        .into_iter()
+        .min_by(|(left, _), (right, _)| left.id.0.cmp(&right.id.0))
+        .map(|(display, _)| &display.id)
+}
+
+fn native_window_display_id(hwnd: HWND, displays: &[DisplayInfo]) -> Option<DisplayId> {
+    // SAFETY: hwnd is the live top-level window currently supplied by EnumWindows.
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL) };
+    if monitor.0 == 0 {
+        return None;
+    }
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..MONITORINFO::default()
+    };
+    // SAFETY: info has the required size and is writable for this synchronous monitor query.
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return None;
+    }
+    let bounds = rect_from_native(info.rcMonitor)?;
+    displays
+        .iter()
+        .find(|display| display.bounds == bounds)
+        .map(|display| display.id.clone())
 }
 
 fn is_cloaked_window(hwnd: HWND) -> bool {
@@ -4632,6 +4749,71 @@ mod tests {
             WS_EX_TOOLWINDOW.0 | WS_EX_APPWINDOW.0
         ));
         assert!(window_styles_allow_task_switcher(0));
+    }
+
+    #[test]
+    fn spanning_window_belongs_only_to_the_display_with_most_visible_area() {
+        let displays = ownership_test_displays();
+        let bounds = Rect {
+            x: 1500,
+            y: 100,
+            width: 1800,
+            height: 900,
+        };
+        assert_eq!(
+            owning_display_id(bounds, Some(&displays[0].id), &displays),
+            Some(&displays[1].id)
+        );
+    }
+
+    #[test]
+    fn exact_window_ownership_tie_prefers_native_monitor_then_stable_id() {
+        let displays = ownership_test_displays();
+        let bounds = Rect {
+            x: 1720,
+            y: 100,
+            width: 400,
+            height: 800,
+        };
+        assert_eq!(
+            owning_display_id(bounds, Some(&displays[1].id), &displays),
+            Some(&displays[1].id)
+        );
+        assert_eq!(
+            owning_display_id(bounds, None, &displays),
+            Some(&displays[0].id)
+        );
+    }
+
+    fn ownership_test_displays() -> Vec<DisplayInfo> {
+        vec![
+            DisplayInfo {
+                id: DisplayId("display-a".to_owned()),
+                name: "Laptop".to_owned(),
+                bounds: Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+                scale_factor: 1.0,
+                rotation_degrees: 0,
+                is_primary: true,
+            },
+            DisplayInfo {
+                id: DisplayId("display-b".to_owned()),
+                name: "External".to_owned(),
+                bounds: Rect {
+                    x: 1920,
+                    y: 0,
+                    width: 2560,
+                    height: 1440,
+                },
+                scale_factor: 1.5,
+                rotation_degrees: 0,
+                is_primary: false,
+            },
+        ]
     }
 
     #[test]
