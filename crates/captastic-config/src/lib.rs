@@ -10,6 +10,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -18,6 +19,8 @@ pub const CONFIG_SCHEMA_VERSION: u32 = 1;
 pub const CONFIG_FILE_NAME: &str = "captastic.toml";
 
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const TEMP_ARTIFACT_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const CORRUPT_ARTIFACT_RETENTION: usize = 5;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[repr(u8)]
@@ -512,6 +515,7 @@ impl AppConfig {
     }
 
     fn load_recovering(path: &Path) -> Result<(Self, Option<ConfigRecovery>), ConfigError> {
+        maintain_config_artifacts(path, None);
         let bytes = match fs::read(path) {
             Ok(bytes) => bytes,
             Err(source) if source.kind() == ErrorKind::NotFound => {
@@ -967,6 +971,7 @@ fn preserve_existing_permissions(_path: &Path, _temporary_path: &Path) -> std::i
 }
 
 fn create_temporary_file(path: &Path) -> std::io::Result<(PathBuf, File)> {
+    maintain_config_artifacts(path, None);
     let parent = usable_parent(path);
     let file_name = path.file_name().ok_or_else(|| {
         std::io::Error::new(
@@ -1020,7 +1025,10 @@ where
             continue;
         }
         match move_source(path, &quarantine_path) {
-            Ok(()) => return Ok(Some(quarantine_path)),
+            Ok(()) => {
+                maintain_config_artifacts(path, Some(&quarantine_path));
+                return Ok(Some(quarantine_path));
+            }
             Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
@@ -1030,6 +1038,57 @@ where
         ErrorKind::AlreadyExists,
         "unable to allocate a unique corrupt-configuration path",
     ))
+}
+
+fn maintain_config_artifacts(path: &Path, protected: Option<&Path>) {
+    maintain_config_artifacts_at(path, protected, SystemTime::now());
+}
+
+fn maintain_config_artifacts_at(path: &Path, protected: Option<&Path>, now: SystemTime) {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let temporary_prefix = format!(".{file_name}.tmp-");
+    let corrupt_prefix = format!("{file_name}.corrupt-");
+    let Ok(entries) = fs::read_dir(usable_parent(path)) else {
+        return;
+    };
+    let mut corrupt = Vec::new();
+    for entry in entries.flatten() {
+        let artifact_path = entry.path();
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if name.starts_with(&temporary_prefix) {
+            let stale = metadata
+                .modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age >= TEMP_ARTIFACT_MAX_AGE);
+            if stale && protected != Some(artifact_path.as_path()) {
+                let _ = fs::remove_file(artifact_path);
+            }
+        } else if name.starts_with(&corrupt_prefix) {
+            corrupt.push((
+                protected == Some(artifact_path.as_path()),
+                metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                artifact_path,
+            ));
+        }
+    }
+    corrupt.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| right.2.cmp(&left.2))
+    });
+    for (_, _, artifact_path) in corrupt.into_iter().skip(CORRUPT_ARTIFACT_RETENTION) {
+        let _ = fs::remove_file(artifact_path);
+    }
 }
 
 fn usable_parent(path: &Path) -> &Path {
@@ -1831,6 +1890,85 @@ mod tests {
                 .expect("read test directory")
                 .count(),
             0
+        );
+    }
+
+    #[test]
+    fn artifact_maintenance_removes_stale_temps_and_bounds_corrupt_backups() {
+        let directory = TestDirectory::new("artifact-retention");
+        let path = directory.join(CONFIG_FILE_NAME);
+        let first_temp = directory.0.join(format!(".{CONFIG_FILE_NAME}.tmp-first"));
+        let second_temp = directory.0.join(format!(".{CONFIG_FILE_NAME}.tmp-second"));
+        fs::write(&first_temp, "first").expect("write first temporary artifact");
+        fs::write(&second_temp, "second").expect("write second temporary artifact");
+        let baseline = SystemTime::now();
+
+        maintain_config_artifacts_at(
+            &path,
+            None,
+            baseline + TEMP_ARTIFACT_MAX_AGE - Duration::from_secs(1),
+        );
+        assert!(first_temp.exists());
+        assert!(second_temp.exists());
+
+        for sequence in 0..=CORRUPT_ARTIFACT_RETENTION {
+            fs::write(
+                directory
+                    .0
+                    .join(format!("{CONFIG_FILE_NAME}.corrupt-test-{sequence}")),
+                "damaged",
+            )
+            .expect("write corrupt artifact");
+        }
+        maintain_config_artifacts_at(
+            &path,
+            None,
+            baseline + TEMP_ARTIFACT_MAX_AGE + Duration::from_secs(1),
+        );
+
+        assert!(!first_temp.exists());
+        assert!(!second_temp.exists());
+        assert_eq!(
+            fs::read_dir(&directory.0)
+                .expect("read retained artifacts")
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(&format!("{CONFIG_FILE_NAME}.corrupt-"))
+                })
+                .count(),
+            CORRUPT_ARTIFACT_RETENTION
+        );
+    }
+
+    #[test]
+    fn artifact_maintenance_never_deletes_the_new_quarantine() {
+        let directory = TestDirectory::new("artifact-protected");
+        let path = directory.join(CONFIG_FILE_NAME);
+        let protected = directory
+            .0
+            .join(format!("{CONFIG_FILE_NAME}.corrupt-protected"));
+        fs::write(&protected, "new damage").expect("write protected quarantine");
+        for sequence in 0..CORRUPT_ARTIFACT_RETENTION {
+            fs::write(
+                directory
+                    .0
+                    .join(format!("{CONFIG_FILE_NAME}.corrupt-old-{sequence}")),
+                "old damage",
+            )
+            .expect("write old quarantine");
+        }
+
+        maintain_config_artifacts_at(&path, Some(&protected), SystemTime::now());
+
+        assert!(protected.exists());
+        assert_eq!(
+            fs::read_dir(&directory.0)
+                .expect("read protected artifacts")
+                .count(),
+            CORRUPT_ARTIFACT_RETENTION
         );
     }
 

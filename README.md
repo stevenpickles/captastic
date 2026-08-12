@@ -119,6 +119,8 @@ is renamed beside the original with a `.corrupt-*` suffix, Captastic starts from
 and the notification area reports the recovery. Well-formed files with unknown keys, wrong types,
 or values that fail validation remain in place and fail startup so operator mistakes are not
 silently discarded. An explicit `--config <path>` is always strict and is never quarantined.
+Captastic retains the five newest corrupt backups and removes abandoned atomic-write `.tmp-*`
+siblings after seven days, preventing recovery artifacts from growing without bound.
 
 When the daemon is started with `--config <path>`, that path is also the sole destination for tray
 Open Config and managed UI-state updates; the default profile is not read or written. The daemon
