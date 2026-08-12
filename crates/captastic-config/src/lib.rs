@@ -1139,9 +1139,11 @@ mod windows_file_move {
 
     use windows::core::PCWSTR;
     use windows::Win32::Storage::FileSystem::{
-        GetFileAttributesW, MoveFileExW, SetFileAttributesW, FILE_ATTRIBUTE_READONLY,
-        FILE_FLAGS_AND_ATTRIBUTES, INVALID_FILE_ATTRIBUTES, MOVEFILE_REPLACE_EXISTING,
-        MOVEFILE_WRITE_THROUGH,
+        GetFileAttributesW, MoveFileExW, SetFileAttributesW, FILE_ATTRIBUTE_ARCHIVE,
+        FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_NOT_CONTENT_INDEXED,
+        FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_SYSTEM,
+        FILE_ATTRIBUTE_TEMPORARY, FILE_FLAGS_AND_ATTRIBUTES, INVALID_FILE_ATTRIBUTES,
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
 
     const SHARING_VIOLATION: i32 = 32;
@@ -1219,9 +1221,26 @@ mod windows_file_move {
     }
 
     fn set_attributes(path: &[u16], attributes: FILE_FLAGS_AND_ATTRIBUTES) -> io::Result<()> {
+        let attributes = settable_attributes(attributes);
         // SAFETY: path is a live, NUL-terminated UTF-16 buffer and attributes came from Windows.
         unsafe { SetFileAttributesW(PCWSTR(path.as_ptr()), attributes) }
             .map_err(|_| io::Error::last_os_error())
+    }
+
+    fn settable_attributes(attributes: FILE_FLAGS_AND_ATTRIBUTES) -> FILE_FLAGS_AND_ATTRIBUTES {
+        let supported = FILE_ATTRIBUTE_ARCHIVE.0
+            | FILE_ATTRIBUTE_HIDDEN.0
+            | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED.0
+            | FILE_ATTRIBUTE_OFFLINE.0
+            | FILE_ATTRIBUTE_READONLY.0
+            | FILE_ATTRIBUTE_SYSTEM.0
+            | FILE_ATTRIBUTE_TEMPORARY.0;
+        let filtered = attributes.0 & supported;
+        if filtered == 0 {
+            FILE_ATTRIBUTE_NORMAL
+        } else {
+            FILE_FLAGS_AND_ATTRIBUTES(filtered)
+        }
     }
 
     #[cfg(test)]
@@ -1236,6 +1255,11 @@ mod windows_file_move {
     #[cfg(test)]
     pub(super) fn set_file_attributes(path: &Path, attributes: u32) -> io::Result<()> {
         set_attributes(&wide_path(path)?, FILE_FLAGS_AND_ATTRIBUTES(attributes))
+    }
+
+    #[cfg(test)]
+    pub(super) fn filtered_file_attributes(attributes: u32) -> u32 {
+        settable_attributes(FILE_FLAGS_AND_ATTRIBUTES(attributes)).0
     }
 
     fn wide_path(path: &Path) -> io::Result<Vec<u16>> {
@@ -1771,6 +1795,24 @@ mod tests {
             "after"
         );
         windows_file_move::set_file_attributes(&path, NORMAL).expect("make test file removable");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_replace_filters_filesystem_controlled_windows_attributes() {
+        const READONLY: u32 = 0x1;
+        const HIDDEN: u32 = 0x2;
+        const COMPRESSED: u32 = 0x800;
+        const ENCRYPTED: u32 = 0x4000;
+        const SPARSE_FILE: u32 = 0x200;
+        const REPARSE_POINT: u32 = 0x400;
+
+        assert_eq!(
+            windows_file_move::filtered_file_attributes(
+                READONLY | HIDDEN | COMPRESSED | ENCRYPTED | SPARSE_FILE | REPARSE_POINT
+            ),
+            READONLY | HIDDEN
+        );
     }
 
     #[test]
