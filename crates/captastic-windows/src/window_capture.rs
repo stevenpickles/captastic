@@ -355,7 +355,7 @@ fn capture_window_with_wgc(
         .min(raw.width / 4)
         .min(raw.height / 4);
     let content_bounds = inset_rect(source_bounds, border_thickness).unwrap_or(source_bounds);
-    let content = crop_bgra(&raw.pixels, source_bounds, content_bounds)?;
+    let content = normalize_wgc_content(crop_bgra(&raw.pixels, source_bounds, content_bounds)?);
     let (pixels, content_width, content_height, radius_scale) = if let Some(max_pixels) = max_pixels
     {
         let (width, height) =
@@ -399,8 +399,6 @@ fn capture_window_with_wgc(
     let inner_corner_radius =
         (window_corner_radius(hwnd) - border_thickness as f32).max(0.0) * radius_scale;
     let border_width = scaled_border_width(border_thickness, radius_scale);
-    let mut pixels = pixels;
-    unpremultiply_bgra(&mut pixels);
     let (pixels, output_width, output_height) = add_clean_window_border(
         pixels,
         content_width,
@@ -449,6 +447,14 @@ fn capture_window_with_wgc(
         frame,
         corner_radius_px,
     })
+}
+
+fn normalize_wgc_content(mut pixels: Vec<u8>) -> Vec<u8> {
+    // WGC publishes premultiplied BGRA. Convert before any GDI scaling because StretchBlt does
+    // not preserve alpha; waiting until after the blit would interpret every pixel as transparent
+    // and erase its RGB channels.
+    unpremultiply_bgra(&mut pixels);
+    pixels
 }
 
 pub(crate) fn scaled_dimensions(width: u32, height: u32, max_pixels: u64) -> (u32, u32) {
@@ -1166,9 +1172,15 @@ mod tests {
 
     #[test]
     fn wgc_colors_are_unpremultiplied_before_straight_alpha_publication() {
-        let mut pixels = vec![25, 50, 100, 128, 9, 8, 7, 0, 10, 20, 30, 255];
-        unpremultiply_bgra(&mut pixels);
+        let pixels = normalize_wgc_content(vec![25, 50, 100, 128, 9, 8, 7, 0, 10, 20, 30, 255]);
         assert_eq!(pixels, [50, 100, 199, 128, 0, 0, 0, 0, 10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn normalized_wgc_rgb_survives_a_scaler_that_discards_alpha() {
+        let mut pixels = normalize_wgc_content(vec![25, 50, 100, 128]);
+        pixels[3] = 0;
+        assert_eq!(&pixels[..3], &[50, 100, 199]);
     }
 
     #[test]
