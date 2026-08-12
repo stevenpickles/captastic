@@ -27,8 +27,18 @@ important for a future public release, but it does not gate the capture mileston
 - Clipboard publication, transparent native-window output, and persistent workflow state.
 - Notification-area controls, launch-at-login management, installation, upgrade, and uninstall.
 - Structured logging, bounded workers, CI, HTML coverage, and portable release packaging.
+- Configured, primary, and pointer-targeted multi-monitor capture with persistent per-display UI
+  state, physical-pixel coordinates, effective-DPI scaling, and bounded topology recovery.
+- Configurable action hotkeys for remembered, Region, Window, full-display, and repeat-last-region
+  workflows, including validated per-display confirmed-region state.
+- Programmatic Windows Graphics Capture fallback for windows rejected by `PrintWindow`, with bounded
+  worker isolation and GPU readback.
 
 ## Milestone 1 — Multi-monitor and topology support
+
+**Status:** In progress. Configured/primary/pointer policies, persistent display identity,
+per-display workflow state, mixed-DPI overlay placement, and topology-triggered backend recovery are
+complete. Rotated-output normalization and virtual-desktop composition remain.
 
 **Outcome:** Captastic behaves predictably across workstation display layouts and can capture the
 display the user intends without initializing a capture engine after the hotkey is pressed.
@@ -86,6 +96,9 @@ display the user intends without initializing a capture engine after the hotkey 
 
 ## Milestone 2 — Configurable and direct hotkeys
 
+**Status:** Complete. The canonical action map, atomic registration, direct full-display capture,
+validated repeat-last-region path, bounded fallback, and structured action logging shipped in PR #7.
+
 **Outcome:** Frequent workflows can bypass unnecessary overlay interaction while retaining the warm
 capture path and explicit failure behavior.
 
@@ -113,6 +126,11 @@ capture path and explicit failure behavior.
 - Direct full-display and last-region capture preserve the existing clipboard and latency boundaries.
 
 ## Milestone 3 — Windows Graphics Capture for windows
+
+**Status:** Functional baseline complete. Captastic already falls back from `PrintWindow` to
+programmatic WGC with bounded frame wait, D3D11 staging readback, and no occluded-desktop fallback.
+Retained-session optimization and richer backend/fallback metrics remain quality follow-ups rather
+than blockers for the next display milestone.
 
 **Outcome:** Window mode captures GPU-rendered and modern applications that do not render reliably
 through `PrintWindow`.
@@ -261,23 +279,23 @@ Authenticode is deliberately not on the near-term critical path. Until signing i
 
 ## Recommended implementation order
 
-1. Multi-monitor capture and topology recovery.
-2. Configurable direct hotkeys, especially repeat-last-region.
-3. WGC window capture with bounded `PrintWindow` fallback.
-4. Asynchronous file output and capture history.
-5. Capture-quality completeness and performance evidence.
-6. Annotation/pinning or cross-platform work, based on audience demand.
+1. Finish rotated-output normalization and virtual-desktop composition.
+2. Complete WGC retention/provenance follow-ups.
+3. Add asynchronous file output and capture history.
+4. Build capture-quality completeness and performance evidence.
+5. Add annotation/pinning or cross-platform work, based on audience demand.
 
 ## Recommended next branch
 
-Use `feature/4/multi-monitor-capture` and deliver it in vertical slices:
+Use `feature/8/normalize-rotated-displays` and normalize rotated single-display outputs before
+starting virtual-desktop composition:
 
-1. Make the configured display ID reach backend construction and persist per-display UI state.
-2. Add pointer-display selection without moving initialization into the hotkey path.
-3. Add topology generation/recovery and display-removal behavior.
-4. Normalize rotated single-display outputs.
-5. Add virtual-desktop bounds and same-adapter composition.
-6. Expand virtual-desktop behavior to explicitly supported multi-adapter and mixed-mode layouts.
-
-The first slice should stop after configured and pointer display selection work reliably; virtual
-desktop composition should not delay that immediately useful improvement.
+1. Define and test raw-texture to top-left BGRA transforms for 0, 90, 180, and 270 degrees.
+2. Apply the transform directly into pooled CPU readback buffers without adding an intermediate
+   full-frame allocation.
+3. Map normalized region coordinates back into raw DXGI texture coordinates, then normalize the
+   copied GPU region before publication.
+4. Verify negative desktop origins, per-display saved regions, direct hotkeys, and dimension
+   metadata remain in normalized physical pixels.
+5. Follow with same-adapter virtual-desktop bounds and composition, then explicitly support or reject
+   multi-adapter and mixed-mode layouts.
