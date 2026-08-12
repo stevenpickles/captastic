@@ -2,7 +2,7 @@
 
 Captastic is a Windows-first Rust prototype for measuring extremely fast screenshot capture and providing a native selection-to-clipboard workflow.
 
-The DXGI backend supports two deliberately different modes. `latest` is the resident-daemon default: when a capture is triggered, it drains any immediately available desktop frame and otherwise reuses the last retained image, so the daemon performs no DXGI acquisition while idle. Only the first capture may wait briefly when no retained image exists yet. `fresh` waits for a desktop frame presented after the trigger and is intended for controlled latency experiments. Both modes report frame age/timing provenance, and BGRA8 CPU readback uses preallocated staging and CPU buffers. By default, the resident daemon opens a native frozen-frame overlay after capture. Its floating toolbar provides full-display, window, and resizable-region modes, an Options menu, and a Capture button. Results are published to the Windows clipboard as uncompressed DIBV5 images plus a registered PNG compatibility representation. Region selections crop the frozen desktop and automatically restore the last adjusted rectangle; window selections retain the native window identity and render that window independently so other windows covering it are not copied.
+The DXGI backend supports two deliberately different modes. `latest` is the resident-daemon default: when a capture is triggered, it drains any immediately available desktop frame and otherwise reuses the last retained image, so the daemon performs no DXGI acquisition while idle. Only the first capture may wait briefly when no retained image exists yet. `fresh` waits for a desktop frame presented after the trigger and is intended for controlled latency experiments. Both modes report frame age/timing provenance, and BGRA8 CPU readback uses preallocated staging and CPU buffers. By default, the resident daemon opens a native frozen-frame overlay after capture. Its floating toolbar provides full-display, window, and resizable-region modes, an Options menu, and a Capture button. Results are published to the Windows clipboard as uncompressed DIBV5 images; straight-alpha window captures also include a registered PNG compatibility representation. Region selections crop the frozen desktop and automatically restore the last adjusted rectangle; window selections retain the native window identity and render that window independently so other windows covering it are not copied.
 
 ## Build and verify
 
@@ -16,7 +16,7 @@ cargo run -p captastic-app -- benchmark --backend fake --iterations 500 --json
 ## Continuous integration
 
 GitHub Actions checks formatting, rejects compiler and Clippy warnings, runs the workspace tests,
-and performs release builds on Windows and Ubuntu. A separate Windows job instruments the workspace
+and performs distribution builds on Windows, Ubuntu, and macOS. A separate Windows job instruments the workspace
 with LLVM source coverage and uploads a browsable `captastic-coverage-html` artifact. Download that
 artifact from the workflow run and open `index.html` to inspect line, function, and region coverage.
 Interactive desktop and clipboard tests remain ignored in hosted CI because they require a live user session.
@@ -77,9 +77,14 @@ Tagged releases and manually dispatched release workflows produce a
 installer from PowerShell:
 
 ```powershell
+Unblock-File .\captastic-<version>-windows-x86_64.zip
+# Extract the archive after unblocking it, then run:
 .\install.ps1
 .\install.ps1 -StartWithWindows
 ```
+
+If the archive was extracted before it was unblocked, run
+`Get-ChildItem -Recurse | Unblock-File` inside the extracted directory before launching the scripts.
 
 The installer copies the CLI and console-free desktop launcher to
 `%LOCALAPPDATA%\Programs\Captastic`, creates a Start Menu shortcut, and starts the tray application.
@@ -140,7 +145,8 @@ selection, validates its persistent display identity and source geometry, and us
 materialization with checked CPU fallback. Missing, stale, or invalid confirmed state opens Region
 mode from daemon-cached restored/default UI state and logs a structured fallback reason; it never
 captures unrelated state or reads TOML after the trigger. All actions retain the configured display
-policy and `latest`/`fresh` mode and pass through the same bounded trigger and output queues.
+policy and `latest`/`fresh` mode. Daemon triggers enter one bounded command queue; selection,
+clipboard, UI-state persistence, and logging each have their own bounded worker queue.
 Captastic writes operational output through Rust's `log` facade to both stderr and a persistent file.
 Capture, selection, clipboard, recovery, and daemon lifecycle messages therefore share one format
 and filtering policy. The default compact format uses an RFC 3339 UTC timestamp with microsecond
