@@ -553,7 +553,7 @@ fn persist_ui_state(
                     (display_id.clone(), 2)
                 }
             };
-            latest.insert(key, update);
+            coalesce_ui_update(&mut latest, key, update);
         }
         for update in latest.into_values() {
             let result = match update {
@@ -579,6 +579,28 @@ fn persist_ui_state(
             }
         }
     }
+}
+
+fn coalesce_ui_update(
+    latest: &mut BTreeMap<(String, u8), captastic_windows::OverlayUiUpdate>,
+    key: (String, u8),
+    mut update: captastic_windows::OverlayUiUpdate,
+) {
+    if let (
+        Some(captastic_windows::OverlayUiUpdate::Interaction {
+            region: previous_region,
+            source: previous_source,
+            ..
+        }),
+        captastic_windows::OverlayUiUpdate::Interaction { region, source, .. },
+    ) = (latest.get(&key), &mut update)
+    {
+        if region.is_none() {
+            *region = *previous_region;
+            *source = *previous_source;
+        }
+    }
+    latest.insert(key, update);
 }
 
 fn apply_ui_update(
@@ -664,5 +686,48 @@ mod tests {
         assert_eq!(display.overlay_center, Some((0.25, 0.75)));
         assert_eq!(display.overlay_position, Some((10, 20)));
         assert!(display.confirmed_region.is_some());
+    }
+
+    #[test]
+    fn coalescing_interactions_preserves_a_region_from_earlier_in_the_batch() {
+        let key = ("display-1".to_owned(), 0);
+        let region = CaptureRegion {
+            x: 1,
+            y: 2,
+            width: 30,
+            height: 40,
+        };
+        let mut latest = BTreeMap::new();
+        coalesce_ui_update(
+            &mut latest,
+            key.clone(),
+            captastic_windows::OverlayUiUpdate::Interaction {
+                display_id: "display-1".to_owned(),
+                tool: captastic_config::CaptureTool::Region,
+                region: Some(region),
+                source: None,
+            },
+        );
+        coalesce_ui_update(
+            &mut latest,
+            key.clone(),
+            captastic_windows::OverlayUiUpdate::Interaction {
+                display_id: "display-1".to_owned(),
+                tool: captastic_config::CaptureTool::Window,
+                region: None,
+                source: None,
+            },
+        );
+
+        let captastic_windows::OverlayUiUpdate::Interaction {
+            tool,
+            region: saved_region,
+            ..
+        } = latest.get(&key).expect("coalesced interaction")
+        else {
+            panic!("expected interaction update");
+        };
+        assert_eq!(*tool, captastic_config::CaptureTool::Window);
+        assert_eq!(*saved_region, Some(region));
     }
 }
