@@ -74,13 +74,15 @@ pub(crate) fn capture_window(hwnd: HWND) -> Result<WgcWindowFrame, CaptureError>
         size,
     )
     .map_err(|error| windows_error("create_frame_pool", error, true))?;
-    let session = pool
+    let mut resources = WgcCaptureResources {
+        pool,
+        session: None,
+    };
+    let session = resources
+        .pool
         .CreateCaptureSession(&item)
         .map_err(|error| windows_error("create_capture_session", error, true))?;
-    let _resources = WgcCaptureResources {
-        pool: pool.clone(),
-        session: session.clone(),
-    };
+    resources.session = Some(session.clone());
     let _ = session.SetIsCursorCaptureEnabled(false);
     let _ = session.SetIsBorderRequired(false);
 
@@ -90,7 +92,8 @@ pub(crate) fn capture_window(hwnd: HWND) -> Result<WgcWindowFrame, CaptureError>
             let _ = sender.try_send(());
             Ok(())
         });
-    let token = pool
+    let token = resources
+        .pool
         .FrameArrived(&handler)
         .map_err(|error| windows_error("subscribe_frame_arrived", error, true))?;
     let result = (|| {
@@ -117,24 +120,27 @@ pub(crate) fn capture_window(hwnd: HWND) -> Result<WgcWindowFrame, CaptureError>
                     None,
                 )
             })?;
-        let frame = pool
+        let frame = resources
+            .pool
             .TryGetNextFrame()
             .map_err(|error| windows_error("get_next_frame", error, true))?;
         readback_frame(&device, &context, &frame)
     })();
 
-    let _ = pool.RemoveFrameArrived(token);
+    let _ = resources.pool.RemoveFrameArrived(token);
     result
 }
 
 struct WgcCaptureResources {
     pool: Direct3D11CaptureFramePool,
-    session: GraphicsCaptureSession,
+    session: Option<GraphicsCaptureSession>,
 }
 
 impl Drop for WgcCaptureResources {
     fn drop(&mut self) {
-        let _ = self.session.Close();
+        if let Some(session) = self.session.as_ref() {
+            let _ = session.Close();
+        }
         let _ = self.pool.Close();
     }
 }
