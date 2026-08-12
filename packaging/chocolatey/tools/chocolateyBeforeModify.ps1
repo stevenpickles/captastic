@@ -9,7 +9,11 @@ if (-not (Test-Path -LiteralPath $cli -PathType Leaf)) {
 
 $status = $null
 try {
-    $status = (& $cli status --json | ConvertFrom-Json).status
+    $statusJson = & $cli status --json
+    if ($LASTEXITCODE -ne 0) {
+        throw "Captastic status failed with exit code $LASTEXITCODE."
+    }
+    $status = ($statusJson | ConvertFrom-Json).status
 } catch {
     throw "Captastic status could not be read before package modification: $($_.Exception.Message)"
 }
