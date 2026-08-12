@@ -592,6 +592,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn one_shot_worker_flushes_ui_state_before_drop_returns() {
+        let directory = std::env::temp_dir().join(format!(
+            "captastic-one-shot-ui-flush-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("create one-shot test directory");
+        let path = directory.join("captastic.toml");
+        let store = captastic_config::UiStateStore::for_config(&path);
+        let worker = OneShotUiStateWorker::start(store.clone()).expect("start one-shot worker");
+        worker
+            .controller()
+            .submit_ui_update(captastic_windows::OverlayUiUpdate::ToolbarCenter {
+                display_id: "display-1".to_owned(),
+                center_x: 0.25,
+                center_y: 0.75,
+            });
+
+        drop(worker);
+
+        assert_eq!(
+            store
+                .load_display_ui_state("display-1")
+                .expect("load flushed one-shot state")
+                .overlay_center,
+            Some((0.25, 0.75))
+        );
+        fs::remove_dir_all(directory).expect("remove one-shot test directory");
+    }
+
+    #[test]
     fn persistence_failures_are_reported_after_the_update_channel_drains() {
         let directory =
             std::env::temp_dir().join(format!("captastic-ui-state-failure-{}", std::process::id()));
