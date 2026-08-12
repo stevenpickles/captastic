@@ -55,6 +55,17 @@ struct ResolvedDaemonArgs {
 
 #[cfg(windows)]
 fn resolve_daemon_args(args: DaemonArgs) -> Result<ResolvedDaemonArgs, AppError> {
+    resolve_daemon_args_with_default(args, AppConfig::load_default_recovering)
+}
+
+#[cfg(windows)]
+fn resolve_daemon_args_with_default(
+    args: DaemonArgs,
+    load_default: impl FnOnce() -> Result<
+        (AppConfig, Option<captastic_config::ConfigRecovery>),
+        captastic_config::ConfigError,
+    >,
+) -> Result<ResolvedDaemonArgs, AppError> {
     let ui_state_store = args
         .config
         .as_ref()
@@ -64,7 +75,7 @@ fn resolve_daemon_args(args: DaemonArgs) -> Result<ResolvedDaemonArgs, AppError>
     let config = match args.config.as_deref() {
         Some(path) => AppConfig::load(path)?,
         None => {
-            let (config, recovery) = AppConfig::load_default_recovering()?;
+            let (config, recovery) = load_default()?;
             if let Some(recovery) = recovery {
                 crate::logging::error(format_args!(
                     "damaged configuration {} was quarantined as {}; continuing with defaults: {}",
@@ -1245,6 +1256,8 @@ fn ns_to_ms(ns: u64) -> f64 {
 
 #[cfg(all(test, windows))]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     use captastic_core::{
@@ -1252,6 +1265,81 @@ mod tests {
     };
 
     use super::*;
+
+    struct TempConfig {
+        directory: PathBuf,
+        path: PathBuf,
+    }
+
+    static NEXT_TEMP_CONFIG: AtomicU64 = AtomicU64::new(0);
+
+    impl TempConfig {
+        fn with_contents(contents: &str) -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "captastic-daemon-test-{}-{}",
+                std::process::id(),
+                NEXT_TEMP_CONFIG.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&directory).expect("create temporary config directory");
+            let path = directory.join("captastic.toml");
+            fs::write(&path, contents).expect("write temporary config");
+            Self { directory, path }
+        }
+    }
+
+    impl Drop for TempConfig {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    #[test]
+    fn explicit_config_remains_strict_and_is_never_quarantined() {
+        let config = TempConfig::with_contents("capture_mod = 'latest'\n");
+        let args = DaemonArgs {
+            config: Some(config.path.clone()),
+            ..DaemonArgs::default()
+        };
+
+        let error = match resolve_daemon_args_with_default(args, || {
+            panic!("explicit configuration must not invoke the recovering default loader")
+        }) {
+            Ok(_) => panic!("unknown explicit field must fail strictly"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, AppError::Config(_)));
+        assert!(
+            config.path.exists(),
+            "the explicit file must remain in place"
+        );
+        assert_eq!(
+            fs::read_dir(&config.directory)
+                .expect("list temporary config directory")
+                .count(),
+            1,
+            "strict loading must not create a quarantine file"
+        );
+    }
+
+    #[test]
+    fn missing_config_argument_uses_the_recovering_default_loader() {
+        let original_path = PathBuf::from("damaged-default.toml");
+        let quarantined_path = PathBuf::from("damaged-default.toml.corrupt-test");
+        let resolved = resolve_daemon_args_with_default(DaemonArgs::default(), || {
+            Ok((
+                AppConfig::default(),
+                Some(captastic_config::ConfigRecovery {
+                    original_path,
+                    quarantined_path,
+                    reason: "test syntax damage".to_owned(),
+                }),
+            ))
+        })
+        .expect("default recovery must permit daemon argument resolution");
+
+        assert!(!resolved.backend.is_empty());
+    }
 
     #[test]
     fn backend_recovery_is_limited_to_session_invalidating_errors() {
