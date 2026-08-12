@@ -333,6 +333,7 @@ pub fn select_from_frozen_frame_with_initial_tool_and_ui(
         hovered_control: None,
         toolbar_position,
         toolbar_drag: None,
+        releasing_pointer_capture: false,
         display_environment,
         reference_metadata: frame.metadata.clone(),
         window_preview: None,
@@ -482,6 +483,7 @@ struct OverlayState {
     hovered_control: Option<ToolbarControl>,
     toolbar_position: POINT,
     toolbar_drag: Option<ToolbarDrag>,
+    releasing_pointer_capture: bool,
     display_environment: DisplayEnvironment,
     reference_metadata: FrameMetadata,
     window_preview: Option<WindowPreviewState>,
@@ -1597,7 +1599,15 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             LRESULT(0)
         }
         WM_LBUTTONUP => {
+            // ReleaseCapture synchronously sends WM_CAPTURECHANGED back to this window. Mark the
+            // release before calling Win32 so that reentrant notification does not erase the drag
+            // which this button-up message still needs to commit.
+            // SAFETY: This single-field mutation ends before ReleaseCapture can re-enter.
+            unsafe { (&mut *state_pointer).releasing_pointer_capture = true };
             release_pointer_capture();
+            // Clear a stale marker if the platform did not deliver WM_CAPTURECHANGED.
+            // SAFETY: ReleaseCapture has returned, so no state borrow spans its callback.
+            unsafe { (&mut *state_pointer).releasing_pointer_capture = false };
             // SAFETY: The Box remains alive for the message loop and this message does not
             // synchronously dispatch another window-procedure callback while borrowed.
             let state = unsafe { &mut *state_pointer };
@@ -1697,6 +1707,9 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             // SAFETY: The state allocation remains live. This arm performs only local mutation
             // and does not call ReleaseCapture recursively.
             let state = unsafe { &mut *state_pointer };
+            if consume_self_initiated_capture_change(&mut state.releasing_pointer_capture) {
+                return LRESULT(0);
+            }
             state.toolbar_drag = None;
             state.resizing = None;
             state.moving_region = None;
@@ -1826,6 +1839,10 @@ fn capture_pointer(hwnd: HWND) {
 fn release_pointer_capture() {
     // SAFETY: Best-effort release on the overlay thread after the matching button-up message.
     let _ = unsafe { ReleaseCapture() };
+}
+
+fn consume_self_initiated_capture_change(releasing_pointer_capture: &mut bool) -> bool {
+    std::mem::take(releasing_pointer_capture)
 }
 
 fn paint_state(device: HDC, state: &mut OverlayState) {
@@ -4171,6 +4188,19 @@ fn duration_ns(duration: std::time::Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn self_initiated_capture_change_preserves_drag_completion_state() {
+        let mut releasing_pointer_capture = true;
+        assert!(consume_self_initiated_capture_change(
+            &mut releasing_pointer_capture
+        ));
+        assert!(!releasing_pointer_capture);
+
+        assert!(!consume_self_initiated_capture_change(
+            &mut releasing_pointer_capture
+        ));
+    }
 
     #[test]
     fn controller_updates_live_ui_before_persistence_receives_the_event() {
