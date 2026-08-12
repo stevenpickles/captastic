@@ -997,6 +997,13 @@ fn create_temporary_file(path: &Path) -> std::io::Result<(PathBuf, File)> {
 }
 
 fn quarantine_config(path: &Path) -> std::io::Result<Option<PathBuf>> {
+    quarantine_config_with(path, |from, to| move_file(from, to, false))
+}
+
+fn quarantine_config_with<F>(path: &Path, mut move_source: F) -> std::io::Result<Option<PathBuf>>
+where
+    F: FnMut(&Path, &Path) -> std::io::Result<()>,
+{
     let parent = usable_parent(path);
     let file_name = path.file_name().ok_or_else(|| {
         std::io::Error::new(
@@ -1012,7 +1019,7 @@ fn quarantine_config(path: &Path) -> std::io::Result<Option<PathBuf>> {
         if quarantine_path.exists() {
             continue;
         }
-        match move_file(path, &quarantine_path, false) {
+        match move_source(path, &quarantine_path) {
             Ok(()) => return Ok(Some(quarantine_path)),
             Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
@@ -1800,6 +1807,31 @@ mod tests {
                 "semantic failures must not create quarantine files"
             );
         }
+    }
+
+    #[test]
+    fn quarantine_tolerates_source_removal_after_the_damaged_read() {
+        let directory = TestDirectory::new("quarantine-not-found-race");
+        let path = directory.join(CONFIG_FILE_NAME);
+        fs::write(&path, "damaged").expect("create source before race");
+
+        let result = quarantine_config_with(&path, |source, _destination| {
+            fs::remove_file(source).expect("simulate concurrent source removal");
+            Err(std::io::Error::new(
+                ErrorKind::NotFound,
+                "source disappeared before quarantine move",
+            ))
+        })
+        .expect("a concurrently removed source is already recovered");
+
+        assert_eq!(result, None);
+        assert!(!path.exists());
+        assert_eq!(
+            fs::read_dir(&directory.0)
+                .expect("read test directory")
+                .count(),
+            0
+        );
     }
 
     #[test]
