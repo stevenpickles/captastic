@@ -30,11 +30,13 @@ use crate::{NativeWindowHandle, OverlaySelection, SelectionKind};
 
 const WINDOW_RENDER_TIMEOUT: Duration = Duration::from_millis(700);
 const MAX_IN_FLIGHT_WINDOW_RENDERS: usize = 2;
+const MAX_WINDOW_RENDER_WORKERS: usize = 8;
 const WINDOW_RESPONSIVENESS_TIMEOUT_MS: u32 = 50;
 pub(crate) const WINDOW_THUMBNAIL_RENDER_BATCH: usize = MAX_IN_FLIGHT_WINDOW_RENDERS - 1;
 const _: () = assert!(MAX_IN_FLIGHT_WINDOW_RENDERS > 1);
 const WINDOW_BORDER_BGRA: [u8; 3] = [188, 180, 176];
 static IN_FLIGHT_WINDOW_RENDERS: AtomicUsize = AtomicUsize::new(0);
+static WINDOW_RENDER_WORKERS: AtomicUsize = AtomicUsize::new(0);
 static DETACHED_WINDOW_RENDERS: AtomicUsize = AtomicUsize::new(0);
 const RENDER_ACTIVE: u8 = 0;
 const RENDER_DETACHED: u8 = 1;
@@ -105,9 +107,10 @@ fn capture_window_bounded(
     reference_metadata: &FrameMetadata,
     max_pixels: Option<u64>,
 ) -> Result<CapturedWindow, CaptureError> {
+    let budget = WindowRenderBudget::acquire()?;
     let permit = WindowRenderPermit::acquire()?;
     let metadata = reference_metadata.clone();
-    run_bounded_window_render(permit, WINDOW_RENDER_TIMEOUT, move || {
+    run_bounded_window_render(permit, budget, WINDOW_RENDER_TIMEOUT, move || {
         // Capture geometry must use physical pixels. Thread DPI awareness is not inherited
         // reliably by newly spawned workers, and mixing virtualized GetWindowRect values with
         // physical DWM bounds leaves asymmetric one- or two-pixel frame artifacts.
@@ -119,6 +122,7 @@ fn capture_window_bounded(
 
 fn run_bounded_window_render<T>(
     permit: WindowRenderPermit<'static>,
+    budget: WindowRenderBudget<'static>,
     timeout: Duration,
     render: impl FnOnce() -> Result<T, CaptureError> + Send + 'static,
 ) -> Result<T, CaptureError>
@@ -132,6 +136,7 @@ where
     thread::Builder::new()
         .name("captastic-window-render".to_owned())
         .spawn(move || {
+            let _budget = budget;
             let _permit = permit;
             let _completion = RenderCompletion(worker_render_state);
             let _ = sender.send(render());
@@ -544,6 +549,51 @@ pub(crate) fn scaled_dimensions(width: u32, height: u32, max_pixels: u64) -> (u3
 struct WindowRenderPermit<'a> {
     active: &'a AtomicUsize,
     released: Arc<AtomicBool>,
+}
+
+#[derive(Debug)]
+struct WindowRenderBudget<'a> {
+    workers: &'a AtomicUsize,
+}
+
+impl WindowRenderBudget<'static> {
+    fn acquire() -> Result<Self, CaptureError> {
+        Self::acquire_from(&WINDOW_RENDER_WORKERS, MAX_WINDOW_RENDER_WORKERS)
+    }
+}
+
+impl<'a> WindowRenderBudget<'a> {
+    fn acquire_from(workers: &'a AtomicUsize, limit: usize) -> Result<Self, CaptureError> {
+        let mut current = workers.load(Ordering::Acquire);
+        loop {
+            if current >= limit {
+                return Err(capture_error(
+                    CaptureErrorKind::BufferExhausted,
+                    "start_window_render",
+                    format!(
+                        "{current} native window-render workers are still running; refusing to create an unbounded thread backlog"
+                    ),
+                    true,
+                    None,
+                ));
+            }
+            match workers.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(Self { workers }),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Drop for WindowRenderBudget<'_> {
+    fn drop(&mut self) {
+        self.workers.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl WindowRenderPermit<'static> {
@@ -1136,10 +1186,12 @@ mod tests {
     #[test]
     fn bounded_render_timeout_reclaims_capacity_before_late_completion() {
         let active = Box::leak(Box::new(AtomicUsize::new(0)));
+        let workers = Box::leak(Box::new(AtomicUsize::new(0)));
         let permit = WindowRenderPermit::acquire_from(active, 1).expect("render permit");
+        let budget = WindowRenderBudget::acquire_from(workers, 1).expect("worker budget");
         let (release_sender, release_receiver) = mpsc::sync_channel(0);
 
-        let error = run_bounded_window_render(permit, Duration::ZERO, move || {
+        let error = run_bounded_window_render(permit, budget, Duration::ZERO, move || {
             release_receiver.recv().expect("release late worker");
             Ok(7_u8)
         })
@@ -1147,19 +1199,30 @@ mod tests {
 
         assert_eq!(error.kind, CaptureErrorKind::Timeout);
         assert_eq!(active.load(Ordering::Acquire), 0);
+        assert_eq!(workers.load(Ordering::Acquire), 1);
+        assert!(WindowRenderBudget::acquire_from(workers, 1).is_err());
         let replacement =
             WindowRenderPermit::acquire_from(active, 1).expect("deadline reclaimed capacity");
         release_sender.send(()).expect("release detached worker");
         drop(replacement);
         assert_eq!(active.load(Ordering::Acquire), 0);
+        for _ in 0..100 {
+            if workers.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            thread::yield_now();
+        }
+        assert_eq!(workers.load(Ordering::Acquire), 0);
     }
 
     #[test]
     fn bounded_render_worker_panic_is_a_non_retryable_native_failure() {
         let active = Box::leak(Box::new(AtomicUsize::new(0)));
+        let workers = Box::leak(Box::new(AtomicUsize::new(0)));
         let permit = WindowRenderPermit::acquire_from(active, 1).expect("render permit");
+        let budget = WindowRenderBudget::acquire_from(workers, 1).expect("worker budget");
 
-        let error = run_bounded_window_render::<u8>(permit, Duration::from_secs(1), || {
+        let error = run_bounded_window_render::<u8>(permit, budget, Duration::from_secs(1), || {
             panic!("scripted render panic")
         })
         .expect_err("panic disconnects the bounded worker");
@@ -1167,6 +1230,24 @@ mod tests {
         assert_eq!(error.kind, CaptureErrorKind::NativeFailure);
         assert!(!error.retryable);
         assert_eq!(active.load(Ordering::Acquire), 0);
+        assert_eq!(workers.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn native_render_worker_budget_is_a_strict_hard_cap() {
+        let workers = AtomicUsize::new(0);
+        let first = WindowRenderBudget::acquire_from(&workers, 2).expect("first worker");
+        let second = WindowRenderBudget::acquire_from(&workers, 2).expect("second worker");
+
+        let error = WindowRenderBudget::acquire_from(&workers, 2).expect_err("worker cap");
+        assert_eq!(error.kind, CaptureErrorKind::BufferExhausted);
+        assert!(error.message.contains("unbounded thread backlog"));
+
+        drop(first);
+        let replacement = WindowRenderBudget::acquire_from(&workers, 2).expect("released slot");
+        drop(second);
+        drop(replacement);
+        assert_eq!(workers.load(Ordering::Acquire), 0);
     }
 
     #[test]
