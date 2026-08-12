@@ -102,20 +102,32 @@ fn capture_window_bounded(
     max_pixels: Option<u64>,
 ) -> Result<CapturedWindow, CaptureError> {
     let permit = WindowRenderPermit::acquire()?;
-    let timeout_permit = permit.clone();
     let metadata = reference_metadata.clone();
+    run_bounded_window_render(permit, WINDOW_RENDER_TIMEOUT, move || {
+        // Capture geometry must use physical pixels. Thread DPI awareness is not inherited
+        // reliably by newly spawned workers, and mixing virtualized GetWindowRect values with
+        // physical DWM bounds leaves asymmetric one- or two-pixel frame artifacts.
+        // SAFETY: Changes DPI virtualization only for this short-lived render worker.
+        let _ = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        capture_window_inner(handle, &metadata, max_pixels)
+    })
+}
+
+fn run_bounded_window_render<T>(
+    permit: WindowRenderPermit<'static>,
+    timeout: Duration,
+    render: impl FnOnce() -> Result<T, CaptureError> + Send + 'static,
+) -> Result<T, CaptureError>
+where
+    T: Send + 'static,
+{
+    let timeout_permit = permit.clone();
     let (sender, receiver) = mpsc::sync_channel(1);
     thread::Builder::new()
         .name("captastic-window-render".to_owned())
         .spawn(move || {
             let _permit = permit;
-            // Capture geometry must use physical pixels. Thread DPI awareness is not inherited
-            // reliably by newly spawned workers, and mixing virtualized GetWindowRect values with
-            // physical DWM bounds leaves asymmetric one- or two-pixel frame artifacts.
-            // SAFETY: Changes DPI virtualization only for this short-lived render worker.
-            let _ =
-                unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
-            let _ = sender.send(capture_window_inner(handle, &metadata, max_pixels));
+            let _ = sender.send(render());
         })
         .map_err(|error| {
             capture_error(
@@ -126,7 +138,7 @@ fn capture_window_bounded(
                 None,
             )
         })?;
-    match receiver.recv_timeout(WINDOW_RENDER_TIMEOUT) {
+    match receiver.recv_timeout(timeout) {
         Ok(result) => result,
         Err(mpsc::RecvTimeoutError::Timeout) => {
             // The detached worker may remain blocked inside a foreign window procedure. Its
@@ -138,7 +150,7 @@ fn capture_window_bounded(
                 "print_selected_window",
                 format!(
                     "the selected window did not render within {} ms",
-                    WINDOW_RENDER_TIMEOUT.as_millis()
+                    timeout.as_millis()
                 ),
                 true,
                 None,
@@ -1074,6 +1086,42 @@ mod tests {
         );
         drop(second);
         drop(replacement);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn bounded_render_timeout_reclaims_capacity_before_late_completion() {
+        let active = Box::leak(Box::new(AtomicUsize::new(0)));
+        let permit = WindowRenderPermit::acquire_from(active, 1).expect("render permit");
+        let (release_sender, release_receiver) = mpsc::sync_channel(0);
+
+        let error = run_bounded_window_render(permit, Duration::ZERO, move || {
+            release_receiver.recv().expect("release late worker");
+            Ok(7_u8)
+        })
+        .expect_err("worker must exceed the immediate deadline");
+
+        assert_eq!(error.kind, CaptureErrorKind::Timeout);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        let replacement =
+            WindowRenderPermit::acquire_from(active, 1).expect("deadline reclaimed capacity");
+        release_sender.send(()).expect("release detached worker");
+        drop(replacement);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn bounded_render_worker_panic_is_a_non_retryable_native_failure() {
+        let active = Box::leak(Box::new(AtomicUsize::new(0)));
+        let permit = WindowRenderPermit::acquire_from(active, 1).expect("render permit");
+
+        let error = run_bounded_window_render::<u8>(permit, Duration::from_secs(1), || {
+            panic!("scripted render panic")
+        })
+        .expect_err("panic disconnects the bounded worker");
+
+        assert_eq!(error.kind, CaptureErrorKind::NativeFailure);
+        assert!(!error.retryable);
         assert_eq!(active.load(Ordering::Acquire), 0);
     }
 
