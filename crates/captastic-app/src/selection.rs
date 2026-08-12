@@ -16,13 +16,16 @@ use crate::error::AppError;
 
 const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const WORKER_STOP_POLL: Duration = Duration::from_millis(5);
+const UI_STATE_QUEUE_CAPACITY: usize = 32;
 
 pub type ConfirmedRegionCache = Arc<Mutex<BTreeMap<String, ConfirmedRegion>>>;
 
 pub struct SelectionWorker {
     sender: Option<mpsc::SyncSender<SelectionJob>>,
-    controller: captastic_windows::OverlayController,
+    controller: Option<captastic_windows::OverlayController>,
+    ui_sender: Option<mpsc::SyncSender<captastic_windows::OverlayUiUpdate>>,
     join: Option<JoinHandle<()>>,
+    ui_join: Option<JoinHandle<()>>,
 }
 
 impl SelectionWorker {
@@ -31,11 +34,24 @@ impl SelectionWorker {
         json_output: bool,
         queue_capacity: usize,
         confirmed_regions: ConfirmedRegionCache,
+        ui_state_store: captastic_config::UiStateStore,
     ) -> Result<Self, AppError> {
         let (sender, receiver) = mpsc::sync_channel::<SelectionJob>(queue_capacity);
-        let controller = captastic_windows::OverlayController::new();
+        let (ui_sender, ui_receiver) = mpsc::sync_channel(UI_STATE_QUEUE_CAPACITY);
+        let live_ui = Arc::new(Mutex::new(BTreeMap::<
+            String,
+            captastic_config::DisplayUiState,
+        >::new()));
+        let persistence_ui = live_ui.clone();
+        let ui_join = thread::Builder::new()
+            .name("captastic-ui-state".to_owned())
+            .spawn(move || persist_ui_state(ui_receiver, ui_state_store, &persistence_ui))
+            .map_err(|error| AppError::BackendUnavailable(error.to_string()))?;
+        let controller = captastic_windows::OverlayController::with_ui_updates(ui_sender.clone());
         let worker_controller = controller.clone();
-        let join = thread::Builder::new()
+        let worker_ui_sender = ui_sender.clone();
+        let worker_live_ui = live_ui;
+        let join = match thread::Builder::new()
             .name("captastic-selection".to_owned())
             .spawn(move || loop {
                 let mut job = match receiver.recv_timeout(Duration::from_secs(30)) {
@@ -51,16 +67,29 @@ impl SelectionWorker {
                     PerfEventKind::SelectionStarted,
                     offset_after_cpu(&job),
                 );
+                let remembered_ui = {
+                    let mut live_ui = worker_live_ui
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    *live_ui
+                        .entry(job.frame.metadata.display_id.0.clone())
+                        .or_insert_with(|| job.remembered_ui.unwrap_or_default())
+                };
                 let selection = captastic_windows::select_from_frozen_frame_with_initial_tool_and_ui(
                     &job.frame,
                     &worker_controller,
                     job.initial_tool,
-                    job.remembered_ui,
+                    Some(remembered_ui),
                 );
                 match selection {
                     Ok(Some(selection)) => {
                         if selection.kind == captastic_windows::SelectionKind::Region {
-                            remember_confirmed_region(&confirmed_regions, &job.frame.metadata, selection.rect);
+                            remember_confirmed_region(
+                                &confirmed_regions,
+                                &worker_ui_sender,
+                                &job.frame.metadata,
+                                selection.rect,
+                            );
                         }
                         let selection_offset_ns = duration_ns(job.triggered_at.elapsed());
                         job.recorder.record(
@@ -215,12 +244,21 @@ impl SelectionWorker {
                         );
                     }
                 }
-            })
-            .map_err(|error| AppError::BackendUnavailable(error.to_string()))?;
+            }) {
+            Ok(join) => join,
+            Err(error) => {
+                drop(controller);
+                drop(ui_sender);
+                let _ = ui_join.join();
+                return Err(AppError::BackendUnavailable(error.to_string()));
+            }
+        };
         Ok(Self {
             sender: Some(sender),
-            controller,
+            controller: Some(controller),
+            ui_sender: Some(ui_sender),
             join: Some(join),
+            ui_join: Some(ui_join),
         })
     }
 
@@ -237,7 +275,10 @@ impl SelectionWorker {
 
     fn stop_inner(&mut self) {
         self.sender.take();
-        self.controller.cancel();
+        if let Some(controller) = self.controller.as_ref() {
+            controller.cancel();
+        }
+        let mut selection_stopped = true;
         if let Some(join) = self.join.take() {
             let started = Instant::now();
             while !join.is_finished() && started.elapsed() < WORKER_STOP_TIMEOUT {
@@ -246,10 +287,18 @@ impl SelectionWorker {
             if join.is_finished() {
                 let _ = join.join();
             } else {
+                selection_stopped = false;
                 crate::logging::error(format_args!(
                     "selection worker did not stop within {} ms; detaching it so shutdown can continue",
                     WORKER_STOP_TIMEOUT.as_millis()
                 ));
+            }
+        }
+        self.controller.take();
+        self.ui_sender.take();
+        if let Some(join) = self.ui_join.take() {
+            if selection_stopped {
+                let _ = join.join();
             }
         }
     }
@@ -390,6 +439,7 @@ fn ns_to_ms(ns: u64) -> f64 {
 
 fn remember_confirmed_region(
     cache: &ConfirmedRegionCache,
+    ui_sender: &mpsc::SyncSender<captastic_windows::OverlayUiUpdate>,
     metadata: &captastic_core::FrameMetadata,
     rect: captastic_core::Rect,
 ) {
@@ -427,14 +477,156 @@ fn remember_confirmed_region(
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.insert(metadata.display_id.0.clone(), confirmed);
     }
-    if let Err(error) = captastic_config::save_display_confirmed_region(
-        &metadata.display_id.0,
-        confirmed.region,
-        confirmed.source,
-    ) {
+    if ui_sender
+        .try_send(captastic_windows::OverlayUiUpdate::ConfirmedRegion {
+            display_id: metadata.display_id.0.clone(),
+            region: confirmed.region,
+            source: confirmed.source,
+        })
+        .is_err()
+    {
         crate::logging::warn(format_args!(
-            "failed to persist confirmed region for display {}: {error}",
+            "UI-state update queue is unavailable; confirmed region for display {} was not saved",
             metadata.display_id.0
         ));
+    }
+}
+
+fn persist_ui_state(
+    receiver: mpsc::Receiver<captastic_windows::OverlayUiUpdate>,
+    store: captastic_config::UiStateStore,
+    live_ui: &Mutex<BTreeMap<String, captastic_config::DisplayUiState>>,
+) {
+    while let Ok(first) = receiver.recv() {
+        let mut latest = BTreeMap::<(String, u8), captastic_windows::OverlayUiUpdate>::new();
+        for update in std::iter::once(first).chain(receiver.try_iter()) {
+            {
+                let mut state = live_ui
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                apply_ui_update(&mut state, &update);
+            }
+            let key = match &update {
+                captastic_windows::OverlayUiUpdate::Interaction { display_id, .. } => {
+                    (display_id.clone(), 0)
+                }
+                captastic_windows::OverlayUiUpdate::ToolbarCenter { display_id, .. } => {
+                    (display_id.clone(), 1)
+                }
+                captastic_windows::OverlayUiUpdate::ConfirmedRegion { display_id, .. } => {
+                    (display_id.clone(), 2)
+                }
+            };
+            latest.insert(key, update);
+        }
+        for update in latest.into_values() {
+            let result = match update {
+                captastic_windows::OverlayUiUpdate::Interaction {
+                    display_id,
+                    tool,
+                    region,
+                    source,
+                } => store.save_display_interaction_state(&display_id, tool, region, source),
+                captastic_windows::OverlayUiUpdate::ToolbarCenter {
+                    display_id,
+                    center_x,
+                    center_y,
+                } => store.save_display_overlay_center(&display_id, center_x, center_y),
+                captastic_windows::OverlayUiUpdate::ConfirmedRegion {
+                    display_id,
+                    region,
+                    source,
+                } => store.save_display_confirmed_region(&display_id, region, source),
+            };
+            if let Err(error) = result {
+                crate::logging::warn(format_args!("failed to persist UI state: {error}"));
+            }
+        }
+    }
+}
+
+fn apply_ui_update(
+    state: &mut BTreeMap<String, captastic_config::DisplayUiState>,
+    update: &captastic_windows::OverlayUiUpdate,
+) {
+    match update {
+        captastic_windows::OverlayUiUpdate::Interaction {
+            display_id,
+            tool,
+            region,
+            source,
+        } => {
+            let display = state.entry(display_id.clone()).or_default();
+            display.tool = Some(*tool);
+            if let Some(region) = region {
+                display.region = Some(*region);
+                display.region_source = *source;
+                display.region_is_display_local = true;
+            }
+        }
+        captastic_windows::OverlayUiUpdate::ToolbarCenter {
+            display_id,
+            center_x,
+            center_y,
+        } => {
+            state.entry(display_id.clone()).or_default().overlay_center =
+                Some((*center_x, *center_y));
+        }
+        captastic_windows::OverlayUiUpdate::ConfirmedRegion {
+            display_id,
+            region,
+            source,
+        } => {
+            state
+                .entry(display_id.clone())
+                .or_default()
+                .confirmed_region = Some(ConfirmedRegion {
+                region: *region,
+                source: *source,
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_ui_updates_merge_without_discarding_startup_state() {
+        let mut state = BTreeMap::from([(
+            "display-1".to_owned(),
+            captastic_config::DisplayUiState {
+                overlay_position: Some((10, 20)),
+                confirmed_region: Some(ConfirmedRegion {
+                    region: CaptureRegion {
+                        x: 1,
+                        y: 2,
+                        width: 3,
+                        height: 4,
+                    },
+                    source: CaptureRegionSource {
+                        width: 100,
+                        height: 80,
+                        rotation_degrees: 0,
+                    },
+                }),
+                ..captastic_config::DisplayUiState::default()
+            },
+        )]);
+
+        apply_ui_update(
+            &mut state,
+            &captastic_windows::OverlayUiUpdate::ToolbarCenter {
+                display_id: "display-1".to_owned(),
+                center_x: 0.25,
+                center_y: 0.75,
+            },
+        );
+
+        let display = state.get("display-1").expect("live display state");
+        assert_eq!(display.overlay_center, Some((0.25, 0.75)));
+        assert_eq!(display.overlay_position, Some((10, 20)));
+        assert!(display.confirmed_region.is_some());
     }
 }

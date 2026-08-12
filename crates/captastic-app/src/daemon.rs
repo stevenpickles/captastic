@@ -45,6 +45,7 @@ struct ResolvedDaemonArgs {
     hotkey_bindings: Vec<HotkeyBinding>,
     confirmed_regions: BTreeMap<String, ConfirmedRegion>,
     ui: UiConfig,
+    ui_state_store: captastic_config::UiStateStore,
     clipboard_queue_capacity: usize,
     selection_queue_capacity: usize,
     max_captures: Option<usize>,
@@ -54,9 +55,26 @@ struct ResolvedDaemonArgs {
 
 #[cfg(windows)]
 fn resolve_daemon_args(args: DaemonArgs) -> Result<ResolvedDaemonArgs, AppError> {
+    let ui_state_store = args
+        .config
+        .as_ref()
+        .map_or_else(captastic_config::UiStateStore::for_default_config, |path| {
+            captastic_config::UiStateStore::for_config(path.clone())
+        });
     let config = match args.config.as_deref() {
         Some(path) => AppConfig::load(path)?,
-        None => AppConfig::load_default()?,
+        None => {
+            let (config, recovery) = AppConfig::load_default_recovering()?;
+            if let Some(recovery) = recovery {
+                crate::logging::error(format_args!(
+                    "damaged configuration {} was quarantined as {}; continuing with defaults: {}",
+                    recovery.original_path.display(),
+                    recovery.quarantined_path.display(),
+                    recovery.reason
+                ));
+            }
+            config
+        }
     };
     config.validate()?;
     let hotkey_bindings = config.hotkey.resolved_bindings()?;
@@ -93,6 +111,7 @@ fn resolve_daemon_args(args: DaemonArgs) -> Result<ResolvedDaemonArgs, AppError>
         hotkey_bindings,
         confirmed_regions,
         ui: config.ui.clone(),
+        ui_state_store,
         selection_queue_capacity: config.selection.queue_capacity,
         max_captures: args.max_captures,
         self_trigger: args.self_trigger,
@@ -156,6 +175,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                 args.json,
                 args.selection_queue_capacity,
                 confirmed_regions.clone(),
+                args.ui_state_store.clone(),
             )
         })
         .transpose()?;
@@ -548,6 +568,21 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                 break;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(worker) = clipboard_worker.as_ref() {
+                    while let Some(failure) = worker.try_recv_failure() {
+                        if let Some(tray) = tray.as_ref() {
+                            let message = format!(
+                                "Capture {} was not copied to the clipboard. {}",
+                                failure.capture_id.0, failure.message
+                            );
+                            if let Err(error) = tray.show_error(message) {
+                                crate::logging::warn(format_args!(
+                                    "failed to surface clipboard error in the notification area: {error}"
+                                ));
+                            }
+                        }
+                    }
+                }
                 if let Some(tray) = tray.as_ref() {
                     while let Some(event) = tray.try_recv() {
                         match event {
@@ -574,7 +609,9 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                     if value { "paused" } else { "resumed" }
                                 );
                             }
-                            captastic_windows::TrayEvent::OpenConfig => open_config_from_tray(),
+                            captastic_windows::TrayEvent::OpenConfig => {
+                                open_config_from_tray(&args.ui_state_store)
+                            }
                             captastic_windows::TrayEvent::OpenLogs => open_logs_from_tray(),
                             captastic_windows::TrayEvent::ToggleStartup => {
                                 toggle_startup_from_tray(tray)
@@ -635,16 +672,24 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
 }
 
 #[cfg(windows)]
-fn open_config_from_tray() {
-    match captastic_config::ensure_default_config() {
-        Ok(path) => {
+fn open_config_from_tray(store: &captastic_config::UiStateStore) {
+    let path = store
+        .path()
+        .map(ToOwned::to_owned)
+        .map_or_else(captastic_config::ensure_default_config, Ok);
+    match path {
+        Ok(path) if path.exists() => {
             if let Err(error) = captastic_windows::open_path(&path) {
                 crate::logging::warn(format_args!("failed to open configuration: {error}"));
             }
         }
-        Err(error) => crate::logging::warn(format_args!(
-            "failed to prepare the default configuration: {error}"
+        Ok(path) => crate::logging::warn(format_args!(
+            "configuration does not exist: {}",
+            path.display()
         )),
+        Err(error) => {
+            crate::logging::warn(format_args!("failed to prepare the configuration: {error}"))
+        }
     }
 }
 
@@ -795,7 +840,10 @@ fn dispatch_output(
                 action,
                 chord,
                 initial_tool,
-                None,
+                Some(captastic_config::resolve_display_ui_state(
+                    cached_ui,
+                    &metadata.display_id.0,
+                )),
                 cpu_ready_offset_ns,
                 frame,
                 native_frame,
