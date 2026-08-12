@@ -34,4 +34,5 @@ fn launch_daemon() -> std::io::Result<()> {
 #[cfg(not(windows))]
 fn main() {
     eprintln!("captastic-desktop is currently available only on Windows");
+    std::process::exit(1);
 }

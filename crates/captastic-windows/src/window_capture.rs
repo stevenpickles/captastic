@@ -1,27 +1,28 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
 use captastic_core::{CaptureError, CaptureErrorKind, CpuFrame, FrameAlpha, FrameMetadata, Rect};
 use windows::core::Error as WindowsError;
-use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_VISIBLE_FRAME_BORDER_THICKNESS,
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DEFAULT, DWMWCP_DONOTROUND, DWMWCP_ROUND,
     DWMWCP_ROUNDSMALL, DWM_WINDOW_CORNER_PREFERENCE,
 };
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, SetStretchBltMode,
-    StretchBlt, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HALFTONE, HBITMAP, HDC,
-    HGDIOBJ, RGBQUAD, SRCCOPY,
+    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GdiFlush, SelectObject,
+    SetStretchBltMode, StretchBlt, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HALFTONE,
+    HBITMAP, HDC, HGDIOBJ, RGBQUAD, SRCCOPY,
 };
 use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
 use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowLongPtrW, GetWindowRect, IsZoomed, GWL_STYLE, PW_RENDERFULLCONTENT, WS_CAPTION,
+    GetWindowLongPtrW, GetWindowRect, IsZoomed, SendMessageTimeoutW, GWL_STYLE,
+    PW_RENDERFULLCONTENT, SMTO_ABORTIFHUNG, SMTO_BLOCK, WM_NULL, WS_CAPTION,
 };
 
 use crate::window_capture_wgc::capture_window as capture_window_wgc_frame;
@@ -29,8 +30,17 @@ use crate::{NativeWindowHandle, OverlaySelection, SelectionKind};
 
 const WINDOW_RENDER_TIMEOUT: Duration = Duration::from_millis(700);
 const MAX_IN_FLIGHT_WINDOW_RENDERS: usize = 2;
+const MAX_WINDOW_RENDER_WORKERS: usize = 8;
+const WINDOW_RESPONSIVENESS_TIMEOUT_MS: u32 = 50;
+pub(crate) const WINDOW_THUMBNAIL_RENDER_BATCH: usize = MAX_IN_FLIGHT_WINDOW_RENDERS - 1;
+const _: () = assert!(MAX_IN_FLIGHT_WINDOW_RENDERS > 1);
 const WINDOW_BORDER_BGRA: [u8; 3] = [188, 180, 176];
 static IN_FLIGHT_WINDOW_RENDERS: AtomicUsize = AtomicUsize::new(0);
+static WINDOW_RENDER_WORKERS: AtomicUsize = AtomicUsize::new(0);
+static DETACHED_WINDOW_RENDERS: AtomicUsize = AtomicUsize::new(0);
+const RENDER_ACTIVE: u8 = 0;
+const RENDER_DETACHED: u8 = 1;
+const RENDER_COMPLETED: u8 = 2;
 
 pub fn materialize_selection(
     frozen_desktop: &CpuFrame,
@@ -97,20 +107,39 @@ fn capture_window_bounded(
     reference_metadata: &FrameMetadata,
     max_pixels: Option<u64>,
 ) -> Result<CapturedWindow, CaptureError> {
+    let budget = WindowRenderBudget::acquire()?;
     let permit = WindowRenderPermit::acquire()?;
     let metadata = reference_metadata.clone();
+    run_bounded_window_render(permit, budget, WINDOW_RENDER_TIMEOUT, move || {
+        // Capture geometry must use physical pixels. Thread DPI awareness is not inherited
+        // reliably by newly spawned workers, and mixing virtualized GetWindowRect values with
+        // physical DWM bounds leaves asymmetric one- or two-pixel frame artifacts.
+        // SAFETY: Changes DPI virtualization only for this short-lived render worker.
+        let _ = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        capture_window_inner(handle, &metadata, max_pixels)
+    })
+}
+
+fn run_bounded_window_render<T>(
+    permit: WindowRenderPermit<'static>,
+    budget: WindowRenderBudget<'static>,
+    timeout: Duration,
+    render: impl FnOnce() -> Result<T, CaptureError> + Send + 'static,
+) -> Result<T, CaptureError>
+where
+    T: Send + 'static,
+{
+    let timeout_permit = permit.clone();
+    let render_state = Arc::new(AtomicU8::new(RENDER_ACTIVE));
+    let worker_render_state = render_state.clone();
     let (sender, receiver) = mpsc::sync_channel(1);
     thread::Builder::new()
         .name("captastic-window-render".to_owned())
         .spawn(move || {
+            let _budget = budget;
             let _permit = permit;
-            // Capture geometry must use physical pixels. Thread DPI awareness is not inherited
-            // reliably by newly spawned workers, and mixing virtualized GetWindowRect values with
-            // physical DWM bounds leaves asymmetric one- or two-pixel frame artifacts.
-            // SAFETY: Changes DPI virtualization only for this short-lived render worker.
-            let _ =
-                unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
-            let _ = sender.send(capture_window_inner(handle, &metadata, max_pixels));
+            let _completion = RenderCompletion(worker_render_state);
+            let _ = sender.send(render());
         })
         .map_err(|error| {
             capture_error(
@@ -121,26 +150,72 @@ fn capture_window_bounded(
                 None,
             )
         })?;
-    receiver
-        .recv_timeout(WINDOW_RENDER_TIMEOUT)
-        .map_err(|error| {
-            let message = match error {
-                mpsc::RecvTimeoutError::Timeout => format!(
-                    "the selected window did not render within {} ms",
-                    WINDOW_RENDER_TIMEOUT.as_millis()
-                ),
-                mpsc::RecvTimeoutError::Disconnected => {
-                    "the window-render worker stopped without returning a frame".to_owned()
-                }
-            };
-            capture_error(
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // The detached worker may remain blocked inside a foreign window procedure. Its
+            // lease expires at the caller's deadline so unrelated windows can still be rendered;
+            // release is idempotent when the worker eventually exits.
+            timeout_permit.release();
+            if mark_render_detached(&render_state, &DETACHED_WINDOW_RENDERS) {
+                log::warn!(
+                    "window render exceeded its deadline; {} detached native render worker(s) remain",
+                    DETACHED_WINDOW_RENDERS.load(Ordering::Acquire)
+                );
+            }
+            Err(capture_error(
                 CaptureErrorKind::Timeout,
                 "print_selected_window",
-                message,
+                format!(
+                    "the selected window did not render within {} ms",
+                    timeout.as_millis()
+                ),
                 true,
                 None,
-            )
-        })?
+            ))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            timeout_permit.release();
+            Err(capture_error(
+                CaptureErrorKind::NativeFailure,
+                "print_selected_window",
+                "the window-render worker stopped without returning a frame",
+                false,
+                None,
+            ))
+        }
+    }
+}
+
+struct RenderCompletion(Arc<AtomicU8>);
+
+impl Drop for RenderCompletion {
+    fn drop(&mut self) {
+        complete_render(&self.0, &DETACHED_WINDOW_RENDERS);
+    }
+}
+
+fn mark_render_detached(state: &AtomicU8, detached_count: &AtomicUsize) -> bool {
+    if state
+        .compare_exchange(
+            RENDER_ACTIVE,
+            RENDER_DETACHED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        detached_count.fetch_add(1, Ordering::AcqRel);
+        true
+    } else {
+        false
+    }
+}
+
+fn complete_render(state: &AtomicU8, detached_count: &AtomicUsize) {
+    if state.swap(RENDER_COMPLETED, Ordering::AcqRel) == RENDER_DETACHED {
+        detached_count.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 fn capture_window_inner(
@@ -164,6 +239,24 @@ fn capture_window_inner(
     })?;
     let visible_frame = visible_frame_bounds(hwnd, capture_bounds);
     let visible_bounds = visible_frame.bounds;
+    let probe_wgc_error = if !window_is_responsive(hwnd) {
+        log::debug!(
+            "window handle=0x{:X} did not answer the responsiveness probe; using Windows Graphics Capture",
+            handle.raw()
+        );
+        match capture_window_with_wgc(hwnd, reference_metadata, max_pixels, &visible_frame) {
+            Ok(capture) => return Ok(capture),
+            Err(error) => {
+                log::debug!(
+                    "window handle=0x{:X} could not use Windows Graphics Capture after the probe; trying bounded PrintWindow: {error}",
+                    handle.raw()
+                );
+                Some(error)
+            }
+        }
+    } else {
+        None
+    };
     let mut surface = DibSurface::new(capture_bounds.width, capture_bounds.height)?;
     surface.clear();
     // SAFETY: hwnd is the selected live top-level window and surface.device contains a selected
@@ -177,6 +270,9 @@ fn capture_window_inner(
         )
     };
     if !rendered.as_bool() {
+        if let Some(error) = probe_wgc_error {
+            return Err(error);
+        }
         log::debug!(
             "window handle=0x{:X} rejected PrintWindow; trying Windows Graphics Capture",
             handle.raw()
@@ -286,6 +382,37 @@ fn capture_window_inner(
     })
 }
 
+fn unpremultiply_bgra(pixels: &mut [u8]) {
+    for pixel in pixels.chunks_exact_mut(4) {
+        let alpha = u32::from(pixel[3]);
+        if alpha == 0 {
+            pixel[..3].fill(0);
+            continue;
+        }
+        for channel in &mut pixel[..3] {
+            *channel = ((u32::from(*channel) * 255 + alpha / 2) / alpha).min(255) as u8;
+        }
+    }
+}
+
+fn window_is_responsive(hwnd: HWND) -> bool {
+    let mut ignored_result = 0_usize;
+    // SAFETY: WM_NULL carries no pointers. The timeout bounds synchronous work in the target
+    // process, and ignored_result remains writable for the duration of the call.
+    unsafe {
+        SendMessageTimeoutW(
+            hwnd,
+            WM_NULL,
+            WPARAM(0),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            WINDOW_RESPONSIVENESS_TIMEOUT_MS,
+            Some(&mut ignored_result),
+        )
+    }
+    .0 != 0
+}
+
 fn capture_window_with_wgc(
     hwnd: HWND,
     reference_metadata: &FrameMetadata,
@@ -304,37 +431,21 @@ fn capture_window_with_wgc(
         .min(raw.width / 4)
         .min(raw.height / 4);
     let content_bounds = inset_rect(source_bounds, border_thickness).unwrap_or(source_bounds);
-    let content = crop_bgra(&raw.pixels, source_bounds, content_bounds)?;
+    let content = normalize_wgc_content(crop_bgra(&raw.pixels, source_bounds, content_bounds)?);
     let (pixels, content_width, content_height, radius_scale) = if let Some(max_pixels) = max_pixels
     {
         let (width, height) =
             scaled_dimensions(content_bounds.width, content_bounds.height, max_pixels);
         if width != content_bounds.width || height != content_bounds.height {
-            let mut source = DibSurface::new(content_bounds.width, content_bounds.height)?;
-            source.write_pixels(&content)?;
-            let scaled = DibSurface::new(width, height)?;
-            // SAFETY: Both DIBs are live and the source/destination rectangles cover them exactly.
-            let scaled_rendered = unsafe {
-                SetStretchBltMode(scaled.device, HALFTONE);
-                StretchBlt(
-                    scaled.device,
-                    0,
-                    0,
-                    width as i32,
-                    height as i32,
-                    source.device,
-                    0,
-                    0,
-                    content_bounds.width as i32,
-                    content_bounds.height as i32,
-                    SRCCOPY,
-                )
-            };
-            if !scaled_rendered.as_bool() {
-                return Err(last_error("scale_wgc_window_thumbnail"));
-            }
             (
-                scaled.copy_pixels(),
+                scale_bgra_with_dib(
+                    &content,
+                    content_bounds.width,
+                    content_bounds.height,
+                    width,
+                    height,
+                    "scale_wgc_window_thumbnail",
+                )?,
                 width,
                 height,
                 width as f32 / content_bounds.width as f32,
@@ -398,6 +509,48 @@ fn capture_window_with_wgc(
     })
 }
 
+fn normalize_wgc_content(mut pixels: Vec<u8>) -> Vec<u8> {
+    // WGC publishes premultiplied BGRA. Convert before any GDI scaling because StretchBlt does
+    // not preserve alpha; waiting until after the blit would interpret every pixel as transparent
+    // and erase its RGB channels.
+    unpremultiply_bgra(&mut pixels);
+    pixels
+}
+
+fn scale_bgra_with_dib(
+    pixels: &[u8],
+    source_width: u32,
+    source_height: u32,
+    target_width: u32,
+    target_height: u32,
+    operation: &'static str,
+) -> Result<Vec<u8>, CaptureError> {
+    let mut source = DibSurface::new(source_width, source_height)?;
+    source.write_pixels(pixels)?;
+    let scaled = DibSurface::new(target_width, target_height)?;
+    // SAFETY: Both DIBs are live and the source/destination rectangles cover them exactly.
+    let scaled_rendered = unsafe {
+        SetStretchBltMode(scaled.device, HALFTONE);
+        StretchBlt(
+            scaled.device,
+            0,
+            0,
+            target_width as i32,
+            target_height as i32,
+            source.device,
+            0,
+            0,
+            source_width as i32,
+            source_height as i32,
+            SRCCOPY,
+        )
+    };
+    if !scaled_rendered.as_bool() {
+        return Err(last_error(operation));
+    }
+    Ok(scaled.copy_pixels())
+}
+
 pub(crate) fn scaled_dimensions(width: u32, height: u32, max_pixels: u64) -> (u32, u32) {
     let pixels = u64::from(width).saturating_mul(u64::from(height));
     if pixels <= max_pixels || pixels == 0 || max_pixels == 0 {
@@ -410,13 +563,68 @@ pub(crate) fn scaled_dimensions(width: u32, height: u32, max_pixels: u64) -> (u3
     )
 }
 
-struct WindowRenderPermit;
+#[derive(Debug)]
+struct WindowRenderPermit<'a> {
+    active: &'a AtomicUsize,
+    released: Arc<AtomicBool>,
+}
 
-impl WindowRenderPermit {
+#[derive(Debug)]
+struct WindowRenderBudget<'a> {
+    workers: &'a AtomicUsize,
+}
+
+impl WindowRenderBudget<'static> {
     fn acquire() -> Result<Self, CaptureError> {
-        let mut active = IN_FLIGHT_WINDOW_RENDERS.load(Ordering::Acquire);
+        Self::acquire_from(&WINDOW_RENDER_WORKERS, MAX_WINDOW_RENDER_WORKERS)
+    }
+}
+
+impl<'a> WindowRenderBudget<'a> {
+    fn acquire_from(workers: &'a AtomicUsize, limit: usize) -> Result<Self, CaptureError> {
+        let mut current = workers.load(Ordering::Acquire);
         loop {
-            if active >= MAX_IN_FLIGHT_WINDOW_RENDERS {
+            if current >= limit {
+                return Err(capture_error(
+                    CaptureErrorKind::BufferExhausted,
+                    "start_window_render",
+                    format!(
+                        "{current} native window-render workers are still running; refusing to create an unbounded thread backlog"
+                    ),
+                    true,
+                    None,
+                ));
+            }
+            match workers.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(Self { workers }),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Drop for WindowRenderBudget<'_> {
+    fn drop(&mut self) {
+        self.workers.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl WindowRenderPermit<'static> {
+    fn acquire() -> Result<Self, CaptureError> {
+        Self::acquire_from(&IN_FLIGHT_WINDOW_RENDERS, MAX_IN_FLIGHT_WINDOW_RENDERS)
+    }
+}
+
+impl<'a> WindowRenderPermit<'a> {
+    fn acquire_from(active_count: &'a AtomicUsize, limit: usize) -> Result<Self, CaptureError> {
+        let mut active = active_count.load(Ordering::Acquire);
+        loop {
+            if active >= limit {
                 return Err(capture_error(
                     CaptureErrorKind::BufferExhausted,
                     "start_window_render",
@@ -425,22 +633,42 @@ impl WindowRenderPermit {
                     None,
                 ));
             }
-            match IN_FLIGHT_WINDOW_RENDERS.compare_exchange_weak(
+            match active_count.compare_exchange_weak(
                 active,
                 active + 1,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Ok(Self),
+                Ok(_) => {
+                    return Ok(Self {
+                        active: active_count,
+                        released: Arc::new(AtomicBool::new(false)),
+                    });
+                }
                 Err(current) => active = current,
             }
         }
     }
+
+    fn release(&self) {
+        if !self.released.swap(true, Ordering::AcqRel) {
+            self.active.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 }
 
-impl Drop for WindowRenderPermit {
+impl Clone for WindowRenderPermit<'_> {
+    fn clone(&self) -> Self {
+        Self {
+            active: self.active,
+            released: self.released.clone(),
+        }
+    }
+}
+
+impl Drop for WindowRenderPermit<'_> {
     fn drop(&mut self) {
-        IN_FLIGHT_WINDOW_RENDERS.fetch_sub(1, Ordering::AcqRel);
+        self.release();
     }
 }
 
@@ -831,6 +1059,8 @@ impl DibSurface {
     }
 
     fn copy_pixels(&self) -> Vec<u8> {
+        // SAFETY: Flushes this thread's queued GDI drawing before CPU reads the DIB section.
+        let _ = unsafe { GdiFlush() };
         // SAFETY: The DIB owns byte_length initialized bytes and stays alive through this copy.
         unsafe { std::slice::from_raw_parts(self.bits, self.byte_length) }.to_vec()
     }
@@ -944,6 +1174,116 @@ mod tests {
     }
 
     #[test]
+    fn render_permit_deadline_reclaims_capacity_idempotently() {
+        let active = AtomicUsize::new(0);
+        let first = WindowRenderPermit::acquire_from(&active, 2).expect("first permit");
+        let first_worker = first.clone();
+        let second = WindowRenderPermit::acquire_from(&active, 2).expect("second permit");
+        let exhausted = WindowRenderPermit::acquire_from(&active, 2).expect_err("capacity bound");
+        assert_eq!(exhausted.kind, CaptureErrorKind::BufferExhausted);
+        assert_eq!(active.load(Ordering::Acquire), 2);
+
+        first.release();
+        assert_eq!(active.load(Ordering::Acquire), 1);
+        let replacement =
+            WindowRenderPermit::acquire_from(&active, 2).expect("deadline reclaimed permit");
+        assert_eq!(active.load(Ordering::Acquire), 2);
+
+        drop(first);
+        drop(first_worker);
+        assert_eq!(
+            active.load(Ordering::Acquire),
+            2,
+            "release must be idempotent"
+        );
+        drop(second);
+        drop(replacement);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn bounded_render_timeout_reclaims_capacity_before_late_completion() {
+        let active = Box::leak(Box::new(AtomicUsize::new(0)));
+        let workers = Box::leak(Box::new(AtomicUsize::new(0)));
+        let permit = WindowRenderPermit::acquire_from(active, 1).expect("render permit");
+        let budget = WindowRenderBudget::acquire_from(workers, 1).expect("worker budget");
+        let (release_sender, release_receiver) = mpsc::sync_channel(0);
+
+        let error = run_bounded_window_render(permit, budget, Duration::ZERO, move || {
+            release_receiver.recv().expect("release late worker");
+            Ok(7_u8)
+        })
+        .expect_err("worker must exceed the immediate deadline");
+
+        assert_eq!(error.kind, CaptureErrorKind::Timeout);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        assert_eq!(workers.load(Ordering::Acquire), 1);
+        assert!(WindowRenderBudget::acquire_from(workers, 1).is_err());
+        let replacement =
+            WindowRenderPermit::acquire_from(active, 1).expect("deadline reclaimed capacity");
+        release_sender.send(()).expect("release detached worker");
+        drop(replacement);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        for _ in 0..100 {
+            if workers.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            thread::yield_now();
+        }
+        assert_eq!(workers.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn bounded_render_worker_panic_is_a_non_retryable_native_failure() {
+        let active = Box::leak(Box::new(AtomicUsize::new(0)));
+        let workers = Box::leak(Box::new(AtomicUsize::new(0)));
+        let permit = WindowRenderPermit::acquire_from(active, 1).expect("render permit");
+        let budget = WindowRenderBudget::acquire_from(workers, 1).expect("worker budget");
+
+        let error = run_bounded_window_render::<u8>(permit, budget, Duration::from_secs(1), || {
+            panic!("scripted render panic")
+        })
+        .expect_err("panic disconnects the bounded worker");
+
+        assert_eq!(error.kind, CaptureErrorKind::NativeFailure);
+        assert!(!error.retryable);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        assert_eq!(workers.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn native_render_worker_budget_is_a_strict_hard_cap() {
+        let workers = AtomicUsize::new(0);
+        let first = WindowRenderBudget::acquire_from(&workers, 2).expect("first worker");
+        let second = WindowRenderBudget::acquire_from(&workers, 2).expect("second worker");
+
+        let error = WindowRenderBudget::acquire_from(&workers, 2).expect_err("worker cap");
+        assert_eq!(error.kind, CaptureErrorKind::BufferExhausted);
+        assert!(error.message.contains("unbounded thread backlog"));
+
+        drop(first);
+        let replacement = WindowRenderBudget::acquire_from(&workers, 2).expect("released slot");
+        drop(second);
+        drop(replacement);
+        assert_eq!(workers.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn detached_render_telemetry_handles_completion_races() {
+        let detached = AtomicUsize::new(0);
+        let timed_out = AtomicU8::new(RENDER_ACTIVE);
+        assert!(mark_render_detached(&timed_out, &detached));
+        assert_eq!(detached.load(Ordering::Acquire), 1);
+        complete_render(&timed_out, &detached);
+        assert_eq!(detached.load(Ordering::Acquire), 0);
+
+        let completed_first = AtomicU8::new(RENDER_ACTIVE);
+        complete_render(&completed_first, &detached);
+        assert!(!mark_render_detached(&completed_first, &detached));
+        assert_eq!(detached.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn visible_frame_crop_removes_the_outer_window_margins() {
         let source_bounds = Rect {
             x: 10,
@@ -1049,6 +1389,31 @@ mod tests {
         assert_eq!(scaled_border_width(0, 0.25), 0);
         assert_eq!(scaled_border_width(2, 1.0), 2);
         assert_eq!(scaled_border_width(2, 0.25), 1);
+    }
+
+    #[test]
+    fn wgc_colors_are_unpremultiplied_before_straight_alpha_publication() {
+        let pixels = normalize_wgc_content(vec![25, 50, 100, 128, 9, 8, 7, 0, 10, 20, 30, 255]);
+        assert_eq!(pixels, [50, 100, 199, 128, 0, 0, 0, 0, 10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn normalized_wgc_rgb_survives_a_scaler_that_discards_alpha() {
+        let mut pixels = normalize_wgc_content(vec![25, 50, 100, 128]);
+        pixels[3] = 0;
+        assert_eq!(&pixels[..3], &[50, 100, 199]);
+    }
+
+    #[test]
+    fn normalized_wgc_rgb_survives_native_dib_thumbnail_round_trip() {
+        let premultiplied_pixel = [25, 50, 100, 128];
+        let pixels = normalize_wgc_content(premultiplied_pixel.repeat(4));
+
+        let scaled = scale_bgra_with_dib(&pixels, 2, 2, 1, 1, "test_wgc_dib_round_trip")
+            .expect("scale normalized WGC pixels through native DIBs");
+
+        assert_eq!(&scaled[..3], &[50, 100, 199]);
+        assert_ne!(&scaled[..3], &[0, 0, 0]);
     }
 
     #[test]

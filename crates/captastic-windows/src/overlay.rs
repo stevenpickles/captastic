@@ -1,7 +1,9 @@
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
-use std::sync::Arc;
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
@@ -26,7 +28,7 @@ use windows::Win32::Graphics::Gdi::GetTextFaceW;
 use windows::Win32::Graphics::Gdi::{
     AddFontMemResourceEx, AlphaBlend, BeginPaint, BitBlt, CreateBitmap, CreateCompatibleDC,
     CreateDIBSection, CreateFontW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW,
-    Ellipse, EndPaint, FillRect, GetMonitorInfoW, GetStockObject, GetTextExtentPoint32W,
+    Ellipse, EndPaint, FillRect, GdiFlush, GetMonitorInfoW, GetStockObject, GetTextExtentPoint32W,
     InvalidateRect, LineTo, MonitorFromRect, MonitorFromWindow, MoveToEx, Rectangle,
     RemoveFontMemResourceEx, RoundRect, SelectObject, SetBkMode, SetStretchBltMode, SetTextColor,
     StretchBlt, UpdateWindow, AC_SRC_ALPHA, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
@@ -40,7 +42,9 @@ use windows::Win32::UI::HiDpi::{
     GetDpiForMonitor, SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT,
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, MDT_EFFECTIVE_DPI,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE, VK_RETURN};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE, VK_RETURN,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyCursor, DestroyWindow,
     DispatchMessageW, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow,
@@ -50,15 +54,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TranslateMessage, UnregisterClassW, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
     GA_ROOTOWNER, GWLP_USERDATA, GWL_EXSTYLE, HCURSOR, ICONINFO, IDC_ARROW, IDC_CROSS, IDC_SIZEALL,
     IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, MSG, SPI_SETLOGICALDPIOVERRIDE,
-    SPI_SETWORKAREA, SW_SHOW, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND,
-    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
-    WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WM_SETTINGCHANGE, WNDCLASSW, WS_EX_APPWINDOW,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    SPI_SETWORKAREA, SW_SHOW, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WM_SETTINGCHANGE, WNDCLASSW,
+    WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 #[cfg(test)]
 use crate::window_capture::scaled_dimensions;
-use crate::window_capture::{capture_window_thumbnail, capture_window_visual};
+use crate::window_capture::{
+    capture_window_thumbnail, capture_window_visual, WINDOW_THUMBNAIL_RENDER_BATCH,
+};
 
 const CLASS_NAME: PCWSTR = w!("CaptasticFrozenSelectionOverlay");
 const DRAG_THRESHOLD: i32 = 4;
@@ -115,6 +121,26 @@ pub struct OverlaySelection {
     pub(crate) window_frame: Option<CpuFrame>,
 }
 
+#[derive(Clone, Debug)]
+pub enum OverlayUiUpdate {
+    Interaction {
+        display_id: String,
+        tool: captastic_config::CaptureTool,
+        region: Option<captastic_config::CaptureRegion>,
+        source: Option<captastic_config::CaptureRegionSource>,
+    },
+    ToolbarCenter {
+        display_id: String,
+        center_x: f64,
+        center_y: f64,
+    },
+    ConfirmedRegion {
+        display_id: String,
+        region: captastic_config::CaptureRegion,
+        source: captastic_config::CaptureRegionSource,
+    },
+}
+
 #[derive(Clone, Default)]
 pub struct OverlayController {
     inner: Arc<OverlayControllerInner>,
@@ -124,6 +150,13 @@ pub struct OverlayController {
 struct OverlayControllerInner {
     hwnd: AtomicIsize,
     cancelled: AtomicBool,
+    ui_updates: Option<OverlayUiSink>,
+}
+
+#[derive(Clone)]
+struct OverlayUiSink {
+    sender: Sender<OverlayUiUpdate>,
+    live_ui: Arc<Mutex<BTreeMap<String, captastic_config::DisplayUiState>>>,
 }
 
 impl OverlayController {
@@ -131,9 +164,44 @@ impl OverlayController {
         Self::default()
     }
 
+    pub fn with_ui_updates(ui_updates: Sender<OverlayUiUpdate>) -> Self {
+        Self {
+            inner: Arc::new(OverlayControllerInner {
+                ui_updates: Some(OverlayUiSink {
+                    sender: ui_updates,
+                    live_ui: Arc::new(Mutex::new(BTreeMap::new())),
+                }),
+                ..OverlayControllerInner::default()
+            }),
+        }
+    }
+
+    pub fn remembered_ui(
+        &self,
+        display_id: &str,
+        fallback: captastic_config::DisplayUiState,
+    ) -> captastic_config::DisplayUiState {
+        let Some(sink) = self.inner.ui_updates.as_ref() else {
+            return fallback;
+        };
+        let mut live_ui = sink
+            .live_ui
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *live_ui.entry(display_id.to_owned()).or_insert(fallback)
+    }
+
+    pub fn submit_ui_update(&self, update: OverlayUiUpdate) {
+        if let Some(sink) = self.inner.ui_updates.as_ref() {
+            sink.submit(update);
+        }
+    }
+
     pub fn cancel(&self) {
-        self.inner.cancelled.store(true, Ordering::Release);
-        let hwnd = self.inner.hwnd.load(Ordering::Acquire);
+        // Sequential consistency prevents the cancel thread and overlay thread from both missing
+        // the other's publication in the store-then-load rendezvous.
+        self.inner.cancelled.store(true, Ordering::SeqCst);
+        let hwnd = self.inner.hwnd.load(Ordering::SeqCst);
         if hwnd != 0 {
             // SAFETY: hwnd was published by the live overlay thread. Posting does not retain it.
             let _ = unsafe { PostMessageW(HWND(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
@@ -169,7 +237,7 @@ pub fn select_from_frozen_frame_with_initial_tool_and_ui(
     remembered_ui: Option<captastic_config::DisplayUiState>,
 ) -> Result<Option<OverlaySelection>, CaptureError> {
     let preparation_started = Instant::now();
-    if controller.inner.cancelled.load(Ordering::Acquire) {
+    if controller.inner.cancelled.load(Ordering::SeqCst) {
         return Ok(None);
     }
     let _dpi_context = ThreadDpiContext::enter_per_monitor_v2()?;
@@ -210,8 +278,7 @@ pub fn select_from_frozen_frame_with_initial_tool_and_ui(
         )
     };
     let display_environment = query_display_environment(source);
-    let remembered_ui =
-        remembered_ui.unwrap_or_else(|| load_display_ui_state(&frame.metadata.display_id));
+    let remembered_ui = remembered_ui.unwrap_or_default();
     let toolbar_position = remembered_toolbar_position(
         remembered_ui.overlay_center,
         remembered_ui.overlay_position,
@@ -266,6 +333,7 @@ pub fn select_from_frozen_frame_with_initial_tool_and_ui(
         hovered_control: None,
         toolbar_position,
         toolbar_drag: None,
+        releasing_pointer_capture: false,
         display_environment,
         reference_metadata: frame.metadata.clone(),
         window_preview: None,
@@ -281,6 +349,7 @@ pub fn select_from_frozen_frame_with_initial_tool_and_ui(
         started: Instant::now(),
         preparation_ns: duration_ns(preparation_started.elapsed()),
         window_overview_ns: None,
+        ui_updates: controller.inner.ui_updates.clone(),
     });
     if tool == CaptureTool::Window {
         build_window_overview(&mut state);
@@ -414,6 +483,7 @@ struct OverlayState {
     hovered_control: Option<ToolbarControl>,
     toolbar_position: POINT,
     toolbar_drag: Option<ToolbarDrag>,
+    releasing_pointer_capture: bool,
     display_environment: DisplayEnvironment,
     reference_metadata: FrameMetadata,
     window_preview: Option<WindowPreviewState>,
@@ -426,6 +496,7 @@ struct OverlayState {
     started: Instant,
     preparation_ns: u64,
     window_overview_ns: Option<u64>,
+    ui_updates: Option<OverlayUiSink>,
 }
 
 struct OverlayResourceCache {
@@ -992,6 +1063,7 @@ fn restore_region_for_display_change(
 }
 
 fn remember_overlay_interaction(
+    ui_updates: Option<&OverlayUiSink>,
     display_id: &DisplayId,
     source: Rect,
     tool: CaptureTool,
@@ -1004,20 +1076,18 @@ fn remember_overlay_interaction(
         width: region.width,
         height: region.height,
     });
-    if let Err(error) = captastic_config::save_display_interaction_state(
-        &display_id.0,
-        tool.to_config(),
-        persisted_region,
-        region.map(|_| captastic_config::CaptureRegionSource {
+    let update = OverlayUiUpdate::Interaction {
+        display_id: display_id.0.clone(),
+        tool: tool.to_config(),
+        region: persisted_region,
+        source: region.map(|_| captastic_config::CaptureRegionSource {
             width: source.width,
             height: source.height,
             rotation_degrees,
         }),
-    ) {
-        log::warn!(
-            "failed to save overlay interaction state for display {}: {error}",
-            display_id.0
-        );
+    };
+    if let Some(sink) = ui_updates {
+        sink.submit(update);
     }
 }
 
@@ -1052,6 +1122,7 @@ fn fit_region_to_source(region: Rect, source: Rect) -> Rect {
 }
 
 fn remember_toolbar_position(
+    ui_updates: Option<&OverlayUiSink>,
     display_id: &DisplayId,
     position: POINT,
     environment: DisplayEnvironment,
@@ -1062,27 +1133,70 @@ fn remember_toolbar_position(
         / f64::from(work_area.width());
     let center_y = f64::from(position.y + metrics.toolbar_height() / 2 - work_area.top)
         / f64::from(work_area.height());
-    if let Err(error) = captastic_config::save_display_overlay_center(
-        &display_id.0,
-        center_x.clamp(0.0, 1.0),
-        center_y.clamp(0.0, 1.0),
-    ) {
-        log::warn!(
-            "failed to save toolbar position for display {}: {error}",
-            display_id.0
-        );
+    let update = OverlayUiUpdate::ToolbarCenter {
+        display_id: display_id.0.clone(),
+        center_x: center_x.clamp(0.0, 1.0),
+        center_y: center_y.clamp(0.0, 1.0),
+    };
+    if let Some(sink) = ui_updates {
+        sink.submit(update);
     }
 }
 
-fn load_display_ui_state(display_id: &DisplayId) -> captastic_config::DisplayUiState {
-    match captastic_config::load_display_ui_state(&display_id.0) {
-        Ok(state) => state,
-        Err(error) => {
-            log::warn!(
-                "failed to load UI state for display {}: {error}",
-                display_id.0
-            );
-            captastic_config::DisplayUiState::default()
+impl OverlayUiSink {
+    fn submit(&self, update: OverlayUiUpdate) {
+        {
+            let mut live_ui = self
+                .live_ui
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            apply_overlay_ui_update(&mut live_ui, &update);
+        }
+        if self.sender.send(update).is_err() {
+            log::warn!("UI-state persistence worker is unavailable; update was not saved to disk");
+        }
+    }
+}
+
+fn apply_overlay_ui_update(
+    state: &mut BTreeMap<String, captastic_config::DisplayUiState>,
+    update: &OverlayUiUpdate,
+) {
+    match update {
+        OverlayUiUpdate::Interaction {
+            display_id,
+            tool,
+            region,
+            source,
+        } => {
+            let display = state.entry(display_id.clone()).or_default();
+            display.tool = Some(*tool);
+            if let Some(region) = region {
+                display.region = Some(*region);
+                display.region_source = *source;
+                display.region_is_display_local = true;
+            }
+        }
+        OverlayUiUpdate::ToolbarCenter {
+            display_id,
+            center_x,
+            center_y,
+        } => {
+            state.entry(display_id.clone()).or_default().overlay_center =
+                Some((*center_x, *center_y));
+        }
+        OverlayUiUpdate::ConfirmedRegion {
+            display_id,
+            region,
+            source,
+        } => {
+            state
+                .entry(display_id.clone())
+                .or_default()
+                .confirmed_region = Some(captastic_config::ConfirmedRegion {
+                region: *region,
+                source: *source,
+            });
         }
     }
 }
@@ -1142,8 +1256,8 @@ fn run_overlay(
         let _ = cache_overlay_state(state);
         return Err(last_error("create_overlay_window"));
     }
-    controller.inner.hwnd.store(hwnd.0, Ordering::Release);
-    if controller.inner.cancelled.load(Ordering::Acquire) {
+    controller.inner.hwnd.store(hwnd.0, Ordering::SeqCst);
+    if controller.inner.cancelled.load(Ordering::SeqCst) {
         // SAFETY: hwnd was just created on this thread and cancellation was requested.
         let _ = unsafe { DestroyWindow(hwnd) };
     }
@@ -1163,7 +1277,7 @@ fn run_overlay(
             let _ = unsafe { DestroyWindow(hwnd) };
             // SAFETY: The callback will no longer access state after DestroyWindow returns.
             let state = unsafe { Box::from_raw(state_pointer) };
-            controller.inner.hwnd.store(0, Ordering::Release);
+            controller.inner.hwnd.store(0, Ordering::SeqCst);
             let previous_foreground = state.previous_foreground;
             let _ = cache_overlay_state(state);
             restore_input_context(previous_foreground);
@@ -1180,7 +1294,7 @@ fn run_overlay(
     }
     // SAFETY: WM_NCDESTROY cleared the window user-data pointer and the loop has ended.
     let state = unsafe { Box::from_raw(state_pointer) };
-    controller.inner.hwnd.store(0, Ordering::Release);
+    controller.inner.hwnd.store(0, Ordering::SeqCst);
     let previous_foreground = state.previous_foreground;
     let result = cache_overlay_state(state);
     restore_input_context(previous_foreground);
@@ -1237,8 +1351,6 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
         // SAFETY: No application state is available, so default handling is required.
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     }
-    // SAFETY: The Box remains alive for the full message loop and callbacks are serialized here.
-    let state = unsafe { &mut *state_pointer };
     match message {
         WM_DPICHANGED => {
             display_configuration_changed_and_close(hwnd, "overlay_dpi_changed");
@@ -1256,6 +1368,9 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
+            // SAFETY: The Box remains alive for the message loop. The last state access occurs
+            // before UpdateWindow can synchronously dispatch WM_PAINT and reborrow the pointer.
+            let state = unsafe { &mut *state_pointer };
             let point = screen_point(state.source, lparam);
             let local = local_point(state.source, point);
             state.pointer_local = Some(local);
@@ -1357,14 +1472,19 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             {
                 return LRESULT(0);
             }
+            let update_window = state.tool == CaptureTool::Window;
             invalidate(hwnd);
-            if state.tool == CaptureTool::Window {
+            if update_window {
                 // SAFETY: Forces the now-cheap cached hover paint before this mouse message returns.
                 let _ = unsafe { UpdateWindow(hwnd) };
             }
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
+            // SAFETY: The Box remains alive for the message loop. SetCapture does not dispatch an
+            // overlay callback while capture is still owned by this window; destruction is only
+            // requested after the final state access in the confirming branches.
+            let state = unsafe { &mut *state_pointer };
             let point = screen_point(state.source, lparam);
             let local = local_point(state.source, point);
             let layout = ToolbarLayout::new(state.display_environment, state.toolbar_position);
@@ -1383,6 +1503,7 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                                 y: local.y.saturating_sub(state.toolbar_position.y),
                             },
                         });
+                        capture_pointer(hwnd);
                     }
                     ToolbarControl::Background => {}
                     ToolbarControl::FullDisplay => {
@@ -1392,7 +1513,9 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                     ToolbarControl::Region => activate_tool(state, CaptureTool::Region),
                     ToolbarControl::Options => state.options_open = !state.options_open,
                     ToolbarControl::Capture => {
-                        confirm_and_close(hwnd, state);
+                        if confirm_overlay(state) {
+                            close_overlay(hwnd);
+                        }
                         return LRESULT(0);
                     }
                     ToolbarControl::DimBackground => {
@@ -1400,7 +1523,8 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                     }
                     ToolbarControl::ClipboardDestination => {}
                     ToolbarControl::Cancel => {
-                        cancel_and_close(hwnd, state);
+                        cancel_overlay(state);
+                        close_overlay(hwnd);
                         return LRESULT(0);
                     }
                 }
@@ -1423,7 +1547,9 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                         .map(|frame| frame.metadata.source_rect);
                     state.selection_kind = state.selection.map(|_| SelectionKind::Window);
                     if state.selection.is_some() {
-                        confirm_and_close(hwnd, state);
+                        if confirm_overlay(state) {
+                            close_overlay(hwnd);
+                        }
                         return LRESULT(0);
                     }
                     rebuild_window_overview_cache(state);
@@ -1444,6 +1570,7 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                 state.anchor = None;
                 state.dragging = false;
                 update_cursor(Some(handle), &state.region_cursor);
+                capture_pointer(hwnd);
             } else if existing_region.is_some_and(|selection| contains(selection, point)) {
                 state.moving_region = existing_region.map(|original| MoveDrag {
                     original,
@@ -1453,6 +1580,7 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                 state.dragging = false;
                 state.hovered_handle = None;
                 set_move_cursor();
+                capture_pointer(hwnd);
             } else {
                 state.anchor = Some(point);
                 state.dragging = false;
@@ -1465,14 +1593,28 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                 state.hovered = None;
                 state.dimension_label_placement = None;
                 update_cursor(None, &state.region_cursor);
+                capture_pointer(hwnd);
             }
             invalidate(hwnd);
             LRESULT(0)
         }
         WM_LBUTTONUP => {
+            // ReleaseCapture synchronously sends WM_CAPTURECHANGED back to this window. Mark the
+            // release before calling Win32 so that reentrant notification does not erase the drag
+            // which this button-up message still needs to commit.
+            // SAFETY: This single-field mutation ends before ReleaseCapture can re-enter.
+            unsafe { (&mut *state_pointer).releasing_pointer_capture = true };
+            release_pointer_capture();
+            // Clear a stale marker if the platform did not deliver WM_CAPTURECHANGED.
+            // SAFETY: ReleaseCapture has returned, so no state borrow spans its callback.
+            unsafe { (&mut *state_pointer).releasing_pointer_capture = false };
+            // SAFETY: The Box remains alive for the message loop and this message does not
+            // synchronously dispatch another window-procedure callback while borrowed.
+            let state = unsafe { &mut *state_pointer };
             let point = screen_point(state.source, lparam);
             if state.toolbar_drag.take().is_some() {
                 remember_toolbar_position(
+                    state.ui_updates.as_ref(),
                     &state.reference_metadata.display_id,
                     state.toolbar_position,
                     state.display_environment,
@@ -1531,28 +1673,62 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             LRESULT(0)
         }
         WM_LBUTTONDBLCLK => {
-            let point = screen_point(state.source, lparam);
-            let local = local_point(state.source, point);
-            let layout = ToolbarLayout::new(state.display_environment, state.toolbar_position);
-            if layout.hit_test(local, state.options_open).is_none() {
-                confirm_and_close(hwnd, state);
+            let should_close = {
+                // SAFETY: The Box remains alive for the message loop. The borrow ends before
+                // close_overlay synchronously dispatches destruction messages.
+                let state = unsafe { &mut *state_pointer };
+                let point = screen_point(state.source, lparam);
+                let local = local_point(state.source, point);
+                let layout = ToolbarLayout::new(state.display_environment, state.toolbar_position);
+                layout.hit_test(local, state.options_open).is_none() && confirm_overlay(state)
+            };
+            if should_close {
+                close_overlay(hwnd);
             }
             LRESULT(0)
         }
         WM_KEYDOWN if wparam.0 == usize::from(VK_RETURN.0) => {
-            confirm_and_close(hwnd, state);
+            // SAFETY: The Box remains alive for the message loop. The borrow is consumed by the
+            // pure state transition and ends before close_overlay dispatches messages.
+            let should_close = confirm_overlay(unsafe { &mut *state_pointer });
+            if should_close {
+                close_overlay(hwnd);
+            }
             LRESULT(0)
         }
         WM_KEYDOWN if wparam.0 == usize::from(VK_ESCAPE.0) => {
-            cancel_and_close(hwnd, state);
+            // SAFETY: The Box remains alive for the message loop. The borrow ends when the pure
+            // cancellation transition returns, before close_overlay dispatches messages.
+            cancel_overlay(unsafe { &mut *state_pointer });
+            close_overlay(hwnd);
+            LRESULT(0)
+        }
+        WM_CAPTURECHANGED => {
+            // SAFETY: The state allocation remains live. This arm performs only local mutation
+            // and does not call ReleaseCapture recursively.
+            let state = unsafe { &mut *state_pointer };
+            if consume_self_initiated_capture_change(&mut state.releasing_pointer_capture) {
+                return LRESULT(0);
+            }
+            state.toolbar_drag = None;
+            state.resizing = None;
+            state.moving_region = None;
+            state.anchor = None;
+            state.dragging = false;
+            state.hovered_handle = None;
+            set_arrow_cursor();
+            invalidate(hwnd);
             LRESULT(0)
         }
         WM_RBUTTONDOWN | WM_CLOSE => {
-            cancel_and_close(hwnd, state);
+            // SAFETY: The Box remains alive for the message loop. The borrow ends when the pure
+            // cancellation transition returns, before close_overlay dispatches messages.
+            cancel_overlay(unsafe { &mut *state_pointer });
+            close_overlay(hwnd);
             LRESULT(0)
         }
         WM_PAINT => {
-            paint(hwnd, state);
+            paint(hwnd, state_pointer);
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
@@ -1576,6 +1752,7 @@ fn remember_overlay_state(state: &mut OverlayState) {
         state.last_region,
     );
     remember_overlay_interaction(
+        state.ui_updates.as_ref(),
         &state.reference_metadata.display_id,
         state.source,
         state.tool,
@@ -1585,7 +1762,7 @@ fn remember_overlay_state(state: &mut OverlayState) {
     state.last_region = region;
 }
 
-fn confirm_and_close(hwnd: HWND, state: &mut OverlayState) {
+fn confirm_overlay(state: &mut OverlayState) -> bool {
     if let (Some(rect), Some(kind)) = (state.selection, state.selection_kind) {
         let window_frame = if kind == SelectionKind::Window {
             state.selected_window_frame.clone()
@@ -1613,13 +1790,17 @@ fn confirm_and_close(hwnd: HWND, state: &mut OverlayState) {
                 .sum(),
             window_frame,
         });
-        // SAFETY: hwnd is the live overlay window and this function runs on its owner thread.
-        let _ = unsafe { DestroyWindow(hwnd) };
+        true
+    } else {
+        false
     }
 }
 
-fn cancel_and_close(hwnd: HWND, state: &mut OverlayState) {
+fn cancel_overlay(state: &mut OverlayState) {
     remember_overlay_state(state);
+}
+
+fn close_overlay(hwnd: HWND) {
     // SAFETY: hwnd is the live overlay window and this function runs on its owner thread.
     let _ = unsafe { DestroyWindow(hwnd) };
 }
@@ -1636,10 +1817,35 @@ fn invalidate(hwnd: HWND) {
     let _ = unsafe { InvalidateRect(hwnd, None, false) };
 }
 
-fn paint(hwnd: HWND, state: &mut OverlayState) {
+fn paint(hwnd: HWND, state_pointer: *mut OverlayState) {
     let mut paint = PAINTSTRUCT::default();
     // SAFETY: paint is writable storage and EndPaint balances this call before return.
     let device = unsafe { BeginPaint(hwnd, &mut paint) };
+    {
+        // SAFETY: The Box remains alive for the message loop. BeginPaint has completed before this
+        // borrow is created, and the borrow ends before EndPaint can synchronously send messages.
+        let state = unsafe { &mut *state_pointer };
+        paint_state(device, state);
+    }
+    // SAFETY: Balances BeginPaint for this exact hwnd/paint structure after releasing state.
+    unsafe { EndPaint(hwnd, &paint) };
+}
+
+fn capture_pointer(hwnd: HWND) {
+    // SAFETY: Captures mouse input to the live overlay for the duration of an active drag.
+    let _ = unsafe { SetCapture(hwnd) };
+}
+
+fn release_pointer_capture() {
+    // SAFETY: Best-effort release on the overlay thread after the matching button-up message.
+    let _ = unsafe { ReleaseCapture() };
+}
+
+fn consume_self_initiated_capture_change(releasing_pointer_capture: &mut bool) -> bool {
+    std::mem::take(releasing_pointer_capture)
+}
+
+fn paint_state(device: HDC, state: &mut OverlayState) {
     let width = state.surface.width;
     if state.tool == CaptureTool::Window {
         let cache_matches = state
@@ -1727,8 +1933,6 @@ fn paint(hwnd: HWND, state: &mut OverlayState) {
             SRCCOPY,
         )
     };
-    // SAFETY: Balances BeginPaint for this exact hwnd/paint structure.
-    unsafe { EndPaint(hwnd, &paint) };
 }
 
 fn apply_dim_wash(destination: HDC, dimmer: HDC, width: i32, height: i32, alpha: u8) -> bool {
@@ -1875,47 +2079,69 @@ fn build_window_overview(state: &mut OverlayState) {
     ensure_window_mode_assets(state);
     if state.window_thumbnails.is_empty() {
         let candidates = state.windows.clone().unwrap_or_default();
-        for batch in candidates.chunks(2) {
-            let rendered = thread::scope(|scope| {
-                let workers: Vec<_> = batch
-                    .iter()
-                    .copied()
-                    .map(|candidate| {
-                        let metadata = &state.reference_metadata;
-                        scope.spawn(move || {
-                            (
-                                candidate.handle,
-                                capture_window_thumbnail(
-                                    candidate.handle,
-                                    metadata,
-                                    WINDOW_THUMBNAIL_MAX_PIXELS,
-                                ),
-                            )
+        let mut pending = candidates
+            .iter()
+            .map(|candidate| candidate.handle)
+            .collect::<Vec<_>>();
+        for attempt in 0..=1 {
+            let mut retry = Vec::new();
+            for batch in pending.chunks(WINDOW_THUMBNAIL_RENDER_BATCH) {
+                let rendered = thread::scope(|scope| {
+                    let workers: Vec<_> = batch
+                        .iter()
+                        .copied()
+                        .map(|handle| {
+                            let metadata = &state.reference_metadata;
+                            scope.spawn(move || {
+                                (
+                                    handle,
+                                    capture_window_thumbnail(
+                                        handle,
+                                        metadata,
+                                        WINDOW_THUMBNAIL_MAX_PIXELS,
+                                    ),
+                                )
+                            })
                         })
-                    })
-                    .collect();
-                workers
-                    .into_iter()
-                    .filter_map(|worker| worker.join().ok())
-                    .collect::<Vec<_>>()
-            });
-            for (handle, capture) in rendered {
-                let Ok(capture) = capture else {
-                    continue;
-                };
-                let Ok(surface) = FrozenSurface::from_straight_alpha(
-                    capture.frame.width,
-                    capture.frame.height,
-                    &capture.frame.pixels,
-                ) else {
-                    continue;
-                };
-                state.window_thumbnails.push(WindowThumbnail {
-                    handle,
-                    surface,
-                    corner_radius_px: capture.corner_radius_px,
+                        .collect();
+                    workers
+                        .into_iter()
+                        .filter_map(|worker| worker.join().ok())
+                        .collect::<Vec<_>>()
                 });
+                for (handle, capture) in rendered {
+                    let capture = match capture {
+                        Ok(capture) => capture,
+                        Err(error) if attempt == 0 && error.retryable => {
+                            retry.push(handle);
+                            continue;
+                        }
+                        Err(error) => {
+                            log::debug!(
+                                "window handle=0x{:X} omitted from overview after render failure: {error}",
+                                handle.raw()
+                            );
+                            continue;
+                        }
+                    };
+                    let Ok(surface) = FrozenSurface::from_straight_alpha(
+                        capture.frame.width,
+                        capture.frame.height,
+                        &capture.frame.pixels,
+                    ) else {
+                        continue;
+                    };
+                    state.window_thumbnails.push(WindowThumbnail {
+                        handle,
+                        surface,
+                        corner_radius_px: capture.corner_radius_px,
+                    });
+                }
             }
+            if retry.is_empty() {
+                break;
+            }
+            pending = retry;
         }
     }
     rebuild_window_overview_cache(state);
@@ -2394,6 +2620,8 @@ fn scale_premultiplied_surface(
     // AlphaBlend's built-in stretch is low quality, while GDI HALFTONE discards the alpha byte.
     // Resample all four premultiplied channels together: area filtering for reduction and bilinear
     // filtering for enlargement. The exact-size result can then be composited 1:1.
+    // SAFETY: Flushes this thread's queued GDI drawing before CPU reads the DIB section.
+    let _ = unsafe { GdiFlush() };
     // SAFETY: Both slices cover their live DIB allocations for the duration of this call.
     let source_pixels = unsafe { std::slice::from_raw_parts(source.bits, source.byte_length) };
     // SAFETY: `scaled` uniquely owns this writable DIB and no GDI operation runs concurrently.
@@ -2587,6 +2815,9 @@ fn draw_antialiased_rounded_outline(
     stroke_width: i32,
     corner_radius: f32,
 ) {
+    // SAFETY: Flushes preceding GDI composition before blend_surface_pixel reads and writes the
+    // same DIB section through its CPU pointer.
+    let _ = unsafe { GdiFlush() };
     let width = (rect.right - rect.left).max(1);
     let height = (rect.bottom - rect.top).max(1);
     let radius = corner_radius.clamp(0.0, width.min(height) as f32 / 2.0);
@@ -3957,6 +4188,44 @@ fn duration_ns(duration: std::time::Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn self_initiated_capture_change_preserves_drag_completion_state() {
+        let mut releasing_pointer_capture = true;
+        assert!(consume_self_initiated_capture_change(
+            &mut releasing_pointer_capture
+        ));
+        assert!(!releasing_pointer_capture);
+
+        assert!(!consume_self_initiated_capture_change(
+            &mut releasing_pointer_capture
+        ));
+    }
+
+    #[test]
+    fn controller_updates_live_ui_before_persistence_receives_the_event() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let controller = OverlayController::with_ui_updates(sender);
+        let fallback = captastic_config::DisplayUiState {
+            overlay_position: Some((10, 20)),
+            ..captastic_config::DisplayUiState::default()
+        };
+        assert_eq!(controller.remembered_ui("display-1", fallback), fallback);
+
+        controller.submit_ui_update(OverlayUiUpdate::ToolbarCenter {
+            display_id: "display-1".to_owned(),
+            center_x: 0.25,
+            center_y: 0.75,
+        });
+
+        let remembered = controller.remembered_ui("display-1", Default::default());
+        assert_eq!(remembered.overlay_center, Some((0.25, 0.75)));
+        assert_eq!(remembered.overlay_position, Some((10, 20)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(OverlayUiUpdate::ToolbarCenter { .. })
+        ));
+    }
 
     #[test]
     fn region_from_points_is_normalized_and_clamped() {

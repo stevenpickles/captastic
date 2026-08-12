@@ -15,8 +15,6 @@ pub enum AppError {
     #[error(transparent)]
     Capture(#[from] captastic_core::CaptureError),
     #[error(transparent)]
-    Pipeline(#[from] captastic_core::PipelineError),
-    #[error(transparent)]
     Metrics(#[from] captastic_core::MetricsError),
     #[error(transparent)]
     Config(#[from] captastic_config::ConfigError),
@@ -33,7 +31,7 @@ impl AppError {
                 4
             }
             Self::Capture(_) => 6,
-            Self::Pipeline(_) | Self::Metrics(_) => 10,
+            Self::Metrics(_) => 10,
             Self::Write { .. } => 8,
         }
     }

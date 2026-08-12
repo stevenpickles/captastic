@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::Path;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use captastic_core::{
-    trigger_queue, validate_event_order, CaptureBackend, CaptureErrorKind, CaptureId, CaptureMode,
-    CaptureRequest, CaptureSource, CursorMode, EventRecorder, FakeBackend, FakeBackendConfig,
-    LatencySummary, PerfEvent, PerfEventKind,
+    validate_event_order, CaptureBackend, CaptureErrorKind, CaptureId, CaptureMode, CaptureRequest,
+    CaptureSource, CursorMode, EventRecorder, FakeBackend, FakeBackendConfig, LatencySummary,
+    PerfEvent, PerfEventKind,
 };
 use serde::Serialize;
 
@@ -95,7 +96,12 @@ pub fn run_with_backend(
         let _ = backend.capture(&request, &mut warmup_recorder);
     }
 
-    let trigger_queue = trigger_queue(options.trigger_queue_capacity)?;
+    if options.trigger_queue_capacity == 0 {
+        return Err(AppError::InvalidArgument(
+            "benchmark trigger queue capacity must be greater than zero".to_owned(),
+        ));
+    }
+    let (trigger_sender, trigger_receiver) = mpsc::sync_channel(options.trigger_queue_capacity);
     let mut recorder = EventRecorder::with_capacity(options.metrics_capacity);
     let mut native_samples = Vec::with_capacity(options.iterations);
     let mut cpu_samples = Vec::with_capacity(options.iterations);
@@ -117,10 +123,14 @@ pub fn run_with_backend(
             options.cpu_frame,
         );
         let triggered_at = request.triggered_at;
-        trigger_queue.try_send(request)?;
+        trigger_sender.try_send(request).map_err(|error| {
+            AppError::InvalidArgument(format!("benchmark trigger queue rejected input: {error}"))
+        })?;
         let enqueued_ns = duration_ns(triggered_at.elapsed());
         recorder.record(capture_id, PerfEventKind::TriggerEnqueued, enqueued_ns);
-        let request = trigger_queue.try_recv()?;
+        let request = trigger_receiver.try_recv().map_err(|error| {
+            AppError::InvalidArgument(format!("benchmark trigger queue lost input: {error}"))
+        })?;
         let dequeued_ns = duration_ns(request.triggered_at.elapsed());
         recorder.record(capture_id, PerfEventKind::TriggerDequeued, dequeued_ns);
         trigger_to_dequeue_samples.push(dequeued_ns);

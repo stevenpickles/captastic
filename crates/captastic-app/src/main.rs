@@ -46,12 +46,20 @@ impl DisplayPolicy {
 fn main() {
     let cli = Cli::parse();
     let logging_config = resolve_logging_config(&cli);
-    let logging_available = match logging::init(&logging_config) {
+    let persistent_logging = uses_persistent_logging(&cli);
+    let logging_result = if persistent_logging {
+        logging::init(&logging_config).map(Some)
+    } else {
+        logging::init_console(&logging_config).map(|()| None)
+    };
+    let logging_available = match logging_result {
         Ok(path) => {
-            log::info!(
-                "Captastic started; persistent log file is {}",
-                path.display()
-            );
+            if let Some(path) = path {
+                log::info!(
+                    "Captastic started; persistent log file is {}",
+                    path.display()
+                );
+            }
             true
         }
         Err(error) => {
@@ -68,8 +76,18 @@ fn main() {
         }
         process::exit(error.exit_code());
     }
-    log::info!("Captastic stopped successfully");
-    log::logger().flush();
+    if logging_available {
+        log::info!("Captastic stopped successfully");
+        log::logger().flush();
+    }
+}
+
+fn uses_persistent_logging(cli: &Cli) -> bool {
+    cli.log_file.is_some()
+        || matches!(
+            cli.command.as_ref(),
+            None | Some(Command::Daemon(_) | Command::Capture(_) | Command::Benchmark(_))
+        )
 }
 
 fn resolve_logging_config(cli: &Cli) -> LoggingConfig {
@@ -83,7 +101,8 @@ fn resolve_logging_config(cli: &Cli) -> LoggingConfig {
         }
         None => AppConfig::load_default()
             .map_or_else(|_| LoggingConfig::default(), |config| config.logging),
-        _ => LoggingConfig::default(),
+        _ => AppConfig::load_default()
+            .map_or_else(|_| LoggingConfig::default(), |config| config.logging),
     };
     if let Some(path) = &cli.log_file {
         logging.file = Some(path.clone());
@@ -177,7 +196,11 @@ fn status(json_output: bool) -> Result<(), AppError> {
 fn status(json_output: bool) -> Result<(), AppError> {
     print_value(
         json_output,
-        &json!({"schema_version": 1, "status": "not_running"}),
+        &json!({
+            "schema_version": 1,
+            "status": "unsupported",
+            "reason": "the native hotkey daemon is currently available only on Windows",
+        }),
     )
 }
 
@@ -238,7 +261,18 @@ fn capture(args: cli::CaptureArgs) -> Result<(), AppError> {
                 )
             })?;
             recorder.record(request.id, PerfEventKind::SelectionStarted, 0);
-            let Some(selection) = captastic_windows::select_from_frozen_frame(&full_frame)? else {
+            let ui_store = captastic_config::UiStateStore::for_default_config();
+            let remembered_ui =
+                load_optional_one_shot_ui_state(&ui_store, &full_frame.metadata.display_id.0);
+            let ui_worker = selection::OneShotUiStateWorker::start(ui_store)?;
+            let selection = captastic_windows::select_from_frozen_frame_with_initial_tool_and_ui(
+                &full_frame,
+                ui_worker.controller(),
+                captastic_windows::InitialSelectionTool::Remembered,
+                Some(remembered_ui),
+            )?;
+            ui_worker.finish()?;
+            let Some(selection) = selection else {
                 recorder.record(request.id, PerfEventKind::AttemptFinished, 0);
                 captastic_core::validate_event_order(recorder.events())?;
                 let value = json!({
@@ -385,6 +419,22 @@ fn capture(args: cli::CaptureArgs) -> Result<(), AppError> {
         log::info!("capture {} complete: {}", request.id.0, value);
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn load_optional_one_shot_ui_state(
+    store: &captastic_config::UiStateStore,
+    display_id: &str,
+) -> captastic_config::DisplayUiState {
+    match store.load_display_ui_state(display_id) {
+        Ok(state) => state,
+        Err(error) => {
+            crate::logging::warn(format_args!(
+                "could not load remembered selection preferences; continuing with defaults: {error}"
+            ));
+            captastic_config::DisplayUiState::default()
+        }
+    }
 }
 
 fn benchmark(args: BenchmarkArgs) -> Result<(), AppError> {
@@ -631,18 +681,29 @@ fn doctor(json_output: bool) -> Result<(), AppError> {
         Ok(backend) => ("available", None, Some(backend.displays().to_vec())),
         Err(error) => ("unavailable", Some(error.to_string()), None),
     };
+    let windows_clipboard = if cfg!(windows) {
+        "available_as_uncompressed_dibv5"
+    } else {
+        "unavailable_on_this_platform"
+    };
+    let windows_selection_overlay = if cfg!(windows) {
+        "available_for_regions_and_native_window_rendering"
+    } else {
+        "unavailable_on_this_platform"
+    };
     print_value(
         json_output,
         &json!({
             "schema_version": 1,
             "phase": 1,
+            "platform": std::env::consts::OS,
             "fake_backend": "available",
             "dxgi_backend": native_status,
             "dxgi_error": native_error,
             "dxgi_displays": displays,
             "cpu_readback": "available_for_unrotated_bgra8_outputs",
-            "windows_clipboard": "available_as_uncompressed_dibv5",
-            "windows_selection_overlay": "available_for_regions_and_native_window_rendering",
+            "windows_clipboard": windows_clipboard,
+            "windows_selection_overlay": windows_selection_overlay,
             "latest_warm_frame": "available",
             "critical_path_policy": "configured",
         }),
@@ -682,7 +743,55 @@ fn duration_ns(duration: std::time::Duration) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use std::fs;
+
     use super::*;
+
+    fn cli(command: Option<Command>) -> Cli {
+        Cli {
+            log_file: None,
+            log_level: None,
+            log_format: None,
+            command,
+        }
+    }
+
+    #[test]
+    fn only_operational_commands_persist_logs_by_default() {
+        assert!(uses_persistent_logging(&cli(None)));
+        assert!(uses_persistent_logging(&cli(Some(Command::Daemon(
+            cli::DaemonArgs::default()
+        )))));
+        assert!(!uses_persistent_logging(&cli(Some(Command::Doctor {
+            json: true
+        }))));
+        let capture = Cli::try_parse_from(["captastic", "capture"]).expect("capture CLI");
+        assert!(uses_persistent_logging(&capture));
+        let benchmark = Cli::try_parse_from(["captastic", "benchmark"]).expect("benchmark CLI");
+        assert!(uses_persistent_logging(&benchmark));
+
+        let mut explicit = cli(Some(Command::Doctor { json: true }));
+        explicit.log_file = Some("doctor.log".into());
+        assert!(uses_persistent_logging(&explicit));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn one_shot_selection_ignores_unreadable_remembered_ui_state() {
+        let directory =
+            std::env::temp_dir().join(format!("captastic-one-shot-ui-load-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("create directory at config path");
+        let store = captastic_config::UiStateStore::for_config(&directory);
+
+        assert_eq!(
+            load_optional_one_shot_ui_state(&store, "display-1"),
+            captastic_config::DisplayUiState::default()
+        );
+
+        fs::remove_dir_all(directory).expect("remove directory at config path");
+    }
 
     #[test]
     fn display_policy_resolves_pointer_primary_virtual_desktop_and_fixed_ids() {

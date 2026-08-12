@@ -18,10 +18,33 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Check out source
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install Rust 1.97.1
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
+
+      - name: Resolve and verify package version
+        id: version
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          $package = $metadata.packages | Where-Object {
+            $_.targets.name -contains 'captastic'
+          } | Select-Object -First 1
+          if ($null -eq $package) {
+            throw 'cargo metadata did not contain the captastic binary target'
+          }
+          $workspaceVersion = "$($package.version)"
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $tagVersion = $env:GITHUB_REF_NAME.Substring(1)
+            if ($tagVersion -ne $workspaceVersion) {
+              throw "Release tag $env:GITHUB_REF_NAME does not match Cargo.toml version $workspaceVersion"
+            }
+            $packageVersion = $tagVersion
+          } else {
+            $packageVersion = "$workspaceVersion-ci.$env:GITHUB_RUN_NUMBER"
+          }
+          "value=$packageVersion" >> $env:GITHUB_OUTPUT
 
       - name: Run workspace tests
         run: cargo test --locked --workspace
@@ -32,29 +55,32 @@ jobs:
       - name: Assemble portable package
         id: portable
         shell: pwsh
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.value }}
         run: |
-          $version = "${{ github.ref_name }}" -replace '[^A-Za-z0-9._-]', '-'
-          $archive = ./scripts/package-windows.ps1 -Version $version
+          $archive = ./scripts/package-windows.ps1 `
+            -Version $env:PACKAGE_VERSION `
+            -Architecture x86_64
           "archive=$archive" >> $env:GITHUB_OUTPUT
 
       - name: Build Chocolatey package
         shell: pwsh
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.value }}
+          PORTABLE_ARCHIVE: ${{ steps.portable.outputs.archive }}
         run: |
-          if ("${{ github.ref }}" -like 'refs/tags/v*') {
-            $packageVersion = "${{ github.ref_name }}".TrimStart('v')
-            $sourceUrl = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$(Split-Path -Leaf '${{ steps.portable.outputs.archive }}')"
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $sourceUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:GITHUB_REF_NAME/$(Split-Path -Leaf $env:PORTABLE_ARCHIVE)"
           } else {
-            $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
-            $packageVersion = "$($metadata.packages[0].version)-ci.${{ github.run_number }}"
-            $sourceUrl = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            $sourceUrl = "https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
           }
           ./scripts/package-chocolatey.ps1 `
-            -Version $packageVersion `
-            -ArchivePath '${{ steps.portable.outputs.archive }}' `
+            -Version $env:PACKAGE_VERSION `
+            -ArchivePath $env:PORTABLE_ARCHIVE `
             -SourceUrl $sourceUrl
 
       - name: Upload portable package
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: captastic-windows-x86_64
           path: |
@@ -66,7 +92,7 @@ jobs:
 
       - name: Publish tagged GitHub release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           generate_release_notes: true
           files: |

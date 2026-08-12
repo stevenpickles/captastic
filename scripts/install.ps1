@@ -26,13 +26,23 @@ $installedDesktop = Join-Path $InstallDirectory 'captastic-desktop.exe'
 
 if (Test-Path -LiteralPath $installedCli -PathType Leaf) {
     & $installedCli stop | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "The installed Captastic daemon stop command failed with exit code $LASTEXITCODE."
+    }
     $deadline = [DateTime]::UtcNow.AddSeconds(5)
     do {
         Start-Sleep -Milliseconds 100
-        $status = (& $installedCli status --json | ConvertFrom-Json).status
+        $statusJson = & $installedCli status --json
+        if ($LASTEXITCODE -ne 0) {
+            throw "The installed Captastic status command failed with exit code $LASTEXITCODE."
+        }
+        $status = ($statusJson | ConvertFrom-Json).status
     } while ($status -eq 'running' -and [DateTime]::UtcNow -lt $deadline)
     if ($status -eq 'running') {
         throw 'The running Captastic daemon did not stop within five seconds.'
+    }
+    if ($status -ne 'not_running') {
+        throw "The installed Captastic daemon returned unexpected status '$status'; refusing to replace its files."
     }
 }
 
@@ -64,6 +74,9 @@ $shortcut.Save()
 
 if ($StartWithWindows) {
     & $installedCli startup enable
+    if ($LASTEXITCODE -ne 0) {
+        throw "Captastic startup registration failed with exit code $LASTEXITCODE."
+    }
 }
 
 if (-not $NoLaunch) {

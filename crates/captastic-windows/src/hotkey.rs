@@ -70,6 +70,7 @@ impl HotkeySpec {
 
 pub struct HotkeyListener {
     thread_id: u32,
+    stop_requested: bool,
     join: Option<JoinHandle<()>>,
 }
 
@@ -146,34 +147,37 @@ impl HotkeyListener {
         })??;
         Ok(Self {
             thread_id,
+            stop_requested: false,
             join: Some(join),
         })
     }
 
-    pub fn stop(mut self) -> Result<(), CaptureError> {
-        self.request_stop()?;
-        self.join_thread();
+    pub fn stop(self) -> Result<(), CaptureError> {
+        self.stop_before(Instant::now() + THREAD_STOP_TIMEOUT)
+    }
+
+    pub fn stop_before(mut self, deadline: Instant) -> Result<(), CaptureError> {
+        let stop_result = self.request_stop();
+        self.join_thread_until(deadline);
+        stop_result
+    }
+
+    pub fn request_stop(&mut self) -> Result<(), CaptureError> {
+        if self.stop_requested {
+            return Ok(());
+        }
+        // SAFETY: thread_id identifies the live message-loop thread, whose queue is initialized.
+        unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) }
+            .map_err(|error| hotkey_error("stop_hotkey_thread", error))?;
+        self.stop_requested = true;
         Ok(())
     }
 
-    fn request_stop(&self) -> Result<(), CaptureError> {
-        // SAFETY: thread_id identifies the live message-loop thread, whose queue is initialized.
-        unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) }
-            .map_err(|error| hotkey_error("stop_hotkey_thread", error))
-    }
-
-    fn join_thread(&mut self) {
+    fn join_thread_until(&mut self, deadline: Instant) {
         if let Some(join) = self.join.take() {
-            let started = Instant::now();
-            while !join.is_finished() && started.elapsed() < THREAD_STOP_TIMEOUT {
-                thread::sleep(THREAD_STOP_POLL);
-            }
-            if join.is_finished() {
-                let _ = join.join();
-            } else {
+            if !join_hotkey_worker_until(join, deadline) {
                 log::error!(
-                    "hotkey worker did not stop within {} ms; detaching it so shutdown can continue",
-                    THREAD_STOP_TIMEOUT.as_millis()
+                    "hotkey worker did not stop before its shutdown deadline; detaching it so shutdown can continue"
                 );
             }
         }
@@ -183,7 +187,19 @@ impl HotkeyListener {
 impl Drop for HotkeyListener {
     fn drop(&mut self) {
         let _ = self.request_stop();
-        self.join_thread();
+        self.join_thread_until(Instant::now() + THREAD_STOP_TIMEOUT);
+    }
+}
+
+fn join_hotkey_worker_until(join: JoinHandle<()>, deadline: Instant) -> bool {
+    while !join.is_finished() && Instant::now() < deadline {
+        thread::sleep(THREAD_STOP_POLL);
+    }
+    if join.is_finished() {
+        let _ = join.join();
+        true
+    } else {
+        false
     }
 }
 
@@ -343,6 +359,24 @@ mod tests {
         let registered = register_all(&specs, &mut registry).expect("registrations succeed");
         unregister_all(&registered, &mut registry);
         assert_eq!(registry.unregistered, vec![specs[1].id, specs[0].id]);
+    }
+
+    #[test]
+    fn hotkey_worker_join_obeys_the_shared_deadline() {
+        let (release_sender, release_receiver) = mpsc::channel();
+        let join = thread::spawn(move || {
+            let _ = release_receiver.recv();
+        });
+        let started = Instant::now();
+
+        assert!(!join_hotkey_worker_until(
+            join,
+            Instant::now() + Duration::from_millis(10)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        release_sender
+            .send(())
+            .expect("release detached hotkey test worker");
     }
 
     #[test]

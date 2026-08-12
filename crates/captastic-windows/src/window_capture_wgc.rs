@@ -74,9 +74,15 @@ pub(crate) fn capture_window(hwnd: HWND) -> Result<WgcWindowFrame, CaptureError>
         size,
     )
     .map_err(|error| windows_error("create_frame_pool", error, true))?;
-    let session = pool
+    let mut resources = WgcCaptureResources {
+        pool,
+        session: None,
+    };
+    let session = resources
+        .pool
         .CreateCaptureSession(&item)
         .map_err(|error| windows_error("create_capture_session", error, true))?;
+    resources.session = Some(session.clone());
     let _ = session.SetIsCursorCaptureEnabled(false);
     let _ = session.SetIsBorderRequired(false);
 
@@ -86,7 +92,8 @@ pub(crate) fn capture_window(hwnd: HWND) -> Result<WgcWindowFrame, CaptureError>
             let _ = sender.try_send(());
             Ok(())
         });
-    let token = pool
+    let token = resources
+        .pool
         .FrameArrived(&handler)
         .map_err(|error| windows_error("subscribe_frame_arrived", error, true))?;
     let result = (|| {
@@ -113,16 +120,29 @@ pub(crate) fn capture_window(hwnd: HWND) -> Result<WgcWindowFrame, CaptureError>
                     None,
                 )
             })?;
-        let frame = pool
+        let frame = resources
+            .pool
             .TryGetNextFrame()
             .map_err(|error| windows_error("get_next_frame", error, true))?;
         readback_frame(&device, &context, &frame)
     })();
 
-    let _ = pool.RemoveFrameArrived(token);
-    let _ = session.Close();
-    let _ = pool.Close();
+    let _ = resources.pool.RemoveFrameArrived(token);
     result
+}
+
+struct WgcCaptureResources {
+    pool: Direct3D11CaptureFramePool,
+    session: Option<GraphicsCaptureSession>,
+}
+
+impl Drop for WgcCaptureResources {
+    fn drop(&mut self) {
+        if let Some(session) = self.session.as_ref() {
+            let _ = session.Close();
+        }
+        let _ = self.pool.Close();
+    }
 }
 
 fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext, IDirect3DDevice), CaptureError> {
@@ -223,7 +243,7 @@ fn readback_frame(
     let mut desc = D3D11_TEXTURE2D_DESC::default();
     // SAFETY: desc is valid writable storage and texture remains live through the query.
     unsafe { texture.GetDesc(&mut desc) };
-    if desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM || desc.Width < width || desc.Height < height {
+    if desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
         return Err(capture_error(
             CaptureErrorKind::Unsupported,
             "validate_frame_texture",
@@ -232,6 +252,18 @@ fn readback_frame(
                 desc.Format.0, desc.Width, desc.Height, width, height
             ),
             false,
+            None,
+        ));
+    }
+    if desc.Width < width || desc.Height < height {
+        return Err(capture_error(
+            CaptureErrorKind::TopologyChanged,
+            "validate_frame_texture",
+            format!(
+                "WGC window resized while capturing: texture={}x{} content={}x{}",
+                desc.Width, desc.Height, width, height
+            ),
+            true,
             None,
         ));
     }

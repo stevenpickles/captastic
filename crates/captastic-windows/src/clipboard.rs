@@ -26,6 +26,7 @@ const CF_DIBV5_FORMAT: u32 = 17;
 const LCS_SRGB: u32 = 0x7352_4742;
 const OPEN_TIMEOUT: Duration = Duration::from_millis(50);
 const MAX_RETRY_DELAY: Duration = Duration::from_millis(5);
+const HRESULT_ACCESS_DENIED: i32 = 0x8007_0005_u32 as i32;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClipboardPublishReport {
@@ -82,9 +83,19 @@ impl ClipboardPublisher {
         unsafe { EmptyClipboard() }
             .map_err(|error| clipboard_error("empty_clipboard", error, false))?;
         dib_memory.transfer_to_clipboard(CF_DIBV5_FORMAT)?;
-        if let Some(png_memory) = png_memory {
-            png_memory.transfer_to_clipboard(self.png_format)?;
-        }
+        let png_payload_bytes = if let Some(png_memory) = png_memory {
+            match png_memory.transfer_to_clipboard(self.png_format) {
+                Ok(()) => png_payload_bytes,
+                Err(error) => {
+                    log::warn!(
+                        "DIBV5 clipboard publication succeeded but optional PNG publication failed: {error}"
+                    );
+                    0
+                }
+            }
+        } else {
+            0
+        };
         drop(clipboard);
         Ok(ClipboardPublishReport {
             payload_bytes: layout.payload_bytes,
@@ -147,13 +158,14 @@ impl ClipboardSession {
             // SAFETY: owner is the live hidden window owned by this worker thread.
             match unsafe { OpenClipboard(owner) } {
                 Ok(()) => return Ok((Self, retries, duration_ns(started.elapsed()))),
-                Err(error) if started.elapsed() < timeout => {
+                Err(error)
+                    if error.code().0 == HRESULT_ACCESS_DENIED && started.elapsed() < timeout =>
+                {
                     retries = retries.saturating_add(1);
                     thread::sleep(delay);
                     delay = delay.saturating_mul(2).min(MAX_RETRY_DELAY);
-                    let _ = error;
                 }
-                Err(error) => {
+                Err(error) if error.code().0 == HRESULT_ACCESS_DENIED => {
                     return Err(CaptureError {
                         kind: CaptureErrorKind::Timeout,
                         backend: "windows-clipboard",
@@ -166,6 +178,7 @@ impl ClipboardSession {
                         native_code: Some(i64::from(error.code().0)),
                     });
                 }
+                Err(error) => return Err(clipboard_error("open_clipboard", error, false)),
             }
         }
     }

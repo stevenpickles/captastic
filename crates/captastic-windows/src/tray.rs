@@ -2,28 +2,32 @@ use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use captastic_core::{CaptureError, CaptureErrorKind};
 use windows::core::{w, Error as WindowsError, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Shutdown::{ShutdownBlockReasonCreate, ShutdownBlockReasonDestroy};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Shell::{
-    ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
-    NIM_MODIFY, NOTIFYICONDATAW,
+    ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR,
+    NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, LoadIconW, PostMessageW,
     PostQuitMessage, PostThreadMessageW, RegisterClassW, RegisterWindowMessageW,
     SetForegroundWindow, SetWindowLongPtrW, TrackPopupMenu, TranslateMessage, UnregisterClassW,
-    CREATESTRUCTW, GWLP_USERDATA, HMENU, HWND_MESSAGE, MB_ICONERROR, MB_OK, MF_CHECKED, MF_GRAYED,
-    MF_SEPARATOR, MF_STRING, MSG, SPI_SETLOGICALDPIOVERRIDE, SPI_SETWORKAREA, SW_SHOWNORMAL,
-    TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, WM_APP, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY,
-    WM_DISPLAYCHANGE, WM_LBUTTONDBLCLK, WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_QUIT, WM_RBUTTONUP,
-    WM_SETTINGCHANGE, WNDCLASSW, WS_OVERLAPPED,
+    CREATESTRUCTW, GWLP_USERDATA, HMENU, MB_ICONERROR, MB_OK, MF_CHECKED, MF_GRAYED, MF_SEPARATOR,
+    MF_STRING, MSG, SPI_SETLOGICALDPIOVERRIDE, SPI_SETWORKAREA, SW_SHOWNORMAL, TPM_BOTTOMALIGN,
+    TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE,
+    WM_ENDSESSION, WM_LBUTTONDBLCLK, WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_QUERYENDSESSION,
+    WM_QUIT, WM_RBUTTONUP, WM_SETTINGCHANGE, WNDCLASSW, WS_OVERLAPPED,
 };
 
 const CLASS_NAME: PCWSTR = w!("CaptasticTrayWindow-v1");
@@ -31,6 +35,7 @@ const WINDOW_NAME: PCWSTR = w!("Captastic");
 const TASKBAR_CREATED_NAME: PCWSTR = w!("TaskbarCreated");
 const TRAY_CALLBACK: u32 = WM_APP + 1;
 const TRAY_SET_STARTUP: u32 = WM_APP + 2;
+const TRAY_SHOW_ERROR: u32 = WM_APP + 3;
 const TRAY_ICON_ID: u32 = 1;
 const APPLICATION_ICON_RESOURCE_ID: usize = 1;
 const COMMAND_CAPTURE: usize = 1_001;
@@ -39,8 +44,11 @@ const COMMAND_CONFIG: usize = 1_003;
 const COMMAND_LOGS: usize = 1_004;
 const COMMAND_STARTUP: usize = 1_005;
 const COMMAND_EXIT: usize = 1_006;
+const SESSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(4);
+const TRAY_STOP_TIMEOUT: Duration = Duration::from_secs(1);
+const TRAY_STOP_POLL: Duration = Duration::from_millis(5);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum TrayEvent {
     Capture,
     PausedChanged(bool),
@@ -52,19 +60,34 @@ pub enum TrayEvent {
 
 pub struct TrayIcon {
     receiver: Receiver<TrayEvent>,
+    notification_sender: SyncSender<TrayNotification>,
     thread_id: u32,
     hwnd: isize,
+    session_shutdown_requested: Arc<AtomicBool>,
+    session_drain_completed: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
 
 impl TrayIcon {
     pub fn start(startup_enabled: bool) -> Result<Self, CaptureError> {
         let (event_sender, receiver) = mpsc::sync_channel(8);
+        let (notification_sender, notification_receiver) = mpsc::sync_channel(8);
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let session_shutdown_requested = Arc::new(AtomicBool::new(false));
+        let session_drain_completed = Arc::new(AtomicBool::new(false));
+        let tray_shutdown_requested = session_shutdown_requested.clone();
+        let tray_drain_completed = session_drain_completed.clone();
         let join = thread::Builder::new()
             .name("captastic-tray".to_owned())
             .spawn(move || {
-                if let Err(error) = run_tray(event_sender, startup_enabled, &ready_sender) {
+                if let Err(error) = run_tray(
+                    event_sender,
+                    notification_receiver,
+                    startup_enabled,
+                    tray_shutdown_requested,
+                    tray_drain_completed,
+                    &ready_sender,
+                ) {
                     let _ = ready_sender.send(Err(error.clone()));
                     log::error!("native tray stopped with an error: {error}");
                 }
@@ -73,8 +96,11 @@ impl TrayIcon {
         match ready_receiver.recv() {
             Ok(Ok((thread_id, hwnd))) => Ok(Self {
                 receiver,
+                notification_sender,
                 thread_id,
                 hwnd,
+                session_shutdown_requested,
+                session_drain_completed,
                 join: Some(join),
             }),
             Ok(Err(error)) => {
@@ -92,6 +118,14 @@ impl TrayIcon {
         self.receiver.try_recv().ok()
     }
 
+    pub fn session_shutdown_requested(&self) -> bool {
+        self.session_shutdown_requested.load(Ordering::Acquire)
+    }
+
+    pub fn signal_session_drained(&self) {
+        self.session_drain_completed.store(true, Ordering::Release);
+    }
+
     pub fn set_startup_enabled(&self, enabled: bool) -> Result<(), CaptureError> {
         // SAFETY: hwnd identifies the live hidden tray window owned by the tray thread.
         unsafe {
@@ -103,6 +137,26 @@ impl TrayIcon {
             )
         }
         .map_err(|error| native_error("update_startup_menu", error))
+    }
+
+    pub fn show_error(&self, message: impl Into<String>) -> Result<(), CaptureError> {
+        self.show_error_with_title("Captastic capture failed", message)
+    }
+
+    pub fn show_error_with_title(
+        &self,
+        title: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Result<(), CaptureError> {
+        self.notification_sender
+            .try_send(TrayNotification {
+                title: title.into(),
+                message: message.into(),
+            })
+            .map_err(|error| tray_error("queue_tray_error", error.to_string()))?;
+        // SAFETY: hwnd identifies the live hidden tray window owned by the tray thread.
+        unsafe { PostMessageW(HWND(self.hwnd), TRAY_SHOW_ERROR, WPARAM(0), LPARAM(0)) }
+            .map_err(|error| native_error("show_tray_error", error))
     }
 
     pub fn stop(mut self) -> Result<(), CaptureError> {
@@ -117,10 +171,28 @@ impl TrayIcon {
         unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) }
             .map_err(|error| native_error("stop_tray_thread", error))?;
         if let Some(join) = self.join.take() {
-            join.join()
-                .map_err(|_| tray_error("join_tray_thread", "tray thread panicked"))?;
+            if !join_tray_worker(join, TRAY_STOP_TIMEOUT)? {
+                log::error!(
+                    "tray worker did not stop within {} ms; detaching it so shutdown can continue",
+                    TRAY_STOP_TIMEOUT.as_millis()
+                );
+            }
         }
         Ok(())
+    }
+}
+
+fn join_tray_worker(join: JoinHandle<()>, timeout: Duration) -> Result<bool, CaptureError> {
+    let started = Instant::now();
+    while !join.is_finished() && started.elapsed() < timeout {
+        thread::sleep(TRAY_STOP_POLL);
+    }
+    if join.is_finished() {
+        join.join()
+            .map_err(|_| tray_error("join_tray_thread", "tray thread panicked"))?;
+        Ok(true)
+    } else {
+        Ok(false)
     }
 }
 
@@ -168,7 +240,10 @@ pub fn show_error_dialog(message: &str) {
 
 fn run_tray(
     event_sender: SyncSender<TrayEvent>,
+    notification_receiver: Receiver<TrayNotification>,
     startup_enabled: bool,
+    session_shutdown_requested: Arc<AtomicBool>,
+    session_drain_completed: Arc<AtomicBool>,
     ready_sender: &SyncSender<Result<(u32, isize), CaptureError>>,
 ) -> Result<(), CaptureError> {
     // SAFETY: No module name requests the current executable module.
@@ -196,10 +271,14 @@ fn run_tray(
     }
     let state = Box::new(TrayState {
         event_sender,
+        notification_receiver,
         paused: false,
         startup_enabled,
         icon,
         taskbar_created,
+        shutdown_block_active: false,
+        session_shutdown_requested,
+        session_drain_completed,
     });
     let state_pointer = Box::into_raw(state);
     // SAFETY: The registered class is live and state_pointer remains allocated through the loop.
@@ -213,7 +292,9 @@ fn run_tray(
             0,
             0,
             0,
-            HWND_MESSAGE,
+            // A hidden top-level window receives system broadcasts and the registered
+            // TaskbarCreated message. Message-only windows are excluded from both.
+            HWND(0),
             HMENU(0),
             instance,
             Some(state_pointer.cast::<c_void>()),
@@ -277,10 +358,14 @@ fn run_tray(
 
 struct TrayState {
     event_sender: SyncSender<TrayEvent>,
+    notification_receiver: Receiver<TrayNotification>,
     paused: bool,
     startup_enabled: bool,
     icon: windows::Win32::UI::WindowsAndMessaging::HICON,
     taskbar_created: u32,
+    shutdown_block_active: bool,
+    session_shutdown_requested: Arc<AtomicBool>,
+    session_drain_completed: Arc<AtomicBool>,
 }
 
 unsafe extern "system" fn tray_window_proc(
@@ -295,6 +380,12 @@ unsafe extern "system" fn tray_window_proc(
         Ok(result) => result,
         Err(_) => {
             log::error!("native tray callback panicked; requesting shutdown");
+            // SAFETY: Best-effort recovery reads the pointer installed for this live window. The
+            // callback boundary caught the panic before unwinding through Win32.
+            let state_pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut TrayState;
+            if !state_pointer.is_null() {
+                send_tray_event(state_pointer, TrayEvent::Exit);
+            }
             // SAFETY: hwnd belongs to this callback and remains valid for destruction.
             let _ = unsafe { DestroyWindow(hwnd) };
             LRESULT(0)
@@ -322,10 +413,14 @@ fn tray_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPAR
         // SAFETY: No application state is available, so default handling is required.
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     }
-    // SAFETY: The Box remains live for the complete message loop and callbacks are serialized.
-    let state = unsafe { &mut *state_pointer };
-    if message == state.taskbar_created {
-        if let Err(error) = add_tray_icon(hwnd, state.icon, state.paused) {
+    let taskbar_state = {
+        // SAFETY: The Box remains live for the message loop. This borrow ends before calling
+        // Shell_NotifyIconW, which may synchronously re-enter this window procedure.
+        let state = unsafe { &*state_pointer };
+        (message == state.taskbar_created).then_some((state.icon, state.paused))
+    };
+    if let Some((icon, paused)) = taskbar_state {
+        if let Err(error) = add_tray_icon(hwnd, icon, paused) {
             log::warn!("failed to restore tray icon after Explorer restart: {error}");
         }
         return LRESULT(0);
@@ -344,10 +439,19 @@ fn tray_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPAR
         }
         TRAY_CALLBACK => {
             let notification = lparam.0 as u32;
-            if notification == WM_LBUTTONDBLCLK && !state.paused {
-                let _ = state.event_sender.try_send(TrayEvent::Capture);
+            let (paused, sender) = {
+                // SAFETY: The state allocation is live; the borrow is released before menu APIs.
+                let state = unsafe { &*state_pointer };
+                (state.paused, state.event_sender.clone())
+            };
+            if notification == WM_LBUTTONDBLCLK && !paused {
+                let _ = sender.try_send(TrayEvent::Capture);
             } else if notification == WM_RBUTTONUP || notification == WM_CONTEXTMENU {
-                if let Err(error) = show_context_menu(hwnd, state.paused, state.startup_enabled) {
+                let startup_enabled = {
+                    // SAFETY: Short immutable read from the live state allocation.
+                    unsafe { (&*state_pointer).startup_enabled }
+                };
+                if let Err(error) = show_context_menu(hwnd, paused, startup_enabled) {
                     log::warn!("failed to show tray menu: {error}");
                 }
             }
@@ -356,37 +460,99 @@ fn tray_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPAR
         WM_COMMAND => {
             match wparam.0 & 0xffff {
                 COMMAND_CAPTURE => {
-                    if !state.paused {
-                        let _ = state.event_sender.try_send(TrayEvent::Capture);
+                    let (paused, sender) = {
+                        // SAFETY: Short immutable read from the live state allocation.
+                        let state = unsafe { &*state_pointer };
+                        (state.paused, state.event_sender.clone())
+                    };
+                    if !paused {
+                        let _ = sender.try_send(TrayEvent::Capture);
                     }
                 }
                 COMMAND_PAUSE => {
-                    state.paused = !state.paused;
-                    if let Err(error) = modify_tray_tooltip(hwnd, state.paused) {
+                    let (paused, sender) = {
+                        // SAFETY: This mutation ends before Shell_NotifyIconW can re-enter.
+                        let state = unsafe { &mut *state_pointer };
+                        state.paused = !state.paused;
+                        (state.paused, state.event_sender.clone())
+                    };
+                    if let Err(error) = modify_tray_tooltip(hwnd, paused) {
                         log::warn!("failed to update tray state: {error}");
                     }
-                    let _ = state
-                        .event_sender
-                        .try_send(TrayEvent::PausedChanged(state.paused));
+                    let _ = sender.try_send(TrayEvent::PausedChanged(paused));
                 }
                 COMMAND_CONFIG => {
-                    let _ = state.event_sender.try_send(TrayEvent::OpenConfig);
+                    send_tray_event(state_pointer, TrayEvent::OpenConfig);
                 }
                 COMMAND_LOGS => {
-                    let _ = state.event_sender.try_send(TrayEvent::OpenLogs);
+                    send_tray_event(state_pointer, TrayEvent::OpenLogs);
                 }
                 COMMAND_STARTUP => {
-                    let _ = state.event_sender.try_send(TrayEvent::ToggleStartup);
+                    send_tray_event(state_pointer, TrayEvent::ToggleStartup);
                 }
                 COMMAND_EXIT => {
-                    let _ = state.event_sender.try_send(TrayEvent::Exit);
+                    send_tray_event(state_pointer, TrayEvent::Exit);
                 }
                 _ => {}
             }
             LRESULT(0)
         }
         TRAY_SET_STARTUP => {
-            state.startup_enabled = wparam.0 != 0;
+            // SAFETY: Short mutation of the live state allocation; no reentrant API is called.
+            unsafe { (&mut *state_pointer).startup_enabled = wparam.0 != 0 };
+            LRESULT(0)
+        }
+        TRAY_SHOW_ERROR => {
+            loop {
+                let message = {
+                    // SAFETY: The receive borrow ends before Shell_NotifyIconW can re-enter.
+                    unsafe { (&mut *state_pointer).notification_receiver.try_recv() }
+                };
+                let Ok(message) = message else { break };
+                if let Err(error) = show_error_notification(hwnd, &message) {
+                    log::warn!("failed to show tray error notification: {error}");
+                }
+            }
+            LRESULT(0)
+        }
+        WM_QUERYENDSESSION => {
+            let block_active = {
+                // SAFETY: Short mutation ends before the Win32 call.
+                let state = unsafe { &mut *state_pointer };
+                if state.shutdown_block_active {
+                    true
+                } else {
+                    state.shutdown_block_active = true;
+                    false
+                }
+            };
+            if !block_active {
+                // SAFETY: hwnd is this live top-level window and the reason is static UTF-16.
+                if let Err(error) = unsafe {
+                    ShutdownBlockReasonCreate(hwnd, w!("Saving Captastic capture preferences"))
+                } {
+                    log::warn!("failed to register session-shutdown drain reason: {error}");
+                }
+            }
+            LRESULT(1)
+        }
+        WM_ENDSESSION => {
+            if session_end_is_committed(wparam.0) {
+                wait_for_session_drain(state_pointer);
+            }
+            let block_active = {
+                // SAFETY: Short mutation of the live state allocation.
+                std::mem::take(unsafe { &mut (&mut *state_pointer).shutdown_block_active })
+            };
+            if block_active {
+                // SAFETY: Balances the successful-or-attempted create for this live window.
+                let _ = unsafe { ShutdownBlockReasonDestroy(hwnd) };
+            }
+            LRESULT(0)
+        }
+        WM_CLOSE => {
+            log::warn!("tray window received WM_CLOSE; requesting daemon shutdown");
+            send_tray_event(state_pointer, TrayEvent::Exit);
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -399,6 +565,42 @@ fn tray_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPAR
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
     }
+}
+
+fn session_end_is_committed(end_session: usize) -> bool {
+    end_session != 0
+}
+
+fn wait_for_session_drain(state_pointer: *mut TrayState) {
+    // SAFETY: Clone the atomics from the live state, then release the borrow before waiting.
+    let (requested, drained) = unsafe {
+        (
+            (&*state_pointer).session_shutdown_requested.clone(),
+            (&*state_pointer).session_drain_completed.clone(),
+        )
+    };
+    if !wait_for_drain_signal(&requested, &drained, SESSION_DRAIN_TIMEOUT) {
+        log::warn!(
+            "daemon did not finish its session-shutdown drain within {} ms",
+            SESSION_DRAIN_TIMEOUT.as_millis()
+        );
+    }
+}
+
+fn wait_for_drain_signal(requested: &AtomicBool, drained: &AtomicBool, timeout: Duration) -> bool {
+    requested.store(true, Ordering::Release);
+    let started = Instant::now();
+    while !drained.load(Ordering::Acquire) && started.elapsed() < timeout {
+        thread::sleep(TRAY_STOP_POLL);
+    }
+    drained.load(Ordering::Acquire)
+}
+
+fn send_tray_event(state_pointer: *mut TrayState, event: TrayEvent) {
+    // SAFETY: Callers invoke this only while processing a message for the live tray window. The
+    // cloned sender outlives the short borrow and sending cannot alias TrayState on reentry.
+    let sender = unsafe { (&*state_pointer).event_sender.clone() };
+    let _ = sender.try_send(event);
 }
 
 fn add_tray_icon(
@@ -424,6 +626,32 @@ fn modify_tray_tooltip(hwnd: HWND, paused: bool) -> Result<(), CaptureError> {
     // SAFETY: data identifies the existing icon and supplies a valid tooltip buffer.
     if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
         return Err(last_error("modify_tray_icon"));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct TrayNotification {
+    title: String,
+    message: String,
+}
+
+fn show_error_notification(
+    hwnd: HWND,
+    notification: &TrayNotification,
+) -> Result<(), CaptureError> {
+    let mut data = tray_data(
+        hwnd,
+        windows::Win32::UI::WindowsAndMessaging::HICON(0),
+        false,
+        NIF_INFO,
+    );
+    write_wide(&mut data.szInfoTitle, &notification.title);
+    write_wide(&mut data.szInfo, &notification.message);
+    data.dwInfoFlags = NIIF_ERROR;
+    // SAFETY: data identifies the existing icon and contains terminated notification buffers.
+    if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
+        return Err(last_error("show_tray_error_notification"));
     }
     Ok(())
 }
@@ -582,6 +810,63 @@ fn tray_error(operation: &'static str, message: impl Into<String>) -> CaptureErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_shutdown_is_routed_only_after_windows_commits_it() {
+        assert!(!session_end_is_committed(0));
+        assert!(session_end_is_committed(1));
+    }
+
+    #[test]
+    fn session_shutdown_handoff_uses_a_dedicated_nonblocking_signal() {
+        let requested = Arc::new(AtomicBool::new(false));
+        let drained = Arc::new(AtomicBool::new(false));
+        let daemon_requested = requested.clone();
+        let daemon_drained = drained.clone();
+        let daemon = thread::spawn(move || {
+            while !daemon_requested.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            daemon_drained.store(true, Ordering::Release);
+        });
+
+        assert!(wait_for_drain_signal(
+            &requested,
+            &drained,
+            Duration::from_secs(1)
+        ));
+        daemon.join().expect("join scripted daemon acknowledgement");
+    }
+
+    #[test]
+    fn session_shutdown_handoff_obeys_its_deadline_without_an_acknowledgement() {
+        let requested = AtomicBool::new(false);
+        let drained = AtomicBool::new(false);
+        let started = Instant::now();
+
+        assert!(!wait_for_drain_signal(
+            &requested,
+            &drained,
+            Duration::from_millis(10)
+        ));
+        assert!(requested.load(Ordering::Acquire));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn tray_worker_join_detaches_at_its_deadline() {
+        let (release_sender, release_receiver) = mpsc::channel();
+        let join = thread::spawn(move || {
+            let _ = release_receiver.recv();
+        });
+
+        let started = Instant::now();
+        assert!(!join_tray_worker(join, Duration::from_millis(10)).expect("bounded join"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        release_sender
+            .send(())
+            .expect("release detached tray test worker");
+    }
 
     #[test]
     fn tray_tooltip_reports_operating_state() {

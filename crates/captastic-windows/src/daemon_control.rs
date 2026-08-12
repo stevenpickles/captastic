@@ -8,6 +8,7 @@ use windows::Win32::System::Threading::{
 };
 
 const CONTROL_EVENT_NAME: windows::core::PCWSTR = w!("Local\\CaptasticDaemonControl-v1");
+const HRESULT_ALREADY_EXISTS: i32 = 0x8007_00B7_u32 as i32;
 
 pub struct DaemonControl {
     event: HANDLE,
@@ -19,7 +20,9 @@ impl DaemonControl {
         let event = unsafe { CreateEventW(None, true, false, CONTROL_EVENT_NAME) }
             .map_err(|error| control_error("create_daemon_control", error, false))?;
         // SAFETY: This reads the calling thread's last-error value immediately after CreateEventW.
-        if unsafe { GetLastError() }.is_err() {
+        let already_exists =
+            unsafe { GetLastError() }.is_err_and(|error| error.code().0 == HRESULT_ALREADY_EXISTS);
+        if already_exists {
             // SAFETY: event is the valid handle returned for the existing named event.
             let _ = unsafe { CloseHandle(event) };
             return Err(CaptureError {

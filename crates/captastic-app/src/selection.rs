@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -16,13 +17,91 @@ use crate::error::AppError;
 
 const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const WORKER_STOP_POLL: Duration = Duration::from_millis(5);
+const WORKER_RECEIVE_POLL: Duration = Duration::from_millis(50);
+const RESOURCE_CACHE_IDLE: Duration = Duration::from_secs(30);
 
 pub type ConfirmedRegionCache = Arc<Mutex<BTreeMap<String, ConfirmedRegion>>>;
 
+pub struct OneShotUiStateWorker {
+    controller: Option<captastic_windows::OverlayController>,
+    failure_receiver: mpsc::Receiver<String>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl OneShotUiStateWorker {
+    pub fn start(store: captastic_config::UiStateStore) -> Result<Self, AppError> {
+        let (sender, receiver) = mpsc::channel();
+        let (failure_sender, failure_receiver) = mpsc::channel();
+        let controller = captastic_windows::OverlayController::with_ui_updates(sender);
+        let join = thread::Builder::new()
+            .name("captastic-ui-state-once".to_owned())
+            .spawn(move || persist_ui_state(receiver, store, Some(failure_sender)))
+            .map_err(|error| AppError::BackendUnavailable(error.to_string()))?;
+        Ok(Self {
+            controller: Some(controller),
+            failure_receiver,
+            join: Some(join),
+        })
+    }
+
+    pub fn controller(&self) -> &captastic_windows::OverlayController {
+        self.controller.as_ref().expect("UI-state worker is active")
+    }
+
+    pub fn finish(mut self) -> Result<(), AppError> {
+        self.controller.take();
+        let Some(join) = self.join.take() else {
+            return Ok(());
+        };
+        if !join_worker_with_timeout(join, "one-shot UI-state", WORKER_STOP_TIMEOUT) {
+            return Err(AppError::BackendUnavailable(format!(
+                "one-shot UI-state persistence did not finish within {} ms",
+                WORKER_STOP_TIMEOUT.as_millis()
+            )));
+        }
+        if let Some(failure) = self.failure_receiver.try_iter().next() {
+            return Err(AppError::BackendUnavailable(failure));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for OneShotUiStateWorker {
+    fn drop(&mut self) {
+        self.controller.take();
+        if let Some(join) = self.join.take() {
+            join_worker_with_timeout(join, "one-shot UI-state", WORKER_STOP_TIMEOUT);
+        }
+    }
+}
+
+fn join_worker_with_timeout(join: JoinHandle<()>, name: &str, timeout: Duration) -> bool {
+    join_worker_until(join, name, Instant::now() + timeout)
+}
+
+fn join_worker_until(join: JoinHandle<()>, name: &str, deadline: Instant) -> bool {
+    while !join.is_finished() && Instant::now() < deadline {
+        thread::sleep(WORKER_STOP_POLL);
+    }
+    if join.is_finished() {
+        let _ = join.join();
+        true
+    } else {
+        crate::logging::error(format_args!(
+            "{name} worker did not stop before its shutdown deadline; detaching it so shutdown can continue"
+        ));
+        false
+    }
+}
+
 pub struct SelectionWorker {
     sender: Option<mpsc::SyncSender<SelectionJob>>,
-    controller: captastic_windows::OverlayController,
+    controller: Option<captastic_windows::OverlayController>,
+    ui_sender: Option<mpsc::Sender<captastic_windows::OverlayUiUpdate>>,
+    failure_receiver: mpsc::Receiver<String>,
+    stop_requested: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
+    ui_join: Option<JoinHandle<()>>,
 }
 
 impl SelectionWorker {
@@ -31,36 +110,66 @@ impl SelectionWorker {
         json_output: bool,
         queue_capacity: usize,
         confirmed_regions: ConfirmedRegionCache,
+        ui_state_store: captastic_config::UiStateStore,
     ) -> Result<Self, AppError> {
         let (sender, receiver) = mpsc::sync_channel::<SelectionJob>(queue_capacity);
-        let controller = captastic_windows::OverlayController::new();
+        let (ui_sender, ui_receiver) = mpsc::channel();
+        let (failure_sender, failure_receiver) = mpsc::channel();
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let worker_stop_requested = stop_requested.clone();
+        let ui_join = thread::Builder::new()
+            .name("captastic-ui-state".to_owned())
+            .spawn(move || persist_ui_state(ui_receiver, ui_state_store, Some(failure_sender)))
+            .map_err(|error| AppError::BackendUnavailable(error.to_string()))?;
+        let controller = captastic_windows::OverlayController::with_ui_updates(ui_sender.clone());
         let worker_controller = controller.clone();
-        let join = thread::Builder::new()
+        let join = match thread::Builder::new()
             .name("captastic-selection".to_owned())
-            .spawn(move || loop {
-                let mut job = match receiver.recv_timeout(Duration::from_secs(30)) {
+            .spawn(move || {
+                let mut cache_idle_started = Instant::now();
+                loop {
+                    if worker_stop_requested.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let mut job = match receiver.recv_timeout(WORKER_RECEIVE_POLL) {
                     Ok(job) => job,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        captastic_windows::clear_overlay_resource_cache();
+                        if worker_stop_requested.load(Ordering::Acquire) {
+                            break;
+                        }
+                        if cache_idle_started.elapsed() >= RESOURCE_CACHE_IDLE {
+                            captastic_windows::clear_overlay_resource_cache();
+                            cache_idle_started = Instant::now();
+                        }
                         continue;
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 };
+                cache_idle_started = Instant::now();
                 job.recorder.record(
                     job.capture_id,
                     PerfEventKind::SelectionStarted,
                     offset_after_cpu(&job),
                 );
+                let remembered_ui = worker_controller.remembered_ui(
+                    &job.frame.metadata.display_id.0,
+                    job.remembered_ui.unwrap_or_default(),
+                );
                 let selection = captastic_windows::select_from_frozen_frame_with_initial_tool_and_ui(
                     &job.frame,
                     &worker_controller,
                     job.initial_tool,
-                    job.remembered_ui,
+                    Some(remembered_ui),
                 );
                 match selection {
                     Ok(Some(selection)) => {
                         if selection.kind == captastic_windows::SelectionKind::Region {
-                            remember_confirmed_region(&confirmed_regions, &job.frame.metadata, selection.rect);
+                            remember_confirmed_region(
+                                &confirmed_regions,
+                                &worker_controller,
+                                &job.frame.metadata,
+                                selection.rect,
+                            );
                         }
                         let selection_offset_ns = duration_ns(job.triggered_at.elapsed());
                         job.recorder.record(
@@ -215,12 +324,28 @@ impl SelectionWorker {
                         );
                     }
                 }
-            })
-            .map_err(|error| AppError::BackendUnavailable(error.to_string()))?;
+            }
+            }) {
+            Ok(join) => join,
+            Err(error) => {
+                drop(controller);
+                drop(ui_sender);
+                join_worker_with_timeout(
+                    ui_join,
+                    "UI-state persistence startup rollback",
+                    WORKER_STOP_TIMEOUT,
+                );
+                return Err(AppError::BackendUnavailable(error.to_string()));
+            }
+        };
         Ok(Self {
             sender: Some(sender),
-            controller,
+            controller: Some(controller),
+            ui_sender: Some(ui_sender),
+            failure_receiver,
+            stop_requested,
             join: Some(join),
+            ui_join: Some(ui_join),
         })
     }
 
@@ -231,25 +356,42 @@ impl SelectionWorker {
             .clone()
     }
 
-    pub fn stop(mut self) {
-        self.stop_inner();
+    pub fn try_recv_persistence_failure(&self) -> Option<String> {
+        self.failure_receiver.try_recv().ok()
     }
 
-    fn stop_inner(&mut self) {
+    #[cfg(test)]
+    pub fn stop(mut self) -> Vec<String> {
+        self.stop_inner(Instant::now() + WORKER_STOP_TIMEOUT);
+        self.failure_receiver.try_iter().collect()
+    }
+
+    pub fn stop_before(mut self, deadline: Instant) -> Vec<String> {
+        self.request_stop();
+        self.stop_inner(deadline);
+        self.failure_receiver.try_iter().collect()
+    }
+
+    pub fn request_stop(&mut self) {
+        self.stop_requested.store(true, Ordering::Release);
         self.sender.take();
-        self.controller.cancel();
+        if let Some(controller) = self.controller.take() {
+            controller.cancel();
+        }
+        self.ui_sender.take();
+    }
+
+    fn stop_inner(&mut self, deadline: Instant) {
+        self.request_stop();
+        let mut selection_stopped = true;
         if let Some(join) = self.join.take() {
-            let started = Instant::now();
-            while !join.is_finished() && started.elapsed() < WORKER_STOP_TIMEOUT {
-                thread::sleep(WORKER_STOP_POLL);
+            if !join_worker_until(join, "selection", deadline) {
+                selection_stopped = false;
             }
-            if join.is_finished() {
-                let _ = join.join();
-            } else {
-                crate::logging::error(format_args!(
-                    "selection worker did not stop within {} ms; detaching it so shutdown can continue",
-                    WORKER_STOP_TIMEOUT.as_millis()
-                ));
+        }
+        if let Some(join) = self.ui_join.take() {
+            if selection_stopped {
+                join_worker_until(join, "UI-state persistence", deadline);
             }
         }
     }
@@ -257,7 +399,7 @@ impl SelectionWorker {
 
 impl Drop for SelectionWorker {
     fn drop(&mut self) {
-        self.stop_inner();
+        self.stop_inner(Instant::now() + WORKER_STOP_TIMEOUT);
     }
 }
 
@@ -390,6 +532,7 @@ fn ns_to_ms(ns: u64) -> f64 {
 
 fn remember_confirmed_region(
     cache: &ConfirmedRegionCache,
+    controller: &captastic_windows::OverlayController,
     metadata: &captastic_core::FrameMetadata,
     rect: captastic_core::Rect,
 ) {
@@ -427,14 +570,296 @@ fn remember_confirmed_region(
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.insert(metadata.display_id.0.clone(), confirmed);
     }
-    if let Err(error) = captastic_config::save_display_confirmed_region(
-        &metadata.display_id.0,
-        confirmed.region,
-        confirmed.source,
-    ) {
-        crate::logging::warn(format_args!(
-            "failed to persist confirmed region for display {}: {error}",
-            metadata.display_id.0
+    controller.submit_ui_update(captastic_windows::OverlayUiUpdate::ConfirmedRegion {
+        display_id: metadata.display_id.0.clone(),
+        region: confirmed.region,
+        source: confirmed.source,
+    });
+}
+
+fn persist_ui_state(
+    receiver: mpsc::Receiver<captastic_windows::OverlayUiUpdate>,
+    store: captastic_config::UiStateStore,
+    failure_sender: Option<mpsc::Sender<String>>,
+) {
+    while let Ok(first) = receiver.recv() {
+        let mut latest = BTreeMap::<(String, u8), captastic_windows::OverlayUiUpdate>::new();
+        for update in std::iter::once(first).chain(receiver.try_iter()) {
+            let key = match &update {
+                captastic_windows::OverlayUiUpdate::Interaction { display_id, .. } => {
+                    (display_id.clone(), 0)
+                }
+                captastic_windows::OverlayUiUpdate::ToolbarCenter { display_id, .. } => {
+                    (display_id.clone(), 1)
+                }
+                captastic_windows::OverlayUiUpdate::ConfirmedRegion { display_id, .. } => {
+                    (display_id.clone(), 2)
+                }
+            };
+            coalesce_ui_update(&mut latest, key, update);
+        }
+        for update in latest.into_values() {
+            let result = match update {
+                captastic_windows::OverlayUiUpdate::Interaction {
+                    display_id,
+                    tool,
+                    region,
+                    source,
+                } => store.save_display_interaction_state(&display_id, tool, region, source),
+                captastic_windows::OverlayUiUpdate::ToolbarCenter {
+                    display_id,
+                    center_x,
+                    center_y,
+                } => store.save_display_overlay_center(&display_id, center_x, center_y),
+                captastic_windows::OverlayUiUpdate::ConfirmedRegion {
+                    display_id,
+                    region,
+                    source,
+                } => store.save_display_confirmed_region(&display_id, region, source),
+            };
+            if let Err(error) = result {
+                let message = format!("failed to persist UI state: {error}");
+                crate::logging::warn(format_args!("{message}"));
+                if let Some(sender) = failure_sender.as_ref() {
+                    let _ = sender.send(message);
+                }
+            }
+        }
+    }
+}
+
+fn coalesce_ui_update(
+    latest: &mut BTreeMap<(String, u8), captastic_windows::OverlayUiUpdate>,
+    key: (String, u8),
+    mut update: captastic_windows::OverlayUiUpdate,
+) {
+    if let (
+        Some(captastic_windows::OverlayUiUpdate::Interaction {
+            region: previous_region,
+            source: previous_source,
+            ..
+        }),
+        captastic_windows::OverlayUiUpdate::Interaction { region, source, .. },
+    ) = (latest.get(&key), &mut update)
+    {
+        if region.is_none() {
+            *region = *previous_region;
+            *source = *previous_source;
+        }
+    }
+    latest.insert(key, update);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    #[test]
+    fn worker_join_timeout_does_not_wait_for_a_stuck_thread() {
+        let (release_sender, release_receiver) = mpsc::channel();
+        let join = thread::spawn(move || {
+            let _ = release_receiver.recv();
+        });
+
+        let started = Instant::now();
+        assert!(!join_worker_with_timeout(
+            join,
+            "test",
+            Duration::from_millis(10)
         ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        release_sender
+            .send(())
+            .expect("release detached test worker");
+    }
+
+    #[test]
+    fn one_shot_worker_flushes_ui_state_before_drop_returns() {
+        let directory = std::env::temp_dir().join(format!(
+            "captastic-one-shot-ui-flush-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("create one-shot test directory");
+        let path = directory.join("captastic.toml");
+        let store = captastic_config::UiStateStore::for_config(&path);
+        let worker = OneShotUiStateWorker::start(store.clone()).expect("start one-shot worker");
+        worker
+            .controller()
+            .submit_ui_update(captastic_windows::OverlayUiUpdate::ToolbarCenter {
+                display_id: "display-1".to_owned(),
+                center_x: 0.25,
+                center_y: 0.75,
+            });
+
+        drop(worker);
+
+        assert_eq!(
+            store
+                .load_display_ui_state("display-1")
+                .expect("load flushed one-shot state")
+                .overlay_center,
+            Some((0.25, 0.75))
+        );
+        fs::remove_dir_all(directory).expect("remove one-shot test directory");
+    }
+
+    #[test]
+    fn one_shot_finish_reports_persistence_failure() {
+        let directory = std::env::temp_dir().join(format!(
+            "captastic-one-shot-ui-failure-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("create invalid config path");
+        let store = captastic_config::UiStateStore::for_config(&directory);
+        let worker = OneShotUiStateWorker::start(store).expect("start one-shot worker");
+        worker
+            .controller()
+            .submit_ui_update(captastic_windows::OverlayUiUpdate::ToolbarCenter {
+                display_id: "display-1".to_owned(),
+                center_x: 0.25,
+                center_y: 0.75,
+            });
+
+        let error = worker
+            .finish()
+            .expect_err("failed persistence must fail one-shot completion");
+
+        assert!(error.to_string().contains("failed to persist UI state"));
+        fs::remove_dir_all(directory).expect("remove invalid config path");
+    }
+
+    #[test]
+    fn persistence_failures_are_reported_after_the_update_channel_drains() {
+        let directory =
+            std::env::temp_dir().join(format!("captastic-ui-state-failure-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("create invalid config path");
+        let store = captastic_config::UiStateStore::for_config(&directory);
+        let (update_sender, update_receiver) = mpsc::channel();
+        let (failure_sender, failure_receiver) = mpsc::channel();
+        update_sender
+            .send(captastic_windows::OverlayUiUpdate::ToolbarCenter {
+                display_id: "display-1".to_owned(),
+                center_x: 0.25,
+                center_y: 0.75,
+            })
+            .expect("queue update");
+        drop(update_sender);
+
+        persist_ui_state(update_receiver, store, Some(failure_sender));
+
+        let failure = failure_receiver
+            .try_recv()
+            .expect("persistence failure must be surfaced");
+        assert!(failure.contains("failed to persist UI state"));
+        fs::remove_dir_all(directory).expect("remove invalid config path");
+    }
+
+    #[test]
+    fn stop_returns_persistence_failures_queued_during_teardown() {
+        let (failure_sender, failure_receiver) = mpsc::channel();
+        failure_sender
+            .send("scripted shutdown failure".to_owned())
+            .expect("queue teardown failure");
+        let worker = SelectionWorker {
+            sender: None,
+            controller: None,
+            ui_sender: None,
+            failure_receiver,
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            join: None,
+            ui_join: None,
+        };
+
+        assert_eq!(worker.stop(), vec!["scripted shutdown failure".to_owned()]);
+    }
+
+    #[test]
+    fn idle_selection_worker_observes_stop_without_sender_disconnect() {
+        let directory = std::env::temp_dir().join(format!(
+            "captastic-idle-selection-stop-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("create idle worker test directory");
+        let (clipboard_sender, _clipboard_receiver) = mpsc::sync_channel(1);
+        let mut worker = SelectionWorker::start(
+            clipboard_sender,
+            false,
+            1,
+            Arc::new(Mutex::new(BTreeMap::new())),
+            captastic_config::UiStateStore::for_config(directory.join("captastic.toml")),
+        )
+        .expect("start idle selection worker");
+
+        let started = Instant::now();
+        worker.request_stop();
+        while !worker
+            .ui_join
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+            && started.elapsed() < Duration::from_millis(500)
+        {
+            thread::yield_now();
+        }
+        assert!(
+            worker
+                .ui_join
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished),
+            "request_stop should close and flush UI persistence before final teardown"
+        );
+        let failures = worker.stop_before(Instant::now() + Duration::from_secs(1));
+
+        assert!(failures.is_empty());
+        assert!(started.elapsed() < Duration::from_millis(500));
+        fs::remove_dir_all(directory).expect("remove idle worker test directory");
+    }
+
+    #[test]
+    fn coalescing_interactions_preserves_a_region_from_earlier_in_the_batch() {
+        let key = ("display-1".to_owned(), 0);
+        let region = CaptureRegion {
+            x: 1,
+            y: 2,
+            width: 30,
+            height: 40,
+        };
+        let mut latest = BTreeMap::new();
+        coalesce_ui_update(
+            &mut latest,
+            key.clone(),
+            captastic_windows::OverlayUiUpdate::Interaction {
+                display_id: "display-1".to_owned(),
+                tool: captastic_config::CaptureTool::Region,
+                region: Some(region),
+                source: None,
+            },
+        );
+        coalesce_ui_update(
+            &mut latest,
+            key.clone(),
+            captastic_windows::OverlayUiUpdate::Interaction {
+                display_id: "display-1".to_owned(),
+                tool: captastic_config::CaptureTool::Window,
+                region: None,
+                source: None,
+            },
+        );
+
+        let captastic_windows::OverlayUiUpdate::Interaction {
+            tool,
+            region: saved_region,
+            ..
+        } = latest.get(&key).expect("coalesced interaction")
+        else {
+            panic!("expected interaction update");
+        };
+        assert_eq!(*tool, captastic_config::CaptureTool::Window);
+        assert_eq!(*saved_region, Some(region));
     }
 }

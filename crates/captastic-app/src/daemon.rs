@@ -10,6 +10,32 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(windows)]
+const CAPTURE_WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(windows)]
+const CAPTURE_WORKER_STOP_POLL: Duration = Duration::from_millis(5);
+#[cfg(windows)]
+const DAEMON_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[cfg(windows)]
+fn join_capture_worker_until(join: thread::JoinHandle<()>, deadline: Instant) {
+    while !join.is_finished() && Instant::now() < deadline {
+        thread::sleep(CAPTURE_WORKER_STOP_POLL);
+    }
+    if join.is_finished() {
+        let _ = join.join();
+    } else {
+        crate::logging::error(format_args!(
+            "capture worker did not stop before the daemon shutdown deadline; detaching it so shutdown can continue"
+        ));
+    }
+}
+
+#[cfg(windows)]
+fn join_capture_worker(join: thread::JoinHandle<()>) {
+    join_capture_worker_until(join, Instant::now() + CAPTURE_WORKER_STOP_TIMEOUT);
+}
+
+#[cfg(windows)]
 use captastic_config::{
     AppConfig, ConfirmedRegion, HotkeyAction, HotkeyBinding, HotkeyChord, UiConfig,
 };
@@ -17,8 +43,9 @@ use captastic_config::{
 use captastic_core::DisplayId;
 #[cfg(windows)]
 use captastic_core::{
-    validate_event_order, CaptureError, CaptureErrorKind, CaptureId, CaptureMode, CaptureRequest,
-    CpuFrame, CursorMode, EventRecorder, FrameMetadata, NativeFrame, PerfEventKind, Rect,
+    validate_event_order, CaptureBackend, CaptureError, CaptureErrorKind, CaptureId, CaptureMode,
+    CaptureRequest, CpuFrame, CursorMode, EventRecorder, FrameMetadata, NativeFrame, PerfEventKind,
+    Rect,
 };
 #[cfg(windows)]
 use serde_json::json;
@@ -45,18 +72,51 @@ struct ResolvedDaemonArgs {
     hotkey_bindings: Vec<HotkeyBinding>,
     confirmed_regions: BTreeMap<String, ConfirmedRegion>,
     ui: UiConfig,
+    ui_state_store: captastic_config::UiStateStore,
     clipboard_queue_capacity: usize,
     selection_queue_capacity: usize,
     max_captures: Option<usize>,
     self_trigger: bool,
     json: bool,
+    startup_warnings: Vec<String>,
 }
 
 #[cfg(windows)]
 fn resolve_daemon_args(args: DaemonArgs) -> Result<ResolvedDaemonArgs, AppError> {
+    resolve_daemon_args_with_default(args, AppConfig::load_default_recovering)
+}
+
+#[cfg(windows)]
+fn resolve_daemon_args_with_default(
+    args: DaemonArgs,
+    load_default: impl FnOnce() -> Result<
+        (AppConfig, Option<captastic_config::ConfigRecovery>),
+        captastic_config::ConfigError,
+    >,
+) -> Result<ResolvedDaemonArgs, AppError> {
+    let mut startup_warnings = Vec::new();
+    let ui_state_store = args
+        .config
+        .as_ref()
+        .map_or_else(captastic_config::UiStateStore::for_default_config, |path| {
+            captastic_config::UiStateStore::for_config(path.clone())
+        });
     let config = match args.config.as_deref() {
         Some(path) => AppConfig::load(path)?,
-        None => AppConfig::load_default()?,
+        None => {
+            let (config, recovery) = load_default()?;
+            if let Some(recovery) = recovery {
+                let message = format!(
+                    "damaged configuration {} was quarantined as {}; continuing with defaults: {}",
+                    recovery.original_path.display(),
+                    recovery.quarantined_path.display(),
+                    recovery.reason
+                );
+                crate::logging::error(format_args!("{message}"));
+                startup_warnings.push(message);
+            }
+            config
+        }
     };
     config.validate()?;
     let hotkey_bindings = config.hotkey.resolved_bindings()?;
@@ -93,10 +153,12 @@ fn resolve_daemon_args(args: DaemonArgs) -> Result<ResolvedDaemonArgs, AppError>
         hotkey_bindings,
         confirmed_regions,
         ui: config.ui.clone(),
+        ui_state_store,
         selection_queue_capacity: config.selection.queue_capacity,
         max_captures: args.max_captures,
         self_trigger: args.self_trigger,
         json: args.json,
+        startup_warnings,
     })
 }
 
@@ -140,12 +202,12 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             )));
         }
     }
-    let clipboard_worker = args
+    let mut clipboard_worker = args
         .clipboard
         .then(|| crate::clipboard::ClipboardWorker::start(args.json, args.clipboard_queue_capacity))
         .transpose()?;
     let confirmed_regions = Arc::new(Mutex::new(args.confirmed_regions.clone()));
-    let selection_worker = args
+    let mut selection_worker = args
         .selection
         .then(|| {
             crate::selection::SelectionWorker::start(
@@ -156,6 +218,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                 args.json,
                 args.selection_queue_capacity,
                 confirmed_regions.clone(),
+                args.ui_state_store.clone(),
             )
         })
         .transpose()?;
@@ -168,6 +231,8 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let (command_sender, command_receiver) = mpsc::sync_channel(args.trigger_queue_capacity);
     let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
     let (done_sender, done_receiver) = mpsc::sync_channel::<Result<(), AppError>>(1);
+    let capture_stop_requested = Arc::new(AtomicBool::new(false));
+    let worker_stop_requested = capture_stop_requested.clone();
     let backend_name = args.backend.clone();
     let display_policy = args.display_policy.clone();
     let mode = args.mode.clone();
@@ -202,6 +267,10 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             let mut next_capture_id = 1_u64;
             let mut recovery: Option<BackendRecovery> = None;
             loop {
+                if worker_stop_requested.load(Ordering::Acquire) {
+                    let _ = done_sender.send(Ok(()));
+                    break;
+                }
                 if recovery
                     .as_ref()
                     .is_some_and(|state| Instant::now() >= state.next_attempt)
@@ -253,71 +322,62 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                             ));
                             continue;
                         }
-                        let mut recovery_attempts = 0_u32;
-                        let (capture_result, mut recorder) = loop {
-                            let mut recorder = trigger_recorder(capture_id, &trigger);
-                            let active_backend = backend
-                                .as_mut()
-                                .expect("capture backend exists outside recovery");
-                            let capture_result = super::resolve_capture_source(
-                                &display_policy,
-                                active_backend.displays(),
-                            )
-                            .and_then(|source| {
-                                log::debug!(
-                                    "capture {} action={} resolved source={source:?}",
+                        let (
+                            capture_result,
+                            mut recorder,
+                            recovery_attempts,
+                            reinitialize_error,
+                        ) = capture_with_backend_recovery(
+                            &mut backend,
+                            |active_backend| {
+                                let mut recorder = trigger_recorder(capture_id, &trigger);
+                                let capture_result = super::resolve_capture_source(
+                                    &display_policy,
+                                    active_backend.displays(),
+                                )
+                                .and_then(|source| {
+                                    log::debug!(
+                                        "capture {} action={} resolved source={source:?}",
+                                        capture_id.0,
+                                        trigger.action
+                                    );
+                                    let request = CaptureRequest {
+                                        id: capture_id,
+                                        triggered_at: trigger.received_at,
+                                        source,
+                                        mode: mode.clone(),
+                                        cpu_frame,
+                                        retain_native_frame: selection_enabled
+                                            && trigger.action != HotkeyAction::FullDisplay,
+                                        cursor: CursorMode::Exclude,
+                                    };
+                                    active_backend.capture(&request, &mut recorder)
+                                });
+                                (capture_result, recorder)
+                            },
+                            || super::create_backend(&backend_name, &display_policy),
+                            thread::sleep,
+                            |attempt, delay, error| {
+                                crate::logging::warn(format_args!(
+                                    "capture {} lost the capture engine; dropping it and retrying {}/{} in {:.0} ms: {error}",
                                     capture_id.0,
-                                    trigger.action
-                                );
-                                let request = CaptureRequest {
-                                    id: capture_id,
-                                    triggered_at: trigger.received_at,
-                                    source,
-                                    mode: mode.clone(),
-                                    cpu_frame,
-                                    retain_native_frame: selection_enabled
-                                        && trigger.action != HotkeyAction::FullDisplay,
-                                    cursor: CursorMode::Exclude,
-                                };
-                                active_backend.capture(&request, &mut recorder)
-                            });
-                            let Err(error) = &capture_result else {
-                                break (capture_result, recorder);
-                            };
-                            if !requires_backend_recovery(error)
-                                || recovery_attempts >= CAPTURE_RECOVERY_RETRIES
-                            {
-                                break (capture_result, recorder);
-                            }
-
-                            recovery_attempts = recovery_attempts.saturating_add(1);
-                            let delay = recovery_delay(recovery_attempts);
+                                    attempt,
+                                    CAPTURE_RECOVERY_RETRIES,
+                                    delay.as_secs_f64() * 1_000.0
+                                ));
+                            },
+                        );
+                        if let Some(reinitialize_error) = reinitialize_error {
                             crate::logging::warn(format_args!(
-                                "capture {} lost the capture engine; dropping it and retrying {}/{} in {:.0} ms: {error}",
-                                capture_id.0,
-                                recovery_attempts,
-                                CAPTURE_RECOVERY_RETRIES,
-                                delay.as_secs_f64() * 1_000.0
+                                "capture engine reinitialization failed during capture {}: {reinitialize_error}",
+                                capture_id.0
                             ));
-                            backend.take();
-                            thread::sleep(delay);
-                            match super::create_backend(&backend_name, &display_policy) {
-                                Ok(replacement) => {
-                                    backend = Some(replacement);
-                                }
-                                Err(reinitialize_error) => {
-                                    crate::logging::warn(format_args!(
-                                        "capture engine reinitialization failed during capture {}: {reinitialize_error}",
-                                        capture_id.0
-                                    ));
-                                    recovery = Some(BackendRecovery {
-                                        failed_attempts: recovery_attempts,
-                                        next_attempt: Instant::now() + delay,
-                                    });
-                                    break (capture_result, recorder);
-                                }
-                            }
-                        };
+                            recovery = Some(BackendRecovery {
+                                failed_attempts: recovery_attempts,
+                                next_attempt: Instant::now()
+                                    + recovery_delay(recovery_attempts),
+                            });
+                        }
                         if recovery_attempts > 0 && capture_result.is_ok() {
                             log::info!(
                                 "capture engine recovered during capture {} after {} attempt(s)",
@@ -423,10 +483,13 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let callback_sender = command_sender.clone();
     let callback_dropped = dropped.clone();
     let callback_paused = paused.clone();
-    let hotkey = match captastic_windows::HotkeyListener::start(
+    let callback_stop_requested = capture_stop_requested.clone();
+    let mut hotkey = match captastic_windows::HotkeyListener::start(
         &args.hotkey_bindings,
         move |action, chord, received_at| {
-            if callback_paused.load(Ordering::Acquire) {
+            if callback_paused.load(Ordering::Acquire)
+                || callback_stop_requested.load(Ordering::Acquire)
+            {
                 return;
             }
             let trigger = TriggerEvent {
@@ -447,7 +510,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         Ok(listener) => listener,
         Err(error) => {
             let _ = command_sender.send(CaptureCommand::Shutdown);
-            let _ = capture_join.join();
+            join_capture_worker(capture_join);
             return Err(error.into());
         }
     };
@@ -456,7 +519,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         Err(error) => {
             let _ = hotkey.stop();
             let _ = command_sender.send(CaptureCommand::Shutdown);
-            let _ = capture_join.join();
+            join_capture_worker(capture_join);
             return Err(error.into());
         }
     };
@@ -478,6 +541,17 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             None
         }
     };
+    if let Some(tray) = tray.as_ref() {
+        for warning in &args.startup_warnings {
+            if let Err(error) =
+                tray.show_error_with_title("Captastic configuration recovered", warning.clone())
+            {
+                crate::logging::warn(format_args!(
+                    "failed to surface startup warning in the notification area: {error}"
+                ));
+            }
+        }
+    }
 
     let active_hotkeys = args
         .hotkey_bindings
@@ -540,14 +614,88 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     }
 
     let mut shutdown_sent = false;
+    let mut shutdown_deadline = None;
     let mut tray_shutdown_requested = false;
+    let mut last_persistence_notification: Option<String> = None;
+    let mut daemon_result = Ok(());
     loop {
+        let session_shutdown_requested = tray
+            .as_ref()
+            .is_some_and(captastic_windows::TrayIcon::session_shutdown_requested);
+        if session_shutdown_requested {
+            tray_shutdown_requested = true;
+        }
+        if tray_shutdown_requested && shutdown_deadline.is_none() {
+            log::info!(
+                "{}; draining daemon workers",
+                if session_shutdown_requested {
+                    "Windows session is ending"
+                } else {
+                    "notification-area shutdown requested"
+                }
+            );
+            shutdown_deadline = Some(Instant::now() + DAEMON_SHUTDOWN_TIMEOUT);
+            paused.store(true, Ordering::Release);
+            capture_stop_requested.store(true, Ordering::Release);
+            if let Some(worker) = selection_worker.as_mut() {
+                worker.request_stop();
+            }
+            if let Some(worker) = clipboard_worker.as_mut() {
+                worker.request_stop();
+            }
+            if let Err(error) = hotkey.request_stop() {
+                crate::logging::warn(format_args!("failed to request hotkey shutdown: {error}"));
+            }
+        }
+        if shutdown_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            crate::logging::error(format_args!(
+                "daemon shutdown exceeded {} ms; continuing bounded teardown while the capture worker is detached",
+                DAEMON_SHUTDOWN_TIMEOUT.as_millis()
+            ));
+            break;
+        }
         match done_receiver.recv_timeout(Duration::from_millis(50)) {
             Ok(result) => {
-                result?;
+                daemon_result = result;
                 break;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(worker) = clipboard_worker.as_ref() {
+                    while let Some(failure) = worker.try_recv_failure() {
+                        if let Some(tray) = tray.as_ref() {
+                            let message = format!(
+                                "Capture {} was not copied to the clipboard. {}",
+                                failure.capture_id.0, failure.message
+                            );
+                            if let Err(error) = tray.show_error(message) {
+                                crate::logging::warn(format_args!(
+                                    "failed to surface clipboard error in the notification area: {error}"
+                                ));
+                            }
+                        }
+                    }
+                }
+                if let Some(worker) = selection_worker.as_ref() {
+                    while let Some(failure) = worker.try_recv_persistence_failure() {
+                        if let Some(tray) = tray.as_ref() {
+                            let message = format!(
+                                "Captastic could not save selection preferences. {failure}"
+                            );
+                            if last_persistence_notification.as_deref() == Some(message.as_str()) {
+                                continue;
+                            }
+                            last_persistence_notification = Some(message.clone());
+                            if let Err(error) = tray.show_error_with_title(
+                                "Captastic preferences were not saved",
+                                message,
+                            ) {
+                                crate::logging::warn(format_args!(
+                                    "failed to surface UI-state persistence error in the notification area: {error}"
+                                ));
+                            }
+                        }
+                    }
+                }
                 if let Some(tray) = tray.as_ref() {
                     while let Some(event) = tray.try_recv() {
                         match event {
@@ -574,7 +722,19 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                     if value { "paused" } else { "resumed" }
                                 );
                             }
-                            captastic_windows::TrayEvent::OpenConfig => open_config_from_tray(),
+                            captastic_windows::TrayEvent::OpenConfig => {
+                                if let Err(message) = open_config_from_tray(&args.ui_state_store) {
+                                    crate::logging::warn(format_args!("{message}"));
+                                    if let Err(error) = tray.show_error_with_title(
+                                        "Captastic could not open configuration",
+                                        message,
+                                    ) {
+                                        crate::logging::warn(format_args!(
+                                            "failed to surface Open Config error in the notification area: {error}"
+                                        ));
+                                    }
+                                }
+                            }
                             captastic_windows::TrayEvent::OpenLogs => open_logs_from_tray(),
                             captastic_windows::TrayEvent::ToggleStartup => {
                                 toggle_startup_from_tray(tray)
@@ -585,40 +745,80 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                         }
                     }
                 }
-                if (console_shutdown.requested()
+                if console_shutdown.requested()
                     || daemon_control.requested()
-                    || tray_shutdown_requested)
-                    && !shutdown_sent
+                    || tray_shutdown_requested
                 {
-                    match command_sender.try_send(CaptureCommand::Shutdown) {
-                        Ok(()) => shutdown_sent = true,
-                        Err(mpsc::TrySendError::Full(_)) => {}
-                        Err(mpsc::TrySendError::Disconnected(_)) => {
-                            return Err(AppError::BackendUnavailable(
-                                "capture worker stopped during console shutdown".to_owned(),
+                    if shutdown_deadline.is_none() {
+                        shutdown_deadline = Some(Instant::now() + DAEMON_SHUTDOWN_TIMEOUT);
+                        paused.store(true, Ordering::Release);
+                        capture_stop_requested.store(true, Ordering::Release);
+                        if let Some(worker) = selection_worker.as_mut() {
+                            worker.request_stop();
+                        }
+                        if let Some(worker) = clipboard_worker.as_mut() {
+                            worker.request_stop();
+                        }
+                        if let Err(error) = hotkey.request_stop() {
+                            crate::logging::warn(format_args!(
+                                "failed to request hotkey shutdown: {error}"
                             ));
+                        }
+                    }
+                    if !shutdown_sent {
+                        match command_sender.try_send(CaptureCommand::Shutdown) {
+                            Ok(()) => shutdown_sent = true,
+                            Err(mpsc::TrySendError::Full(_)) => {}
+                            Err(mpsc::TrySendError::Disconnected(_)) => {
+                                shutdown_sent = true;
+                            }
                         }
                     }
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(AppError::BackendUnavailable(
+                daemon_result = Err(AppError::BackendUnavailable(
                     "capture worker stopped unexpectedly".to_owned(),
                 ));
+                break;
             }
         }
     }
+    let teardown_deadline =
+        shutdown_deadline.unwrap_or_else(|| Instant::now() + DAEMON_SHUTDOWN_TIMEOUT);
+    capture_stop_requested.store(true, Ordering::Release);
+    if let Some(worker) = selection_worker.as_mut() {
+        worker.request_stop();
+    }
+    if let Some(worker) = clipboard_worker.as_mut() {
+        worker.request_stop();
+    }
+    let hotkey_stop_error = hotkey.stop_before(teardown_deadline).err();
+    let _ = command_sender.try_send(CaptureCommand::Shutdown);
+    join_capture_worker_until(capture_join, teardown_deadline);
+    let persistence_failures = selection_worker
+        .take()
+        .map_or_else(Vec::new, |worker| worker.stop_before(teardown_deadline));
+    let clipboard_failures = clipboard_worker
+        .take()
+        .map_or_else(Vec::new, |worker| worker.stop_before(teardown_deadline));
+    for failure in clipboard_failures {
+        crate::logging::warn(format_args!(
+            "shutdown retained clipboard failure for capture {} in the persistent log: {}",
+            failure.capture_id.0, failure.message
+        ));
+    }
+    for failure in persistence_failures {
+        crate::logging::warn(format_args!(
+            "shutdown retained UI-state persistence failure in the persistent log: {failure}"
+        ));
+    }
+    console_shutdown.signal_drained();
+    if let Some(tray) = tray.as_ref() {
+        tray.signal_session_drained();
+    }
     if let Some(tray) = tray {
         tray.stop()?;
-    }
-    hotkey.stop()?;
-    let _ = command_sender.send(CaptureCommand::Shutdown);
-    let _ = capture_join.join();
-    if let Some(worker) = selection_worker {
-        worker.stop();
-    }
-    if let Some(worker) = clipboard_worker {
-        worker.stop();
     }
     let dropped = dropped.load(Ordering::Relaxed);
     if dropped != 0 {
@@ -631,20 +831,20 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     } else {
         log::info!("daemon stopped cleanly");
     }
-    Ok(())
+    if let Some(error) = hotkey_stop_error {
+        return Err(error.into());
+    }
+    daemon_result
 }
 
 #[cfg(windows)]
-fn open_config_from_tray() {
-    match captastic_config::ensure_default_config() {
-        Ok(path) => {
-            if let Err(error) = captastic_windows::open_path(&path) {
-                crate::logging::warn(format_args!("failed to open configuration: {error}"));
-            }
-        }
-        Err(error) => crate::logging::warn(format_args!(
-            "failed to prepare the default configuration: {error}"
-        )),
+fn open_config_from_tray(store: &captastic_config::UiStateStore) -> Result<(), String> {
+    let path = store.prepare_for_open();
+    match path {
+        Ok(path) if path.exists() => captastic_windows::open_path(&path)
+            .map_err(|error| format!("failed to open configuration: {error}")),
+        Ok(path) => Err(format!("configuration does not exist: {}", path.display())),
+        Err(error) => Err(format!("failed to prepare the configuration: {error}")),
     }
 }
 
@@ -733,6 +933,46 @@ fn requires_backend_recovery(error: &CaptureError) -> bool {
 }
 
 #[cfg(windows)]
+fn capture_with_backend_recovery<T, R>(
+    backend: &mut Option<Box<dyn CaptureBackend>>,
+    mut attempt_capture: impl FnMut(&mut dyn CaptureBackend) -> (Result<T, CaptureError>, R),
+    mut rebuild_backend: impl FnMut() -> Result<Box<dyn CaptureBackend>, AppError>,
+    mut wait: impl FnMut(Duration),
+    mut on_retry: impl FnMut(u32, Duration, &CaptureError),
+) -> (Result<T, CaptureError>, R, u32, Option<AppError>) {
+    let mut recovery_attempts = 0_u32;
+    loop {
+        let active_backend = backend
+            .as_deref_mut()
+            .expect("capture backend exists outside recovery");
+        let (capture_result, recorder) = attempt_capture(active_backend);
+        let Err(error) = &capture_result else {
+            return (capture_result, recorder, recovery_attempts, None);
+        };
+        if !requires_backend_recovery(error) || recovery_attempts >= CAPTURE_RECOVERY_RETRIES {
+            return (capture_result, recorder, recovery_attempts, None);
+        }
+
+        recovery_attempts = recovery_attempts.saturating_add(1);
+        let delay = recovery_delay(recovery_attempts);
+        on_retry(recovery_attempts, delay, error);
+        backend.take();
+        wait(delay);
+        match rebuild_backend() {
+            Ok(replacement) => *backend = Some(replacement),
+            Err(reinitialize_error) => {
+                return (
+                    capture_result,
+                    recorder,
+                    recovery_attempts,
+                    Some(reinitialize_error),
+                );
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
 fn action_requires_selection(action: HotkeyAction) -> bool {
     matches!(
         action,
@@ -795,7 +1035,10 @@ fn dispatch_output(
                 action,
                 chord,
                 initial_tool,
-                None,
+                Some(captastic_config::resolve_display_ui_state(
+                    cached_ui,
+                    &metadata.display_id.0,
+                )),
                 cpu_ready_offset_ns,
                 frame,
                 native_frame,
@@ -1196,13 +1439,105 @@ fn ns_to_ms(ns: u64) -> f64 {
 
 #[cfg(all(test, windows))]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     use captastic_core::{
-        CaptureMode, ColorSpace, FrameMetadata, FrameOrigin, PixelFormat, Rect, TimingProvenance,
+        CaptureMode, CaptureSource, ColorSpace, FakeBackend, FakeBackendConfig, FakeFailure,
+        FrameMetadata, FrameOrigin, PixelFormat, Rect, TimingProvenance,
     };
 
     use super::*;
+
+    struct TempConfig {
+        directory: PathBuf,
+        path: PathBuf,
+    }
+
+    static NEXT_TEMP_CONFIG: AtomicU64 = AtomicU64::new(0);
+
+    impl TempConfig {
+        fn with_contents(contents: &str) -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "captastic-daemon-test-{}-{}",
+                std::process::id(),
+                NEXT_TEMP_CONFIG.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&directory).expect("create temporary config directory");
+            let path = directory.join("captastic.toml");
+            fs::write(&path, contents).expect("write temporary config");
+            Self { directory, path }
+        }
+    }
+
+    impl Drop for TempConfig {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    #[test]
+    fn explicit_config_remains_strict_and_is_never_quarantined() {
+        let config = TempConfig::with_contents("capture_mod = 'latest'\n");
+        let args = DaemonArgs {
+            config: Some(config.path.clone()),
+            ..DaemonArgs::default()
+        };
+
+        let error = match resolve_daemon_args_with_default(args, || {
+            panic!("explicit configuration must not invoke the recovering default loader")
+        }) {
+            Ok(_) => panic!("unknown explicit field must fail strictly"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, AppError::Config(_)));
+        assert!(
+            config.path.exists(),
+            "the explicit file must remain in place"
+        );
+        assert_eq!(
+            fs::read_dir(&config.directory)
+                .expect("list temporary config directory")
+                .count(),
+            1,
+            "strict loading must not create a quarantine file"
+        );
+    }
+
+    #[test]
+    fn tray_open_config_reports_a_missing_explicit_path() {
+        let config = TempConfig::with_contents("schema_version = 1\n");
+        fs::remove_file(&config.path).expect("remove explicit config");
+        let store = captastic_config::UiStateStore::for_config(&config.path);
+
+        let error = open_config_from_tray(&store).expect_err("missing explicit config must fail");
+
+        assert!(error.contains("does not exist"));
+        assert!(!config.path.exists());
+    }
+
+    #[test]
+    fn missing_config_argument_uses_the_recovering_default_loader() {
+        let original_path = PathBuf::from("damaged-default.toml");
+        let quarantined_path = PathBuf::from("damaged-default.toml.corrupt-test");
+        let resolved = resolve_daemon_args_with_default(DaemonArgs::default(), || {
+            Ok((
+                AppConfig::default(),
+                Some(captastic_config::ConfigRecovery {
+                    original_path,
+                    quarantined_path,
+                    reason: "test syntax damage".to_owned(),
+                }),
+            ))
+        })
+        .expect("default recovery must permit daemon argument resolution");
+
+        assert!(!resolved.backend.is_empty());
+        assert_eq!(resolved.startup_warnings.len(), 1);
+        assert!(resolved.startup_warnings[0].contains("quarantined"));
+    }
 
     #[test]
     fn backend_recovery_is_limited_to_session_invalidating_errors() {
@@ -1225,6 +1560,50 @@ mod tests {
         )));
         assert_eq!(recovery_delay(1), Duration::from_millis(50));
         assert_eq!(recovery_delay(99), Duration::from_millis(1_600));
+    }
+
+    #[test]
+    fn scripted_access_loss_rebuilds_backend_and_retries_capture() {
+        let mut backend: Option<Box<dyn CaptureBackend>> =
+            Some(Box::new(FakeBackend::new(FakeBackendConfig {
+                failure_script: vec![FakeFailure::new(1, CaptureErrorKind::AccessLost, true)],
+                ..FakeBackendConfig::default()
+            })));
+        let request = CaptureRequest {
+            id: CaptureId(1),
+            triggered_at: Instant::now(),
+            source: CaptureSource::Display(DisplayId::primary()),
+            mode: CaptureMode::Latest { max_age_ms: None },
+            cpu_frame: true,
+            retain_native_frame: false,
+            cursor: CursorMode::Exclude,
+        };
+        let mut rebuilds = 0_u32;
+        let mut waits = Vec::new();
+        let mut retry_kinds = Vec::new();
+
+        let (result, recorder, attempts, rebuild_error) = capture_with_backend_recovery(
+            &mut backend,
+            |active_backend| {
+                let mut recorder = EventRecorder::with_capacity(8);
+                let result = active_backend.capture(&request, &mut recorder);
+                (result, recorder)
+            },
+            || {
+                rebuilds = rebuilds.saturating_add(1);
+                Ok(Box::new(FakeBackend::new(FakeBackendConfig::default())))
+            },
+            |delay| waits.push(delay),
+            |_, _, error| retry_kinds.push(error.kind),
+        );
+
+        assert!(result.is_ok());
+        validate_event_order(recorder.events()).expect("successful retry event order");
+        assert_eq!(attempts, 1);
+        assert_eq!(rebuilds, 1);
+        assert_eq!(waits, vec![Duration::from_millis(50)]);
+        assert_eq!(retry_kinds, vec![CaptureErrorKind::AccessLost]);
+        assert!(rebuild_error.is_none());
     }
 
     #[test]
