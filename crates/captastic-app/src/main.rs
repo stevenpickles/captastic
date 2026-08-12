@@ -271,7 +271,7 @@ fn capture(args: cli::CaptureArgs) -> Result<(), AppError> {
                 captastic_windows::InitialSelectionTool::Remembered,
                 Some(remembered_ui),
             )?;
-            drop(ui_worker);
+            ui_worker.finish()?;
             let Some(selection) = selection else {
                 recorder.record(request.id, PerfEventKind::AttemptFinished, 0);
                 captastic_core::validate_event_order(recorder.events())?;

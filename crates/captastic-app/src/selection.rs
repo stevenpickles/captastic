@@ -21,25 +21,45 @@ pub type ConfirmedRegionCache = Arc<Mutex<BTreeMap<String, ConfirmedRegion>>>;
 
 pub struct OneShotUiStateWorker {
     controller: Option<captastic_windows::OverlayController>,
+    failure_receiver: mpsc::Receiver<String>,
     join: Option<JoinHandle<()>>,
 }
 
 impl OneShotUiStateWorker {
     pub fn start(store: captastic_config::UiStateStore) -> Result<Self, AppError> {
         let (sender, receiver) = mpsc::channel();
+        let (failure_sender, failure_receiver) = mpsc::channel();
         let controller = captastic_windows::OverlayController::with_ui_updates(sender);
         let join = thread::Builder::new()
             .name("captastic-ui-state-once".to_owned())
-            .spawn(move || persist_ui_state(receiver, store, None))
+            .spawn(move || persist_ui_state(receiver, store, Some(failure_sender)))
             .map_err(|error| AppError::BackendUnavailable(error.to_string()))?;
         Ok(Self {
             controller: Some(controller),
+            failure_receiver,
             join: Some(join),
         })
     }
 
     pub fn controller(&self) -> &captastic_windows::OverlayController {
         self.controller.as_ref().expect("UI-state worker is active")
+    }
+
+    pub fn finish(mut self) -> Result<(), AppError> {
+        self.controller.take();
+        let Some(join) = self.join.take() else {
+            return Ok(());
+        };
+        if !join_worker_with_timeout(join, "one-shot UI-state", WORKER_STOP_TIMEOUT) {
+            return Err(AppError::BackendUnavailable(format!(
+                "one-shot UI-state persistence did not finish within {} ms",
+                WORKER_STOP_TIMEOUT.as_millis()
+            )));
+        }
+        if let Some(failure) = self.failure_receiver.try_iter().next() {
+            return Err(AppError::BackendUnavailable(failure));
+        }
+        Ok(())
     }
 }
 
@@ -660,6 +680,32 @@ mod tests {
             Some((0.25, 0.75))
         );
         fs::remove_dir_all(directory).expect("remove one-shot test directory");
+    }
+
+    #[test]
+    fn one_shot_finish_reports_persistence_failure() {
+        let directory = std::env::temp_dir().join(format!(
+            "captastic-one-shot-ui-failure-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("create invalid config path");
+        let store = captastic_config::UiStateStore::for_config(&directory);
+        let worker = OneShotUiStateWorker::start(store).expect("start one-shot worker");
+        worker
+            .controller()
+            .submit_ui_update(captastic_windows::OverlayUiUpdate::ToolbarCenter {
+                display_id: "display-1".to_owned(),
+                center_x: 0.25,
+                center_y: 0.75,
+            });
+
+        let error = worker
+            .finish()
+            .expect_err("failed persistence must fail one-shot completion");
+
+        assert!(error.to_string().contains("failed to persist UI state"));
+        fs::remove_dir_all(directory).expect("remove invalid config path");
     }
 
     #[test]
