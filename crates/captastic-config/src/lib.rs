@@ -371,6 +371,15 @@ impl UiStateStore {
         self.path.as_deref()
     }
 
+    pub fn prepare_for_open(&self) -> Result<PathBuf, ConfigError> {
+        let path = self.required_path()?;
+        prepare_config_path_for_open(
+            path,
+            default_config_path().as_deref(),
+            ensure_default_config,
+        )
+    }
+
     fn required_path(&self) -> Result<&Path, ConfigError> {
         self.path
             .as_deref()
@@ -418,6 +427,18 @@ impl UiStateStore {
         let current = read_optional_config_source(path)?;
         let updated = update_display_confirmed_region(&current, display_id, region, source)?;
         write_config_source(path, updated)
+    }
+}
+
+fn prepare_config_path_for_open(
+    path: &Path,
+    default_path: Option<&Path>,
+    ensure_default: impl FnOnce() -> Result<PathBuf, ConfigError>,
+) -> Result<PathBuf, ConfigError> {
+    if path.exists() || default_path != Some(path) {
+        Ok(path.to_path_buf())
+    } else {
+        ensure_default()
     }
 }
 
@@ -1604,6 +1625,28 @@ mod tests {
         assert_eq!(state.overlay_center, Some((0.25, 0.75)));
         assert!(path.exists());
         assert!(!directory.join(CONFIG_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn opening_a_missing_default_prepares_it_but_explicit_paths_remain_strict() {
+        let directory = TestDirectory::new("prepare-config");
+        let default_path = directory.join(CONFIG_FILE_NAME);
+        let explicit_path = directory.join("explicit.toml");
+
+        let prepared = prepare_config_path_for_open(&default_path, Some(&default_path), || {
+            fs::write(&default_path, "schema_version = 1\n").expect("create default");
+            Ok(default_path.clone())
+        })
+        .expect("prepare missing default");
+        assert_eq!(prepared, default_path);
+        assert!(prepared.exists());
+
+        let explicit = prepare_config_path_for_open(&explicit_path, Some(&default_path), || {
+            panic!("explicit paths must not be synthesized")
+        })
+        .expect("return missing explicit path");
+        assert_eq!(explicit, explicit_path);
+        assert!(!explicit.exists());
     }
 
     #[test]

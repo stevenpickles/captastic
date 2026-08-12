@@ -673,10 +673,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
 
 #[cfg(windows)]
 fn open_config_from_tray(store: &captastic_config::UiStateStore) {
-    let path = store
-        .path()
-        .map(ToOwned::to_owned)
-        .map_or_else(captastic_config::ensure_default_config, Ok);
+    let path = store.prepare_for_open();
     match path {
         Ok(path) if path.exists() => {
             if let Err(error) = captastic_windows::open_path(&path) {
