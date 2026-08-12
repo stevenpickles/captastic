@@ -41,6 +41,9 @@ if (Test-Path -LiteralPath $installedCli -PathType Leaf) {
     if ($status -eq 'running') {
         throw 'The running Captastic daemon did not stop within five seconds.'
     }
+    if ($status -ne 'not_running') {
+        throw "The installed Captastic daemon returned unexpected status '$status'; refusing to replace its files."
+    }
 }
 
 New-Item -ItemType Directory -Path $InstallDirectory -Force | Out-Null

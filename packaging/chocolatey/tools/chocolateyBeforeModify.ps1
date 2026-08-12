@@ -11,11 +11,14 @@ $status = $null
 try {
     $status = (& $cli status --json | ConvertFrom-Json).status
 } catch {
-    Write-Warning "Captastic status could not be read before package modification: $($_.Exception.Message)"
+    throw "Captastic status could not be read before package modification: $($_.Exception.Message)"
 }
 
-if ($status -ne 'running') {
+if ($status -eq 'not_running') {
     return
+}
+if ($status -ne 'running') {
+    throw "Captastic returned unexpected status '$status'; refusing package modification."
 }
 
 & $cli stop | Out-Null
@@ -26,9 +29,16 @@ if ($LASTEXITCODE -ne 0) {
 $deadline = [DateTime]::UtcNow.AddSeconds(5)
 do {
     Start-Sleep -Milliseconds 100
-    $status = (& $cli status --json | ConvertFrom-Json).status
+    $statusJson = & $cli status --json
+    if ($LASTEXITCODE -ne 0) {
+        throw "Captastic status failed with exit code $LASTEXITCODE while waiting for shutdown."
+    }
+    $status = ($statusJson | ConvertFrom-Json).status
 } while ($status -eq 'running' -and [DateTime]::UtcNow -lt $deadline)
 
 if ($status -eq 'running') {
     throw 'The running Captastic daemon did not stop within five seconds.'
+}
+if ($status -ne 'not_running') {
+    throw "Captastic returned unexpected status '$status' after stop; refusing package modification."
 }

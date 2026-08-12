@@ -25,7 +25,9 @@ daemon from retaining the session control event; the migration also preserves `~
 
 ## Build and test locally
 
-Build the distribution binaries and portable archive from an elevated PowerShell prompt:
+Build the distribution binaries and portable archive from an elevated PowerShell 7 (`pwsh`)
+prompt. The packaging scripts reject Windows PowerShell 5.1 because its ZIP entry separators are
+not portable:
 
 ```powershell
 cargo build --locked --profile dist --workspace
