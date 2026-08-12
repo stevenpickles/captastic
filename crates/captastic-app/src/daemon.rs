@@ -17,8 +17,9 @@ use captastic_config::{
 use captastic_core::DisplayId;
 #[cfg(windows)]
 use captastic_core::{
-    validate_event_order, CaptureError, CaptureErrorKind, CaptureId, CaptureMode, CaptureRequest,
-    CpuFrame, CursorMode, EventRecorder, FrameMetadata, NativeFrame, PerfEventKind, Rect,
+    validate_event_order, CaptureBackend, CaptureError, CaptureErrorKind, CaptureId, CaptureMode,
+    CaptureRequest, CpuFrame, CursorMode, EventRecorder, FrameMetadata, NativeFrame, PerfEventKind,
+    Rect,
 };
 #[cfg(windows)]
 use serde_json::json;
@@ -289,71 +290,62 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                             ));
                             continue;
                         }
-                        let mut recovery_attempts = 0_u32;
-                        let (capture_result, mut recorder) = loop {
-                            let mut recorder = trigger_recorder(capture_id, &trigger);
-                            let active_backend = backend
-                                .as_mut()
-                                .expect("capture backend exists outside recovery");
-                            let capture_result = super::resolve_capture_source(
-                                &display_policy,
-                                active_backend.displays(),
-                            )
-                            .and_then(|source| {
-                                log::debug!(
-                                    "capture {} action={} resolved source={source:?}",
+                        let (
+                            capture_result,
+                            mut recorder,
+                            recovery_attempts,
+                            reinitialize_error,
+                        ) = capture_with_backend_recovery(
+                            &mut backend,
+                            |active_backend| {
+                                let mut recorder = trigger_recorder(capture_id, &trigger);
+                                let capture_result = super::resolve_capture_source(
+                                    &display_policy,
+                                    active_backend.displays(),
+                                )
+                                .and_then(|source| {
+                                    log::debug!(
+                                        "capture {} action={} resolved source={source:?}",
+                                        capture_id.0,
+                                        trigger.action
+                                    );
+                                    let request = CaptureRequest {
+                                        id: capture_id,
+                                        triggered_at: trigger.received_at,
+                                        source,
+                                        mode: mode.clone(),
+                                        cpu_frame,
+                                        retain_native_frame: selection_enabled
+                                            && trigger.action != HotkeyAction::FullDisplay,
+                                        cursor: CursorMode::Exclude,
+                                    };
+                                    active_backend.capture(&request, &mut recorder)
+                                });
+                                (capture_result, recorder)
+                            },
+                            || super::create_backend(&backend_name, &display_policy),
+                            thread::sleep,
+                            |attempt, delay, error| {
+                                crate::logging::warn(format_args!(
+                                    "capture {} lost the capture engine; dropping it and retrying {}/{} in {:.0} ms: {error}",
                                     capture_id.0,
-                                    trigger.action
-                                );
-                                let request = CaptureRequest {
-                                    id: capture_id,
-                                    triggered_at: trigger.received_at,
-                                    source,
-                                    mode: mode.clone(),
-                                    cpu_frame,
-                                    retain_native_frame: selection_enabled
-                                        && trigger.action != HotkeyAction::FullDisplay,
-                                    cursor: CursorMode::Exclude,
-                                };
-                                active_backend.capture(&request, &mut recorder)
-                            });
-                            let Err(error) = &capture_result else {
-                                break (capture_result, recorder);
-                            };
-                            if !requires_backend_recovery(error)
-                                || recovery_attempts >= CAPTURE_RECOVERY_RETRIES
-                            {
-                                break (capture_result, recorder);
-                            }
-
-                            recovery_attempts = recovery_attempts.saturating_add(1);
-                            let delay = recovery_delay(recovery_attempts);
+                                    attempt,
+                                    CAPTURE_RECOVERY_RETRIES,
+                                    delay.as_secs_f64() * 1_000.0
+                                ));
+                            },
+                        );
+                        if let Some(reinitialize_error) = reinitialize_error {
                             crate::logging::warn(format_args!(
-                                "capture {} lost the capture engine; dropping it and retrying {}/{} in {:.0} ms: {error}",
-                                capture_id.0,
-                                recovery_attempts,
-                                CAPTURE_RECOVERY_RETRIES,
-                                delay.as_secs_f64() * 1_000.0
+                                "capture engine reinitialization failed during capture {}: {reinitialize_error}",
+                                capture_id.0
                             ));
-                            backend.take();
-                            thread::sleep(delay);
-                            match super::create_backend(&backend_name, &display_policy) {
-                                Ok(replacement) => {
-                                    backend = Some(replacement);
-                                }
-                                Err(reinitialize_error) => {
-                                    crate::logging::warn(format_args!(
-                                        "capture engine reinitialization failed during capture {}: {reinitialize_error}",
-                                        capture_id.0
-                                    ));
-                                    recovery = Some(BackendRecovery {
-                                        failed_attempts: recovery_attempts,
-                                        next_attempt: Instant::now() + delay,
-                                    });
-                                    break (capture_result, recorder);
-                                }
-                            }
-                        };
+                            recovery = Some(BackendRecovery {
+                                failed_attempts: recovery_attempts,
+                                next_attempt: Instant::now()
+                                    + recovery_delay(recovery_attempts),
+                            });
+                        }
                         if recovery_attempts > 0 && capture_result.is_ok() {
                             log::info!(
                                 "capture engine recovered during capture {} after {} attempt(s)",
@@ -836,6 +828,46 @@ fn requires_backend_recovery(error: &CaptureError) -> bool {
 }
 
 #[cfg(windows)]
+fn capture_with_backend_recovery<T, R>(
+    backend: &mut Option<Box<dyn CaptureBackend>>,
+    mut attempt_capture: impl FnMut(&mut dyn CaptureBackend) -> (Result<T, CaptureError>, R),
+    mut rebuild_backend: impl FnMut() -> Result<Box<dyn CaptureBackend>, AppError>,
+    mut wait: impl FnMut(Duration),
+    mut on_retry: impl FnMut(u32, Duration, &CaptureError),
+) -> (Result<T, CaptureError>, R, u32, Option<AppError>) {
+    let mut recovery_attempts = 0_u32;
+    loop {
+        let active_backend = backend
+            .as_deref_mut()
+            .expect("capture backend exists outside recovery");
+        let (capture_result, recorder) = attempt_capture(active_backend);
+        let Err(error) = &capture_result else {
+            return (capture_result, recorder, recovery_attempts, None);
+        };
+        if !requires_backend_recovery(error) || recovery_attempts >= CAPTURE_RECOVERY_RETRIES {
+            return (capture_result, recorder, recovery_attempts, None);
+        }
+
+        recovery_attempts = recovery_attempts.saturating_add(1);
+        let delay = recovery_delay(recovery_attempts);
+        on_retry(recovery_attempts, delay, error);
+        backend.take();
+        wait(delay);
+        match rebuild_backend() {
+            Ok(replacement) => *backend = Some(replacement),
+            Err(reinitialize_error) => {
+                return (
+                    capture_result,
+                    recorder,
+                    recovery_attempts,
+                    Some(reinitialize_error),
+                );
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
 fn action_requires_selection(action: HotkeyAction) -> bool {
     matches!(
         action,
@@ -1307,7 +1339,8 @@ mod tests {
     use std::sync::Arc;
 
     use captastic_core::{
-        CaptureMode, ColorSpace, FrameMetadata, FrameOrigin, PixelFormat, Rect, TimingProvenance,
+        CaptureMode, CaptureSource, ColorSpace, FakeBackend, FakeBackendConfig, FakeFailure,
+        FrameMetadata, FrameOrigin, PixelFormat, Rect, TimingProvenance,
     };
 
     use super::*;
@@ -1422,6 +1455,50 @@ mod tests {
         )));
         assert_eq!(recovery_delay(1), Duration::from_millis(50));
         assert_eq!(recovery_delay(99), Duration::from_millis(1_600));
+    }
+
+    #[test]
+    fn scripted_access_loss_rebuilds_backend_and_retries_capture() {
+        let mut backend: Option<Box<dyn CaptureBackend>> =
+            Some(Box::new(FakeBackend::new(FakeBackendConfig {
+                failure_script: vec![FakeFailure::new(1, CaptureErrorKind::AccessLost, true)],
+                ..FakeBackendConfig::default()
+            })));
+        let request = CaptureRequest {
+            id: CaptureId(1),
+            triggered_at: Instant::now(),
+            source: CaptureSource::Display(DisplayId::primary()),
+            mode: CaptureMode::Latest { max_age_ms: None },
+            cpu_frame: true,
+            retain_native_frame: false,
+            cursor: CursorMode::Exclude,
+        };
+        let mut rebuilds = 0_u32;
+        let mut waits = Vec::new();
+        let mut retry_kinds = Vec::new();
+
+        let (result, recorder, attempts, rebuild_error) = capture_with_backend_recovery(
+            &mut backend,
+            |active_backend| {
+                let mut recorder = EventRecorder::with_capacity(8);
+                let result = active_backend.capture(&request, &mut recorder);
+                (result, recorder)
+            },
+            || {
+                rebuilds = rebuilds.saturating_add(1);
+                Ok(Box::new(FakeBackend::new(FakeBackendConfig::default())))
+            },
+            |delay| waits.push(delay),
+            |_, _, error| retry_kinds.push(error.kind),
+        );
+
+        assert!(result.is_ok());
+        validate_event_order(recorder.events()).expect("successful retry event order");
+        assert_eq!(attempts, 1);
+        assert_eq!(rebuilds, 1);
+        assert_eq!(waits, vec![Duration::from_millis(50)]);
+        assert_eq!(retry_kinds, vec![CaptureErrorKind::AccessLost]);
+        assert!(rebuild_error.is_none());
     }
 
     #[test]
