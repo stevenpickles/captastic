@@ -12,7 +12,8 @@ use serde_json::json;
 
 use crate::error::AppError;
 
-const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(1);
+// A terminal publish can consume three 250 ms backoffs plus native clipboard open waits.
+const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const WORKER_STOP_POLL: Duration = Duration::from_millis(5);
 const PUBLISH_RETRY_LIMIT: u32 = 3;
 const PUBLISH_RETRY_DELAY: Duration = Duration::from_millis(250);
