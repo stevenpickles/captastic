@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
@@ -35,6 +35,10 @@ pub(crate) const WINDOW_THUMBNAIL_RENDER_BATCH: usize = MAX_IN_FLIGHT_WINDOW_REN
 const _: () = assert!(MAX_IN_FLIGHT_WINDOW_RENDERS > 1);
 const WINDOW_BORDER_BGRA: [u8; 3] = [188, 180, 176];
 static IN_FLIGHT_WINDOW_RENDERS: AtomicUsize = AtomicUsize::new(0);
+static DETACHED_WINDOW_RENDERS: AtomicUsize = AtomicUsize::new(0);
+const RENDER_ACTIVE: u8 = 0;
+const RENDER_DETACHED: u8 = 1;
+const RENDER_COMPLETED: u8 = 2;
 
 pub fn materialize_selection(
     frozen_desktop: &CpuFrame,
@@ -122,11 +126,14 @@ where
     T: Send + 'static,
 {
     let timeout_permit = permit.clone();
+    let render_state = Arc::new(AtomicU8::new(RENDER_ACTIVE));
+    let worker_render_state = render_state.clone();
     let (sender, receiver) = mpsc::sync_channel(1);
     thread::Builder::new()
         .name("captastic-window-render".to_owned())
         .spawn(move || {
             let _permit = permit;
+            let _completion = RenderCompletion(worker_render_state);
             let _ = sender.send(render());
         })
         .map_err(|error| {
@@ -145,6 +152,12 @@ where
             // lease expires at the caller's deadline so unrelated windows can still be rendered;
             // release is idempotent when the worker eventually exits.
             timeout_permit.release();
+            if mark_render_detached(&render_state, &DETACHED_WINDOW_RENDERS) {
+                log::warn!(
+                    "window render exceeded its deadline; {} detached native render worker(s) remain",
+                    DETACHED_WINDOW_RENDERS.load(Ordering::Acquire)
+                );
+            }
             Err(capture_error(
                 CaptureErrorKind::Timeout,
                 "print_selected_window",
@@ -166,6 +179,37 @@ where
                 None,
             ))
         }
+    }
+}
+
+struct RenderCompletion(Arc<AtomicU8>);
+
+impl Drop for RenderCompletion {
+    fn drop(&mut self) {
+        complete_render(&self.0, &DETACHED_WINDOW_RENDERS);
+    }
+}
+
+fn mark_render_detached(state: &AtomicU8, detached_count: &AtomicUsize) -> bool {
+    if state
+        .compare_exchange(
+            RENDER_ACTIVE,
+            RENDER_DETACHED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        detached_count.fetch_add(1, Ordering::AcqRel);
+        true
+    } else {
+        false
+    }
+}
+
+fn complete_render(state: &AtomicU8, detached_count: &AtomicUsize) {
+    if state.swap(RENDER_COMPLETED, Ordering::AcqRel) == RENDER_DETACHED {
+        detached_count.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -1123,6 +1167,21 @@ mod tests {
         assert_eq!(error.kind, CaptureErrorKind::NativeFailure);
         assert!(!error.retryable);
         assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn detached_render_telemetry_handles_completion_races() {
+        let detached = AtomicUsize::new(0);
+        let timed_out = AtomicU8::new(RENDER_ACTIVE);
+        assert!(mark_render_detached(&timed_out, &detached));
+        assert_eq!(detached.load(Ordering::Acquire), 1);
+        complete_render(&timed_out, &detached);
+        assert_eq!(detached.load(Ordering::Acquire), 0);
+
+        let completed_first = AtomicU8::new(RENDER_ACTIVE);
+        complete_render(&completed_first, &detached);
+        assert!(!mark_render_detached(&completed_first, &detached));
+        assert_eq!(detached.load(Ordering::Acquire), 0);
     }
 
     #[test]
