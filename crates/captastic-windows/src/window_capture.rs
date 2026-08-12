@@ -32,6 +32,7 @@ const WINDOW_RENDER_TIMEOUT: Duration = Duration::from_millis(700);
 const MAX_IN_FLIGHT_WINDOW_RENDERS: usize = 2;
 const WINDOW_RESPONSIVENESS_TIMEOUT_MS: u32 = 50;
 pub(crate) const WINDOW_THUMBNAIL_RENDER_BATCH: usize = MAX_IN_FLIGHT_WINDOW_RENDERS - 1;
+const _: () = assert!(MAX_IN_FLIGHT_WINDOW_RENDERS > 1);
 const WINDOW_BORDER_BGRA: [u8; 3] = [188, 180, 176];
 static IN_FLIGHT_WINDOW_RENDERS: AtomicUsize = AtomicUsize::new(0);
 

@@ -53,10 +53,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TranslateMessage, UnregisterClassW, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
     GA_ROOTOWNER, GWLP_USERDATA, GWL_EXSTYLE, HCURSOR, ICONINFO, IDC_ARROW, IDC_CROSS, IDC_SIZEALL,
     IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, MSG, SPI_SETLOGICALDPIOVERRIDE,
-    SPI_SETWORKAREA, SW_SHOW, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND,
-    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
-    WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WM_SETTINGCHANGE, WNDCLASSW, WS_EX_APPWINDOW,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    SPI_SETWORKAREA, SW_SHOW, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WM_SETTINGCHANGE, WNDCLASSW,
+    WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 #[cfg(test)]
@@ -1281,8 +1281,8 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
-            // SAFETY: The Box remains alive for the message loop. This borrow is limited to this
-            // message arm and is not passed across a synchronously dispatching Win32 call.
+            // SAFETY: The Box remains alive for the message loop. The last state access occurs
+            // before UpdateWindow can synchronously dispatch WM_PAINT and reborrow the pointer.
             let state = unsafe { &mut *state_pointer };
             let point = screen_point(state.source, lparam);
             let local = local_point(state.source, point);
@@ -1385,16 +1385,18 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             {
                 return LRESULT(0);
             }
+            let update_window = state.tool == CaptureTool::Window;
             invalidate(hwnd);
-            if state.tool == CaptureTool::Window {
+            if update_window {
                 // SAFETY: Forces the now-cheap cached hover paint before this mouse message returns.
                 let _ = unsafe { UpdateWindow(hwnd) };
             }
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
-            // SAFETY: The Box remains alive for the message loop. This borrow is limited to this
-            // message arm and ends before any requested window destruction is dispatched.
+            // SAFETY: The Box remains alive for the message loop. SetCapture does not dispatch an
+            // overlay callback while capture is still owned by this window; destruction is only
+            // requested after the final state access in the confirming branches.
             let state = unsafe { &mut *state_pointer };
             let point = screen_point(state.source, lparam);
             let local = local_point(state.source, point);
@@ -1604,6 +1606,20 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             // cancellation transition returns, before close_overlay dispatches messages.
             cancel_overlay(unsafe { &mut *state_pointer });
             close_overlay(hwnd);
+            LRESULT(0)
+        }
+        WM_CAPTURECHANGED => {
+            // SAFETY: The state allocation remains live. This arm performs only local mutation
+            // and does not call ReleaseCapture recursively.
+            let state = unsafe { &mut *state_pointer };
+            state.toolbar_drag = None;
+            state.resizing = None;
+            state.moving_region = None;
+            state.anchor = None;
+            state.dragging = false;
+            state.hovered_handle = None;
+            set_arrow_cursor();
+            invalidate(hwnd);
             LRESULT(0)
         }
         WM_RBUTTONDOWN | WM_CLOSE => {
