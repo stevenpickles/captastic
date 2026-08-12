@@ -437,31 +437,15 @@ fn capture_window_with_wgc(
         let (width, height) =
             scaled_dimensions(content_bounds.width, content_bounds.height, max_pixels);
         if width != content_bounds.width || height != content_bounds.height {
-            let mut source = DibSurface::new(content_bounds.width, content_bounds.height)?;
-            source.write_pixels(&content)?;
-            let scaled = DibSurface::new(width, height)?;
-            // SAFETY: Both DIBs are live and the source/destination rectangles cover them exactly.
-            let scaled_rendered = unsafe {
-                SetStretchBltMode(scaled.device, HALFTONE);
-                StretchBlt(
-                    scaled.device,
-                    0,
-                    0,
-                    width as i32,
-                    height as i32,
-                    source.device,
-                    0,
-                    0,
-                    content_bounds.width as i32,
-                    content_bounds.height as i32,
-                    SRCCOPY,
-                )
-            };
-            if !scaled_rendered.as_bool() {
-                return Err(last_error("scale_wgc_window_thumbnail"));
-            }
             (
-                scaled.copy_pixels(),
+                scale_bgra_with_dib(
+                    &content,
+                    content_bounds.width,
+                    content_bounds.height,
+                    width,
+                    height,
+                    "scale_wgc_window_thumbnail",
+                )?,
                 width,
                 height,
                 width as f32 / content_bounds.width as f32,
@@ -531,6 +515,40 @@ fn normalize_wgc_content(mut pixels: Vec<u8>) -> Vec<u8> {
     // and erase its RGB channels.
     unpremultiply_bgra(&mut pixels);
     pixels
+}
+
+fn scale_bgra_with_dib(
+    pixels: &[u8],
+    source_width: u32,
+    source_height: u32,
+    target_width: u32,
+    target_height: u32,
+    operation: &'static str,
+) -> Result<Vec<u8>, CaptureError> {
+    let mut source = DibSurface::new(source_width, source_height)?;
+    source.write_pixels(pixels)?;
+    let scaled = DibSurface::new(target_width, target_height)?;
+    // SAFETY: Both DIBs are live and the source/destination rectangles cover them exactly.
+    let scaled_rendered = unsafe {
+        SetStretchBltMode(scaled.device, HALFTONE);
+        StretchBlt(
+            scaled.device,
+            0,
+            0,
+            target_width as i32,
+            target_height as i32,
+            source.device,
+            0,
+            0,
+            source_width as i32,
+            source_height as i32,
+            SRCCOPY,
+        )
+    };
+    if !scaled_rendered.as_bool() {
+        return Err(last_error(operation));
+    }
+    Ok(scaled.copy_pixels())
 }
 
 pub(crate) fn scaled_dimensions(width: u32, height: u32, max_pixels: u64) -> (u32, u32) {
@@ -1384,6 +1402,18 @@ mod tests {
         let mut pixels = normalize_wgc_content(vec![25, 50, 100, 128]);
         pixels[3] = 0;
         assert_eq!(&pixels[..3], &[50, 100, 199]);
+    }
+
+    #[test]
+    fn normalized_wgc_rgb_survives_native_dib_thumbnail_round_trip() {
+        let premultiplied_pixel = [25, 50, 100, 128];
+        let pixels = normalize_wgc_content(premultiplied_pixel.repeat(4));
+
+        let scaled = scale_bgra_with_dib(&pixels, 2, 2, 1, 1, "test_wgc_dib_round_trip")
+            .expect("scale normalized WGC pixels through native DIBs");
+
+        assert_eq!(&scaled[..3], &[50, 100, 199]);
+        assert_ne!(&scaled[..3], &[0, 0, 0]);
     }
 
     #[test]
