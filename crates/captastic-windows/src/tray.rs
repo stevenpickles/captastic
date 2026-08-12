@@ -21,9 +21,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, SetWindowLongPtrW, TrackPopupMenu, TranslateMessage, UnregisterClassW,
     CREATESTRUCTW, GWLP_USERDATA, HMENU, MB_ICONERROR, MB_OK, MF_CHECKED, MF_GRAYED, MF_SEPARATOR,
     MF_STRING, MSG, SPI_SETLOGICALDPIOVERRIDE, SPI_SETWORKAREA, SW_SHOWNORMAL, TPM_BOTTOMALIGN,
-    TPM_RIGHTBUTTON, WM_APP, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE,
-    WM_LBUTTONDBLCLK, WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_QUIT, WM_RBUTTONUP, WM_SETTINGCHANGE,
-    WNDCLASSW, WS_OVERLAPPED,
+    TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE,
+    WM_ENDSESSION, WM_LBUTTONDBLCLK, WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_QUERYENDSESSION,
+    WM_QUIT, WM_RBUTTONUP, WM_SETTINGCHANGE, WNDCLASSW, WS_OVERLAPPED,
 };
 
 const CLASS_NAME: PCWSTR = w!("CaptasticTrayWindow-v1");
@@ -49,6 +49,7 @@ pub enum TrayEvent {
     OpenLogs,
     ToggleStartup,
     Exit,
+    SessionEnding,
 }
 
 pub struct TrayIcon {
@@ -318,6 +319,12 @@ unsafe extern "system" fn tray_window_proc(
         Ok(result) => result,
         Err(_) => {
             log::error!("native tray callback panicked; requesting shutdown");
+            // SAFETY: Best-effort recovery reads the pointer installed for this live window. The
+            // callback boundary caught the panic before unwinding through Win32.
+            let state_pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut TrayState;
+            if !state_pointer.is_null() {
+                send_tray_event(state_pointer, TrayEvent::Exit);
+            }
             // SAFETY: hwnd belongs to this callback and remains valid for destruction.
             let _ = unsafe { DestroyWindow(hwnd) };
             LRESULT(0)
@@ -345,10 +352,14 @@ fn tray_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPAR
         // SAFETY: No application state is available, so default handling is required.
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     }
-    // SAFETY: The Box remains live for the complete message loop and callbacks are serialized.
-    let state = unsafe { &mut *state_pointer };
-    if message == state.taskbar_created {
-        if let Err(error) = add_tray_icon(hwnd, state.icon, state.paused) {
+    let taskbar_state = {
+        // SAFETY: The Box remains live for the message loop. This borrow ends before calling
+        // Shell_NotifyIconW, which may synchronously re-enter this window procedure.
+        let state = unsafe { &*state_pointer };
+        (message == state.taskbar_created).then_some((state.icon, state.paused))
+    };
+    if let Some((icon, paused)) = taskbar_state {
+        if let Err(error) = add_tray_icon(hwnd, icon, paused) {
             log::warn!("failed to restore tray icon after Explorer restart: {error}");
         }
         return LRESULT(0);
@@ -367,10 +378,19 @@ fn tray_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPAR
         }
         TRAY_CALLBACK => {
             let notification = lparam.0 as u32;
-            if notification == WM_LBUTTONDBLCLK && !state.paused {
-                let _ = state.event_sender.try_send(TrayEvent::Capture);
+            let (paused, sender) = {
+                // SAFETY: The state allocation is live; the borrow is released before menu APIs.
+                let state = unsafe { &*state_pointer };
+                (state.paused, state.event_sender.clone())
+            };
+            if notification == WM_LBUTTONDBLCLK && !paused {
+                let _ = sender.try_send(TrayEvent::Capture);
             } else if notification == WM_RBUTTONUP || notification == WM_CONTEXTMENU {
-                if let Err(error) = show_context_menu(hwnd, state.paused, state.startup_enabled) {
+                let startup_enabled = {
+                    // SAFETY: Short immutable read from the live state allocation.
+                    unsafe { (&*state_pointer).startup_enabled }
+                };
+                if let Err(error) = show_context_menu(hwnd, paused, startup_enabled) {
                     log::warn!("failed to show tray menu: {error}");
                 }
             }
@@ -379,45 +399,72 @@ fn tray_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPAR
         WM_COMMAND => {
             match wparam.0 & 0xffff {
                 COMMAND_CAPTURE => {
-                    if !state.paused {
-                        let _ = state.event_sender.try_send(TrayEvent::Capture);
+                    let (paused, sender) = {
+                        // SAFETY: Short immutable read from the live state allocation.
+                        let state = unsafe { &*state_pointer };
+                        (state.paused, state.event_sender.clone())
+                    };
+                    if !paused {
+                        let _ = sender.try_send(TrayEvent::Capture);
                     }
                 }
                 COMMAND_PAUSE => {
-                    state.paused = !state.paused;
-                    if let Err(error) = modify_tray_tooltip(hwnd, state.paused) {
+                    let (paused, sender) = {
+                        // SAFETY: This mutation ends before Shell_NotifyIconW can re-enter.
+                        let state = unsafe { &mut *state_pointer };
+                        state.paused = !state.paused;
+                        (state.paused, state.event_sender.clone())
+                    };
+                    if let Err(error) = modify_tray_tooltip(hwnd, paused) {
                         log::warn!("failed to update tray state: {error}");
                     }
-                    let _ = state
-                        .event_sender
-                        .try_send(TrayEvent::PausedChanged(state.paused));
+                    let _ = sender.try_send(TrayEvent::PausedChanged(paused));
                 }
                 COMMAND_CONFIG => {
-                    let _ = state.event_sender.try_send(TrayEvent::OpenConfig);
+                    send_tray_event(state_pointer, TrayEvent::OpenConfig);
                 }
                 COMMAND_LOGS => {
-                    let _ = state.event_sender.try_send(TrayEvent::OpenLogs);
+                    send_tray_event(state_pointer, TrayEvent::OpenLogs);
                 }
                 COMMAND_STARTUP => {
-                    let _ = state.event_sender.try_send(TrayEvent::ToggleStartup);
+                    send_tray_event(state_pointer, TrayEvent::ToggleStartup);
                 }
                 COMMAND_EXIT => {
-                    let _ = state.event_sender.try_send(TrayEvent::Exit);
+                    send_tray_event(state_pointer, TrayEvent::Exit);
                 }
                 _ => {}
             }
             LRESULT(0)
         }
         TRAY_SET_STARTUP => {
-            state.startup_enabled = wparam.0 != 0;
+            // SAFETY: Short mutation of the live state allocation; no reentrant API is called.
+            unsafe { (&mut *state_pointer).startup_enabled = wparam.0 != 0 };
             LRESULT(0)
         }
         TRAY_SHOW_ERROR => {
-            while let Ok(message) = state.notification_receiver.try_recv() {
+            loop {
+                let message = {
+                    // SAFETY: The receive borrow ends before Shell_NotifyIconW can re-enter.
+                    unsafe { (&mut *state_pointer).notification_receiver.try_recv() }
+                };
+                let Ok(message) = message else { break };
                 if let Err(error) = show_error_notification(hwnd, &message) {
                     log::warn!("failed to show tray error notification: {error}");
                 }
             }
+            LRESULT(0)
+        }
+        WM_QUERYENDSESSION => {
+            send_tray_event(state_pointer, TrayEvent::SessionEnding);
+            LRESULT(1)
+        }
+        WM_ENDSESSION if wparam.0 != 0 => {
+            send_tray_event(state_pointer, TrayEvent::SessionEnding);
+            LRESULT(0)
+        }
+        WM_CLOSE => {
+            log::warn!("tray window received WM_CLOSE; requesting daemon shutdown");
+            send_tray_event(state_pointer, TrayEvent::Exit);
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -430,6 +477,13 @@ fn tray_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPAR
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
     }
+}
+
+fn send_tray_event(state_pointer: *mut TrayState, event: TrayEvent) {
+    // SAFETY: Callers invoke this only while processing a message for the live tray window. The
+    // cloned sender outlives the short borrow and sending cannot alias TrayState on reentry.
+    let sender = unsafe { (&*state_pointer).event_sender.clone() };
+    let _ = sender.try_send(event);
 }
 
 fn add_tray_icon(

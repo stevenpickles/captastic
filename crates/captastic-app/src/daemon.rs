@@ -619,6 +619,10 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                             captastic_windows::TrayEvent::Exit => {
                                 tray_shutdown_requested = true;
                             }
+                            captastic_windows::TrayEvent::SessionEnding => {
+                                log::info!("Windows session is ending; draining daemon workers");
+                                tray_shutdown_requested = true;
+                            }
                         }
                     }
                 }
