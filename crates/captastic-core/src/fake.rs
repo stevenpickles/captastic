@@ -17,6 +17,29 @@ pub struct FakeBackendConfig {
     pub readback_delay: Duration,
     pub frame_age: Duration,
     pub fail_every: Option<u64>,
+    pub failure_script: Vec<FakeFailure>,
+    pub capabilities: BackendCapabilities,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FakeFailure {
+    pub attempt: u64,
+    pub kind: CaptureErrorKind,
+    pub operation: &'static str,
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl FakeFailure {
+    pub fn new(attempt: u64, kind: CaptureErrorKind, retryable: bool) -> Self {
+        Self {
+            attempt,
+            kind,
+            operation: "capture",
+            message: format!("scripted {kind:?} failure on attempt {attempt}"),
+            retryable,
+        }
+    }
 }
 
 impl Default for FakeBackendConfig {
@@ -28,6 +51,8 @@ impl Default for FakeBackendConfig {
             readback_delay: Duration::from_micros(250),
             frame_age: Duration::from_millis(1),
             fail_every: None,
+            failure_script: Vec::new(),
+            capabilities: default_capabilities(),
         }
     }
 }
@@ -63,18 +88,8 @@ impl FakeBackend {
     /// changes. Callers are responsible for supplying valid display records.
     pub fn with_displays(config: FakeBackendConfig, displays: Vec<DisplayInfo>) -> Self {
         Self {
+            capabilities: config.capabilities.clone(),
             config,
-            capabilities: BackendCapabilities {
-                display_capture: true,
-                window_capture: false,
-                virtual_desktop_capture: false,
-                fresh_mode: true,
-                latest_mode: true,
-                cursor_control: true,
-                hdr: false,
-                presentation_time: true,
-                warm_stream: true,
-            },
             displays,
             attempts: 0,
         }
@@ -108,6 +123,54 @@ impl FakeBackend {
             native_code: None,
         })
     }
+
+    fn validate_request_capabilities(&self, request: &CaptureRequest) -> Result<(), CaptureError> {
+        let supported = match request.mode {
+            CaptureMode::Fresh { .. } => self.capabilities.fresh_mode,
+            CaptureMode::Latest { .. } => self.capabilities.latest_mode,
+        };
+        if !supported {
+            return Err(self.unsupported(
+                "capture_mode",
+                format!(
+                    "{} mode is disabled by the fake backend capabilities",
+                    request.mode.name()
+                ),
+            ));
+        }
+        if request.cursor == crate::CursorMode::Include && !self.capabilities.cursor_control {
+            return Err(self.unsupported(
+                "cursor",
+                "cursor inclusion is disabled by the fake backend capabilities",
+            ));
+        }
+        Ok(())
+    }
+
+    fn unsupported(&self, operation: &'static str, message: impl Into<String>) -> CaptureError {
+        CaptureError {
+            kind: CaptureErrorKind::Unsupported,
+            backend: "fake",
+            operation,
+            message: message.into(),
+            retryable: false,
+            native_code: None,
+        }
+    }
+}
+
+fn default_capabilities() -> BackendCapabilities {
+    BackendCapabilities {
+        display_capture: true,
+        window_capture: false,
+        virtual_desktop_capture: false,
+        fresh_mode: true,
+        latest_mode: true,
+        cursor_control: true,
+        hdr: false,
+        presentation_time: true,
+        warm_stream: true,
+    }
 }
 
 impl CaptureBackend for FakeBackend {
@@ -128,10 +191,33 @@ impl CaptureBackend for FakeBackend {
         request: &CaptureRequest,
         recorder: &mut EventRecorder,
     ) -> Result<CaptureOutcome, CaptureError> {
+        if !self.capabilities.display_capture {
+            return Err(self.unsupported(
+                "capture_display",
+                "display capture is disabled by the fake backend capabilities",
+            ));
+        }
+        self.validate_request_capabilities(request)?;
         let display = self.requested_display(&request.source)?;
         self.attempts = self.attempts.saturating_add(1);
         let started = Instant::now();
         recorder.record(request.id, PerfEventKind::CaptureRequested, 0);
+
+        if let Some(failure) = self
+            .config
+            .failure_script
+            .iter()
+            .find(|failure| failure.attempt == self.attempts)
+        {
+            return Err(CaptureError {
+                kind: failure.kind,
+                backend: "fake",
+                operation: failure.operation,
+                message: failure.message.clone(),
+                retryable: failure.retryable,
+                native_code: None,
+            });
+        }
 
         if self
             .config
@@ -370,6 +456,71 @@ mod tests {
             .expect_err("missing display must fail");
         assert_eq!(error.kind, CaptureErrorKind::SourceUnavailable);
         assert_eq!(error.operation, "resolve_display");
+    }
+
+    #[test]
+    fn scripted_failures_preserve_kind_retryability_and_attempt_order() {
+        let mut backend = FakeBackend::new(FakeBackendConfig {
+            native_delay: Duration::ZERO,
+            readback_delay: Duration::ZERO,
+            failure_script: vec![
+                FakeFailure::new(2, CaptureErrorKind::Timeout, true),
+                FakeFailure {
+                    attempt: 3,
+                    kind: CaptureErrorKind::PermissionDenied,
+                    operation: "acquire_frame",
+                    message: "scripted permission loss".to_owned(),
+                    retryable: false,
+                },
+            ],
+            ..FakeBackendConfig::default()
+        });
+        let mut recorder = EventRecorder::with_capacity(16);
+
+        backend
+            .capture(
+                &request(CaptureMode::Latest { max_age_ms: None }),
+                &mut recorder,
+            )
+            .expect("first attempt succeeds");
+        let timeout = backend
+            .capture(
+                &request(CaptureMode::Latest { max_age_ms: None }),
+                &mut recorder,
+            )
+            .expect_err("second attempt is scripted to time out");
+        assert_eq!(timeout.kind, CaptureErrorKind::Timeout);
+        assert!(timeout.retryable);
+
+        let denied = backend
+            .capture(
+                &request(CaptureMode::Latest { max_age_ms: None }),
+                &mut recorder,
+            )
+            .expect_err("third attempt is scripted to lose permission");
+        assert_eq!(denied.kind, CaptureErrorKind::PermissionDenied);
+        assert_eq!(denied.operation, "acquire_frame");
+        assert!(!denied.retryable);
+    }
+
+    #[test]
+    fn configured_capability_limits_are_reported_and_enforced() {
+        let mut config = FakeBackendConfig::default();
+        config.capabilities.latest_mode = false;
+        let mut backend = FakeBackend::new(config);
+        let mut recorder = EventRecorder::with_capacity(8);
+
+        assert!(!backend.capabilities().latest_mode);
+        let error = backend
+            .capture(
+                &request(CaptureMode::Latest { max_age_ms: None }),
+                &mut recorder,
+            )
+            .expect_err("disabled latest mode must fail");
+        assert_eq!(error.kind, CaptureErrorKind::Unsupported);
+        assert_eq!(error.operation, "capture_mode");
+        assert!(!error.retryable);
+        assert_eq!(backend.attempts, 0);
     }
 
     fn display(id: &str, primary: bool) -> DisplayInfo {

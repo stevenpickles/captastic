@@ -14,7 +14,7 @@ pub use capture::{
 };
 pub use display::{DisplayId, DisplayInfo, DisplayTopology, DisplayTopologyError, Rect};
 pub use error::{CaptureError, CaptureErrorKind, FrameError, MetricsError, PipelineError};
-pub use fake::{FakeBackend, FakeBackendConfig};
+pub use fake::{FakeBackend, FakeBackendConfig, FakeFailure};
 pub use frame::{
     ColorSpace, CpuFrame, FrameAlpha, FrameMetadata, FrameOrigin, PixelFormat, TimingProvenance,
 };
