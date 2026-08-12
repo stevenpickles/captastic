@@ -1139,7 +1139,9 @@ mod windows_file_move {
 
     use windows::core::PCWSTR;
     use windows::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        GetFileAttributesW, MoveFileExW, SetFileAttributesW, FILE_ATTRIBUTE_READONLY,
+        FILE_FLAGS_AND_ATTRIBUTES, INVALID_FILE_ATTRIBUTES, MOVEFILE_REPLACE_EXISTING,
+        MOVEFILE_WRITE_THROUGH,
     };
 
     const SHARING_VIOLATION: i32 = 32;
@@ -1149,6 +1151,11 @@ mod windows_file_move {
     pub(super) fn move_file(from: &Path, to: &Path, replace_existing: bool) -> io::Result<()> {
         let from_wide = wide_path(from)?;
         let to_wide = wide_path(to)?;
+        let preserved_attributes = if replace_existing {
+            prepare_attribute_preserving_replace(&from_wide, &to_wide)?
+        } else {
+            None
+        };
         let mut flags = MOVEFILE_WRITE_THROUGH;
         if replace_existing {
             flags |= MOVEFILE_REPLACE_EXISTING;
@@ -1165,10 +1172,70 @@ mod windows_file_move {
             let error = io::Error::last_os_error();
             if error.raw_os_error() != Some(SHARING_VIOLATION) || started.elapsed() >= RETRY_TIMEOUT
             {
+                if let Some((source_attributes, destination_attributes)) = preserved_attributes {
+                    let _ = set_attributes(&from_wide, source_attributes);
+                    let _ = set_attributes(&to_wide, destination_attributes);
+                }
                 return Err(error);
             }
             thread::sleep(RETRY_INTERVAL);
         }
+    }
+
+    fn prepare_attribute_preserving_replace(
+        from: &[u16],
+        to: &[u16],
+    ) -> io::Result<Option<(FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAGS_AND_ATTRIBUTES)>> {
+        let Some(destination_attributes) = attributes(to)? else {
+            return Ok(None);
+        };
+        let source_attributes = attributes(from)?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "replacement source disappeared")
+        })?;
+        set_attributes(from, destination_attributes)?;
+        if destination_attributes.0 & FILE_ATTRIBUTE_READONLY.0 != 0 {
+            let writable =
+                FILE_FLAGS_AND_ATTRIBUTES(destination_attributes.0 & !FILE_ATTRIBUTE_READONLY.0);
+            if let Err(error) = set_attributes(to, writable) {
+                let _ = set_attributes(from, source_attributes);
+                return Err(error);
+            }
+        }
+        Ok(Some((source_attributes, destination_attributes)))
+    }
+
+    fn attributes(path: &[u16]) -> io::Result<Option<FILE_FLAGS_AND_ATTRIBUTES>> {
+        // SAFETY: path is a live, NUL-terminated UTF-16 buffer.
+        let raw = unsafe { GetFileAttributesW(PCWSTR(path.as_ptr())) };
+        if raw != INVALID_FILE_ATTRIBUTES {
+            return Ok(Some(FILE_FLAGS_AND_ATTRIBUTES(raw)));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(error)
+        }
+    }
+
+    fn set_attributes(path: &[u16], attributes: FILE_FLAGS_AND_ATTRIBUTES) -> io::Result<()> {
+        // SAFETY: path is a live, NUL-terminated UTF-16 buffer and attributes came from Windows.
+        unsafe { SetFileAttributesW(PCWSTR(path.as_ptr()), attributes) }
+            .map_err(|_| io::Error::last_os_error())
+    }
+
+    #[cfg(test)]
+    pub(super) fn file_attributes(path: &Path) -> io::Result<u32> {
+        attributes(&wide_path(path)?)?
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "file attributes are unavailable")
+            })
+            .map(|attributes| attributes.0)
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_file_attributes(path: &Path, attributes: u32) -> io::Result<()> {
+        set_attributes(&wide_path(path)?, FILE_FLAGS_AND_ATTRIBUTES(attributes))
     }
 
     fn wide_path(path: &Path) -> io::Result<Vec<u16>> {
@@ -1680,6 +1747,30 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("directory entries");
         assert_eq!(entries.len(), 1, "temporary file should be cleaned up");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_replace_preserves_hidden_and_readonly_attributes_on_windows() {
+        const READONLY: u32 = 0x1;
+        const HIDDEN: u32 = 0x2;
+        const NORMAL: u32 = 0x80;
+
+        let directory = TestDirectory::new("windows-attributes");
+        let path = directory.join(CONFIG_FILE_NAME);
+        fs::write(&path, "before").expect("write attributed config");
+        windows_file_move::set_file_attributes(&path, READONLY | HIDDEN)
+            .expect("set original attributes");
+
+        write_config_source(&path, "after".to_owned()).expect("replace attributed config");
+
+        let attributes = windows_file_move::file_attributes(&path).expect("read final attributes");
+        assert_eq!(attributes & (READONLY | HIDDEN), READONLY | HIDDEN);
+        assert_eq!(
+            fs::read_to_string(&path).expect("read replacement"),
+            "after"
+        );
+        windows_file_move::set_file_attributes(&path, NORMAL).expect("make test file removable");
     }
 
     #[test]
