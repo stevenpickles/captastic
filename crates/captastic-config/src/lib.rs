@@ -920,6 +920,11 @@ where
     F: FnOnce(&Path, &Path) -> std::io::Result<()>,
 {
     let (temporary_path, mut temporary_file) = create_temporary_file(path)?;
+    if let Err(error) = preserve_existing_permissions(path, &temporary_path) {
+        drop(temporary_file);
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
     let write_result = temporary_file
         .write_all(contents)
         .and_then(|()| temporary_file.sync_all());
@@ -933,6 +938,20 @@ where
         return Err(error);
     }
     sync_parent_directory(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn preserve_existing_permissions(path: &Path, temporary_path: &Path) -> std::io::Result<()> {
+    match fs::metadata(path) {
+        Ok(metadata) => fs::set_permissions(temporary_path, metadata.permissions()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(unix))]
+fn preserve_existing_permissions(_path: &Path, _temporary_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -1607,6 +1626,29 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("directory entries");
         assert_eq!(entries.len(), 1, "temporary file should be moved away");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_existing_unix_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = test_directory("atomic-permissions");
+        fs::create_dir_all(&directory).expect("create test directory");
+        let path = directory.join("captastic.toml");
+        fs::write(&path, "old").expect("write original");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("restrict original permissions");
+
+        atomic_write(&path, b"new", replace_file).expect("replace config");
+
+        let mode = fs::metadata(&path)
+            .expect("replacement metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        fs::remove_dir_all(directory).expect("remove test directory");
     }
 
     #[test]
