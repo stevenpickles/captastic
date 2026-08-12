@@ -68,7 +68,7 @@ impl SessionEndRequest {
 
 pub struct TrayIcon {
     receiver: Receiver<TrayEvent>,
-    notification_sender: SyncSender<String>,
+    notification_sender: SyncSender<TrayNotification>,
     thread_id: u32,
     hwnd: isize,
     join: Option<JoinHandle<()>>,
@@ -130,8 +130,19 @@ impl TrayIcon {
     }
 
     pub fn show_error(&self, message: impl Into<String>) -> Result<(), CaptureError> {
+        self.show_error_with_title("Captastic capture failed", message)
+    }
+
+    pub fn show_error_with_title(
+        &self,
+        title: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Result<(), CaptureError> {
         self.notification_sender
-            .try_send(message.into())
+            .try_send(TrayNotification {
+                title: title.into(),
+                message: message.into(),
+            })
             .map_err(|error| tray_error("queue_tray_error", error.to_string()))?;
         // SAFETY: hwnd identifies the live hidden tray window owned by the tray thread.
         unsafe { PostMessageW(HWND(self.hwnd), TRAY_SHOW_ERROR, WPARAM(0), LPARAM(0)) }
@@ -201,7 +212,7 @@ pub fn show_error_dialog(message: &str) {
 
 fn run_tray(
     event_sender: SyncSender<TrayEvent>,
-    notification_receiver: Receiver<String>,
+    notification_receiver: Receiver<TrayNotification>,
     startup_enabled: bool,
     ready_sender: &SyncSender<Result<(u32, isize), CaptureError>>,
 ) -> Result<(), CaptureError> {
@@ -315,7 +326,7 @@ fn run_tray(
 
 struct TrayState {
     event_sender: SyncSender<TrayEvent>,
-    notification_receiver: Receiver<String>,
+    notification_receiver: Receiver<TrayNotification>,
     paused: bool,
     startup_enabled: bool,
     icon: windows::Win32::UI::WindowsAndMessaging::HICON,
@@ -576,15 +587,24 @@ fn modify_tray_tooltip(hwnd: HWND, paused: bool) -> Result<(), CaptureError> {
     Ok(())
 }
 
-fn show_error_notification(hwnd: HWND, message: &str) -> Result<(), CaptureError> {
+#[derive(Debug)]
+struct TrayNotification {
+    title: String,
+    message: String,
+}
+
+fn show_error_notification(
+    hwnd: HWND,
+    notification: &TrayNotification,
+) -> Result<(), CaptureError> {
     let mut data = tray_data(
         hwnd,
         windows::Win32::UI::WindowsAndMessaging::HICON(0),
         false,
         NIF_INFO,
     );
-    write_wide(&mut data.szInfoTitle, "Captastic capture failed");
-    write_wide(&mut data.szInfo, message);
+    write_wide(&mut data.szInfoTitle, &notification.title);
+    write_wide(&mut data.szInfo, &notification.message);
     data.dwInfoFlags = NIIF_ERROR;
     // SAFETY: data identifies the existing icon and contains terminated notification buffers.
     if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {

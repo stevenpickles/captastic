@@ -516,7 +516,9 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     };
     if let Some(tray) = tray.as_ref() {
         for warning in &args.startup_warnings {
-            if let Err(error) = tray.show_error(warning.clone()) {
+            if let Err(error) =
+                tray.show_error_with_title("Captastic configuration recovered", warning.clone())
+            {
                 crate::logging::warn(format_args!(
                     "failed to surface startup warning in the notification area: {error}"
                 ));
@@ -587,6 +589,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let mut shutdown_sent = false;
     let mut tray_shutdown_requested = false;
     let mut session_end_request = None;
+    let mut last_persistence_notification: Option<String> = None;
     loop {
         match done_receiver.recv_timeout(Duration::from_millis(50)) {
             Ok(result) => {
@@ -615,7 +618,14 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                             let message = format!(
                                 "Captastic could not save selection preferences. {failure}"
                             );
-                            if let Err(error) = tray.show_error(message) {
+                            if last_persistence_notification.as_deref() == Some(message.as_str()) {
+                                continue;
+                            }
+                            last_persistence_notification = Some(message.clone());
+                            if let Err(error) = tray.show_error_with_title(
+                                "Captastic preferences were not saved",
+                                message,
+                            ) {
                                 crate::logging::warn(format_args!(
                                     "failed to surface UI-state persistence error in the notification area: {error}"
                                 ));
@@ -650,7 +660,17 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                 );
                             }
                             captastic_windows::TrayEvent::OpenConfig => {
-                                open_config_from_tray(&args.ui_state_store)
+                                if let Err(message) = open_config_from_tray(&args.ui_state_store) {
+                                    crate::logging::warn(format_args!("{message}"));
+                                    if let Err(error) = tray.show_error_with_title(
+                                        "Captastic could not open configuration",
+                                        message,
+                                    ) {
+                                        crate::logging::warn(format_args!(
+                                            "failed to surface Open Config error in the notification area: {error}"
+                                        ));
+                                    }
+                                }
                             }
                             captastic_windows::TrayEvent::OpenLogs => open_logs_from_tray(),
                             captastic_windows::TrayEvent::ToggleStartup => {
@@ -721,21 +741,13 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
 }
 
 #[cfg(windows)]
-fn open_config_from_tray(store: &captastic_config::UiStateStore) {
+fn open_config_from_tray(store: &captastic_config::UiStateStore) -> Result<(), String> {
     let path = store.prepare_for_open();
     match path {
-        Ok(path) if path.exists() => {
-            if let Err(error) = captastic_windows::open_path(&path) {
-                crate::logging::warn(format_args!("failed to open configuration: {error}"));
-            }
-        }
-        Ok(path) => crate::logging::warn(format_args!(
-            "configuration does not exist: {}",
-            path.display()
-        )),
-        Err(error) => {
-            crate::logging::warn(format_args!("failed to prepare the configuration: {error}"))
-        }
+        Ok(path) if path.exists() => captastic_windows::open_path(&path)
+            .map_err(|error| format!("failed to open configuration: {error}")),
+        Ok(path) => Err(format!("configuration does not exist: {}", path.display())),
+        Err(error) => Err(format!("failed to prepare the configuration: {error}")),
     }
 }
 
@@ -1354,6 +1366,18 @@ mod tests {
             1,
             "strict loading must not create a quarantine file"
         );
+    }
+
+    #[test]
+    fn tray_open_config_reports_a_missing_explicit_path() {
+        let config = TempConfig::with_contents("schema_version = 1\n");
+        fs::remove_file(&config.path).expect("remove explicit config");
+        let store = captastic_config::UiStateStore::for_config(&config.path);
+
+        let error = open_config_from_tray(&store).expect_err("missing explicit config must fail");
+
+        assert!(error.contains("does not exist"));
+        assert!(!config.path.exists());
     }
 
     #[test]
