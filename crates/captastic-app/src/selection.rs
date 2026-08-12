@@ -30,7 +30,7 @@ impl OneShotUiStateWorker {
         let controller = captastic_windows::OverlayController::with_ui_updates(sender);
         let join = thread::Builder::new()
             .name("captastic-ui-state-once".to_owned())
-            .spawn(move || persist_ui_state(receiver, store))
+            .spawn(move || persist_ui_state(receiver, store, None))
             .map_err(|error| AppError::BackendUnavailable(error.to_string()))?;
         Ok(Self {
             controller: Some(controller),
@@ -56,6 +56,7 @@ pub struct SelectionWorker {
     sender: Option<mpsc::SyncSender<SelectionJob>>,
     controller: Option<captastic_windows::OverlayController>,
     ui_sender: Option<mpsc::Sender<captastic_windows::OverlayUiUpdate>>,
+    failure_receiver: mpsc::Receiver<String>,
     join: Option<JoinHandle<()>>,
     ui_join: Option<JoinHandle<()>>,
 }
@@ -70,9 +71,10 @@ impl SelectionWorker {
     ) -> Result<Self, AppError> {
         let (sender, receiver) = mpsc::sync_channel::<SelectionJob>(queue_capacity);
         let (ui_sender, ui_receiver) = mpsc::channel();
+        let (failure_sender, failure_receiver) = mpsc::channel();
         let ui_join = thread::Builder::new()
             .name("captastic-ui-state".to_owned())
-            .spawn(move || persist_ui_state(ui_receiver, ui_state_store))
+            .spawn(move || persist_ui_state(ui_receiver, ui_state_store, Some(failure_sender)))
             .map_err(|error| AppError::BackendUnavailable(error.to_string()))?;
         let controller = captastic_windows::OverlayController::with_ui_updates(ui_sender.clone());
         let worker_controller = controller.clone();
@@ -278,6 +280,7 @@ impl SelectionWorker {
             sender: Some(sender),
             controller: Some(controller),
             ui_sender: Some(ui_sender),
+            failure_receiver,
             join: Some(join),
             ui_join: Some(ui_join),
         })
@@ -288,6 +291,10 @@ impl SelectionWorker {
             .as_ref()
             .expect("selection worker is running")
             .clone()
+    }
+
+    pub fn try_recv_persistence_failure(&self) -> Option<String> {
+        self.failure_receiver.try_recv().ok()
     }
 
     pub fn stop(mut self) {
@@ -508,6 +515,7 @@ fn remember_confirmed_region(
 fn persist_ui_state(
     receiver: mpsc::Receiver<captastic_windows::OverlayUiUpdate>,
     store: captastic_config::UiStateStore,
+    failure_sender: Option<mpsc::Sender<String>>,
 ) {
     while let Ok(first) = receiver.recv() {
         let mut latest = BTreeMap::<(String, u8), captastic_windows::OverlayUiUpdate>::new();
@@ -545,7 +553,11 @@ fn persist_ui_state(
                 } => store.save_display_confirmed_region(&display_id, region, source),
             };
             if let Err(error) = result {
-                crate::logging::warn(format_args!("failed to persist UI state: {error}"));
+                let message = format!("failed to persist UI state: {error}");
+                crate::logging::warn(format_args!("{message}"));
+                if let Some(sender) = failure_sender.as_ref() {
+                    let _ = sender.send(message);
+                }
             }
         }
     }
@@ -575,7 +587,36 @@ fn coalesce_ui_update(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
+
+    #[test]
+    fn persistence_failures_are_reported_after_the_update_channel_drains() {
+        let directory =
+            std::env::temp_dir().join(format!("captastic-ui-state-failure-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("create invalid config path");
+        let store = captastic_config::UiStateStore::for_config(&directory);
+        let (update_sender, update_receiver) = mpsc::channel();
+        let (failure_sender, failure_receiver) = mpsc::channel();
+        update_sender
+            .send(captastic_windows::OverlayUiUpdate::ToolbarCenter {
+                display_id: "display-1".to_owned(),
+                center_x: 0.25,
+                center_y: 0.75,
+            })
+            .expect("queue update");
+        drop(update_sender);
+
+        persist_ui_state(update_receiver, store, Some(failure_sender));
+
+        let failure = failure_receiver
+            .try_recv()
+            .expect("persistence failure must be surfaced");
+        assert!(failure.contains("failed to persist UI state"));
+        fs::remove_dir_all(directory).expect("remove invalid config path");
+    }
 
     #[test]
     fn coalescing_interactions_preserves_a_region_from_earlier_in_the_batch() {

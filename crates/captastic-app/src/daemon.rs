@@ -51,6 +51,7 @@ struct ResolvedDaemonArgs {
     max_captures: Option<usize>,
     self_trigger: bool,
     json: bool,
+    startup_warnings: Vec<String>,
 }
 
 #[cfg(windows)]
@@ -66,6 +67,7 @@ fn resolve_daemon_args_with_default(
         captastic_config::ConfigError,
     >,
 ) -> Result<ResolvedDaemonArgs, AppError> {
+    let mut startup_warnings = Vec::new();
     let ui_state_store = args
         .config
         .as_ref()
@@ -77,12 +79,14 @@ fn resolve_daemon_args_with_default(
         None => {
             let (config, recovery) = load_default()?;
             if let Some(recovery) = recovery {
-                crate::logging::error(format_args!(
+                let message = format!(
                     "damaged configuration {} was quarantined as {}; continuing with defaults: {}",
                     recovery.original_path.display(),
                     recovery.quarantined_path.display(),
                     recovery.reason
-                ));
+                );
+                crate::logging::error(format_args!("{message}"));
+                startup_warnings.push(message);
             }
             config
         }
@@ -127,6 +131,7 @@ fn resolve_daemon_args_with_default(
         max_captures: args.max_captures,
         self_trigger: args.self_trigger,
         json: args.json,
+        startup_warnings,
     })
 }
 
@@ -509,6 +514,15 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             None
         }
     };
+    if let Some(tray) = tray.as_ref() {
+        for warning in &args.startup_warnings {
+            if let Err(error) = tray.show_error(warning.clone()) {
+                crate::logging::warn(format_args!(
+                    "failed to surface startup warning in the notification area: {error}"
+                ));
+            }
+        }
+    }
 
     let active_hotkeys = args
         .hotkey_bindings
@@ -589,6 +603,20 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                             if let Err(error) = tray.show_error(message) {
                                 crate::logging::warn(format_args!(
                                     "failed to surface clipboard error in the notification area: {error}"
+                                ));
+                            }
+                        }
+                    }
+                }
+                if let Some(worker) = selection_worker.as_ref() {
+                    while let Some(failure) = worker.try_recv_persistence_failure() {
+                        if let Some(tray) = tray.as_ref() {
+                            let message = format!(
+                                "Captastic could not save selection preferences. {failure}"
+                            );
+                            if let Err(error) = tray.show_error(message) {
+                                crate::logging::warn(format_args!(
+                                    "failed to surface UI-state persistence error in the notification area: {error}"
                                 ));
                             }
                         }
@@ -1339,6 +1367,8 @@ mod tests {
         .expect("default recovery must permit daemon argument resolution");
 
         assert!(!resolved.backend.is_empty());
+        assert_eq!(resolved.startup_warnings.len(), 1);
+        assert!(resolved.startup_warnings[0].contains("quarantined"));
     }
 
     #[test]
