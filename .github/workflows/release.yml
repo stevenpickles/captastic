@@ -63,15 +63,18 @@ jobs:
 
       - name: Build Chocolatey package
         shell: pwsh
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.value }}
+          PORTABLE_ARCHIVE: ${{ steps.portable.outputs.archive }}
         run: |
-          if ("${{ github.ref }}" -like 'refs/tags/v*') {
-            $sourceUrl = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$(Split-Path -Leaf '${{ steps.portable.outputs.archive }}')"
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $sourceUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:GITHUB_REF_NAME/$(Split-Path -Leaf $env:PORTABLE_ARCHIVE)"
           } else {
-            $sourceUrl = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            $sourceUrl = "https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
           }
           ./scripts/package-chocolatey.ps1 `
-            -Version '${{ steps.version.outputs.value }}' `
-            -ArchivePath '${{ steps.portable.outputs.archive }}' `
+            -Version $env:PACKAGE_VERSION `
+            -ArchivePath $env:PORTABLE_ARCHIVE `
             -SourceUrl $sourceUrl
 
       - name: Upload portable package
