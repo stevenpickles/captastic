@@ -13,11 +13,12 @@ use std::time::{Duration, Instant};
 const CAPTURE_WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(windows)]
 const CAPTURE_WORKER_STOP_POLL: Duration = Duration::from_millis(5);
+#[cfg(windows)]
+const DAEMON_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[cfg(windows)]
-fn join_capture_worker(join: thread::JoinHandle<()>) {
-    let started = Instant::now();
-    while !join.is_finished() && started.elapsed() < CAPTURE_WORKER_STOP_TIMEOUT {
+fn join_capture_worker_until(join: thread::JoinHandle<()>, deadline: Instant) {
+    while !join.is_finished() && Instant::now() < deadline {
         thread::sleep(CAPTURE_WORKER_STOP_POLL);
     }
     if join.is_finished() {
@@ -25,9 +26,14 @@ fn join_capture_worker(join: thread::JoinHandle<()>) {
     } else {
         crate::logging::error(format_args!(
             "capture worker did not stop within {} ms; detaching it so shutdown can continue",
-            CAPTURE_WORKER_STOP_TIMEOUT.as_millis()
+            DAEMON_SHUTDOWN_TIMEOUT.as_millis()
         ));
     }
+}
+
+#[cfg(windows)]
+fn join_capture_worker(join: thread::JoinHandle<()>) {
+    join_capture_worker_until(join, Instant::now() + CAPTURE_WORKER_STOP_TIMEOUT);
 }
 
 #[cfg(windows)]
@@ -226,6 +232,8 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let (command_sender, command_receiver) = mpsc::sync_channel(args.trigger_queue_capacity);
     let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
     let (done_sender, done_receiver) = mpsc::sync_channel::<Result<(), AppError>>(1);
+    let capture_stop_requested = Arc::new(AtomicBool::new(false));
+    let worker_stop_requested = capture_stop_requested.clone();
     let backend_name = args.backend.clone();
     let display_policy = args.display_policy.clone();
     let mode = args.mode.clone();
@@ -260,6 +268,10 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             let mut next_capture_id = 1_u64;
             let mut recovery: Option<BackendRecovery> = None;
             loop {
+                if worker_stop_requested.load(Ordering::Acquire) {
+                    let _ = done_sender.send(Ok(()));
+                    break;
+                }
                 if recovery
                     .as_ref()
                     .is_some_and(|state| Instant::now() >= state.next_attempt)
@@ -472,10 +484,13 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let callback_sender = command_sender.clone();
     let callback_dropped = dropped.clone();
     let callback_paused = paused.clone();
+    let callback_stop_requested = capture_stop_requested.clone();
     let hotkey = match captastic_windows::HotkeyListener::start(
         &args.hotkey_bindings,
         move |action, chord, received_at| {
-            if callback_paused.load(Ordering::Acquire) {
+            if callback_paused.load(Ordering::Acquire)
+                || callback_stop_requested.load(Ordering::Acquire)
+            {
                 return;
             }
             let trigger = TriggerEvent {
@@ -600,13 +615,22 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     }
 
     let mut shutdown_sent = false;
+    let mut shutdown_deadline = None;
     let mut tray_shutdown_requested = false;
     let mut session_end_request = None;
     let mut last_persistence_notification: Option<String> = None;
+    let mut daemon_result = Ok(());
     loop {
+        if shutdown_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            crate::logging::error(format_args!(
+                "daemon shutdown exceeded {} ms; continuing bounded teardown while the capture worker is detached",
+                DAEMON_SHUTDOWN_TIMEOUT.as_millis()
+            ));
+            break;
+        }
         match done_receiver.recv_timeout(Duration::from_millis(50)) {
             Ok(result) => {
-                result?;
+                daemon_result = result;
                 break;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -700,60 +724,54 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                         }
                     }
                 }
-                if (console_shutdown.requested()
+                if console_shutdown.requested()
                     || daemon_control.requested()
-                    || tray_shutdown_requested)
-                    && !shutdown_sent
+                    || tray_shutdown_requested
                 {
-                    match command_sender.try_send(CaptureCommand::Shutdown) {
-                        Ok(()) => shutdown_sent = true,
-                        Err(mpsc::TrySendError::Full(_)) => {}
-                        Err(mpsc::TrySendError::Disconnected(_)) => {
-                            return Err(AppError::BackendUnavailable(
-                                "capture worker stopped during console shutdown".to_owned(),
-                            ));
+                    if shutdown_deadline.is_none() {
+                        shutdown_deadline = Some(Instant::now() + DAEMON_SHUTDOWN_TIMEOUT);
+                        paused.store(true, Ordering::Release);
+                        capture_stop_requested.store(true, Ordering::Release);
+                    }
+                    if !shutdown_sent {
+                        match command_sender.try_send(CaptureCommand::Shutdown) {
+                            Ok(()) => shutdown_sent = true,
+                            Err(mpsc::TrySendError::Full(_)) => {}
+                            Err(mpsc::TrySendError::Disconnected(_)) => {
+                                shutdown_sent = true;
+                            }
                         }
                     }
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(AppError::BackendUnavailable(
+                daemon_result = Err(AppError::BackendUnavailable(
                     "capture worker stopped unexpectedly".to_owned(),
                 ));
+                break;
             }
         }
     }
-    hotkey.stop()?;
-    let _ = command_sender.send(CaptureCommand::Shutdown);
-    join_capture_worker(capture_join);
-    let persistence_failures = selection_worker.map_or_else(Vec::new, |worker| worker.stop());
-    let clipboard_failures = clipboard_worker.map_or_else(Vec::new, |worker| worker.stop());
-    if let Some(tray) = tray.as_ref() {
-        for failure in clipboard_failures {
-            let message = format!(
-                "Capture {} was not copied to the clipboard. {}",
-                failure.capture_id.0, failure.message
-            );
-            if let Err(error) = tray.show_error(message) {
-                crate::logging::warn(format_args!(
-                    "failed to surface shutdown-time clipboard error in the notification area: {error}"
-                ));
-            }
-        }
-        for failure in persistence_failures {
-            let message = format!("Captastic could not save selection preferences. {failure}");
-            if last_persistence_notification.as_deref() == Some(message.as_str()) {
-                continue;
-            }
-            last_persistence_notification = Some(message.clone());
-            if let Err(error) =
-                tray.show_error_with_title("Captastic preferences were not saved", message)
-            {
-                crate::logging::warn(format_args!(
-                    "failed to surface shutdown-time UI-state persistence error in the notification area: {error}"
-                ));
-            }
-        }
+    let hotkey_stop_error = hotkey.stop().err();
+    capture_stop_requested.store(true, Ordering::Release);
+    let _ = command_sender.try_send(CaptureCommand::Shutdown);
+    let teardown_deadline =
+        shutdown_deadline.unwrap_or_else(|| Instant::now() + DAEMON_SHUTDOWN_TIMEOUT);
+    join_capture_worker_until(capture_join, teardown_deadline);
+    let persistence_failures =
+        selection_worker.map_or_else(Vec::new, |worker| worker.stop_before(teardown_deadline));
+    let clipboard_failures =
+        clipboard_worker.map_or_else(Vec::new, |worker| worker.stop_before(teardown_deadline));
+    for failure in clipboard_failures {
+        crate::logging::warn(format_args!(
+            "shutdown retained clipboard failure for capture {} in the persistent log: {}",
+            failure.capture_id.0, failure.message
+        ));
+    }
+    for failure in persistence_failures {
+        crate::logging::warn(format_args!(
+            "shutdown retained UI-state persistence failure in the persistent log: {failure}"
+        ));
     }
     console_shutdown.signal_drained();
     if let Some(request) = session_end_request {
@@ -773,7 +791,10 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     } else {
         log::info!("daemon stopped cleanly");
     }
-    Ok(())
+    if let Some(error) = hotkey_stop_error {
+        return Err(error.into());
+    }
+    daemon_result
 }
 
 #[cfg(windows)]

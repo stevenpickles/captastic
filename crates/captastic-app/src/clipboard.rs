@@ -180,17 +180,22 @@ impl ClipboardWorker {
         self.failure_receiver.try_recv().ok()
     }
 
+    #[cfg(test)]
     pub fn stop(mut self) -> Vec<ClipboardFailure> {
-        self.stop_inner();
+        self.stop_inner(Instant::now() + WORKER_STOP_TIMEOUT);
         self.failure_receiver.try_iter().collect()
     }
 
-    fn stop_inner(&mut self) {
+    pub fn stop_before(mut self, deadline: Instant) -> Vec<ClipboardFailure> {
+        self.stop_inner(deadline);
+        self.failure_receiver.try_iter().collect()
+    }
+
+    fn stop_inner(&mut self, deadline: Instant) {
         self.stop_requested.store(true, Ordering::Release);
         self.sender.take();
         if let Some(join) = self.join.take() {
-            let started = Instant::now();
-            while !join.is_finished() && started.elapsed() < WORKER_STOP_TIMEOUT {
+            while !join.is_finished() && Instant::now() < deadline {
                 thread::sleep(WORKER_STOP_POLL);
             }
             if join.is_finished() {
@@ -212,7 +217,7 @@ pub struct ClipboardFailure {
 
 impl Drop for ClipboardWorker {
     fn drop(&mut self) {
-        self.stop_inner();
+        self.stop_inner(Instant::now() + WORKER_STOP_TIMEOUT);
     }
 }
 

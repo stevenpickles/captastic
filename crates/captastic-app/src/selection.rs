@@ -53,8 +53,11 @@ impl Drop for OneShotUiStateWorker {
 }
 
 fn join_worker_with_timeout(join: JoinHandle<()>, name: &str, timeout: Duration) -> bool {
-    let started = Instant::now();
-    while !join.is_finished() && started.elapsed() < timeout {
+    join_worker_until(join, name, Instant::now() + timeout)
+}
+
+fn join_worker_until(join: JoinHandle<()>, name: &str, deadline: Instant) -> bool {
+    while !join.is_finished() && Instant::now() < deadline {
         thread::sleep(WORKER_STOP_POLL);
     }
     if join.is_finished() {
@@ -63,7 +66,7 @@ fn join_worker_with_timeout(join: JoinHandle<()>, name: &str, timeout: Duration)
     } else {
         crate::logging::error(format_args!(
             "{name} worker did not stop within {} ms; detaching it so shutdown can continue",
-            timeout.as_millis()
+            WORKER_STOP_TIMEOUT.as_millis()
         ));
         false
     }
@@ -289,7 +292,11 @@ impl SelectionWorker {
             Err(error) => {
                 drop(controller);
                 drop(ui_sender);
-                let _ = ui_join.join();
+                join_worker_with_timeout(
+                    ui_join,
+                    "UI-state persistence startup rollback",
+                    WORKER_STOP_TIMEOUT,
+                );
                 return Err(AppError::BackendUnavailable(error.to_string()));
             }
         };
@@ -314,19 +321,25 @@ impl SelectionWorker {
         self.failure_receiver.try_recv().ok()
     }
 
+    #[cfg(test)]
     pub fn stop(mut self) -> Vec<String> {
-        self.stop_inner();
+        self.stop_inner(Instant::now() + WORKER_STOP_TIMEOUT);
         self.failure_receiver.try_iter().collect()
     }
 
-    fn stop_inner(&mut self) {
+    pub fn stop_before(mut self, deadline: Instant) -> Vec<String> {
+        self.stop_inner(deadline);
+        self.failure_receiver.try_iter().collect()
+    }
+
+    fn stop_inner(&mut self, deadline: Instant) {
         self.sender.take();
         if let Some(controller) = self.controller.as_ref() {
             controller.cancel();
         }
         let mut selection_stopped = true;
         if let Some(join) = self.join.take() {
-            if !join_worker_with_timeout(join, "selection", WORKER_STOP_TIMEOUT) {
+            if !join_worker_until(join, "selection", deadline) {
                 selection_stopped = false;
             }
         }
@@ -334,7 +347,7 @@ impl SelectionWorker {
         self.ui_sender.take();
         if let Some(join) = self.ui_join.take() {
             if selection_stopped {
-                join_worker_with_timeout(join, "UI-state persistence", WORKER_STOP_TIMEOUT);
+                join_worker_until(join, "UI-state persistence", deadline);
             }
         }
     }
@@ -342,7 +355,7 @@ impl SelectionWorker {
 
 impl Drop for SelectionWorker {
     fn drop(&mut self) {
-        self.stop_inner();
+        self.stop_inner(Instant::now() + WORKER_STOP_TIMEOUT);
     }
 }
 
