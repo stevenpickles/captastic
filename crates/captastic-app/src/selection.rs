@@ -375,9 +375,10 @@ impl SelectionWorker {
     pub fn request_stop(&mut self) {
         self.stop_requested.store(true, Ordering::Release);
         self.sender.take();
-        if let Some(controller) = self.controller.as_ref() {
+        if let Some(controller) = self.controller.take() {
             controller.cancel();
         }
+        self.ui_sender.take();
     }
 
     fn stop_inner(&mut self, deadline: Instant) {
@@ -388,8 +389,6 @@ impl SelectionWorker {
                 selection_stopped = false;
             }
         }
-        self.controller.take();
-        self.ui_sender.take();
         if let Some(join) = self.ui_join.take() {
             if selection_stopped {
                 join_worker_until(join, "UI-state persistence", deadline);
@@ -788,7 +787,7 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory).expect("create idle worker test directory");
         let (clipboard_sender, _clipboard_receiver) = mpsc::sync_channel(1);
-        let worker = SelectionWorker::start(
+        let mut worker = SelectionWorker::start(
             clipboard_sender,
             false,
             1,
@@ -798,6 +797,22 @@ mod tests {
         .expect("start idle selection worker");
 
         let started = Instant::now();
+        worker.request_stop();
+        while !worker
+            .ui_join
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+            && started.elapsed() < Duration::from_millis(500)
+        {
+            thread::yield_now();
+        }
+        assert!(
+            worker
+                .ui_join
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished),
+            "request_stop should close and flush UI persistence before final teardown"
+        );
         let failures = worker.stop_before(Instant::now() + Duration::from_secs(1));
 
         assert!(failures.is_empty());
