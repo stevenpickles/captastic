@@ -25,8 +25,7 @@ fn join_capture_worker_until(join: thread::JoinHandle<()>, deadline: Instant) {
         let _ = join.join();
     } else {
         crate::logging::error(format_args!(
-            "capture worker did not stop within {} ms; detaching it so shutdown can continue",
-            DAEMON_SHUTDOWN_TIMEOUT.as_millis()
+            "capture worker did not stop before the daemon shutdown deadline; detaching it so shutdown can continue"
         ));
     }
 }
@@ -203,12 +202,12 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             )));
         }
     }
-    let clipboard_worker = args
+    let mut clipboard_worker = args
         .clipboard
         .then(|| crate::clipboard::ClipboardWorker::start(args.json, args.clipboard_queue_capacity))
         .transpose()?;
     let confirmed_regions = Arc::new(Mutex::new(args.confirmed_regions.clone()));
-    let selection_worker = args
+    let mut selection_worker = args
         .selection
         .then(|| {
             crate::selection::SelectionWorker::start(
@@ -617,10 +616,34 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let mut shutdown_sent = false;
     let mut shutdown_deadline = None;
     let mut tray_shutdown_requested = false;
-    let mut session_end_request = None;
     let mut last_persistence_notification: Option<String> = None;
     let mut daemon_result = Ok(());
     loop {
+        let session_shutdown_requested = tray
+            .as_ref()
+            .is_some_and(captastic_windows::TrayIcon::session_shutdown_requested);
+        if session_shutdown_requested {
+            tray_shutdown_requested = true;
+        }
+        if tray_shutdown_requested && shutdown_deadline.is_none() {
+            log::info!(
+                "{}; draining daemon workers",
+                if session_shutdown_requested {
+                    "Windows session is ending"
+                } else {
+                    "notification-area shutdown requested"
+                }
+            );
+            shutdown_deadline = Some(Instant::now() + DAEMON_SHUTDOWN_TIMEOUT);
+            paused.store(true, Ordering::Release);
+            capture_stop_requested.store(true, Ordering::Release);
+            if let Some(worker) = selection_worker.as_mut() {
+                worker.request_stop();
+            }
+            if let Some(worker) = clipboard_worker.as_mut() {
+                worker.request_stop();
+            }
+        }
         if shutdown_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             crate::logging::error(format_args!(
                 "daemon shutdown exceeded {} ms; continuing bounded teardown while the capture worker is detached",
@@ -716,11 +739,6 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                             captastic_windows::TrayEvent::Exit => {
                                 tray_shutdown_requested = true;
                             }
-                            captastic_windows::TrayEvent::SessionEnding(request) => {
-                                log::info!("Windows session is ending; draining daemon workers");
-                                session_end_request = Some(request);
-                                tray_shutdown_requested = true;
-                            }
                         }
                     }
                 }
@@ -732,6 +750,12 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                         shutdown_deadline = Some(Instant::now() + DAEMON_SHUTDOWN_TIMEOUT);
                         paused.store(true, Ordering::Release);
                         capture_stop_requested.store(true, Ordering::Release);
+                        if let Some(worker) = selection_worker.as_mut() {
+                            worker.request_stop();
+                        }
+                        if let Some(worker) = clipboard_worker.as_mut() {
+                            worker.request_stop();
+                        }
                     }
                     if !shutdown_sent {
                         match command_sender.try_send(CaptureCommand::Shutdown) {
@@ -752,16 +776,24 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             }
         }
     }
-    let hotkey_stop_error = hotkey.stop().err();
-    capture_stop_requested.store(true, Ordering::Release);
-    let _ = command_sender.try_send(CaptureCommand::Shutdown);
     let teardown_deadline =
         shutdown_deadline.unwrap_or_else(|| Instant::now() + DAEMON_SHUTDOWN_TIMEOUT);
+    capture_stop_requested.store(true, Ordering::Release);
+    if let Some(worker) = selection_worker.as_mut() {
+        worker.request_stop();
+    }
+    if let Some(worker) = clipboard_worker.as_mut() {
+        worker.request_stop();
+    }
+    let hotkey_stop_error = hotkey.stop().err();
+    let _ = command_sender.try_send(CaptureCommand::Shutdown);
     join_capture_worker_until(capture_join, teardown_deadline);
-    let persistence_failures =
-        selection_worker.map_or_else(Vec::new, |worker| worker.stop_before(teardown_deadline));
-    let clipboard_failures =
-        clipboard_worker.map_or_else(Vec::new, |worker| worker.stop_before(teardown_deadline));
+    let persistence_failures = selection_worker
+        .take()
+        .map_or_else(Vec::new, |worker| worker.stop_before(teardown_deadline));
+    let clipboard_failures = clipboard_worker
+        .take()
+        .map_or_else(Vec::new, |worker| worker.stop_before(teardown_deadline));
     for failure in clipboard_failures {
         crate::logging::warn(format_args!(
             "shutdown retained clipboard failure for capture {} in the persistent log: {}",
@@ -774,8 +806,8 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         ));
     }
     console_shutdown.signal_drained();
-    if let Some(request) = session_end_request {
-        request.signal_drained();
+    if let Some(tray) = tray.as_ref() {
+        tray.signal_session_drained();
     }
     if let Some(tray) = tray {
         tray.stop()?;

@@ -16,6 +16,7 @@ use crate::error::AppError;
 // A terminal publish can consume three 250 ms backoffs plus native clipboard open waits.
 const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const WORKER_STOP_POLL: Duration = Duration::from_millis(5);
+const WORKER_RECEIVE_POLL: Duration = Duration::from_millis(50);
 const PUBLISH_RETRY_LIMIT: u32 = 3;
 const PUBLISH_RETRY_DELAY: Duration = Duration::from_millis(250);
 
@@ -46,7 +47,20 @@ impl ClipboardWorker {
                 if ready_sender.send(Ok(())).is_err() {
                     return;
                 }
-                while let Ok(mut job) = receiver.recv() {
+                loop {
+                    if worker_stop_requested.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let mut job = match receiver.recv_timeout(WORKER_RECEIVE_POLL) {
+                        Ok(job) => job,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if worker_stop_requested.load(Ordering::Acquire) {
+                                break;
+                            }
+                            continue;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
                     job.recorder.record(
                         job.capture_id,
                         PerfEventKind::ClipboardStarted,
@@ -187,13 +201,18 @@ impl ClipboardWorker {
     }
 
     pub fn stop_before(mut self, deadline: Instant) -> Vec<ClipboardFailure> {
+        self.request_stop();
         self.stop_inner(deadline);
         self.failure_receiver.try_iter().collect()
     }
 
-    fn stop_inner(&mut self, deadline: Instant) {
+    pub fn request_stop(&mut self) {
         self.stop_requested.store(true, Ordering::Release);
         self.sender.take();
+    }
+
+    fn stop_inner(&mut self, deadline: Instant) {
+        self.request_stop();
         if let Some(join) = self.join.take() {
             while !join.is_finished() && Instant::now() < deadline {
                 thread::sleep(WORKER_STOP_POLL);

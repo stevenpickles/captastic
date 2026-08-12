@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -16,6 +17,8 @@ use crate::error::AppError;
 
 const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const WORKER_STOP_POLL: Duration = Duration::from_millis(5);
+const WORKER_RECEIVE_POLL: Duration = Duration::from_millis(50);
+const RESOURCE_CACHE_IDLE: Duration = Duration::from_secs(30);
 
 pub type ConfirmedRegionCache = Arc<Mutex<BTreeMap<String, ConfirmedRegion>>>;
 
@@ -96,6 +99,7 @@ pub struct SelectionWorker {
     controller: Option<captastic_windows::OverlayController>,
     ui_sender: Option<mpsc::Sender<captastic_windows::OverlayUiUpdate>>,
     failure_receiver: mpsc::Receiver<String>,
+    stop_requested: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
     ui_join: Option<JoinHandle<()>>,
 }
@@ -111,6 +115,8 @@ impl SelectionWorker {
         let (sender, receiver) = mpsc::sync_channel::<SelectionJob>(queue_capacity);
         let (ui_sender, ui_receiver) = mpsc::channel();
         let (failure_sender, failure_receiver) = mpsc::channel();
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let worker_stop_requested = stop_requested.clone();
         let ui_join = thread::Builder::new()
             .name("captastic-ui-state".to_owned())
             .spawn(move || persist_ui_state(ui_receiver, ui_state_store, Some(failure_sender)))
@@ -119,15 +125,27 @@ impl SelectionWorker {
         let worker_controller = controller.clone();
         let join = match thread::Builder::new()
             .name("captastic-selection".to_owned())
-            .spawn(move || loop {
-                let mut job = match receiver.recv_timeout(Duration::from_secs(30)) {
+            .spawn(move || {
+                let mut cache_idle_started = Instant::now();
+                loop {
+                    if worker_stop_requested.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let mut job = match receiver.recv_timeout(WORKER_RECEIVE_POLL) {
                     Ok(job) => job,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        captastic_windows::clear_overlay_resource_cache();
+                        if worker_stop_requested.load(Ordering::Acquire) {
+                            break;
+                        }
+                        if cache_idle_started.elapsed() >= RESOURCE_CACHE_IDLE {
+                            captastic_windows::clear_overlay_resource_cache();
+                            cache_idle_started = Instant::now();
+                        }
                         continue;
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 };
+                cache_idle_started = Instant::now();
                 job.recorder.record(
                     job.capture_id,
                     PerfEventKind::SelectionStarted,
@@ -306,6 +324,7 @@ impl SelectionWorker {
                         );
                     }
                 }
+            }
             }) {
             Ok(join) => join,
             Err(error) => {
@@ -324,6 +343,7 @@ impl SelectionWorker {
             controller: Some(controller),
             ui_sender: Some(ui_sender),
             failure_receiver,
+            stop_requested,
             join: Some(join),
             ui_join: Some(ui_join),
         })
@@ -347,15 +367,21 @@ impl SelectionWorker {
     }
 
     pub fn stop_before(mut self, deadline: Instant) -> Vec<String> {
+        self.request_stop();
         self.stop_inner(deadline);
         self.failure_receiver.try_iter().collect()
     }
 
-    fn stop_inner(&mut self, deadline: Instant) {
+    pub fn request_stop(&mut self) {
+        self.stop_requested.store(true, Ordering::Release);
         self.sender.take();
         if let Some(controller) = self.controller.as_ref() {
             controller.cancel();
         }
+    }
+
+    fn stop_inner(&mut self, deadline: Instant) {
+        self.request_stop();
         let mut selection_stopped = true;
         if let Some(join) = self.join.take() {
             if !join_worker_until(join, "selection", deadline) {
@@ -745,11 +771,38 @@ mod tests {
             controller: None,
             ui_sender: None,
             failure_receiver,
+            stop_requested: Arc::new(AtomicBool::new(false)),
             join: None,
             ui_join: None,
         };
 
         assert_eq!(worker.stop(), vec!["scripted shutdown failure".to_owned()]);
+    }
+
+    #[test]
+    fn idle_selection_worker_observes_stop_without_sender_disconnect() {
+        let directory = std::env::temp_dir().join(format!(
+            "captastic-idle-selection-stop-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("create idle worker test directory");
+        let (clipboard_sender, _clipboard_receiver) = mpsc::sync_channel(1);
+        let worker = SelectionWorker::start(
+            clipboard_sender,
+            false,
+            1,
+            Arc::new(Mutex::new(BTreeMap::new())),
+            captastic_config::UiStateStore::for_config(directory.join("captastic.toml")),
+        )
+        .expect("start idle selection worker");
+
+        let started = Instant::now();
+        let failures = worker.stop_before(Instant::now() + Duration::from_secs(1));
+
+        assert!(failures.is_empty());
+        assert!(started.elapsed() < Duration::from_millis(500));
+        fs::remove_dir_all(directory).expect("remove idle worker test directory");
     }
 
     #[test]

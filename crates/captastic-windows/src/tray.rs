@@ -2,9 +2,11 @@ use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use captastic_core::{CaptureError, CaptureErrorKind};
 use windows::core::{w, Error as WindowsError, PCWSTR};
@@ -43,6 +45,8 @@ const COMMAND_LOGS: usize = 1_004;
 const COMMAND_STARTUP: usize = 1_005;
 const COMMAND_EXIT: usize = 1_006;
 const SESSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(4);
+const TRAY_STOP_TIMEOUT: Duration = Duration::from_secs(1);
+const TRAY_STOP_POLL: Duration = Duration::from_millis(5);
 
 #[derive(Clone, Debug)]
 pub enum TrayEvent {
@@ -52,18 +56,6 @@ pub enum TrayEvent {
     OpenLogs,
     ToggleStartup,
     Exit,
-    SessionEnding(SessionEndRequest),
-}
-
-#[derive(Clone, Debug)]
-pub struct SessionEndRequest {
-    drained: SyncSender<()>,
-}
-
-impl SessionEndRequest {
-    pub fn signal_drained(self) {
-        let _ = self.drained.send(());
-    }
 }
 
 pub struct TrayIcon {
@@ -71,6 +63,8 @@ pub struct TrayIcon {
     notification_sender: SyncSender<TrayNotification>,
     thread_id: u32,
     hwnd: isize,
+    session_shutdown_requested: Arc<AtomicBool>,
+    session_drain_completed: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -79,6 +73,10 @@ impl TrayIcon {
         let (event_sender, receiver) = mpsc::sync_channel(8);
         let (notification_sender, notification_receiver) = mpsc::sync_channel(8);
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let session_shutdown_requested = Arc::new(AtomicBool::new(false));
+        let session_drain_completed = Arc::new(AtomicBool::new(false));
+        let tray_shutdown_requested = session_shutdown_requested.clone();
+        let tray_drain_completed = session_drain_completed.clone();
         let join = thread::Builder::new()
             .name("captastic-tray".to_owned())
             .spawn(move || {
@@ -86,6 +84,8 @@ impl TrayIcon {
                     event_sender,
                     notification_receiver,
                     startup_enabled,
+                    tray_shutdown_requested,
+                    tray_drain_completed,
                     &ready_sender,
                 ) {
                     let _ = ready_sender.send(Err(error.clone()));
@@ -99,6 +99,8 @@ impl TrayIcon {
                 notification_sender,
                 thread_id,
                 hwnd,
+                session_shutdown_requested,
+                session_drain_completed,
                 join: Some(join),
             }),
             Ok(Err(error)) => {
@@ -114,6 +116,14 @@ impl TrayIcon {
 
     pub fn try_recv(&self) -> Option<TrayEvent> {
         self.receiver.try_recv().ok()
+    }
+
+    pub fn session_shutdown_requested(&self) -> bool {
+        self.session_shutdown_requested.load(Ordering::Acquire)
+    }
+
+    pub fn signal_session_drained(&self) {
+        self.session_drain_completed.store(true, Ordering::Release);
     }
 
     pub fn set_startup_enabled(&self, enabled: bool) -> Result<(), CaptureError> {
@@ -161,10 +171,28 @@ impl TrayIcon {
         unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) }
             .map_err(|error| native_error("stop_tray_thread", error))?;
         if let Some(join) = self.join.take() {
-            join.join()
-                .map_err(|_| tray_error("join_tray_thread", "tray thread panicked"))?;
+            if !join_tray_worker(join, TRAY_STOP_TIMEOUT)? {
+                log::error!(
+                    "tray worker did not stop within {} ms; detaching it so shutdown can continue",
+                    TRAY_STOP_TIMEOUT.as_millis()
+                );
+            }
         }
         Ok(())
+    }
+}
+
+fn join_tray_worker(join: JoinHandle<()>, timeout: Duration) -> Result<bool, CaptureError> {
+    let started = Instant::now();
+    while !join.is_finished() && started.elapsed() < timeout {
+        thread::sleep(TRAY_STOP_POLL);
+    }
+    if join.is_finished() {
+        join.join()
+            .map_err(|_| tray_error("join_tray_thread", "tray thread panicked"))?;
+        Ok(true)
+    } else {
+        Ok(false)
     }
 }
 
@@ -214,6 +242,8 @@ fn run_tray(
     event_sender: SyncSender<TrayEvent>,
     notification_receiver: Receiver<TrayNotification>,
     startup_enabled: bool,
+    session_shutdown_requested: Arc<AtomicBool>,
+    session_drain_completed: Arc<AtomicBool>,
     ready_sender: &SyncSender<Result<(u32, isize), CaptureError>>,
 ) -> Result<(), CaptureError> {
     // SAFETY: No module name requests the current executable module.
@@ -247,6 +277,8 @@ fn run_tray(
         icon,
         taskbar_created,
         shutdown_block_active: false,
+        session_shutdown_requested,
+        session_drain_completed,
     });
     let state_pointer = Box::into_raw(state);
     // SAFETY: The registered class is live and state_pointer remains allocated through the loop.
@@ -332,6 +364,8 @@ struct TrayState {
     icon: windows::Win32::UI::WindowsAndMessaging::HICON,
     taskbar_created: u32,
     shutdown_block_active: bool,
+    session_shutdown_requested: Arc<AtomicBool>,
+    session_drain_completed: Arc<AtomicBool>,
 }
 
 unsafe extern "system" fn tray_window_proc(
@@ -538,19 +572,28 @@ fn session_end_is_committed(end_session: usize) -> bool {
 }
 
 fn wait_for_session_drain(state_pointer: *mut TrayState) {
-    let (drained, wait_for_drain) = mpsc::sync_channel(0);
-    // SAFETY: Clone the sender from the live state, then release the borrow before blocking.
-    let sender = unsafe { (&*state_pointer).event_sender.clone() };
-    if sender
-        .send(TrayEvent::SessionEnding(SessionEndRequest { drained }))
-        .is_ok()
-        && wait_for_drain.recv_timeout(SESSION_DRAIN_TIMEOUT).is_err()
-    {
+    // SAFETY: Clone the atomics from the live state, then release the borrow before waiting.
+    let (requested, drained) = unsafe {
+        (
+            (&*state_pointer).session_shutdown_requested.clone(),
+            (&*state_pointer).session_drain_completed.clone(),
+        )
+    };
+    if !wait_for_drain_signal(&requested, &drained, SESSION_DRAIN_TIMEOUT) {
         log::warn!(
             "daemon did not finish its session-shutdown drain within {} ms",
             SESSION_DRAIN_TIMEOUT.as_millis()
         );
     }
+}
+
+fn wait_for_drain_signal(requested: &AtomicBool, drained: &AtomicBool, timeout: Duration) -> bool {
+    requested.store(true, Ordering::Release);
+    let started = Instant::now();
+    while !drained.load(Ordering::Acquire) && started.elapsed() < timeout {
+        thread::sleep(TRAY_STOP_POLL);
+    }
+    drained.load(Ordering::Acquire)
 }
 
 fn send_tray_event(state_pointer: *mut TrayState, event: TrayEvent) {
@@ -772,6 +815,57 @@ mod tests {
     fn session_shutdown_is_routed_only_after_windows_commits_it() {
         assert!(!session_end_is_committed(0));
         assert!(session_end_is_committed(1));
+    }
+
+    #[test]
+    fn session_shutdown_handoff_uses_a_dedicated_nonblocking_signal() {
+        let requested = Arc::new(AtomicBool::new(false));
+        let drained = Arc::new(AtomicBool::new(false));
+        let daemon_requested = requested.clone();
+        let daemon_drained = drained.clone();
+        let daemon = thread::spawn(move || {
+            while !daemon_requested.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            daemon_drained.store(true, Ordering::Release);
+        });
+
+        assert!(wait_for_drain_signal(
+            &requested,
+            &drained,
+            Duration::from_secs(1)
+        ));
+        daemon.join().expect("join scripted daemon acknowledgement");
+    }
+
+    #[test]
+    fn session_shutdown_handoff_obeys_its_deadline_without_an_acknowledgement() {
+        let requested = AtomicBool::new(false);
+        let drained = AtomicBool::new(false);
+        let started = Instant::now();
+
+        assert!(!wait_for_drain_signal(
+            &requested,
+            &drained,
+            Duration::from_millis(10)
+        ));
+        assert!(requested.load(Ordering::Acquire));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn tray_worker_join_detaches_at_its_deadline() {
+        let (release_sender, release_receiver) = mpsc::channel();
+        let join = thread::spawn(move || {
+            let _ = release_receiver.recv();
+        });
+
+        let started = Instant::now();
+        assert!(!join_tray_worker(join, Duration::from_millis(10)).expect("bounded join"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        release_sender
+            .send(())
+            .expect("release detached tray test worker");
     }
 
     #[test]
