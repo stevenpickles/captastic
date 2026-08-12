@@ -71,15 +71,3 @@ pub enum MetricsError {
         current_rank: u8,
     },
 }
-
-#[derive(Debug, Error, Eq, PartialEq)]
-pub enum PipelineError {
-    #[error("queue capacity must be greater than zero")]
-    InvalidCapacity,
-    #[error("queue is full")]
-    Full,
-    #[error("queue is disconnected")]
-    Disconnected,
-    #[error("queue is empty")]
-    Empty,
-}
