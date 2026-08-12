@@ -247,8 +247,7 @@ pub fn select_from_frozen_frame_with_initial_tool_and_ui(
         )
     };
     let display_environment = query_display_environment(source);
-    let remembered_ui =
-        remembered_ui.unwrap_or_else(|| load_display_ui_state(&frame.metadata.display_id));
+    let remembered_ui = remembered_ui.unwrap_or_default();
     let toolbar_position = remembered_toolbar_position(
         remembered_ui.overlay_center,
         remembered_ui.overlay_position,
@@ -1111,19 +1110,6 @@ fn remember_toolbar_position(
     if let Some(sender) = ui_updates {
         if sender.try_send(update).is_err() {
             log::warn!("UI-state update queue is unavailable; toolbar position was not saved");
-        }
-    }
-}
-
-fn load_display_ui_state(display_id: &DisplayId) -> captastic_config::DisplayUiState {
-    match captastic_config::load_display_ui_state(&display_id.0) {
-        Ok(state) => state,
-        Err(error) => {
-            log::warn!(
-                "failed to load UI state for display {}: {error}",
-                display_id.0
-            );
-            captastic_config::DisplayUiState::default()
         }
     }
 }

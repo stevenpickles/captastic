@@ -253,7 +253,18 @@ fn capture(args: cli::CaptureArgs) -> Result<(), AppError> {
                 )
             })?;
             recorder.record(request.id, PerfEventKind::SelectionStarted, 0);
-            let Some(selection) = captastic_windows::select_from_frozen_frame(&full_frame)? else {
+            let ui_store = captastic_config::UiStateStore::for_default_config();
+            let remembered_ui =
+                ui_store.load_display_ui_state(&full_frame.metadata.display_id.0)?;
+            let ui_worker = selection::OneShotUiStateWorker::start(ui_store)?;
+            let selection = captastic_windows::select_from_frozen_frame_with_initial_tool_and_ui(
+                &full_frame,
+                ui_worker.controller(),
+                captastic_windows::InitialSelectionTool::Remembered,
+                Some(remembered_ui),
+            )?;
+            drop(ui_worker);
+            let Some(selection) = selection else {
                 recorder.record(request.id, PerfEventKind::AttemptFinished, 0);
                 captastic_core::validate_event_order(recorder.events())?;
                 let value = json!({

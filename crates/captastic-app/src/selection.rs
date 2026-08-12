@@ -20,6 +20,42 @@ const UI_STATE_QUEUE_CAPACITY: usize = 32;
 
 pub type ConfirmedRegionCache = Arc<Mutex<BTreeMap<String, ConfirmedRegion>>>;
 
+pub struct OneShotUiStateWorker {
+    controller: Option<captastic_windows::OverlayController>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl OneShotUiStateWorker {
+    pub fn start(store: captastic_config::UiStateStore) -> Result<Self, AppError> {
+        let (sender, receiver) = mpsc::sync_channel(UI_STATE_QUEUE_CAPACITY);
+        let controller = captastic_windows::OverlayController::with_ui_updates(sender);
+        let join = thread::Builder::new()
+            .name("captastic-ui-state-once".to_owned())
+            .spawn(move || {
+                let live_ui = Mutex::new(BTreeMap::new());
+                persist_ui_state(receiver, store, &live_ui);
+            })
+            .map_err(|error| AppError::BackendUnavailable(error.to_string()))?;
+        Ok(Self {
+            controller: Some(controller),
+            join: Some(join),
+        })
+    }
+
+    pub fn controller(&self) -> &captastic_windows::OverlayController {
+        self.controller.as_ref().expect("UI-state worker is active")
+    }
+}
+
+impl Drop for OneShotUiStateWorker {
+    fn drop(&mut self) {
+        self.controller.take();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
 pub struct SelectionWorker {
     sender: Option<mpsc::SyncSender<SelectionJob>>,
     controller: Option<captastic_windows::OverlayController>,
