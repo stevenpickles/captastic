@@ -454,12 +454,11 @@ fn tray_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPAR
             }
             LRESULT(0)
         }
-        WM_QUERYENDSESSION => {
-            send_tray_event(state_pointer, TrayEvent::SessionEnding);
-            LRESULT(1)
-        }
-        WM_ENDSESSION if wparam.0 != 0 => {
-            send_tray_event(state_pointer, TrayEvent::SessionEnding);
+        WM_QUERYENDSESSION => LRESULT(1),
+        WM_ENDSESSION => {
+            if session_end_is_committed(wparam.0) {
+                send_tray_event(state_pointer, TrayEvent::SessionEnding);
+            }
             LRESULT(0)
         }
         WM_CLOSE => {
@@ -477,6 +476,10 @@ fn tray_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPAR
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
     }
+}
+
+fn session_end_is_committed(end_session: usize) -> bool {
+    end_session != 0
 }
 
 fn send_tray_event(state_pointer: *mut TrayState, event: TrayEvent) {
@@ -684,6 +687,12 @@ fn tray_error(operation: &'static str, message: impl Into<String>) -> CaptureErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_shutdown_is_routed_only_after_windows_commits_it() {
+        assert!(!session_end_is_committed(0));
+        assert!(session_end_is_committed(1));
+    }
 
     #[test]
     fn tray_tooltip_reports_operating_state() {
