@@ -202,8 +202,7 @@ impl ClipboardWorker {
                 let _ = join.join();
             } else {
                 crate::logging::error(format_args!(
-                    "clipboard worker did not stop within {} ms; detaching it so shutdown can continue",
-                    WORKER_STOP_TIMEOUT.as_millis()
+                    "clipboard worker did not stop before its shutdown deadline; detaching it so shutdown can continue"
                 ));
             }
         }

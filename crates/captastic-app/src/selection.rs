@@ -85,8 +85,7 @@ fn join_worker_until(join: JoinHandle<()>, name: &str, deadline: Instant) -> boo
         true
     } else {
         crate::logging::error(format_args!(
-            "{name} worker did not stop within {} ms; detaching it so shutdown can continue",
-            WORKER_STOP_TIMEOUT.as_millis()
+            "{name} worker did not stop before its shutdown deadline; detaching it so shutdown can continue"
         ));
         false
     }
