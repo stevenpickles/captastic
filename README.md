@@ -172,8 +172,11 @@ Daemon settings use TOML values first and explicit CLI flags second. `max_frame_
 The default `daemon.display = "pointer"` opens Captastic on the monitor containing the pointer when
 the capture hotkey is dequeued. Captastic resolves the pointer once per capture and does not install
 or run a cursor polling loop. Set `daemon.display = "primary"` to always follow the current Windows
-primary monitor. To pin
-Captastic to one physical monitor, list the attached displays without creating a capture session:
+primary monitor. Set `daemon.display = "virtual_desktop"` to compose the normalized physical-pixel
+bounds of every display when all outputs share one DXGI adapter. Desktop gaps are opaque black and,
+if Windows reports overlapping display bounds, the lexicographically smaller persistent display ID
+wins. Multi-adapter virtual desktops return an explicit unsupported-topology error. To pin Captastic
+to one physical monitor, list the attached displays without creating a capture session:
 
 ```powershell
 captastic displays --backend dxgi --json

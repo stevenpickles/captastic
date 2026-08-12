@@ -415,15 +415,17 @@ impl AppConfig {
             "daemon.trigger_queue_capacity",
             self.daemon.trigger_queue_capacity,
         )?;
-        if !matches!(self.daemon.display.as_str(), "primary" | "pointer")
-            && self
-                .daemon
-                .display
-                .strip_prefix("display:")
-                .is_none_or(|id| id.trim().is_empty())
+        if !matches!(
+            self.daemon.display.as_str(),
+            "primary" | "pointer" | "virtual_desktop"
+        ) && self
+            .daemon
+            .display
+            .strip_prefix("display:")
+            .is_none_or(|id| id.trim().is_empty())
         {
             return Err(ConfigError::InvalidValue(
-                "daemon.display must be pointer, primary, or display:<persistent-id>".to_owned(),
+                "daemon.display must be pointer, primary, virtual_desktop, or display:<persistent-id>".to_owned(),
             ));
         }
         validate_capacity("selection.queue_capacity", self.selection.queue_capacity)?;
@@ -1500,19 +1502,21 @@ mod tests {
     }
 
     #[test]
-    fn accepts_pointer_primary_or_a_persistent_display_id() {
+    fn accepts_pointer_primary_virtual_desktop_or_a_persistent_display_id() {
         let mut config = AppConfig::default();
         config.daemon.display = "pointer".to_owned();
         config.validate().expect("pointer display policy");
         config.daemon.display = "primary".to_owned();
         config.validate().expect("primary display policy");
+        config.daemon.display = "virtual_desktop".to_owned();
+        config.validate().expect("virtual desktop policy");
         config.daemon.display = "display:windows-monitor-0123456789abcdef".to_owned();
         config.validate().expect("fixed display policy");
     }
 
     #[test]
-    fn rejects_unimplemented_or_empty_display_policies() {
-        for value in ["virtual_desktop", "display:", "windows-monitor-id"] {
+    fn rejects_empty_or_unknown_display_policies() {
+        for value in ["display:", "windows-monitor-id"] {
             let mut config = AppConfig::default();
             config.daemon.display = value.to_owned();
             assert!(matches!(

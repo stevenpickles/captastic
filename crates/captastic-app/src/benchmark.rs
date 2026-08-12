@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use captastic_core::{
     trigger_queue, validate_event_order, CaptureBackend, CaptureErrorKind, CaptureId, CaptureMode,
-    CaptureRequest, CaptureSource, CursorMode, DisplayId, EventRecorder, FakeBackend,
-    FakeBackendConfig, LatencySummary, PerfEvent, PerfEventKind,
+    CaptureRequest, CaptureSource, CursorMode, EventRecorder, FakeBackend, FakeBackendConfig,
+    LatencySummary, PerfEvent, PerfEventKind,
 };
 use serde::Serialize;
 
@@ -18,7 +18,7 @@ pub struct BenchmarkOptions {
     pub warmup: usize,
     pub mode: CaptureMode,
     pub cpu_frame: bool,
-    pub display_id: DisplayId,
+    pub source: CaptureSource,
     pub trigger_queue_capacity: usize,
     pub metrics_capacity: usize,
     pub fake: FakeBackendConfig,
@@ -88,7 +88,7 @@ pub fn run_with_backend(
     for index in 0..options.warmup {
         let request = request(
             index as u64,
-            &options.display_id,
+            &options.source,
             &options.mode,
             options.cpu_frame,
         );
@@ -112,7 +112,7 @@ pub fn run_with_backend(
         recorder.record(capture_id, PerfEventKind::HotkeyReceived, 0);
         let request = request(
             capture_id.0,
-            &options.display_id,
+            &options.source,
             &options.mode,
             options.cpu_frame,
         );
@@ -257,11 +257,11 @@ pub fn write_json_lines(path: &Path, events: &[PerfEvent]) -> Result<(), AppErro
     })
 }
 
-fn request(id: u64, display_id: &DisplayId, mode: &CaptureMode, cpu_frame: bool) -> CaptureRequest {
+fn request(id: u64, source: &CaptureSource, mode: &CaptureMode, cpu_frame: bool) -> CaptureRequest {
     CaptureRequest {
         id: CaptureId(id),
         triggered_at: Instant::now(),
-        source: CaptureSource::Display(display_id.clone()),
+        source: source.clone(),
         mode: mode.clone(),
         cpu_frame,
         retain_native_frame: false,
@@ -285,6 +285,7 @@ pub fn fake_config(native_us: u64, readback_us: u64, frame_age_us: u64) -> FakeB
 #[cfg(test)]
 mod tests {
     use super::*;
+    use captastic_core::DisplayId;
 
     #[test]
     fn synthetic_benchmark_has_complete_samples() {
@@ -295,7 +296,7 @@ mod tests {
                 max_age_ms: Some(25),
             },
             cpu_frame: true,
-            display_id: DisplayId::primary(),
+            source: CaptureSource::Display(DisplayId::primary()),
             trigger_queue_capacity: 1,
             metrics_capacity: 100,
             fake: fake_config(0, 0, 1_000),
