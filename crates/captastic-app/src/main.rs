@@ -263,7 +263,7 @@ fn capture(args: cli::CaptureArgs) -> Result<(), AppError> {
             recorder.record(request.id, PerfEventKind::SelectionStarted, 0);
             let ui_store = captastic_config::UiStateStore::for_default_config();
             let remembered_ui =
-                ui_store.load_display_ui_state(&full_frame.metadata.display_id.0)?;
+                load_optional_one_shot_ui_state(&ui_store, &full_frame.metadata.display_id.0);
             let ui_worker = selection::OneShotUiStateWorker::start(ui_store)?;
             let selection = captastic_windows::select_from_frozen_frame_with_initial_tool_and_ui(
                 &full_frame,
@@ -419,6 +419,22 @@ fn capture(args: cli::CaptureArgs) -> Result<(), AppError> {
         log::info!("capture {} complete: {}", request.id.0, value);
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn load_optional_one_shot_ui_state(
+    store: &captastic_config::UiStateStore,
+    display_id: &str,
+) -> captastic_config::DisplayUiState {
+    match store.load_display_ui_state(display_id) {
+        Ok(state) => state,
+        Err(error) => {
+            crate::logging::warn(format_args!(
+                "could not load remembered selection preferences; continuing with defaults: {error}"
+            ));
+            captastic_config::DisplayUiState::default()
+        }
+    }
 }
 
 fn benchmark(args: BenchmarkArgs) -> Result<(), AppError> {
@@ -727,6 +743,9 @@ fn duration_ns(duration: std::time::Duration) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use std::fs;
+
     use super::*;
 
     fn cli(command: Option<Command>) -> Cli {
@@ -755,6 +774,23 @@ mod tests {
         let mut explicit = cli(Some(Command::Doctor { json: true }));
         explicit.log_file = Some("doctor.log".into());
         assert!(uses_persistent_logging(&explicit));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn one_shot_selection_ignores_unreadable_remembered_ui_state() {
+        let directory =
+            std::env::temp_dir().join(format!("captastic-one-shot-ui-load-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("create directory at config path");
+        let store = captastic_config::UiStateStore::for_config(&directory);
+
+        assert_eq!(
+            load_optional_one_shot_ui_state(&store, "display-1"),
+            captastic_config::DisplayUiState::default()
+        );
+
+        fs::remove_dir_all(directory).expect("remove directory at config path");
     }
 
     #[test]
