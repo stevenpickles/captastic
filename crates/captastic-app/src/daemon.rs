@@ -484,7 +484,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let callback_dropped = dropped.clone();
     let callback_paused = paused.clone();
     let callback_stop_requested = capture_stop_requested.clone();
-    let hotkey = match captastic_windows::HotkeyListener::start(
+    let mut hotkey = match captastic_windows::HotkeyListener::start(
         &args.hotkey_bindings,
         move |action, chord, received_at| {
             if callback_paused.load(Ordering::Acquire)
@@ -643,6 +643,9 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             if let Some(worker) = clipboard_worker.as_mut() {
                 worker.request_stop();
             }
+            if let Err(error) = hotkey.request_stop() {
+                crate::logging::warn(format_args!("failed to request hotkey shutdown: {error}"));
+            }
         }
         if shutdown_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             crate::logging::error(format_args!(
@@ -756,6 +759,11 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                         if let Some(worker) = clipboard_worker.as_mut() {
                             worker.request_stop();
                         }
+                        if let Err(error) = hotkey.request_stop() {
+                            crate::logging::warn(format_args!(
+                                "failed to request hotkey shutdown: {error}"
+                            ));
+                        }
                     }
                     if !shutdown_sent {
                         match command_sender.try_send(CaptureCommand::Shutdown) {
@@ -785,7 +793,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     if let Some(worker) = clipboard_worker.as_mut() {
         worker.request_stop();
     }
-    let hotkey_stop_error = hotkey.stop().err();
+    let hotkey_stop_error = hotkey.stop_before(teardown_deadline).err();
     let _ = command_sender.try_send(CaptureCommand::Shutdown);
     join_capture_worker_until(capture_join, teardown_deadline);
     let persistence_failures = selection_worker
