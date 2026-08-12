@@ -178,13 +178,24 @@ fn capture_window_inner(
     })?;
     let visible_frame = visible_frame_bounds(hwnd, capture_bounds);
     let visible_bounds = visible_frame.bounds;
-    if !window_is_responsive(hwnd) {
+    let probe_wgc_error = if !window_is_responsive(hwnd) {
         log::debug!(
             "window handle=0x{:X} did not answer the responsiveness probe; using Windows Graphics Capture",
             handle.raw()
         );
-        return capture_window_with_wgc(hwnd, reference_metadata, max_pixels, &visible_frame);
-    }
+        match capture_window_with_wgc(hwnd, reference_metadata, max_pixels, &visible_frame) {
+            Ok(capture) => return Ok(capture),
+            Err(error) => {
+                log::debug!(
+                    "window handle=0x{:X} could not use Windows Graphics Capture after the probe; trying bounded PrintWindow: {error}",
+                    handle.raw()
+                );
+                Some(error)
+            }
+        }
+    } else {
+        None
+    };
     let mut surface = DibSurface::new(capture_bounds.width, capture_bounds.height)?;
     surface.clear();
     // SAFETY: hwnd is the selected live top-level window and surface.device contains a selected
@@ -198,6 +209,9 @@ fn capture_window_inner(
         )
     };
     if !rendered.as_bool() {
+        if let Some(error) = probe_wgc_error {
+            return Err(error);
+        }
         log::debug!(
             "window handle=0x{:X} rejected PrintWindow; trying Windows Graphics Capture",
             handle.raw()
