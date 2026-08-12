@@ -491,26 +491,40 @@ impl AppConfig {
     }
 
     fn load_recovering(path: &Path) -> Result<(Self, Option<ConfigRecovery>), ConfigError> {
-        match Self::load_optional(path) {
-            Ok(config) => Ok((config, None)),
-            Err(ConfigError::Parse(source)) => {
-                let reason = source.to_string();
-                let quarantined_path =
-                    quarantine_config(path).map_err(|source| ConfigError::Quarantine {
-                        path: path.display().to_string(),
-                        source,
-                    })?;
-                Ok((
-                    Self::default(),
-                    Some(ConfigRecovery {
-                        original_path: path.to_path_buf(),
-                        quarantined_path,
-                        reason,
-                    }),
-                ))
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(source) if source.kind() == ErrorKind::NotFound => {
+                return Ok((Self::default(), None));
             }
-            Err(error) => Err(error),
+            Err(source) => {
+                return Err(ConfigError::Read {
+                    path: path.display().to_string(),
+                    source,
+                });
+            }
+        };
+        if let Err(syntax_error) = text.parse::<toml_edit::Document>() {
+            let reason = syntax_error.to_string();
+            let quarantined_path =
+                quarantine_config(path).map_err(|source| ConfigError::Quarantine {
+                    path: path.display().to_string(),
+                    source,
+                })?;
+            let Some(quarantined_path) = quarantined_path else {
+                return Ok((Self::default(), None));
+            };
+            return Ok((
+                Self::default(),
+                Some(ConfigRecovery {
+                    original_path: path.to_path_buf(),
+                    quarantined_path,
+                    reason,
+                }),
+            ));
         }
+        let config: Self = toml::from_str(&text)?;
+        config.validate()?;
+        Ok((config, None))
     }
 
     pub fn confirmed_regions(&self) -> BTreeMap<String, ConfirmedRegion> {
@@ -931,7 +945,7 @@ fn create_temporary_file(path: &Path) -> std::io::Result<(PathBuf, File)> {
     ))
 }
 
-fn quarantine_config(path: &Path) -> std::io::Result<PathBuf> {
+fn quarantine_config(path: &Path) -> std::io::Result<Option<PathBuf>> {
     let parent = usable_parent(path);
     let file_name = path.file_name().ok_or_else(|| {
         std::io::Error::new(
@@ -948,9 +962,9 @@ fn quarantine_config(path: &Path) -> std::io::Result<PathBuf> {
             continue;
         }
         match move_file(path, &quarantine_path, false) {
-            Ok(()) => return Ok(quarantine_path),
+            Ok(()) => return Ok(Some(quarantine_path)),
             Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(quarantine_path),
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         }
     }
@@ -1613,7 +1627,31 @@ mod tests {
             fs::read_to_string(&recovery.quarantined_path).expect("quarantined contents"),
             malformed
         );
-        assert!(recovery.reason.contains("TOML parse error"));
+        assert!(!recovery.reason.is_empty());
+    }
+
+    #[test]
+    fn recovering_load_keeps_well_formed_but_invalid_config_in_place() {
+        let directory = TestDirectory::new("strict-recovery");
+        let path = directory.join(CONFIG_FILE_NAME);
+        let invalid = "schema_version = 1\nunknown_key = true\n";
+        fs::write(&path, invalid).expect("write well-formed invalid config");
+
+        let error = AppConfig::load_recovering(&path)
+            .expect_err("unknown fields remain strict instead of being quarantined");
+
+        assert!(matches!(error, ConfigError::Parse(_)));
+        assert_eq!(
+            fs::read_to_string(&path).expect("original remains"),
+            invalid
+        );
+        assert_eq!(
+            fs::read_dir(&directory.0)
+                .expect("read test directory")
+                .count(),
+            1,
+            "strict failures must not create a quarantine file"
+        );
     }
 
     #[test]
