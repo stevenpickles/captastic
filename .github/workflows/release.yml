@@ -55,9 +55,11 @@ jobs:
       - name: Assemble portable package
         id: portable
         shell: pwsh
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.value }}
         run: |
           $archive = ./scripts/package-windows.ps1 `
-            -Version '${{ steps.version.outputs.value }}' `
+            -Version $env:PACKAGE_VERSION `
             -Architecture x86_64
           "archive=$archive" >> $env:GITHUB_OUTPUT
 
