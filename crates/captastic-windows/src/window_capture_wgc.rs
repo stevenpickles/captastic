@@ -77,6 +77,10 @@ pub(crate) fn capture_window(hwnd: HWND) -> Result<WgcWindowFrame, CaptureError>
     let session = pool
         .CreateCaptureSession(&item)
         .map_err(|error| windows_error("create_capture_session", error, true))?;
+    let _resources = WgcCaptureResources {
+        pool: pool.clone(),
+        session: session.clone(),
+    };
     let _ = session.SetIsCursorCaptureEnabled(false);
     let _ = session.SetIsBorderRequired(false);
 
@@ -120,9 +124,19 @@ pub(crate) fn capture_window(hwnd: HWND) -> Result<WgcWindowFrame, CaptureError>
     })();
 
     let _ = pool.RemoveFrameArrived(token);
-    let _ = session.Close();
-    let _ = pool.Close();
     result
+}
+
+struct WgcCaptureResources {
+    pool: Direct3D11CaptureFramePool,
+    session: GraphicsCaptureSession,
+}
+
+impl Drop for WgcCaptureResources {
+    fn drop(&mut self) {
+        let _ = self.session.Close();
+        let _ = self.pool.Close();
+    }
 }
 
 fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext, IDirect3DDevice), CaptureError> {
