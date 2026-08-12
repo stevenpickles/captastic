@@ -4,11 +4,13 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use captastic_core::{CaptureError, CaptureErrorKind};
 use windows::core::{w, Error as WindowsError, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Shutdown::{ShutdownBlockReasonCreate, ShutdownBlockReasonDestroy};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Shell::{
     ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR,
@@ -40,8 +42,9 @@ const COMMAND_CONFIG: usize = 1_003;
 const COMMAND_LOGS: usize = 1_004;
 const COMMAND_STARTUP: usize = 1_005;
 const COMMAND_EXIT: usize = 1_006;
+const SESSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(4);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum TrayEvent {
     Capture,
     PausedChanged(bool),
@@ -49,7 +52,18 @@ pub enum TrayEvent {
     OpenLogs,
     ToggleStartup,
     Exit,
-    SessionEnding,
+    SessionEnding(SessionEndRequest),
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionEndRequest {
+    drained: SyncSender<()>,
+}
+
+impl SessionEndRequest {
+    pub fn signal_drained(self) {
+        let _ = self.drained.send(());
+    }
 }
 
 pub struct TrayIcon {
@@ -221,6 +235,7 @@ fn run_tray(
         startup_enabled,
         icon,
         taskbar_created,
+        shutdown_block_active: false,
     });
     let state_pointer = Box::into_raw(state);
     // SAFETY: The registered class is live and state_pointer remains allocated through the loop.
@@ -305,6 +320,7 @@ struct TrayState {
     startup_enabled: bool,
     icon: windows::Win32::UI::WindowsAndMessaging::HICON,
     taskbar_created: u32,
+    shutdown_block_active: bool,
 }
 
 unsafe extern "system" fn tray_window_proc(
@@ -454,10 +470,38 @@ fn tray_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPAR
             }
             LRESULT(0)
         }
-        WM_QUERYENDSESSION => LRESULT(1),
+        WM_QUERYENDSESSION => {
+            let block_active = {
+                // SAFETY: Short mutation ends before the Win32 call.
+                let state = unsafe { &mut *state_pointer };
+                if state.shutdown_block_active {
+                    true
+                } else {
+                    state.shutdown_block_active = true;
+                    false
+                }
+            };
+            if !block_active {
+                // SAFETY: hwnd is this live top-level window and the reason is static UTF-16.
+                if let Err(error) = unsafe {
+                    ShutdownBlockReasonCreate(hwnd, w!("Saving Captastic capture preferences"))
+                } {
+                    log::warn!("failed to register session-shutdown drain reason: {error}");
+                }
+            }
+            LRESULT(1)
+        }
         WM_ENDSESSION => {
             if session_end_is_committed(wparam.0) {
-                send_tray_event(state_pointer, TrayEvent::SessionEnding);
+                wait_for_session_drain(state_pointer);
+            }
+            let block_active = {
+                // SAFETY: Short mutation of the live state allocation.
+                std::mem::take(unsafe { &mut (&mut *state_pointer).shutdown_block_active })
+            };
+            if block_active {
+                // SAFETY: Balances the successful-or-attempted create for this live window.
+                let _ = unsafe { ShutdownBlockReasonDestroy(hwnd) };
             }
             LRESULT(0)
         }
@@ -480,6 +524,22 @@ fn tray_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPAR
 
 fn session_end_is_committed(end_session: usize) -> bool {
     end_session != 0
+}
+
+fn wait_for_session_drain(state_pointer: *mut TrayState) {
+    let (drained, wait_for_drain) = mpsc::sync_channel(0);
+    // SAFETY: Clone the sender from the live state, then release the borrow before blocking.
+    let sender = unsafe { (&*state_pointer).event_sender.clone() };
+    if sender
+        .send(TrayEvent::SessionEnding(SessionEndRequest { drained }))
+        .is_ok()
+        && wait_for_drain.recv_timeout(SESSION_DRAIN_TIMEOUT).is_err()
+    {
+        log::warn!(
+            "daemon did not finish its session-shutdown drain within {} ms",
+            SESSION_DRAIN_TIMEOUT.as_millis()
+        );
+    }
 }
 
 fn send_tray_event(state_pointer: *mut TrayState, event: TrayEvent) {

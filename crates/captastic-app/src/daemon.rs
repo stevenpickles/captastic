@@ -586,6 +586,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
 
     let mut shutdown_sent = false;
     let mut tray_shutdown_requested = false;
+    let mut session_end_request = None;
     loop {
         match done_receiver.recv_timeout(Duration::from_millis(50)) {
             Ok(result) => {
@@ -658,8 +659,9 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                             captastic_windows::TrayEvent::Exit => {
                                 tray_shutdown_requested = true;
                             }
-                            captastic_windows::TrayEvent::SessionEnding => {
+                            captastic_windows::TrayEvent::SessionEnding(request) => {
                                 log::info!("Windows session is ending; draining daemon workers");
+                                session_end_request = Some(request);
                                 tray_shutdown_requested = true;
                             }
                         }
@@ -688,9 +690,6 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             }
         }
     }
-    if let Some(tray) = tray {
-        tray.stop()?;
-    }
     hotkey.stop()?;
     let _ = command_sender.send(CaptureCommand::Shutdown);
     let _ = capture_join.join();
@@ -699,6 +698,13 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     }
     if let Some(worker) = clipboard_worker {
         worker.stop();
+    }
+    console_shutdown.signal_drained();
+    if let Some(request) = session_end_request {
+        request.signal_drained();
+    }
+    if let Some(tray) = tray {
+        tray.stop()?;
     }
     let dropped = dropped.load(Ordering::Relaxed);
     if dropped != 0 {

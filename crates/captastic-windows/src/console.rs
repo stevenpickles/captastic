@@ -1,13 +1,19 @@
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use captastic_core::{CaptureError, CaptureErrorKind};
 use windows::Win32::Foundation::BOOL;
 use windows::Win32::System::Console::{
-    SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT, PHANDLER_ROUTINE,
+    SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT,
+    CTRL_SHUTDOWN_EVENT, PHANDLER_ROUTINE,
 };
 
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+static DRAIN_COMPLETED: AtomicBool = AtomicBool::new(false);
+const CONSOLE_DRAIN_TIMEOUT: Duration = Duration::from_secs(4);
+const CONSOLE_DRAIN_POLL: Duration = Duration::from_millis(10);
 
 pub struct ConsoleShutdown;
 
@@ -24,6 +30,7 @@ impl ConsoleShutdown {
             ));
         }
         SHUTDOWN_REQUESTED.store(false, Ordering::Release);
+        DRAIN_COMPLETED.store(false, Ordering::Release);
         // SAFETY: console_control_handler has the required system ABI, contains only atomic
         // operations, and remains valid for the process lifetime. Drop unregisters this instance.
         let registration =
@@ -42,6 +49,10 @@ impl ConsoleShutdown {
     pub fn requested(&self) -> bool {
         SHUTDOWN_REQUESTED.load(Ordering::Acquire)
     }
+
+    pub fn signal_drained(&self) {
+        DRAIN_COMPLETED.store(true, Ordering::Release);
+    }
 }
 
 impl Drop for ConsoleShutdown {
@@ -51,14 +62,27 @@ impl Drop for ConsoleShutdown {
             SetConsoleCtrlHandler(PHANDLER_ROUTINE::Some(console_control_handler), false)
         };
         SHUTDOWN_REQUESTED.store(false, Ordering::Release);
+        DRAIN_COMPLETED.store(false, Ordering::Release);
         INSTALLED.store(false, Ordering::Release);
     }
 }
 
 unsafe extern "system" fn console_control_handler(control_type: u32) -> BOOL {
     match control_type {
-        CTRL_C_EVENT | CTRL_BREAK_EVENT => {
+        CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT
+        | CTRL_SHUTDOWN_EVENT => {
             SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+            if matches!(
+                control_type,
+                CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT
+            ) {
+                let started = Instant::now();
+                while !DRAIN_COMPLETED.load(Ordering::Acquire)
+                    && started.elapsed() < CONSOLE_DRAIN_TIMEOUT
+                {
+                    thread::sleep(CONSOLE_DRAIN_POLL);
+                }
+            }
             BOOL(1)
         }
         _ => BOOL(0),
@@ -97,5 +121,18 @@ mod tests {
         // an atomic flag.
         assert_eq!(unsafe { console_control_handler(CTRL_C_EVENT) }, BOOL(1));
         assert!(SHUTDOWN_REQUESTED.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn terminal_console_events_are_claimed_and_wait_for_drain_signal() {
+        SHUTDOWN_REQUESTED.store(false, Ordering::Release);
+        DRAIN_COMPLETED.store(true, Ordering::Release);
+        assert_eq!(
+            // SAFETY: CTRL_LOGOFF_EVENT is documented and the pre-set signal avoids blocking.
+            unsafe { console_control_handler(CTRL_LOGOFF_EVENT) },
+            BOOL(1)
+        );
+        assert!(SHUTDOWN_REQUESTED.load(Ordering::Acquire));
+        DRAIN_COMPLETED.store(false, Ordering::Release);
     }
 }
