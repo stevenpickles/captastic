@@ -1,4 +1,5 @@
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -21,6 +22,7 @@ const PUBLISH_RETRY_DELAY: Duration = Duration::from_millis(250);
 pub struct ClipboardWorker {
     sender: Option<mpsc::SyncSender<ClipboardJob>>,
     failure_receiver: mpsc::Receiver<ClipboardFailure>,
+    stop_requested: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -29,6 +31,8 @@ impl ClipboardWorker {
         let (sender, receiver) = mpsc::sync_channel::<ClipboardJob>(queue_capacity);
         let (failure_sender, failure_receiver) = mpsc::sync_channel(queue_capacity);
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let worker_stop_requested = stop_requested.clone();
         let join = thread::Builder::new()
             .name("captastic-clipboard".to_owned())
             .spawn(move || {
@@ -51,6 +55,7 @@ impl ClipboardWorker {
                     let (publish_result, publish_retries) = publish_with_retry(
                         || publisher.publish(&job.frame),
                         thread::sleep,
+                        || worker_stop_requested.load(Ordering::Acquire),
                     );
                     match publish_result {
                         Ok(report) => {
@@ -147,6 +152,9 @@ impl ClipboardWorker {
                             }
                         }
                     }
+                    if worker_stop_requested.load(Ordering::Acquire) {
+                        break;
+                    }
                 }
             })
             .map_err(|error| AppError::BackendUnavailable(error.to_string()))?;
@@ -156,6 +164,7 @@ impl ClipboardWorker {
         Ok(Self {
             sender: Some(sender),
             failure_receiver,
+            stop_requested,
             join: Some(join),
         })
     }
@@ -176,6 +185,7 @@ impl ClipboardWorker {
     }
 
     fn stop_inner(&mut self) {
+        self.stop_requested.store(true, Ordering::Release);
         self.sender.take();
         if let Some(join) = self.join.take() {
             let started = Instant::now();
@@ -256,11 +266,12 @@ fn ns_to_ms(ns: u64) -> f64 {
 fn publish_with_retry<T>(
     mut publish: impl FnMut() -> Result<T, CaptureError>,
     mut wait: impl FnMut(Duration),
+    mut stop_requested: impl FnMut() -> bool,
 ) -> (Result<T, CaptureError>, u32) {
     let mut retries = 0_u32;
     loop {
         match publish() {
-            Err(error) if error.retryable && retries < PUBLISH_RETRY_LIMIT => {
+            Err(error) if error.retryable && retries < PUBLISH_RETRY_LIMIT && !stop_requested() => {
                 retries = retries.saturating_add(1);
                 wait(PUBLISH_RETRY_DELAY);
             }
@@ -294,6 +305,7 @@ mod tests {
                 Err::<(), _>(publish_error(true))
             },
             |delay| waits.push(delay),
+            || false,
         );
 
         assert!(result.is_err());
@@ -314,6 +326,7 @@ mod tests {
                 Err::<(), _>(publish_error(false))
             },
             |_| panic!("non-retryable failure must not wait"),
+            || false,
         );
 
         assert!(result.is_err());
@@ -334,10 +347,28 @@ mod tests {
                 }
             },
             |_| {},
+            || false,
         );
 
         assert_eq!(result.expect("eventual success"), "published");
         assert_eq!(attempts, 3);
         assert_eq!(retries, 2);
+    }
+
+    #[test]
+    fn retry_loop_stops_after_shutdown_is_requested() {
+        let mut attempts = 0_u32;
+        let (result, retries) = publish_with_retry(
+            || {
+                attempts = attempts.saturating_add(1);
+                Err::<(), _>(publish_error(true))
+            },
+            |_| panic!("shutdown must prevent another retry delay"),
+            || true,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(attempts, 1);
+        assert_eq!(retries, 0);
     }
 }
