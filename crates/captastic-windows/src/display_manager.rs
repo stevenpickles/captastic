@@ -419,6 +419,20 @@ fn copy_frame_into(
             true,
         )
     })?;
+    let frame_right = local_x
+        .checked_add(frame.width as usize)
+        .filter(|right| *right <= bounds.width as usize);
+    let frame_bottom = local_y
+        .checked_add(frame.height as usize)
+        .filter(|bottom| *bottom <= bounds.height as usize);
+    if frame_right.is_none() || frame_bottom.is_none() {
+        return Err(manager_error(
+            CaptureErrorKind::TopologyChanged,
+            "compose_virtual_desktop",
+            "display bounds extend outside the virtual-desktop rows",
+            true,
+        ));
+    }
     let row_bytes = frame.width as usize * 4;
     for row in 0..frame.height as usize {
         let source_start = row * frame.stride_bytes as usize;
@@ -769,6 +783,39 @@ mod tests {
         assert_eq!(pixel(&frame, 3, 0), [2, 2, 2, 0xff]);
         assert_eq!(pixel(&frame, 2, 1), OPAQUE_BLACK);
         assert_eq!(pixel(&frame, 5, 2), OPAQUE_BLACK);
+    }
+
+    #[test]
+    fn stale_frame_cannot_wrap_past_the_virtual_desktop_row() {
+        let stale = display(
+            "stale",
+            Rect {
+                x: 2,
+                y: 0,
+                width: 2,
+                height: 1,
+            },
+            0,
+            true,
+        );
+        let current_bounds = Rect {
+            x: 0,
+            y: 0,
+            width: 3,
+            height: 2,
+        };
+        let mut pool = CompositeBufferPool::new(1);
+
+        let error = compose_virtual_desktop(
+            &[solid_frame(&stale, 7)],
+            current_bounds,
+            &request(),
+            &mut pool,
+        )
+        .expect_err("stale frame crosses the row boundary");
+
+        assert_eq!(error.kind, CaptureErrorKind::TopologyChanged);
+        assert!(error.message.contains("outside the virtual-desktop rows"));
     }
 
     #[test]

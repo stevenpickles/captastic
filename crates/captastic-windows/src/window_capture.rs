@@ -1,27 +1,28 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
 use captastic_core::{CaptureError, CaptureErrorKind, CpuFrame, FrameAlpha, FrameMetadata, Rect};
 use windows::core::Error as WindowsError;
-use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_VISIBLE_FRAME_BORDER_THICKNESS,
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DEFAULT, DWMWCP_DONOTROUND, DWMWCP_ROUND,
     DWMWCP_ROUNDSMALL, DWM_WINDOW_CORNER_PREFERENCE,
 };
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, SetStretchBltMode,
-    StretchBlt, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HALFTONE, HBITMAP, HDC,
-    HGDIOBJ, RGBQUAD, SRCCOPY,
+    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GdiFlush, SelectObject,
+    SetStretchBltMode, StretchBlt, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HALFTONE,
+    HBITMAP, HDC, HGDIOBJ, RGBQUAD, SRCCOPY,
 };
 use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
 use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowLongPtrW, GetWindowRect, IsZoomed, GWL_STYLE, PW_RENDERFULLCONTENT, WS_CAPTION,
+    GetWindowLongPtrW, GetWindowRect, IsZoomed, SendMessageTimeoutW, GWL_STYLE,
+    PW_RENDERFULLCONTENT, SMTO_ABORTIFHUNG, SMTO_BLOCK, WM_NULL, WS_CAPTION,
 };
 
 use crate::window_capture_wgc::capture_window as capture_window_wgc_frame;
@@ -29,6 +30,8 @@ use crate::{NativeWindowHandle, OverlaySelection, SelectionKind};
 
 const WINDOW_RENDER_TIMEOUT: Duration = Duration::from_millis(700);
 const MAX_IN_FLIGHT_WINDOW_RENDERS: usize = 2;
+const WINDOW_RESPONSIVENESS_TIMEOUT_MS: u32 = 50;
+pub(crate) const WINDOW_THUMBNAIL_RENDER_BATCH: usize = MAX_IN_FLIGHT_WINDOW_RENDERS - 1;
 const WINDOW_BORDER_BGRA: [u8; 3] = [188, 180, 176];
 static IN_FLIGHT_WINDOW_RENDERS: AtomicUsize = AtomicUsize::new(0);
 
@@ -98,6 +101,7 @@ fn capture_window_bounded(
     max_pixels: Option<u64>,
 ) -> Result<CapturedWindow, CaptureError> {
     let permit = WindowRenderPermit::acquire()?;
+    let timeout_permit = permit.clone();
     let metadata = reference_metadata.clone();
     let (sender, receiver) = mpsc::sync_channel(1);
     thread::Builder::new()
@@ -121,26 +125,35 @@ fn capture_window_bounded(
                 None,
             )
         })?;
-    receiver
-        .recv_timeout(WINDOW_RENDER_TIMEOUT)
-        .map_err(|error| {
-            let message = match error {
-                mpsc::RecvTimeoutError::Timeout => format!(
+    match receiver.recv_timeout(WINDOW_RENDER_TIMEOUT) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // The detached worker may remain blocked inside a foreign window procedure. Its
+            // lease expires at the caller's deadline so unrelated windows can still be rendered;
+            // release is idempotent when the worker eventually exits.
+            timeout_permit.release();
+            Err(capture_error(
+                CaptureErrorKind::Timeout,
+                "print_selected_window",
+                format!(
                     "the selected window did not render within {} ms",
                     WINDOW_RENDER_TIMEOUT.as_millis()
                 ),
-                mpsc::RecvTimeoutError::Disconnected => {
-                    "the window-render worker stopped without returning a frame".to_owned()
-                }
-            };
-            capture_error(
-                CaptureErrorKind::Timeout,
-                "print_selected_window",
-                message,
                 true,
                 None,
-            )
-        })?
+            ))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            timeout_permit.release();
+            Err(capture_error(
+                CaptureErrorKind::NativeFailure,
+                "print_selected_window",
+                "the window-render worker stopped without returning a frame",
+                false,
+                None,
+            ))
+        }
+    }
 }
 
 fn capture_window_inner(
@@ -164,6 +177,13 @@ fn capture_window_inner(
     })?;
     let visible_frame = visible_frame_bounds(hwnd, capture_bounds);
     let visible_bounds = visible_frame.bounds;
+    if !window_is_responsive(hwnd) {
+        log::debug!(
+            "window handle=0x{:X} did not answer the responsiveness probe; using Windows Graphics Capture",
+            handle.raw()
+        );
+        return capture_window_with_wgc(hwnd, reference_metadata, max_pixels, &visible_frame);
+    }
     let mut surface = DibSurface::new(capture_bounds.width, capture_bounds.height)?;
     surface.clear();
     // SAFETY: hwnd is the selected live top-level window and surface.device contains a selected
@@ -286,6 +306,37 @@ fn capture_window_inner(
     })
 }
 
+fn unpremultiply_bgra(pixels: &mut [u8]) {
+    for pixel in pixels.chunks_exact_mut(4) {
+        let alpha = u32::from(pixel[3]);
+        if alpha == 0 {
+            pixel[..3].fill(0);
+            continue;
+        }
+        for channel in &mut pixel[..3] {
+            *channel = ((u32::from(*channel) * 255 + alpha / 2) / alpha).min(255) as u8;
+        }
+    }
+}
+
+fn window_is_responsive(hwnd: HWND) -> bool {
+    let mut ignored_result = 0_usize;
+    // SAFETY: WM_NULL carries no pointers. The timeout bounds synchronous work in the target
+    // process, and ignored_result remains writable for the duration of the call.
+    unsafe {
+        SendMessageTimeoutW(
+            hwnd,
+            WM_NULL,
+            WPARAM(0),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            WINDOW_RESPONSIVENESS_TIMEOUT_MS,
+            Some(&mut ignored_result),
+        )
+    }
+    .0 != 0
+}
+
 fn capture_window_with_wgc(
     hwnd: HWND,
     reference_metadata: &FrameMetadata,
@@ -348,6 +399,8 @@ fn capture_window_with_wgc(
     let inner_corner_radius =
         (window_corner_radius(hwnd) - border_thickness as f32).max(0.0) * radius_scale;
     let border_width = scaled_border_width(border_thickness, radius_scale);
+    let mut pixels = pixels;
+    unpremultiply_bgra(&mut pixels);
     let (pixels, output_width, output_height) = add_clean_window_border(
         pixels,
         content_width,
@@ -410,13 +463,23 @@ pub(crate) fn scaled_dimensions(width: u32, height: u32, max_pixels: u64) -> (u3
     )
 }
 
-struct WindowRenderPermit;
+#[derive(Debug)]
+struct WindowRenderPermit<'a> {
+    active: &'a AtomicUsize,
+    released: Arc<AtomicBool>,
+}
 
-impl WindowRenderPermit {
+impl WindowRenderPermit<'static> {
     fn acquire() -> Result<Self, CaptureError> {
-        let mut active = IN_FLIGHT_WINDOW_RENDERS.load(Ordering::Acquire);
+        Self::acquire_from(&IN_FLIGHT_WINDOW_RENDERS, MAX_IN_FLIGHT_WINDOW_RENDERS)
+    }
+}
+
+impl<'a> WindowRenderPermit<'a> {
+    fn acquire_from(active_count: &'a AtomicUsize, limit: usize) -> Result<Self, CaptureError> {
+        let mut active = active_count.load(Ordering::Acquire);
         loop {
-            if active >= MAX_IN_FLIGHT_WINDOW_RENDERS {
+            if active >= limit {
                 return Err(capture_error(
                     CaptureErrorKind::BufferExhausted,
                     "start_window_render",
@@ -425,22 +488,42 @@ impl WindowRenderPermit {
                     None,
                 ));
             }
-            match IN_FLIGHT_WINDOW_RENDERS.compare_exchange_weak(
+            match active_count.compare_exchange_weak(
                 active,
                 active + 1,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Ok(Self),
+                Ok(_) => {
+                    return Ok(Self {
+                        active: active_count,
+                        released: Arc::new(AtomicBool::new(false)),
+                    });
+                }
                 Err(current) => active = current,
             }
         }
     }
+
+    fn release(&self) {
+        if !self.released.swap(true, Ordering::AcqRel) {
+            self.active.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 }
 
-impl Drop for WindowRenderPermit {
+impl Clone for WindowRenderPermit<'_> {
+    fn clone(&self) -> Self {
+        Self {
+            active: self.active,
+            released: self.released.clone(),
+        }
+    }
+}
+
+impl Drop for WindowRenderPermit<'_> {
     fn drop(&mut self) {
-        IN_FLIGHT_WINDOW_RENDERS.fetch_sub(1, Ordering::AcqRel);
+        self.release();
     }
 }
 
@@ -831,6 +914,8 @@ impl DibSurface {
     }
 
     fn copy_pixels(&self) -> Vec<u8> {
+        // SAFETY: Flushes this thread's queued GDI drawing before CPU reads the DIB section.
+        let _ = unsafe { GdiFlush() };
         // SAFETY: The DIB owns byte_length initialized bytes and stays alive through this copy.
         unsafe { std::slice::from_raw_parts(self.bits, self.byte_length) }.to_vec()
     }
@@ -944,6 +1029,34 @@ mod tests {
     }
 
     #[test]
+    fn render_permit_deadline_reclaims_capacity_idempotently() {
+        let active = AtomicUsize::new(0);
+        let first = WindowRenderPermit::acquire_from(&active, 2).expect("first permit");
+        let first_worker = first.clone();
+        let second = WindowRenderPermit::acquire_from(&active, 2).expect("second permit");
+        let exhausted = WindowRenderPermit::acquire_from(&active, 2).expect_err("capacity bound");
+        assert_eq!(exhausted.kind, CaptureErrorKind::BufferExhausted);
+        assert_eq!(active.load(Ordering::Acquire), 2);
+
+        first.release();
+        assert_eq!(active.load(Ordering::Acquire), 1);
+        let replacement =
+            WindowRenderPermit::acquire_from(&active, 2).expect("deadline reclaimed permit");
+        assert_eq!(active.load(Ordering::Acquire), 2);
+
+        drop(first);
+        drop(first_worker);
+        assert_eq!(
+            active.load(Ordering::Acquire),
+            2,
+            "release must be idempotent"
+        );
+        drop(second);
+        drop(replacement);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn visible_frame_crop_removes_the_outer_window_margins() {
         let source_bounds = Rect {
             x: 10,
@@ -1049,6 +1162,13 @@ mod tests {
         assert_eq!(scaled_border_width(0, 0.25), 0);
         assert_eq!(scaled_border_width(2, 1.0), 2);
         assert_eq!(scaled_border_width(2, 0.25), 1);
+    }
+
+    #[test]
+    fn wgc_colors_are_unpremultiplied_before_straight_alpha_publication() {
+        let mut pixels = vec![25, 50, 100, 128, 9, 8, 7, 0, 10, 20, 30, 255];
+        unpremultiply_bgra(&mut pixels);
+        assert_eq!(pixels, [50, 100, 199, 128, 0, 0, 0, 0, 10, 20, 30, 255]);
     }
 
     #[test]
