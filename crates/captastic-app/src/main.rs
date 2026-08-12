@@ -46,12 +46,20 @@ impl DisplayPolicy {
 fn main() {
     let cli = Cli::parse();
     let logging_config = resolve_logging_config(&cli);
-    let logging_available = match logging::init(&logging_config) {
+    let persistent_logging = uses_persistent_logging(&cli);
+    let logging_result = if persistent_logging {
+        logging::init(&logging_config).map(Some)
+    } else {
+        logging::init_console(&logging_config).map(|()| None)
+    };
+    let logging_available = match logging_result {
         Ok(path) => {
-            log::info!(
-                "Captastic started; persistent log file is {}",
-                path.display()
-            );
+            if let Some(path) = path {
+                log::info!(
+                    "Captastic started; persistent log file is {}",
+                    path.display()
+                );
+            }
             true
         }
         Err(error) => {
@@ -68,8 +76,14 @@ fn main() {
         }
         process::exit(error.exit_code());
     }
-    log::info!("Captastic stopped successfully");
-    log::logger().flush();
+    if logging_available {
+        log::info!("Captastic stopped successfully");
+        log::logger().flush();
+    }
+}
+
+fn uses_persistent_logging(cli: &Cli) -> bool {
+    cli.log_file.is_some() || matches!(cli.command.as_ref(), None | Some(Command::Daemon(_)))
 }
 
 fn resolve_logging_config(cli: &Cli) -> LoggingConfig {
@@ -83,7 +97,8 @@ fn resolve_logging_config(cli: &Cli) -> LoggingConfig {
         }
         None => AppConfig::load_default()
             .map_or_else(|_| LoggingConfig::default(), |config| config.logging),
-        _ => LoggingConfig::default(),
+        _ => AppConfig::load_default()
+            .map_or_else(|_| LoggingConfig::default(), |config| config.logging),
     };
     if let Some(path) = &cli.log_file {
         logging.file = Some(path.clone());
@@ -631,18 +646,29 @@ fn doctor(json_output: bool) -> Result<(), AppError> {
         Ok(backend) => ("available", None, Some(backend.displays().to_vec())),
         Err(error) => ("unavailable", Some(error.to_string()), None),
     };
+    let windows_clipboard = if cfg!(windows) {
+        "available_as_uncompressed_dibv5"
+    } else {
+        "unavailable_on_this_platform"
+    };
+    let windows_selection_overlay = if cfg!(windows) {
+        "available_for_regions_and_native_window_rendering"
+    } else {
+        "unavailable_on_this_platform"
+    };
     print_value(
         json_output,
         &json!({
             "schema_version": 1,
             "phase": 1,
+            "platform": std::env::consts::OS,
             "fake_backend": "available",
             "dxgi_backend": native_status,
             "dxgi_error": native_error,
             "dxgi_displays": displays,
             "cpu_readback": "available_for_unrotated_bgra8_outputs",
-            "windows_clipboard": "available_as_uncompressed_dibv5",
-            "windows_selection_overlay": "available_for_regions_and_native_window_rendering",
+            "windows_clipboard": windows_clipboard,
+            "windows_selection_overlay": windows_selection_overlay,
             "latest_warm_frame": "available",
             "critical_path_policy": "configured",
         }),
@@ -683,6 +709,30 @@ fn duration_ns(duration: std::time::Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cli(command: Option<Command>) -> Cli {
+        Cli {
+            log_file: None,
+            log_level: None,
+            log_format: None,
+            command,
+        }
+    }
+
+    #[test]
+    fn only_daemon_commands_persist_logs_by_default() {
+        assert!(uses_persistent_logging(&cli(None)));
+        assert!(uses_persistent_logging(&cli(Some(Command::Daemon(
+            cli::DaemonArgs::default()
+        )))));
+        assert!(!uses_persistent_logging(&cli(Some(Command::Doctor {
+            json: true
+        }))));
+
+        let mut explicit = cli(Some(Command::Doctor { json: true }));
+        explicit.log_file = Some("doctor.log".into());
+        assert!(uses_persistent_logging(&explicit));
+    }
 
     #[test]
     fn display_policy_resolves_pointer_primary_virtual_desktop_and_fixed_ids() {

@@ -26,6 +26,11 @@ struct AsyncFileLogger {
     sender: SyncSender<LogMessage>,
 }
 
+struct ConsoleLogger {
+    level: LevelFilter,
+    format: LineFormat,
+}
+
 enum LogMessage {
     Entry(LogEntry),
     Flush(SyncSender<()>),
@@ -151,6 +156,34 @@ impl Log for AsyncFileLogger {
     }
 }
 
+impl Log for ConsoleLogger {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        metadata.level() <= self.level
+    }
+
+    fn log(&self, record: &Record<'_>) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        let current_thread = thread::current();
+        let entry = LogEntry {
+            unix_micros: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_micros()),
+            level: record.level(),
+            target: record.target().to_owned(),
+            thread: current_thread.name().unwrap_or("unnamed").to_owned(),
+            message: record.args().to_string(),
+        };
+        let mut console = anstream::stderr();
+        let _ = writeln!(console, "{}", format_console_entry(self.format, &entry));
+    }
+
+    fn flush(&self) {
+        let _ = anstream::stderr().flush();
+    }
+}
+
 pub fn init(config: &LoggingConfig) -> Result<PathBuf, String> {
     let level = parse_level(&config.level)?;
     let format = match config.format.as_str() {
@@ -204,6 +237,19 @@ pub fn init(config: &LoggingConfig) -> Result<PathBuf, String> {
     log::set_max_level(level);
     let _ = LOG_PATH.set(path.clone());
     Ok(path)
+}
+
+pub fn init_console(config: &LoggingConfig) -> Result<(), String> {
+    let level = parse_level(&config.level)?;
+    let format = match config.format.as_str() {
+        "compact" => LineFormat::Compact,
+        "json" => LineFormat::Json,
+        value => return Err(format!("unsupported log format {value}")),
+    };
+    log::set_boxed_logger(Box::new(ConsoleLogger { level, format }))
+        .map_err(|error| format!("failed to install logger: {error}"))?;
+    log::set_max_level(level);
+    Ok(())
 }
 
 #[cfg(windows)]
