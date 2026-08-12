@@ -38,7 +38,7 @@ pub use overlay::{
     clear_overlay_resource_cache, select_from_frozen_frame,
     select_from_frozen_frame_with_controller, select_from_frozen_frame_with_initial_tool,
     select_from_frozen_frame_with_initial_tool_and_ui, InitialSelectionTool, NativeWindowHandle,
-    OverlayController, OverlaySelection, SelectionKind,
+    OverlayController, OverlaySelection, OverlayUiUpdate, SelectionKind,
 };
 #[cfg(windows)]
 pub use startup::{disable_startup, enable_startup, startup_command};
