@@ -63,6 +63,15 @@ pub fn enumerate_displays() -> Result<Vec<DisplayInfo>, CaptureError> {
     enumerate_outputs().map(|outputs| outputs.into_iter().map(|output| output.info).collect())
 }
 
+pub(crate) fn enumerate_display_adapters() -> Result<Vec<(DisplayInfo, i64)>, CaptureError> {
+    enumerate_outputs().map(|outputs| {
+        outputs
+            .into_iter()
+            .map(|output| (output.info, output.adapter_luid))
+            .collect()
+    })
+}
+
 pub struct DxgiBackend {
     _com: ComApartment,
     device: ID3D11Device,
@@ -254,6 +263,15 @@ impl CaptureBackend for DxgiBackend {
                         "backend was initialized for {}, not {}",
                         self.selected.id.0, id.0
                     ),
+                    false,
+                    None,
+                ));
+            }
+            CaptureSource::VirtualDesktop => {
+                return Err(capture_error(
+                    CaptureErrorKind::Unsupported,
+                    "capture",
+                    "a single-output DXGI backend cannot capture the virtual desktop; use the DXGI display manager",
                     false,
                     None,
                 ));
@@ -1522,6 +1540,7 @@ fn normalize_bgra_into(
 }
 struct OutputRecord {
     adapter: IDXGIAdapter1,
+    adapter_luid: i64,
     output: IDXGIOutput1,
     info: DisplayInfo,
 }
@@ -1603,6 +1622,7 @@ fn enumerate_outputs() -> Result<Vec<OutputRecord>, CaptureError> {
                     .unwrap_or(gdi_name);
                 records.push(OutputRecord {
                     adapter: adapter.clone(),
+                    adapter_luid: luid_to_i64(adapter_desc.AdapterLuid),
                     output: output1,
                     info: DisplayInfo {
                         id,
@@ -1620,6 +1640,10 @@ fn enumerate_outputs() -> Result<Vec<OutputRecord>, CaptureError> {
         adapter_index = adapter_index.saturating_add(1);
     }
     Ok(records)
+}
+
+fn luid_to_i64(luid: windows::Win32::Foundation::LUID) -> i64 {
+    (i64::from(luid.HighPart) << 32) | i64::from(luid.LowPart)
 }
 
 fn effective_monitor_scale(monitor: HMONITOR, display_name: &str) -> f32 {

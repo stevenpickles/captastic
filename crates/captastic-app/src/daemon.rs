@@ -18,8 +18,7 @@ use captastic_core::DisplayId;
 #[cfg(windows)]
 use captastic_core::{
     validate_event_order, CaptureError, CaptureErrorKind, CaptureId, CaptureMode, CaptureRequest,
-    CaptureSource, CpuFrame, CursorMode, EventRecorder, FrameMetadata, NativeFrame, PerfEventKind,
-    Rect,
+    CpuFrame, CursorMode, EventRecorder, FrameMetadata, NativeFrame, PerfEventKind, Rect,
 };
 #[cfg(windows)]
 use serde_json::json;
@@ -260,21 +259,20 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                             let active_backend = backend
                                 .as_mut()
                                 .expect("capture backend exists outside recovery");
-                            let capture_result = super::resolve_capture_display(
+                            let capture_result = super::resolve_capture_source(
                                 &display_policy,
                                 active_backend.displays(),
                             )
-                            .and_then(|display_id| {
+                            .and_then(|source| {
                                 log::debug!(
-                                    "capture {} action={} resolved display={}",
+                                    "capture {} action={} resolved source={source:?}",
                                     capture_id.0,
-                                    trigger.action,
-                                    display_id.0
+                                    trigger.action
                                 );
                                 let request = CaptureRequest {
                                     id: capture_id,
                                     triggered_at: trigger.received_at,
-                                    source: CaptureSource::Display(display_id),
+                                    source,
                                     mode: mode.clone(),
                                     cpu_frame,
                                     retain_native_frame: selection_enabled

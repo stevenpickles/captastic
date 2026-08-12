@@ -15,6 +15,11 @@ impl DisplayId {
         Self("primary".to_owned())
     }
 
+    /// The normalized, physical-pixel union of all attached desktop displays.
+    pub fn virtual_desktop() -> Self {
+        Self("virtual_desktop".to_owned())
+    }
+
     pub fn is_primary_alias(&self) -> bool {
         self.0 == "primary"
     }

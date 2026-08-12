@@ -81,7 +81,16 @@ impl FakeBackend {
     }
 
     fn requested_display(&self, source: &CaptureSource) -> Result<DisplayInfo, CaptureError> {
-        let CaptureSource::Display(id) = source;
+        let CaptureSource::Display(id) = source else {
+            return Err(CaptureError {
+                kind: CaptureErrorKind::Unsupported,
+                backend: "fake",
+                operation: "resolve_display",
+                message: "virtual-desktop capture is not supported by the fake backend".to_owned(),
+                retryable: false,
+                native_code: None,
+            });
+        };
         let display = if id.is_primary_alias() {
             self.displays
                 .iter()

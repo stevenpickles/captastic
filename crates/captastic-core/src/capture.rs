@@ -30,6 +30,7 @@ impl CaptureMode {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CaptureSource {
     Display(DisplayId),
+    VirtualDesktop,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

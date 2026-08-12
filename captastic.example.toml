@@ -4,6 +4,7 @@ schema_version = 1
 backend = "dxgi"
 display = "pointer"
 # Use "primary" to always target the Windows primary monitor.
+# Use "virtual_desktop" to compose every display when they share one DXGI adapter.
 # To select one monitor, run `captastic displays --backend dxgi --json` and use:
 # display = "display:windows-monitor-0123456789abcdef"
 trigger_queue_capacity = 4

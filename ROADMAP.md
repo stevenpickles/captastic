@@ -36,9 +36,10 @@ important for a future public release, but it does not gate the capture mileston
 
 ## Milestone 1 — Multi-monitor and topology support
 
-**Status:** In progress. Configured/primary/pointer policies, persistent display identity,
-per-display workflow state, mixed-DPI overlay placement, and topology-triggered backend recovery are
-complete. Rotated-output normalization and virtual-desktop composition remain.
+**Status:** In progress. Configured/primary/pointer/virtual-desktop policies, persistent display
+identity, per-display workflow state, mixed-DPI overlay placement, topology-triggered backend
+recovery, rotated-output normalization, and same-adapter virtual-desktop composition are complete.
+Multi-adapter composition and broader hardware validation remain.
 
 **Outcome:** Captastic behaves predictably across workstation display layouts and can capture the
 display the user intends without initializing a capture engine after the hotkey is pressed.
@@ -72,10 +73,13 @@ display the user intends without initializing a capture engine after the hotkey 
 - Rebuild only affected duplication/device state while keeping shutdown and pending captures bounded.
 - Normalize all DXGI rotations into the top-left BGRA frame contract instead of rejecting portrait
   outputs.
-- Add virtual-desktop composition in phases: same-adapter outputs first, then explicit behavior for
-  multiple adapters, mixed refresh rates, mixed rotation, and mixed color modes.
-- Define whether the virtual-desktop result preserves physical pixel density or applies an explicit
-  normalization policy; do not rescale implicitly.
+- Same-adapter virtual-desktop composition preserves each output's physical pixels without scaling,
+  normalizes rotated outputs before placement, fills topology gaps with opaque black, and resolves
+  overlapping bounds by stable display ID so enumeration order cannot change the result. Composite
+  output uses three reusable CPU slots and rejects layouts larger than the 512 MiB frame limit.
+- Multi-adapter topologies currently return a structured unsupported error. A later slice must define
+  cross-adapter transfer/synchronization, mixed-refresh freshness semantics, and mixed color/HDR
+  behavior without adding unbounded copies or capture-engine initialization to the hotkey path.
 
 ### Validation
 

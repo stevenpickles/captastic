@@ -28,6 +28,7 @@ enum DisplayPolicy {
     Pointer,
     Primary,
     Fixed(DisplayId),
+    VirtualDesktop,
 }
 
 impl DisplayPolicy {
@@ -37,6 +38,7 @@ impl DisplayPolicy {
             Self::Pointer => "pointer".to_owned(),
             Self::Primary => "primary".to_owned(),
             Self::Fixed(id) => format!("display:{}", id.0),
+            Self::VirtualDesktop => "virtual_desktop".to_owned(),
         }
     }
 }
@@ -204,12 +206,12 @@ fn capture(args: cli::CaptureArgs) -> Result<(), AppError> {
     }
     let display_policy = resolve_display_policy(&args.display)?;
     let mut backend = create_backend(&args.backend, &display_policy)?;
-    let display_id = resolve_capture_display(&display_policy, backend.displays())?;
+    let source = resolve_capture_source(&display_policy, backend.displays())?;
     let mut recorder = EventRecorder::with_capacity(16);
     let request = CaptureRequest {
         id: CaptureId(1),
         triggered_at: Instant::now(),
-        source: CaptureSource::Display(display_id),
+        source,
         mode: capture_mode(args.mode),
         cpu_frame: args.cpu_frame,
         retain_native_frame: args.selection,
@@ -392,14 +394,20 @@ fn benchmark(args: BenchmarkArgs) -> Result<(), AppError> {
     } else {
         Some(create_backend(&args.backend, &display_policy)?)
     };
-    let display_id = match native_backend.as_deref() {
-        Some(backend) => resolve_capture_display(&display_policy, backend.displays())?,
+    let source = match native_backend.as_deref() {
+        Some(backend) => resolve_capture_source(&display_policy, backend.displays())?,
         None => match &display_policy {
-            DisplayPolicy::Primary => DisplayId::primary(),
-            DisplayPolicy::Fixed(id) => id.clone(),
+            DisplayPolicy::Primary => CaptureSource::Display(DisplayId::primary()),
+            DisplayPolicy::Fixed(id) => CaptureSource::Display(id.clone()),
             DisplayPolicy::Pointer => {
                 return Err(AppError::InvalidArgument(
                     "the fake benchmark backend does not support pointer display selection"
+                        .to_owned(),
+                ));
+            }
+            DisplayPolicy::VirtualDesktop => {
+                return Err(AppError::InvalidArgument(
+                    "the fake benchmark backend does not support virtual-desktop capture"
                         .to_owned(),
                 ));
             }
@@ -410,7 +418,7 @@ fn benchmark(args: BenchmarkArgs) -> Result<(), AppError> {
         warmup: args.warmup,
         mode: capture_mode(args.mode),
         cpu_frame: args.cpu_frame,
-        display_id: display_id.clone(),
+        source,
         trigger_queue_capacity: 4,
         metrics_capacity: args.iterations.saturating_mul(10).saturating_add(32),
         fake: benchmark::fake_config(
@@ -503,6 +511,9 @@ fn resolve_display_policy(value: &str) -> Result<DisplayPolicy, AppError> {
     if value == "primary" {
         return Ok(DisplayPolicy::Primary);
     }
+    if value == "virtual_desktop" {
+        return Ok(DisplayPolicy::VirtualDesktop);
+    }
     if let Some(id) = value.strip_prefix("display:") {
         let id = id.trim();
         if !id.is_empty() {
@@ -510,31 +521,34 @@ fn resolve_display_policy(value: &str) -> Result<DisplayPolicy, AppError> {
         }
     }
     Err(AppError::InvalidArgument(
-        "display must be pointer, primary, or display:<persistent-id>; virtual_desktop is not implemented yet"
-            .to_owned(),
+        "display must be pointer, primary, virtual_desktop, or display:<persistent-id>".to_owned(),
     ))
 }
 
 #[cfg(windows)]
-fn resolve_capture_display(
+fn resolve_capture_source(
     policy: &DisplayPolicy,
     displays: &[captastic_core::DisplayInfo],
-) -> Result<DisplayId, captastic_core::CaptureError> {
+) -> Result<CaptureSource, captastic_core::CaptureError> {
     match policy {
-        DisplayPolicy::Pointer => captastic_windows::display_containing_pointer(displays),
-        DisplayPolicy::Primary => Ok(DisplayId::primary()),
-        DisplayPolicy::Fixed(id) => Ok(id.clone()),
+        DisplayPolicy::Pointer => {
+            captastic_windows::display_containing_pointer(displays).map(CaptureSource::Display)
+        }
+        DisplayPolicy::Primary => Ok(CaptureSource::Display(DisplayId::primary())),
+        DisplayPolicy::Fixed(id) => Ok(CaptureSource::Display(id.clone())),
+        DisplayPolicy::VirtualDesktop => Ok(CaptureSource::VirtualDesktop),
     }
 }
 
 #[cfg(not(windows))]
-fn resolve_capture_display(
+fn resolve_capture_source(
     policy: &DisplayPolicy,
     _displays: &[captastic_core::DisplayInfo],
-) -> Result<DisplayId, captastic_core::CaptureError> {
+) -> Result<CaptureSource, captastic_core::CaptureError> {
     match policy {
-        DisplayPolicy::Primary => Ok(DisplayId::primary()),
-        DisplayPolicy::Fixed(id) => Ok(id.clone()),
+        DisplayPolicy::Primary => Ok(CaptureSource::Display(DisplayId::primary())),
+        DisplayPolicy::Fixed(id) => Ok(CaptureSource::Display(id.clone())),
+        DisplayPolicy::VirtualDesktop => Ok(CaptureSource::VirtualDesktop),
         DisplayPolicy::Pointer => Err(captastic_core::CaptureError {
             kind: captastic_core::CaptureErrorKind::Unsupported,
             backend: "platform",
@@ -596,6 +610,9 @@ fn create_dxgi_backend(
             &DisplayId::primary(),
         )?)),
         DisplayPolicy::Fixed(id) => Ok(Box::new(captastic_windows::DxgiBackend::new(id)?)),
+        DisplayPolicy::VirtualDesktop => {
+            Ok(Box::new(captastic_windows::DxgiDisplayManager::new()?))
+        }
     }
 }
 
@@ -668,7 +685,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn display_policy_resolves_pointer_primary_and_fixed_ids() {
+    fn display_policy_resolves_pointer_primary_virtual_desktop_and_fixed_ids() {
         assert_eq!(
             resolve_display_policy("pointer").expect("pointer"),
             DisplayPolicy::Pointer
@@ -676,6 +693,10 @@ mod tests {
         assert_eq!(
             resolve_display_policy("primary").expect("primary"),
             DisplayPolicy::Primary
+        );
+        assert_eq!(
+            resolve_display_policy("virtual_desktop").expect("virtual desktop"),
+            DisplayPolicy::VirtualDesktop
         );
         assert_eq!(
             resolve_display_policy("display:windows-monitor-0123456789abcdef")
@@ -686,7 +707,7 @@ mod tests {
 
     #[test]
     fn unresolved_display_policies_fail_before_backend_initialization() {
-        for value in ["virtual_desktop", "display:", "unexpected"] {
+        for value in ["display:", "unexpected"] {
             assert!(matches!(
                 resolve_display_policy(value),
                 Err(AppError::InvalidArgument(_))
