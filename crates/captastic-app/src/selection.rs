@@ -47,8 +47,25 @@ impl Drop for OneShotUiStateWorker {
     fn drop(&mut self) {
         self.controller.take();
         if let Some(join) = self.join.take() {
-            let _ = join.join();
+            join_worker_with_timeout(join, "one-shot UI-state", WORKER_STOP_TIMEOUT);
         }
+    }
+}
+
+fn join_worker_with_timeout(join: JoinHandle<()>, name: &str, timeout: Duration) -> bool {
+    let started = Instant::now();
+    while !join.is_finished() && started.elapsed() < timeout {
+        thread::sleep(WORKER_STOP_POLL);
+    }
+    if join.is_finished() {
+        let _ = join.join();
+        true
+    } else {
+        crate::logging::error(format_args!(
+            "{name} worker did not stop within {} ms; detaching it so shutdown can continue",
+            timeout.as_millis()
+        ));
+        false
     }
 }
 
@@ -308,25 +325,15 @@ impl SelectionWorker {
         }
         let mut selection_stopped = true;
         if let Some(join) = self.join.take() {
-            let started = Instant::now();
-            while !join.is_finished() && started.elapsed() < WORKER_STOP_TIMEOUT {
-                thread::sleep(WORKER_STOP_POLL);
-            }
-            if join.is_finished() {
-                let _ = join.join();
-            } else {
+            if !join_worker_with_timeout(join, "selection", WORKER_STOP_TIMEOUT) {
                 selection_stopped = false;
-                crate::logging::error(format_args!(
-                    "selection worker did not stop within {} ms; detaching it so shutdown can continue",
-                    WORKER_STOP_TIMEOUT.as_millis()
-                ));
             }
         }
         self.controller.take();
         self.ui_sender.take();
         if let Some(join) = self.ui_join.take() {
             if selection_stopped {
-                let _ = join.join();
+                join_worker_with_timeout(join, "UI-state persistence", WORKER_STOP_TIMEOUT);
             }
         }
     }
@@ -590,6 +597,25 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    #[test]
+    fn worker_join_timeout_does_not_wait_for_a_stuck_thread() {
+        let (release_sender, release_receiver) = mpsc::channel();
+        let join = thread::spawn(move || {
+            let _ = release_receiver.recv();
+        });
+
+        let started = Instant::now();
+        assert!(!join_worker_with_timeout(
+            join,
+            "test",
+            Duration::from_millis(10)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        release_sender
+            .send(())
+            .expect("release detached test worker");
+    }
 
     #[test]
     fn one_shot_worker_flushes_ui_state_before_drop_returns() {

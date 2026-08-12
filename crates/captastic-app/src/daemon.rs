@@ -10,6 +10,27 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(windows)]
+const CAPTURE_WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(windows)]
+const CAPTURE_WORKER_STOP_POLL: Duration = Duration::from_millis(5);
+
+#[cfg(windows)]
+fn join_capture_worker(join: thread::JoinHandle<()>) {
+    let started = Instant::now();
+    while !join.is_finished() && started.elapsed() < CAPTURE_WORKER_STOP_TIMEOUT {
+        thread::sleep(CAPTURE_WORKER_STOP_POLL);
+    }
+    if join.is_finished() {
+        let _ = join.join();
+    } else {
+        crate::logging::error(format_args!(
+            "capture worker did not stop within {} ms; detaching it so shutdown can continue",
+            CAPTURE_WORKER_STOP_TIMEOUT.as_millis()
+        ));
+    }
+}
+
+#[cfg(windows)]
 use captastic_config::{
     AppConfig, ConfirmedRegion, HotkeyAction, HotkeyBinding, HotkeyChord, UiConfig,
 };
@@ -475,7 +496,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         Ok(listener) => listener,
         Err(error) => {
             let _ = command_sender.send(CaptureCommand::Shutdown);
-            let _ = capture_join.join();
+            join_capture_worker(capture_join);
             return Err(error.into());
         }
     };
@@ -484,7 +505,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         Err(error) => {
             let _ = hotkey.stop();
             let _ = command_sender.send(CaptureCommand::Shutdown);
-            let _ = capture_join.join();
+            join_capture_worker(capture_join);
             return Err(error.into());
         }
     };
@@ -704,7 +725,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     }
     hotkey.stop()?;
     let _ = command_sender.send(CaptureCommand::Shutdown);
-    let _ = capture_join.join();
+    join_capture_worker(capture_join);
     if let Some(worker) = selection_worker {
         worker.stop();
     }
