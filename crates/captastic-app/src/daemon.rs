@@ -726,11 +726,34 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     hotkey.stop()?;
     let _ = command_sender.send(CaptureCommand::Shutdown);
     join_capture_worker(capture_join);
-    if let Some(worker) = selection_worker {
-        worker.stop();
-    }
-    if let Some(worker) = clipboard_worker {
-        worker.stop();
+    let persistence_failures = selection_worker.map_or_else(Vec::new, |worker| worker.stop());
+    let clipboard_failures = clipboard_worker.map_or_else(Vec::new, |worker| worker.stop());
+    if let Some(tray) = tray.as_ref() {
+        for failure in clipboard_failures {
+            let message = format!(
+                "Capture {} was not copied to the clipboard. {}",
+                failure.capture_id.0, failure.message
+            );
+            if let Err(error) = tray.show_error(message) {
+                crate::logging::warn(format_args!(
+                    "failed to surface shutdown-time clipboard error in the notification area: {error}"
+                ));
+            }
+        }
+        for failure in persistence_failures {
+            let message = format!("Captastic could not save selection preferences. {failure}");
+            if last_persistence_notification.as_deref() == Some(message.as_str()) {
+                continue;
+            }
+            last_persistence_notification = Some(message.clone());
+            if let Err(error) =
+                tray.show_error_with_title("Captastic preferences were not saved", message)
+            {
+                crate::logging::warn(format_args!(
+                    "failed to surface shutdown-time UI-state persistence error in the notification area: {error}"
+                ));
+            }
+        }
     }
     console_shutdown.signal_drained();
     if let Some(request) = session_end_request {

@@ -180,8 +180,9 @@ impl ClipboardWorker {
         self.failure_receiver.try_recv().ok()
     }
 
-    pub fn stop(mut self) {
+    pub fn stop(mut self) -> Vec<ClipboardFailure> {
         self.stop_inner();
+        self.failure_receiver.try_iter().collect()
     }
 
     fn stop_inner(&mut self) {
@@ -370,5 +371,28 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(attempts, 1);
         assert_eq!(retries, 0);
+    }
+
+    #[test]
+    fn stop_returns_failures_queued_during_worker_teardown() {
+        let (failure_sender, failure_receiver) = mpsc::sync_channel(1);
+        failure_sender
+            .send(ClipboardFailure {
+                capture_id: CaptureId(9),
+                message: "scripted shutdown failure".to_owned(),
+            })
+            .expect("queue teardown failure");
+        let worker = ClipboardWorker {
+            sender: None,
+            failure_receiver,
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            join: None,
+        };
+
+        let failures = worker.stop();
+
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].capture_id, CaptureId(9));
+        assert_eq!(failures[0].message, "scripted shutdown failure");
     }
 }

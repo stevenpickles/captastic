@@ -314,8 +314,9 @@ impl SelectionWorker {
         self.failure_receiver.try_recv().ok()
     }
 
-    pub fn stop(mut self) {
+    pub fn stop(mut self) -> Vec<String> {
         self.stop_inner();
+        self.failure_receiver.try_iter().collect()
     }
 
     fn stop_inner(&mut self) {
@@ -673,6 +674,24 @@ mod tests {
             .expect("persistence failure must be surfaced");
         assert!(failure.contains("failed to persist UI state"));
         fs::remove_dir_all(directory).expect("remove invalid config path");
+    }
+
+    #[test]
+    fn stop_returns_persistence_failures_queued_during_teardown() {
+        let (failure_sender, failure_receiver) = mpsc::channel();
+        failure_sender
+            .send("scripted shutdown failure".to_owned())
+            .expect("queue teardown failure");
+        let worker = SelectionWorker {
+            sender: None,
+            controller: None,
+            ui_sender: None,
+            failure_receiver,
+            join: None,
+            ui_join: None,
+        };
+
+        assert_eq!(worker.stop(), vec!["scripted shutdown failure".to_owned()]);
     }
 
     #[test]
