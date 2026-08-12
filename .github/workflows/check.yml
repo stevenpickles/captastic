@@ -43,6 +43,11 @@ jobs:
       - name: Build distribution workspace
         run: cargo build --locked --profile dist --workspace
 
+      - name: Run PowerShell packaging tests
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/test-package-windows.ps1
+
       - name: Validate Windows and Chocolatey packages
         if: runner.os == 'Windows'
         shell: pwsh

@@ -28,11 +28,17 @@ function Get-PeMachine([string]$Path) {
     $stream = [System.IO.File]::OpenRead($Path)
     $reader = [System.IO.BinaryReader]::new($stream)
     try {
+        if ($stream.Length -lt 0x40) {
+            throw "$Path is a truncated PE executable (the DOS header is incomplete)."
+        }
         if ($reader.ReadUInt16() -ne 0x5A4D) {
             throw "$Path is not a PE executable (missing MZ header)."
         }
         $stream.Position = 0x3C
         $peOffset = $reader.ReadUInt32()
+        if ($peOffset -gt ($stream.Length - 6)) {
+            throw "$Path is a truncated PE executable (the PE header is outside the file)."
+        }
         $stream.Position = $peOffset
         if ($reader.ReadUInt32() -ne 0x00004550) {
             throw "$Path is not a PE executable (missing PE signature)."
