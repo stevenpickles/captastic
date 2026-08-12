@@ -11,19 +11,19 @@ use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Shell::{
-    ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
-    NIM_MODIFY, NOTIFYICONDATAW,
+    ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR,
+    NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, LoadIconW, PostMessageW,
     PostQuitMessage, PostThreadMessageW, RegisterClassW, RegisterWindowMessageW,
     SetForegroundWindow, SetWindowLongPtrW, TrackPopupMenu, TranslateMessage, UnregisterClassW,
-    CREATESTRUCTW, GWLP_USERDATA, HMENU, HWND_MESSAGE, MB_ICONERROR, MB_OK, MF_CHECKED, MF_GRAYED,
-    MF_SEPARATOR, MF_STRING, MSG, SPI_SETLOGICALDPIOVERRIDE, SPI_SETWORKAREA, SW_SHOWNORMAL,
-    TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, WM_APP, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY,
-    WM_DISPLAYCHANGE, WM_LBUTTONDBLCLK, WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_QUIT, WM_RBUTTONUP,
-    WM_SETTINGCHANGE, WNDCLASSW, WS_OVERLAPPED,
+    CREATESTRUCTW, GWLP_USERDATA, HMENU, MB_ICONERROR, MB_OK, MF_CHECKED, MF_GRAYED, MF_SEPARATOR,
+    MF_STRING, MSG, SPI_SETLOGICALDPIOVERRIDE, SPI_SETWORKAREA, SW_SHOWNORMAL, TPM_BOTTOMALIGN,
+    TPM_RIGHTBUTTON, WM_APP, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE,
+    WM_LBUTTONDBLCLK, WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_QUIT, WM_RBUTTONUP, WM_SETTINGCHANGE,
+    WNDCLASSW, WS_OVERLAPPED,
 };
 
 const CLASS_NAME: PCWSTR = w!("CaptasticTrayWindow-v1");
@@ -31,6 +31,7 @@ const WINDOW_NAME: PCWSTR = w!("Captastic");
 const TASKBAR_CREATED_NAME: PCWSTR = w!("TaskbarCreated");
 const TRAY_CALLBACK: u32 = WM_APP + 1;
 const TRAY_SET_STARTUP: u32 = WM_APP + 2;
+const TRAY_SHOW_ERROR: u32 = WM_APP + 3;
 const TRAY_ICON_ID: u32 = 1;
 const APPLICATION_ICON_RESOURCE_ID: usize = 1;
 const COMMAND_CAPTURE: usize = 1_001;
@@ -52,6 +53,7 @@ pub enum TrayEvent {
 
 pub struct TrayIcon {
     receiver: Receiver<TrayEvent>,
+    notification_sender: SyncSender<String>,
     thread_id: u32,
     hwnd: isize,
     join: Option<JoinHandle<()>>,
@@ -60,11 +62,17 @@ pub struct TrayIcon {
 impl TrayIcon {
     pub fn start(startup_enabled: bool) -> Result<Self, CaptureError> {
         let (event_sender, receiver) = mpsc::sync_channel(8);
+        let (notification_sender, notification_receiver) = mpsc::sync_channel(8);
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let join = thread::Builder::new()
             .name("captastic-tray".to_owned())
             .spawn(move || {
-                if let Err(error) = run_tray(event_sender, startup_enabled, &ready_sender) {
+                if let Err(error) = run_tray(
+                    event_sender,
+                    notification_receiver,
+                    startup_enabled,
+                    &ready_sender,
+                ) {
                     let _ = ready_sender.send(Err(error.clone()));
                     log::error!("native tray stopped with an error: {error}");
                 }
@@ -73,6 +81,7 @@ impl TrayIcon {
         match ready_receiver.recv() {
             Ok(Ok((thread_id, hwnd))) => Ok(Self {
                 receiver,
+                notification_sender,
                 thread_id,
                 hwnd,
                 join: Some(join),
@@ -103,6 +112,15 @@ impl TrayIcon {
             )
         }
         .map_err(|error| native_error("update_startup_menu", error))
+    }
+
+    pub fn show_error(&self, message: impl Into<String>) -> Result<(), CaptureError> {
+        self.notification_sender
+            .try_send(message.into())
+            .map_err(|error| tray_error("queue_tray_error", error.to_string()))?;
+        // SAFETY: hwnd identifies the live hidden tray window owned by the tray thread.
+        unsafe { PostMessageW(HWND(self.hwnd), TRAY_SHOW_ERROR, WPARAM(0), LPARAM(0)) }
+            .map_err(|error| native_error("show_tray_error", error))
     }
 
     pub fn stop(mut self) -> Result<(), CaptureError> {
@@ -168,6 +186,7 @@ pub fn show_error_dialog(message: &str) {
 
 fn run_tray(
     event_sender: SyncSender<TrayEvent>,
+    notification_receiver: Receiver<String>,
     startup_enabled: bool,
     ready_sender: &SyncSender<Result<(u32, isize), CaptureError>>,
 ) -> Result<(), CaptureError> {
@@ -196,6 +215,7 @@ fn run_tray(
     }
     let state = Box::new(TrayState {
         event_sender,
+        notification_receiver,
         paused: false,
         startup_enabled,
         icon,
@@ -213,7 +233,9 @@ fn run_tray(
             0,
             0,
             0,
-            HWND_MESSAGE,
+            // A hidden top-level window receives system broadcasts and the registered
+            // TaskbarCreated message. Message-only windows are excluded from both.
+            HWND(0),
             HMENU(0),
             instance,
             Some(state_pointer.cast::<c_void>()),
@@ -277,6 +299,7 @@ fn run_tray(
 
 struct TrayState {
     event_sender: SyncSender<TrayEvent>,
+    notification_receiver: Receiver<String>,
     paused: bool,
     startup_enabled: bool,
     icon: windows::Win32::UI::WindowsAndMessaging::HICON,
@@ -389,6 +412,14 @@ fn tray_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPAR
             state.startup_enabled = wparam.0 != 0;
             LRESULT(0)
         }
+        TRAY_SHOW_ERROR => {
+            while let Ok(message) = state.notification_receiver.try_recv() {
+                if let Err(error) = show_error_notification(hwnd, &message) {
+                    log::warn!("failed to show tray error notification: {error}");
+                }
+            }
+            LRESULT(0)
+        }
         WM_DESTROY => {
             // SAFETY: Ends only this tray thread's message loop.
             unsafe { PostQuitMessage(0) };
@@ -424,6 +455,23 @@ fn modify_tray_tooltip(hwnd: HWND, paused: bool) -> Result<(), CaptureError> {
     // SAFETY: data identifies the existing icon and supplies a valid tooltip buffer.
     if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
         return Err(last_error("modify_tray_icon"));
+    }
+    Ok(())
+}
+
+fn show_error_notification(hwnd: HWND, message: &str) -> Result<(), CaptureError> {
+    let mut data = tray_data(
+        hwnd,
+        windows::Win32::UI::WindowsAndMessaging::HICON(0),
+        false,
+        NIF_INFO,
+    );
+    write_wide(&mut data.szInfoTitle, "Captastic capture failed");
+    write_wide(&mut data.szInfo, message);
+    data.dwInfoFlags = NIIF_ERROR;
+    // SAFETY: data identifies the existing icon and contains terminated notification buffers.
+    if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
+        return Err(last_error("show_tray_error_notification"));
     }
     Ok(())
 }

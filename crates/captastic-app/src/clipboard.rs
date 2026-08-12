@@ -3,22 +3,30 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use captastic_config::{HotkeyAction, HotkeyChord};
-use captastic_core::{validate_event_order, CaptureId, CpuFrame, EventRecorder, PerfEventKind};
+#[cfg(test)]
+use captastic_core::CaptureErrorKind;
+use captastic_core::{
+    validate_event_order, CaptureError, CaptureId, CpuFrame, EventRecorder, PerfEventKind,
+};
 use serde_json::json;
 
 use crate::error::AppError;
 
 const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const WORKER_STOP_POLL: Duration = Duration::from_millis(5);
+const PUBLISH_RETRY_LIMIT: u32 = 3;
+const PUBLISH_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 pub struct ClipboardWorker {
     sender: Option<mpsc::SyncSender<ClipboardJob>>,
+    failure_receiver: mpsc::Receiver<ClipboardFailure>,
     join: Option<JoinHandle<()>>,
 }
 
 impl ClipboardWorker {
     pub fn start(json_output: bool, queue_capacity: usize) -> Result<Self, AppError> {
         let (sender, receiver) = mpsc::sync_channel::<ClipboardJob>(queue_capacity);
+        let (failure_sender, failure_receiver) = mpsc::sync_channel(queue_capacity);
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let join = thread::Builder::new()
             .name("captastic-clipboard".to_owned())
@@ -39,7 +47,11 @@ impl ClipboardWorker {
                         PerfEventKind::ClipboardStarted,
                         offset_after_cpu(&job),
                     );
-                    match publisher.publish(&job.frame) {
+                    let (publish_result, publish_retries) = publish_with_retry(
+                        || publisher.publish(&job.frame),
+                        thread::sleep,
+                    );
+                    match publish_result {
                         Ok(report) => {
                             let total_offset_ns = duration_ns(job.triggered_at.elapsed());
                             let cpu_to_clipboard_ns =
@@ -55,11 +67,12 @@ impl ClipboardWorker {
                                 total_offset_ns,
                             );
                             log::info!(
-                                "clipboard {}: committed {:.3} ms after CPU ({:.3} ms total, {} retries) payload_bytes={} png_bytes={} publish_ns={}",
+                                "clipboard {}: committed {:.3} ms after CPU ({:.3} ms total, open_retries={} publish_retries={}) payload_bytes={} png_bytes={} publish_ns={}",
                                 job.capture_id.0,
                                 ns_to_ms(cpu_to_clipboard_ns),
                                 ns_to_ms(total_offset_ns),
                                 report.open_retries,
+                                publish_retries,
                                 report.payload_bytes,
                                 report.png_payload_bytes,
                                 report.publish_ns
@@ -89,6 +102,7 @@ impl ClipboardWorker {
                                         "allocation_copy_ns": report.allocation_copy_ns,
                                         "open_wait_ns": report.open_wait_ns,
                                         "open_retries": report.open_retries,
+                                        "publish_retries": publish_retries,
                                         "publish_ns": report.publish_ns,
                                     })
                                 );
@@ -110,6 +124,10 @@ impl ClipboardWorker {
                                 "clipboard {} failed without invalidating capture: {error}",
                                 job.capture_id.0
                             ));
+                            let _ = failure_sender.try_send(ClipboardFailure {
+                                capture_id: job.capture_id,
+                                message: error.to_string(),
+                            });
                             if json_output {
                                 println!(
                                     "{}",
@@ -122,6 +140,7 @@ impl ClipboardWorker {
                                         "error": error.to_string(),
                                         "native_code": error.native_code,
                                         "retryable": error.retryable,
+                                        "publish_retries": publish_retries,
                                     })
                                 );
                             }
@@ -135,6 +154,7 @@ impl ClipboardWorker {
         })??;
         Ok(Self {
             sender: Some(sender),
+            failure_receiver,
             join: Some(join),
         })
     }
@@ -144,6 +164,10 @@ impl ClipboardWorker {
             .as_ref()
             .expect("clipboard worker is running")
             .clone()
+    }
+
+    pub fn try_recv_failure(&self) -> Option<ClipboardFailure> {
+        self.failure_receiver.try_recv().ok()
     }
 
     pub fn stop(mut self) {
@@ -167,6 +191,11 @@ impl ClipboardWorker {
             }
         }
     }
+}
+
+pub struct ClipboardFailure {
+    pub capture_id: CaptureId,
+    pub message: String,
 }
 
 impl Drop for ClipboardWorker {
@@ -221,4 +250,93 @@ fn duration_ns(duration: std::time::Duration) -> u64 {
 
 fn ns_to_ms(ns: u64) -> f64 {
     ns as f64 / 1_000_000.0
+}
+
+fn publish_with_retry<T>(
+    mut publish: impl FnMut() -> Result<T, CaptureError>,
+    mut wait: impl FnMut(Duration),
+) -> (Result<T, CaptureError>, u32) {
+    let mut retries = 0_u32;
+    loop {
+        match publish() {
+            Err(error) if error.retryable && retries < PUBLISH_RETRY_LIMIT => {
+                retries = retries.saturating_add(1);
+                wait(PUBLISH_RETRY_DELAY);
+            }
+            result => return (result, retries),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn publish_error(retryable: bool) -> CaptureError {
+        CaptureError {
+            kind: CaptureErrorKind::NativeFailure,
+            backend: "test-clipboard",
+            operation: "publish",
+            message: "scripted failure".to_owned(),
+            retryable,
+            native_code: None,
+        }
+    }
+
+    #[test]
+    fn retryable_clipboard_failures_are_retried_to_the_limit() {
+        let mut attempts = 0_u32;
+        let mut waits = Vec::new();
+        let (result, retries) = publish_with_retry(
+            || {
+                attempts = attempts.saturating_add(1);
+                Err::<(), _>(publish_error(true))
+            },
+            |delay| waits.push(delay),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(attempts, PUBLISH_RETRY_LIMIT + 1);
+        assert_eq!(retries, PUBLISH_RETRY_LIMIT);
+        assert_eq!(
+            waits,
+            vec![PUBLISH_RETRY_DELAY; PUBLISH_RETRY_LIMIT as usize]
+        );
+    }
+
+    #[test]
+    fn non_retryable_clipboard_failure_is_not_retried() {
+        let mut attempts = 0_u32;
+        let (result, retries) = publish_with_retry(
+            || {
+                attempts = attempts.saturating_add(1);
+                Err::<(), _>(publish_error(false))
+            },
+            |_| panic!("non-retryable failure must not wait"),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(attempts, 1);
+        assert_eq!(retries, 0);
+    }
+
+    #[test]
+    fn retry_loop_returns_success_after_transient_failures() {
+        let mut attempts = 0_u32;
+        let (result, retries) = publish_with_retry(
+            || {
+                attempts = attempts.saturating_add(1);
+                if attempts < 3 {
+                    Err(publish_error(true))
+                } else {
+                    Ok("published")
+                }
+            },
+            |_| {},
+        );
+
+        assert_eq!(result.expect("eventual success"), "published");
+        assert_eq!(attempts, 3);
+        assert_eq!(retries, 2);
+    }
 }
