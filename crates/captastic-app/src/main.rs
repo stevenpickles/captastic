@@ -196,7 +196,11 @@ fn status(json_output: bool) -> Result<(), AppError> {
 fn status(json_output: bool) -> Result<(), AppError> {
     print_value(
         json_output,
-        &json!({"schema_version": 1, "status": "not_running"}),
+        &json!({
+            "schema_version": 1,
+            "status": "unsupported",
+            "reason": "the native hotkey daemon is currently available only on Windows",
+        }),
     )
 }
 
