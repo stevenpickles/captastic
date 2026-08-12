@@ -154,11 +154,16 @@ impl DxgiBackend {
             .map_err(|error| map_windows_error("duplicate_output", error))?;
         let qpc_frequency = query_performance_frequency()?;
         let staging = None;
+        let (retained_width, retained_height) = dimensions_after_rotation(
+            selected_record.info.bounds.width,
+            selected_record.info.bounds.height,
+            selected_record.info.rotation_degrees,
+        );
         let retained = RetainedTexture::create(
             &device,
             retained_desc(
-                selected_record.info.bounds.width,
-                selected_record.info.bounds.height,
+                retained_width,
+                retained_height,
                 DXGI_FORMAT_B8G8R8A8_UNORM,
                 DXGI_SAMPLE_DESC {
                     Count: 1,
@@ -343,15 +348,6 @@ impl CaptureBackend for DxgiBackend {
                 None
             };
             let cpu_frame = if request.cpu_frame {
-                if self.selected.rotation_degrees != 0 {
-                    return Err(capture_error(
-                        CaptureErrorKind::Unsupported,
-                        "readback",
-                        "rotated-output normalization is not implemented yet",
-                        false,
-                        None,
-                    ));
-                }
                 Some(self.readback(
                     &texture,
                     texture_desc,
@@ -450,15 +446,6 @@ impl DxgiBackend {
             None
         };
         let cpu_frame = if request.cpu_frame {
-            if self.selected.rotation_degrees != 0 {
-                return Err(capture_error(
-                    CaptureErrorKind::Unsupported,
-                    "readback",
-                    "rotated-output normalization is not implemented yet",
-                    false,
-                    None,
-                ));
-            }
             Some(self.readback(
                 &retained_texture,
                 retained_desc,
@@ -557,6 +544,11 @@ impl DxgiBackend {
             || self.retained.desc.Height != source_desc.Height
             || self.retained.desc.Format != source_desc.Format
         {
+            let (normalized_width, normalized_height) = dimensions_after_rotation(
+                source_desc.Width,
+                source_desc.Height,
+                self.selected.rotation_degrees,
+            );
             self.retained = RetainedTexture::create(
                 &self.device,
                 retained_desc(
@@ -566,8 +558,8 @@ impl DxgiBackend {
                     source_desc.SampleDesc,
                 ),
             )?;
-            self.selected.bounds.width = source_desc.Width;
-            self.selected.bounds.height = source_desc.Height;
+            self.selected.bounds.width = normalized_width;
+            self.selected.bounds.height = normalized_height;
             for display in &mut self.displays {
                 if display.id == self.selected.id {
                     display.bounds = self.selected.bounds;
@@ -612,28 +604,50 @@ impl DxgiBackend {
         // matching dimensions/format. Immediate-context access is serialized by the lock.
         unsafe { context.CopyResource(&staging, source) };
         let mapped = MappedTexture::map(&context, &staging)?;
-        let tight_stride = source_desc.Width.checked_mul(4).ok_or_else(|| {
+        let raw_tight_stride = source_desc.Width.checked_mul(4).ok_or_else(|| {
             capture_error(
                 CaptureErrorKind::InvalidFrame,
                 "readback",
-                "CPU frame stride overflowed",
+                "raw CPU frame stride overflowed",
                 false,
                 None,
             )
         })?;
-        if mapped.data.RowPitch < tight_stride {
+        if mapped.data.RowPitch < raw_tight_stride {
             return Err(capture_error(
                 CaptureErrorKind::InvalidFrame,
                 "readback",
                 format!(
                     "mapped row pitch {} is smaller than required {}",
-                    mapped.data.RowPitch, tight_stride
+                    mapped.data.RowPitch, raw_tight_stride
                 ),
                 false,
                 None,
             ));
         }
-        let len = frame_byte_len(source_desc.Width, source_desc.Height)?;
+        let layout = normalized_layout(
+            source_desc.Width,
+            source_desc.Height,
+            metadata.rotation_degrees,
+        )?;
+        if layout.width != metadata.source_rect.width
+            || layout.height != metadata.source_rect.height
+        {
+            return Err(capture_error(
+                CaptureErrorKind::TopologyChanged,
+                "readback",
+                format!(
+                    "normalized DXGI dimensions {}x{} do not match display bounds {}x{}",
+                    layout.width,
+                    layout.height,
+                    metadata.source_rect.width,
+                    metadata.source_rect.height
+                ),
+                true,
+                None,
+            ));
+        }
+        let len = frame_byte_len(layout.width, layout.height)?;
         let slot_index = self.cpu_pool.available_index(len).ok_or_else(|| {
             capture_error(
                 CaptureErrorKind::BufferExhausted,
@@ -643,8 +657,18 @@ impl DxgiBackend {
                 None,
             )
         })?;
-        let tight_stride_usize = tight_stride as usize;
         let source_stride = mapped.data.RowPitch as usize;
+        let source_len = source_stride
+            .checked_mul(source_desc.Height as usize)
+            .ok_or_else(|| {
+                capture_error(
+                    CaptureErrorKind::InvalidFrame,
+                    "readback",
+                    "mapped DXGI source size overflowed",
+                    false,
+                    None,
+                )
+            })?;
         {
             let pixels = Arc::get_mut(
                 self.cpu_pool.slots[slot_index]
@@ -652,27 +676,18 @@ impl DxgiBackend {
                     .expect("available slot is initialized"),
             )
             .expect("available slot has exactly one owner");
-            if source_stride == tight_stride_usize {
-                // SAFETY: Equal source/destination strides make the complete mapped texture one
-                // contiguous initialized byte range valid until the matching Unmap.
-                let source_pixels =
-                    unsafe { std::slice::from_raw_parts(mapped.data.pData.cast::<u8>(), len) };
-                pixels.copy_from_slice(source_pixels);
-            } else {
-                for row in 0..source_desc.Height as usize {
-                    let destination_start = row * tight_stride_usize;
-                    let destination_end = destination_start + tight_stride_usize;
-                    // SAFETY: D3D11 Map returned a non-null pointer valid until Unmap. RowPitch
-                    // covers at least tight_stride bytes and row is within the mapped height.
-                    let source_row = unsafe {
-                        std::slice::from_raw_parts(
-                            (mapped.data.pData as *const u8).add(row * source_stride),
-                            tight_stride_usize,
-                        )
-                    };
-                    pixels[destination_start..destination_end].copy_from_slice(source_row);
-                }
-            }
+            // SAFETY: Map returned a non-null pointer covering RowPitch bytes for every raw row;
+            // the slice does not outlive the mapped guard.
+            let source_pixels =
+                unsafe { std::slice::from_raw_parts(mapped.data.pData.cast::<u8>(), source_len) };
+            normalize_bgra_into(
+                source_pixels,
+                source_desc.Width,
+                source_desc.Height,
+                source_stride,
+                metadata.rotation_degrees,
+                pixels,
+            )?;
         }
         drop(mapped);
         let pixels = self.cpu_pool.slots[slot_index]
@@ -690,9 +705,9 @@ impl DxgiBackend {
         );
         CpuFrame::new(
             pixels,
-            source_desc.Width,
-            source_desc.Height,
-            tight_stride,
+            layout.width,
+            layout.height,
+            layout.stride,
             PixelFormat::Bgra8Unorm,
             FrameOrigin::TopLeft,
             ColorSpace::Srgb,
@@ -708,7 +723,6 @@ impl DxgiBackend {
             )
         })
     }
-
     fn staging_texture(
         &mut self,
         source_desc: D3D11_TEXTURE2D_DESC,
@@ -816,27 +830,33 @@ impl DxgiGpuFrame {
                 None,
             ));
         }
+        let raw_local = raw_selection_for_rotation(
+            local,
+            self.desc.Width,
+            self.desc.Height,
+            self.metadata.rotation_degrees,
+        )?;
         let destination_desc = staging_desc(
-            selection.width,
-            selection.height,
+            raw_local.width,
+            raw_local.height,
             self.desc.Format,
             self.desc.SampleDesc,
         );
         let staging = StagingTexture::create(&self.device, destination_desc)?.texture;
-        let local_x = u32::try_from(local.x).map_err(|_| {
+        let local_x = u32::try_from(raw_local.x).map_err(|_| {
             capture_error(
                 CaptureErrorKind::InvalidFrame,
                 "gpu_region_readback",
-                "selected region has a negative local x coordinate",
+                "raw selected region has a negative x coordinate",
                 false,
                 None,
             )
         })?;
-        let local_y = u32::try_from(local.y).map_err(|_| {
+        let local_y = u32::try_from(raw_local.y).map_err(|_| {
             capture_error(
                 CaptureErrorKind::InvalidFrame,
                 "gpu_region_readback",
-                "selected region has a negative local y coordinate",
+                "raw selected region has a negative y coordinate",
                 false,
                 None,
             )
@@ -845,14 +865,14 @@ impl DxgiGpuFrame {
             left: local_x,
             top: local_y,
             front: 0,
-            right: local_x.saturating_add(local.width),
-            bottom: local_y.saturating_add(local.height),
+            right: local_x.saturating_add(raw_local.width),
+            bottom: local_y.saturating_add(raw_local.height),
             back: 1,
         };
         let context = lock_context(&self.context)?;
         let copy_started = Instant::now();
-        // SAFETY: The source box was checked against the immutable snapshot, and the destination
-        // staging texture exactly matches its dimensions and format. Context access is serialized.
+        // SAFETY: The raw source box was transformed and checked against the immutable snapshot;
+        // the staging texture exactly matches its dimensions and format. Context access is serialized.
         unsafe {
             context.CopySubresourceRegion(&staging, 0, 0, 0, 0, &self.texture, 0, Some(&source_box))
         };
@@ -860,51 +880,68 @@ impl DxgiGpuFrame {
         let map_started = Instant::now();
         let mapped = MappedTexture::map(&context, &staging)?;
         let map_wait_ns = duration_ns_u64(map_started.elapsed());
-        let tight_stride = selection.width.checked_mul(4).ok_or_else(|| {
+        let raw_tight_stride = raw_local.width.checked_mul(4).ok_or_else(|| {
             capture_error(
                 CaptureErrorKind::InvalidFrame,
                 "gpu_region_readback",
-                "selected frame stride overflowed",
+                "raw selected frame stride overflowed",
                 false,
                 None,
             )
         })?;
-        if mapped.data.RowPitch < tight_stride {
+        if mapped.data.RowPitch < raw_tight_stride {
             return Err(capture_error(
                 CaptureErrorKind::InvalidFrame,
                 "gpu_region_readback",
-                "mapped row pitch is smaller than the selected frame stride",
+                "mapped row pitch is smaller than the raw selected frame stride",
                 false,
                 None,
             ));
         }
-        let bytes_read = frame_byte_len(selection.width, selection.height)?;
+        let layout = normalized_layout(
+            raw_local.width,
+            raw_local.height,
+            self.metadata.rotation_degrees,
+        )?;
+        if layout.width != selection.width || layout.height != selection.height {
+            return Err(capture_error(
+                CaptureErrorKind::InvalidFrame,
+                "gpu_region_readback",
+                "rotated GPU region dimensions do not match the normalized selection",
+                false,
+                None,
+            ));
+        }
+        let bytes_read = frame_byte_len(layout.width, layout.height)?;
         let full_frame_bytes = frame_byte_len(self.desc.Width, self.desc.Height)?;
         let mut pixels = vec![0_u8; bytes_read];
         let cpu_copy_started = Instant::now();
         let source_stride = mapped.data.RowPitch as usize;
-        let tight_stride_usize = tight_stride as usize;
-        let contiguous_rows = source_stride == tight_stride_usize;
-        if contiguous_rows {
-            // SAFETY: Equal pitches make the mapped region a contiguous byte range valid until
-            // the matching Unmap performed by `MappedTexture`.
-            let source_pixels =
-                unsafe { std::slice::from_raw_parts(mapped.data.pData.cast::<u8>(), bytes_read) };
-            pixels.copy_from_slice(source_pixels);
-        } else {
-            for row in 0..selection.height as usize {
-                let destination_start = row * tight_stride_usize;
-                // SAFETY: RowPitch covers a complete row and `row` is inside the mapped height.
-                let source_row = unsafe {
-                    std::slice::from_raw_parts(
-                        (mapped.data.pData as *const u8).add(row * source_stride),
-                        tight_stride_usize,
-                    )
-                };
-                pixels[destination_start..destination_start + tight_stride_usize]
-                    .copy_from_slice(source_row);
-            }
-        }
+        let source_len = source_stride
+            .checked_mul(raw_local.height as usize)
+            .ok_or_else(|| {
+                capture_error(
+                    CaptureErrorKind::InvalidFrame,
+                    "gpu_region_readback",
+                    "mapped raw region size overflowed",
+                    false,
+                    None,
+                )
+            })?;
+        let contiguous_rows =
+            self.metadata.rotation_degrees == 0 && source_stride == raw_tight_stride as usize;
+        // SAFETY: Map returned a non-null pointer covering RowPitch bytes for every copied raw row;
+        // the slice does not outlive the mapped guard.
+        let source_pixels =
+            unsafe { std::slice::from_raw_parts(mapped.data.pData.cast::<u8>(), source_len) };
+        normalize_bgra_into(
+            source_pixels,
+            raw_local.width,
+            raw_local.height,
+            source_stride,
+            self.metadata.rotation_degrees,
+            &mut pixels,
+        )?;
         let cpu_copy_ns = duration_ns_u64(cpu_copy_started.elapsed());
         drop(mapped);
         drop(context);
@@ -914,9 +951,9 @@ impl DxgiGpuFrame {
         metadata.pool_slot = None;
         let frame = CpuFrame::new(
             Arc::from(pixels),
-            selection.width,
-            selection.height,
-            tight_stride,
+            layout.width,
+            layout.height,
+            layout.stride,
             PixelFormat::Bgra8Unorm,
             FrameOrigin::TopLeft,
             ColorSpace::Srgb,
@@ -980,6 +1017,97 @@ fn local_selection(source: Rect, selection: Rect) -> Result<Rect, CaptureError> 
     })
 }
 
+fn raw_selection_for_rotation(
+    normalized: Rect,
+    raw_width: u32,
+    raw_height: u32,
+    rotation_degrees: u16,
+) -> Result<Rect, CaptureError> {
+    let layout = normalized_layout(raw_width, raw_height, rotation_degrees)?;
+    let x = u32::try_from(normalized.x).map_err(|_| {
+        capture_error(
+            CaptureErrorKind::InvalidFrame,
+            "gpu_region_readback",
+            "normalized region has a negative x coordinate",
+            false,
+            None,
+        )
+    })?;
+    let y = u32::try_from(normalized.y).map_err(|_| {
+        capture_error(
+            CaptureErrorKind::InvalidFrame,
+            "gpu_region_readback",
+            "normalized region has a negative y coordinate",
+            false,
+            None,
+        )
+    })?;
+    let right = x.checked_add(normalized.width).ok_or_else(|| {
+        capture_error(
+            CaptureErrorKind::InvalidFrame,
+            "gpu_region_readback",
+            "normalized region right edge overflowed",
+            false,
+            None,
+        )
+    })?;
+    let bottom = y.checked_add(normalized.height).ok_or_else(|| {
+        capture_error(
+            CaptureErrorKind::InvalidFrame,
+            "gpu_region_readback",
+            "normalized region bottom edge overflowed",
+            false,
+            None,
+        )
+    })?;
+    if normalized.width == 0
+        || normalized.height == 0
+        || right > layout.width
+        || bottom > layout.height
+    {
+        return Err(capture_error(
+            CaptureErrorKind::InvalidFrame,
+            "gpu_region_readback",
+            "normalized region lies outside the rotated DXGI texture",
+            false,
+            None,
+        ));
+    }
+    let (raw_x, raw_y, width, height) = match rotation_degrees {
+        0 => (x, y, normalized.width, normalized.height),
+        90 => (y, raw_height - right, normalized.height, normalized.width),
+        180 => (
+            raw_width - right,
+            raw_height - bottom,
+            normalized.width,
+            normalized.height,
+        ),
+        270 => (raw_width - bottom, x, normalized.height, normalized.width),
+        _ => unreachable!("rotation was validated above"),
+    };
+    Ok(Rect {
+        x: i32::try_from(raw_x).map_err(|_| {
+            capture_error(
+                CaptureErrorKind::InvalidFrame,
+                "gpu_region_readback",
+                "raw region x coordinate exceeds Win32 limits",
+                false,
+                None,
+            )
+        })?,
+        y: i32::try_from(raw_y).map_err(|_| {
+            capture_error(
+                CaptureErrorKind::InvalidFrame,
+                "gpu_region_readback",
+                "raw region y coordinate exceeds Win32 limits",
+                false,
+                None,
+            )
+        })?,
+        width,
+        height,
+    })
+}
 fn lock_context(
     context: &Arc<Mutex<ID3D11DeviceContext>>,
 ) -> Result<std::sync::MutexGuard<'_, ID3D11DeviceContext>, CaptureError> {
@@ -1244,6 +1372,154 @@ fn frame_byte_len(width: u32, height: u32) -> Result<usize, CaptureError> {
         })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PixelLayout {
+    width: u32,
+    height: u32,
+    stride: u32,
+}
+
+fn dimensions_after_rotation(width: u32, height: u32, rotation_degrees: u16) -> (u32, u32) {
+    if matches!(rotation_degrees, 90 | 270) {
+        (height, width)
+    } else {
+        (width, height)
+    }
+}
+
+fn normalized_layout(
+    raw_width: u32,
+    raw_height: u32,
+    rotation_degrees: u16,
+) -> Result<PixelLayout, CaptureError> {
+    if raw_width == 0 || raw_height == 0 {
+        return Err(capture_error(
+            CaptureErrorKind::InvalidFrame,
+            "normalize_rotation",
+            "raw DXGI frame dimensions must be non-zero",
+            false,
+            None,
+        ));
+    }
+    if !matches!(rotation_degrees, 0 | 90 | 180 | 270) {
+        return Err(capture_error(
+            CaptureErrorKind::InvalidFrame,
+            "normalize_rotation",
+            format!("unsupported display rotation {rotation_degrees}"),
+            false,
+            None,
+        ));
+    }
+    let (width, height) = dimensions_after_rotation(raw_width, raw_height, rotation_degrees);
+    let stride = width.checked_mul(4).ok_or_else(|| {
+        capture_error(
+            CaptureErrorKind::InvalidFrame,
+            "normalize_rotation",
+            "normalized CPU frame stride overflowed",
+            false,
+            None,
+        )
+    })?;
+    Ok(PixelLayout {
+        width,
+        height,
+        stride,
+    })
+}
+
+fn normalize_bgra_into(
+    source: &[u8],
+    source_width: u32,
+    source_height: u32,
+    source_stride: usize,
+    rotation_degrees: u16,
+    destination: &mut [u8],
+) -> Result<PixelLayout, CaptureError> {
+    let layout = normalized_layout(source_width, source_height, rotation_degrees)?;
+    let source_row_bytes = usize::try_from(source_width)
+        .ok()
+        .and_then(|width| width.checked_mul(4))
+        .ok_or_else(|| {
+            capture_error(
+                CaptureErrorKind::InvalidFrame,
+                "normalize_rotation",
+                "raw DXGI row size overflowed",
+                false,
+                None,
+            )
+        })?;
+    if source_stride < source_row_bytes {
+        return Err(capture_error(
+            CaptureErrorKind::InvalidFrame,
+            "normalize_rotation",
+            "raw DXGI stride is smaller than one pixel row",
+            false,
+            None,
+        ));
+    }
+    let required_source = source_stride
+        .checked_mul(source_height as usize)
+        .ok_or_else(|| {
+            capture_error(
+                CaptureErrorKind::InvalidFrame,
+                "normalize_rotation",
+                "mapped DXGI source size overflowed",
+                false,
+                None,
+            )
+        })?;
+    if source.len() < required_source {
+        return Err(capture_error(
+            CaptureErrorKind::InvalidFrame,
+            "normalize_rotation",
+            "mapped DXGI source is shorter than its declared layout",
+            false,
+            None,
+        ));
+    }
+    let required_destination = frame_byte_len(layout.width, layout.height)?;
+    if destination.len() != required_destination {
+        return Err(capture_error(
+            CaptureErrorKind::InvalidFrame,
+            "normalize_rotation",
+            "normalized destination does not match its declared layout",
+            false,
+            None,
+        ));
+    }
+
+    let output_stride = layout.stride as usize;
+    if rotation_degrees == 0 {
+        for row in 0..source_height as usize {
+            let source_start = row * source_stride;
+            let destination_start = row * output_stride;
+            destination[destination_start..destination_start + output_stride]
+                .copy_from_slice(&source[source_start..source_start + source_row_bytes]);
+        }
+        return Ok(layout);
+    }
+
+    let raw_width = source_width as usize;
+    let raw_height = source_height as usize;
+    for destination_y in 0..layout.height as usize {
+        for destination_x in 0..layout.width as usize {
+            let (source_x, source_y) = match rotation_degrees {
+                90 => (destination_y, raw_height - 1 - destination_x),
+                180 => (
+                    raw_width - 1 - destination_x,
+                    raw_height - 1 - destination_y,
+                ),
+                270 => (raw_width - 1 - destination_y, destination_x),
+                _ => unreachable!("rotation was validated above"),
+            };
+            let source_start = source_y * source_stride + source_x * 4;
+            let destination_start = destination_y * output_stride + destination_x * 4;
+            destination[destination_start..destination_start + 4]
+                .copy_from_slice(&source[source_start..source_start + 4]);
+        }
+    }
+    Ok(layout)
+}
 struct OutputRecord {
     adapter: IDXGIAdapter1,
     output: IDXGIOutput1,
@@ -2002,5 +2278,183 @@ mod tests {
         assert_eq!(actual.frame.width, expected.width);
         assert_eq!(actual.frame.height, expected.height);
         assert_eq!(&*actual.frame.pixels, &*expected.pixels);
+    }
+    fn labeled_bgra(width: u32, height: u32, stride: usize) -> Vec<u8> {
+        let mut pixels = vec![0xee; stride * height as usize];
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let label = (y * width as usize + x + 1) as u8;
+                let start = y * stride + x * 4;
+                pixels[start..start + 4].copy_from_slice(&[label, 0, 0, 0xff]);
+            }
+        }
+        pixels
+    }
+
+    fn blue_channel(pixels: &[u8]) -> Vec<u8> {
+        pixels.chunks_exact(4).map(|pixel| pixel[0]).collect()
+    }
+
+    #[test]
+    fn rotation_normalization_orients_pixels_and_removes_row_padding() {
+        let raw = labeled_bgra(3, 2, 16);
+        let cases = [
+            (0, 3, 2, vec![1, 2, 3, 4, 5, 6]),
+            (90, 2, 3, vec![4, 1, 5, 2, 6, 3]),
+            (180, 3, 2, vec![6, 5, 4, 3, 2, 1]),
+            (270, 2, 3, vec![3, 6, 2, 5, 1, 4]),
+        ];
+
+        for (rotation, expected_width, expected_height, expected_labels) in cases {
+            let mut normalized = vec![0; expected_width as usize * expected_height as usize * 4];
+            let layout = normalize_bgra_into(&raw, 3, 2, 16, rotation, &mut normalized)
+                .expect("rotation normalization");
+            assert_eq!(layout.width, expected_width);
+            assert_eq!(layout.height, expected_height);
+            assert_eq!(layout.stride, expected_width * 4);
+            assert_eq!(blue_channel(&normalized), expected_labels);
+        }
+    }
+
+    #[test]
+    fn normalized_regions_map_back_to_raw_texture_coordinates() {
+        let selection = Rect {
+            x: 100,
+            y: 200,
+            width: 300,
+            height: 400,
+        };
+        let cases = [
+            (
+                0,
+                Rect {
+                    x: 100,
+                    y: 200,
+                    width: 300,
+                    height: 400,
+                },
+            ),
+            (
+                90,
+                Rect {
+                    x: 200,
+                    y: 680,
+                    width: 400,
+                    height: 300,
+                },
+            ),
+            (
+                180,
+                Rect {
+                    x: 1520,
+                    y: 480,
+                    width: 300,
+                    height: 400,
+                },
+            ),
+            (
+                270,
+                Rect {
+                    x: 1320,
+                    y: 100,
+                    width: 400,
+                    height: 300,
+                },
+            ),
+        ];
+
+        for (rotation, expected) in cases {
+            assert_eq!(
+                raw_selection_for_rotation(selection, 1920, 1080, rotation)
+                    .expect("valid rotated selection"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn normalizing_a_raw_region_matches_cropping_the_normalized_frame() {
+        let raw_width = 4;
+        let raw_height = 3;
+        let raw_stride = raw_width as usize * 4;
+        let raw = labeled_bgra(raw_width, raw_height, raw_stride);
+        let raw_selection = Rect {
+            x: 1,
+            y: 1,
+            width: 2,
+            height: 2,
+        };
+
+        for rotation in [0, 90, 180, 270] {
+            let full_layout = normalized_layout(raw_width, raw_height, rotation)
+                .expect("normalized full-frame layout");
+            let mut full = vec![0; frame_byte_len(full_layout.width, full_layout.height).unwrap()];
+            normalize_bgra_into(&raw, raw_width, raw_height, raw_stride, rotation, &mut full)
+                .expect("full-frame normalization");
+
+            let normalized_selection = match rotation {
+                0 => raw_selection,
+                90 => Rect {
+                    x: 0,
+                    y: 1,
+                    width: 2,
+                    height: 2,
+                },
+                180 => Rect {
+                    x: 1,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                },
+                270 => Rect {
+                    x: 1,
+                    y: 1,
+                    width: 2,
+                    height: 2,
+                },
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                raw_selection_for_rotation(normalized_selection, raw_width, raw_height, rotation,)
+                    .expect("normalized selection mapping"),
+                raw_selection
+            );
+
+            let raw_x = raw_selection.x as usize;
+            let raw_y = raw_selection.y as usize;
+            let selected_stride = raw_selection.width as usize * 4;
+            let mut selected_raw = vec![0; selected_stride * raw_selection.height as usize];
+            for row in 0..raw_selection.height as usize {
+                let source_start = (raw_y + row) * raw_stride + raw_x * 4;
+                let destination_start = row * selected_stride;
+                selected_raw[destination_start..destination_start + selected_stride]
+                    .copy_from_slice(&raw[source_start..source_start + selected_stride]);
+            }
+            let mut normalized_region =
+                vec![
+                    0;
+                    frame_byte_len(normalized_selection.width, normalized_selection.height,)
+                        .unwrap()
+                ];
+            normalize_bgra_into(
+                &selected_raw,
+                raw_selection.width,
+                raw_selection.height,
+                selected_stride,
+                rotation,
+                &mut normalized_region,
+            )
+            .expect("selected-region normalization");
+
+            let full_stride = full_layout.stride as usize;
+            let crop_stride = normalized_selection.width as usize * 4;
+            let mut cropped = Vec::with_capacity(normalized_region.len());
+            for row in 0..normalized_selection.height as usize {
+                let start = (normalized_selection.y as usize + row) * full_stride
+                    + normalized_selection.x as usize * 4;
+                cropped.extend_from_slice(&full[start..start + crop_stride]);
+            }
+            assert_eq!(normalized_region, cropped, "rotation {rotation}");
+        }
     }
 }
