@@ -267,6 +267,72 @@ platforms as equivalent when they are not.
 After capture quality and history are stable, choose annotation/pinning or the first cross-platform
 proof based on the intended audience. Neither should delay the Windows workstation milestones.
 
+## Architecture hardening backlog
+
+These items were deliberately separated from the code-review remediation branch because each
+changes a public contract or a broad subsystem boundary. They should land as independently reviewed
+branches before the affected subsystem grows further.
+
+### Extract overlay and tray message state machines
+
+**Why:** Recent defects arose from reentrant Win32 messages mutating state that was also being
+consumed by the originating handler. The current large message procedures make transition coverage
+and teardown reasoning unnecessarily difficult.
+
+- Extract drag ownership, capture loss, button release, and toolbar persistence decisions into a
+  pure overlay transition function.
+- Extract tray session-ending, callback reentrancy, and notification-routing decisions into a pure
+  transition function.
+- Keep Win32 procedures responsible for translating messages and applying declared effects, not for
+  owning product state transitions.
+- Add table-driven coverage for normal ordering, self-generated `WM_CAPTURECHANGED`, externally
+  stolen capture, canceled shutdown, committed session shutdown, and callback reentrancy.
+- Decompose `overlay.rs` only along tested ownership boundaries; avoid a mechanical file split that
+  preserves hidden coupling.
+
+**Exit criteria:** Every drag and session-shutdown transition is testable without creating a native
+window, native handlers contain no duplicated state cleanup, and reentrant messages cannot consume
+state required by their caller.
+
+### Resolve dormant configuration and telemetry surfaces
+
+**Why:** Accepted-but-unused settings create false product contracts and make cross-platform
+backends inherit behavior that does not exist. Write-only telemetry has the same maintenance cost
+without diagnostic value.
+
+- Either implement `hotkey.repeat = "coalesce"` with bounded, documented semantics or reject/remove
+  it with a migration note.
+- Implement `[output]` only through Milestone 4's bounded asynchronous output worker; until then,
+  reject unsupported non-default values rather than silently accepting them.
+- Inventory and remove legacy UI-state save/load entry points superseded by `UiStateStore`.
+- Either expose `backend_duration` in structured results/diagnostics with a precise timing contract
+  or remove it from the public capture outcome.
+- Add compatibility tests proving obsolete or unsupported configuration receives an actionable
+  error instead of being silently ignored.
+
+**Exit criteria:** Every documented configuration value changes observable behavior, every public
+metric has a consumer and timing definition, and platform backends do not need to emulate dead
+Windows-era surfaces.
+
+### Decide the mouse-capture and software-KVM contract
+
+**Why:** Win32 mouse capture reliably completes drags outside the overlay, but software KVM and
+mouse-sharing tools may depend on retaining input ownership. This is a product interoperability
+decision, not an implementation-only cleanup.
+
+- Test toolbar, draw, move, and resize drags with the supported multi-monitor matrix and at least
+  two representative software-KVM/input-sharing products.
+- Compare the current active-drag-only `SetCapture` design with a capture-free design that infers
+  release/cancellation from raw input, polling, or focus/cursor transitions.
+- Record the chosen behavior in an ADR, including behavior at overlay boundaries, capture theft,
+  remote sessions, and disconnected KVM peers.
+- If Win32 capture remains, document tested compatibility and retain bounded self-release and
+  external-capture-loss state-machine tests. If capture-free behavior wins, remove `SetCapture`
+  without regressing cross-monitor drag completion.
+
+**Exit criteria:** The selected input-ownership contract is validated on real software-KVM and
+multi-monitor setups, documented as an explicit product choice, and enforced by transition tests.
+
 ## Release signing and distribution backlog
 
 Authenticode is deliberately not on the near-term critical path. Until signing is provisioned:
