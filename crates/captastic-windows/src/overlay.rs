@@ -1,8 +1,9 @@
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
-use std::sync::mpsc::SyncSender;
-use std::sync::Arc;
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
@@ -149,7 +150,13 @@ pub struct OverlayController {
 struct OverlayControllerInner {
     hwnd: AtomicIsize,
     cancelled: AtomicBool,
-    ui_updates: Option<SyncSender<OverlayUiUpdate>>,
+    ui_updates: Option<OverlayUiSink>,
+}
+
+#[derive(Clone)]
+struct OverlayUiSink {
+    sender: Sender<OverlayUiUpdate>,
+    live_ui: Arc<Mutex<BTreeMap<String, captastic_config::DisplayUiState>>>,
 }
 
 impl OverlayController {
@@ -157,12 +164,36 @@ impl OverlayController {
         Self::default()
     }
 
-    pub fn with_ui_updates(ui_updates: SyncSender<OverlayUiUpdate>) -> Self {
+    pub fn with_ui_updates(ui_updates: Sender<OverlayUiUpdate>) -> Self {
         Self {
             inner: Arc::new(OverlayControllerInner {
-                ui_updates: Some(ui_updates),
+                ui_updates: Some(OverlayUiSink {
+                    sender: ui_updates,
+                    live_ui: Arc::new(Mutex::new(BTreeMap::new())),
+                }),
                 ..OverlayControllerInner::default()
             }),
+        }
+    }
+
+    pub fn remembered_ui(
+        &self,
+        display_id: &str,
+        fallback: captastic_config::DisplayUiState,
+    ) -> captastic_config::DisplayUiState {
+        let Some(sink) = self.inner.ui_updates.as_ref() else {
+            return fallback;
+        };
+        let mut live_ui = sink
+            .live_ui
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *live_ui.entry(display_id.to_owned()).or_insert(fallback)
+    }
+
+    pub fn submit_ui_update(&self, update: OverlayUiUpdate) {
+        if let Some(sink) = self.inner.ui_updates.as_ref() {
+            sink.submit(update);
         }
     }
 
@@ -463,7 +494,7 @@ struct OverlayState {
     started: Instant,
     preparation_ns: u64,
     window_overview_ns: Option<u64>,
-    ui_updates: Option<SyncSender<OverlayUiUpdate>>,
+    ui_updates: Option<OverlayUiSink>,
 }
 
 struct OverlayResourceCache {
@@ -1030,7 +1061,7 @@ fn restore_region_for_display_change(
 }
 
 fn remember_overlay_interaction(
-    ui_updates: Option<&SyncSender<OverlayUiUpdate>>,
+    ui_updates: Option<&OverlayUiSink>,
     display_id: &DisplayId,
     source: Rect,
     tool: CaptureTool,
@@ -1053,10 +1084,8 @@ fn remember_overlay_interaction(
             rotation_degrees,
         }),
     };
-    if let Some(sender) = ui_updates {
-        if sender.try_send(update).is_err() {
-            log::warn!("UI-state update queue is unavailable; interaction state was not saved");
-        }
+    if let Some(sink) = ui_updates {
+        sink.submit(update);
     }
 }
 
@@ -1091,7 +1120,7 @@ fn fit_region_to_source(region: Rect, source: Rect) -> Rect {
 }
 
 fn remember_toolbar_position(
-    ui_updates: Option<&SyncSender<OverlayUiUpdate>>,
+    ui_updates: Option<&OverlayUiSink>,
     display_id: &DisplayId,
     position: POINT,
     environment: DisplayEnvironment,
@@ -1107,9 +1136,65 @@ fn remember_toolbar_position(
         center_x: center_x.clamp(0.0, 1.0),
         center_y: center_y.clamp(0.0, 1.0),
     };
-    if let Some(sender) = ui_updates {
-        if sender.try_send(update).is_err() {
-            log::warn!("UI-state update queue is unavailable; toolbar position was not saved");
+    if let Some(sink) = ui_updates {
+        sink.submit(update);
+    }
+}
+
+impl OverlayUiSink {
+    fn submit(&self, update: OverlayUiUpdate) {
+        {
+            let mut live_ui = self
+                .live_ui
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            apply_overlay_ui_update(&mut live_ui, &update);
+        }
+        if self.sender.send(update).is_err() {
+            log::warn!("UI-state persistence worker is unavailable; update was not saved to disk");
+        }
+    }
+}
+
+fn apply_overlay_ui_update(
+    state: &mut BTreeMap<String, captastic_config::DisplayUiState>,
+    update: &OverlayUiUpdate,
+) {
+    match update {
+        OverlayUiUpdate::Interaction {
+            display_id,
+            tool,
+            region,
+            source,
+        } => {
+            let display = state.entry(display_id.clone()).or_default();
+            display.tool = Some(*tool);
+            if let Some(region) = region {
+                display.region = Some(*region);
+                display.region_source = *source;
+                display.region_is_display_local = true;
+            }
+        }
+        OverlayUiUpdate::ToolbarCenter {
+            display_id,
+            center_x,
+            center_y,
+        } => {
+            state.entry(display_id.clone()).or_default().overlay_center =
+                Some((*center_x, *center_y));
+        }
+        OverlayUiUpdate::ConfirmedRegion {
+            display_id,
+            region,
+            source,
+        } => {
+            state
+                .entry(display_id.clone())
+                .or_default()
+                .confirmed_region = Some(captastic_config::ConfirmedRegion {
+                region: *region,
+                source: *source,
+            });
         }
     }
 }
@@ -4086,6 +4171,31 @@ fn duration_ns(duration: std::time::Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controller_updates_live_ui_before_persistence_receives_the_event() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let controller = OverlayController::with_ui_updates(sender);
+        let fallback = captastic_config::DisplayUiState {
+            overlay_position: Some((10, 20)),
+            ..captastic_config::DisplayUiState::default()
+        };
+        assert_eq!(controller.remembered_ui("display-1", fallback), fallback);
+
+        controller.submit_ui_update(OverlayUiUpdate::ToolbarCenter {
+            display_id: "display-1".to_owned(),
+            center_x: 0.25,
+            center_y: 0.75,
+        });
+
+        let remembered = controller.remembered_ui("display-1", Default::default());
+        assert_eq!(remembered.overlay_center, Some((0.25, 0.75)));
+        assert_eq!(remembered.overlay_position, Some((10, 20)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(OverlayUiUpdate::ToolbarCenter { .. })
+        ));
+    }
 
     #[test]
     fn region_from_points_is_normalized_and_clamped() {
