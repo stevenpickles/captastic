@@ -83,7 +83,11 @@ fn main() {
 }
 
 fn uses_persistent_logging(cli: &Cli) -> bool {
-    cli.log_file.is_some() || matches!(cli.command.as_ref(), None | Some(Command::Daemon(_)))
+    cli.log_file.is_some()
+        || matches!(
+            cli.command.as_ref(),
+            None | Some(Command::Daemon(_) | Command::Capture(_) | Command::Benchmark(_))
+        )
 }
 
 fn resolve_logging_config(cli: &Cli) -> LoggingConfig {
@@ -731,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn only_daemon_commands_persist_logs_by_default() {
+    fn only_operational_commands_persist_logs_by_default() {
         assert!(uses_persistent_logging(&cli(None)));
         assert!(uses_persistent_logging(&cli(Some(Command::Daemon(
             cli::DaemonArgs::default()
@@ -739,6 +743,10 @@ mod tests {
         assert!(!uses_persistent_logging(&cli(Some(Command::Doctor {
             json: true
         }))));
+        let capture = Cli::try_parse_from(["captastic", "capture"]).expect("capture CLI");
+        assert!(uses_persistent_logging(&capture));
+        let benchmark = Cli::try_parse_from(["captastic", "benchmark"]).expect("benchmark CLI");
+        assert!(uses_persistent_logging(&benchmark));
 
         let mut explicit = cli(Some(Command::Doctor { json: true }));
         explicit.log_file = Some("doctor.log".into());

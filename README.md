@@ -114,6 +114,13 @@ after cancellation. Region coordinates are monitor-local, so negative origins do
 preserve the rest of the TOML document and its comments. Existing global `[ui]` values remain a
 backward-compatible fallback until that monitor records its own state.
 
+When the daemon is started with `--config <path>`, that path is also the sole destination for tray
+Open Config and managed UI-state updates; the default profile is not read or written. The daemon
+loads behavioral and remembered UI settings at startup, so hand edits take effect after a restart.
+Background UI saves re-read the current document and preserve unrelated edits and comments. The
+one-shot `captastic capture --selection true` command uses the default profile and flushes its UI
+updates before exiting.
+
 ## Configurable hotkeys
 
 The canonical format keeps bindings under `[hotkey.bindings]`. Only `last_workflow` is enabled by
@@ -147,7 +154,9 @@ mode from daemon-cached restored/default UI state and logs a structured fallback
 captures unrelated state or reads TOML after the trigger. All actions retain the configured display
 policy and `latest`/`fresh` mode. Daemon triggers enter one bounded command queue; selection,
 clipboard, UI-state persistence, and logging each have their own bounded worker queue.
-Captastic writes operational output through Rust's `log` facade to both stderr and a persistent file.
+Daemon, capture, and benchmark commands write operational output through Rust's `log` facade to
+both stderr and a persistent file. Read-only utility commands use stderr only unless `--log-file`
+is supplied.
 Capture, selection, clipboard, recovery, and daemon lifecycle messages therefore share one format
 and filtering policy. The default compact format uses an RFC 3339 UTC timestamp with microsecond
 precision, followed by the level, Rust module target, and message:
