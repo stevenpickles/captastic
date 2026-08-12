@@ -512,8 +512,8 @@ impl AppConfig {
     }
 
     fn load_recovering(path: &Path) -> Result<(Self, Option<ConfigRecovery>), ConfigError> {
-        let text = match fs::read_to_string(path) {
-            Ok(text) => text,
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
             Err(source) if source.kind() == ErrorKind::NotFound => {
                 return Ok((Self::default(), None));
             }
@@ -524,24 +524,14 @@ impl AppConfig {
                 });
             }
         };
+        let text = match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(error) => {
+                return quarantine_damaged_config(path, error.to_string());
+            }
+        };
         if let Err(syntax_error) = text.parse::<toml_edit::Document>() {
-            let reason = syntax_error.to_string();
-            let quarantined_path =
-                quarantine_config(path).map_err(|source| ConfigError::Quarantine {
-                    path: path.display().to_string(),
-                    source,
-                })?;
-            let Some(quarantined_path) = quarantined_path else {
-                return Ok((Self::default(), None));
-            };
-            return Ok((
-                Self::default(),
-                Some(ConfigRecovery {
-                    original_path: path.to_path_buf(),
-                    quarantined_path,
-                    reason,
-                }),
-            ));
+            return quarantine_damaged_config(path, syntax_error.to_string());
         }
         let config: Self = toml::from_str(&text)?;
         config.validate()?;
@@ -760,6 +750,27 @@ impl AppConfig {
     pub fn to_toml_pretty(&self) -> Result<String, ConfigError> {
         toml::to_string_pretty(self).map_err(ConfigError::Serialize)
     }
+}
+
+fn quarantine_damaged_config(
+    path: &Path,
+    reason: String,
+) -> Result<(AppConfig, Option<ConfigRecovery>), ConfigError> {
+    let quarantined_path = quarantine_config(path).map_err(|source| ConfigError::Quarantine {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let Some(quarantined_path) = quarantined_path else {
+        return Ok((AppConfig::default(), None));
+    };
+    Ok((
+        AppConfig::default(),
+        Some(ConfigRecovery {
+            original_path: path.to_path_buf(),
+            quarantined_path,
+            reason,
+        }),
+    ))
 }
 
 pub fn load_display_ui_state(display_id: &str) -> Result<DisplayUiState, ConfigError> {
@@ -1737,6 +1748,58 @@ mod tests {
             1,
             "strict failures must not create a quarantine file"
         );
+    }
+
+    #[test]
+    fn recovering_load_quarantines_invalid_utf8() {
+        let directory = TestDirectory::new("invalid-utf8-recovery");
+        let path = directory.join(CONFIG_FILE_NAME);
+        let damaged = b"schema_version = 1\n#\xff\n";
+        fs::write(&path, damaged).expect("write invalid UTF-8 config");
+
+        let (config, recovery) =
+            AppConfig::load_recovering(&path).expect("recover invalid UTF-8 default config");
+        let recovery = recovery.expect("recovery metadata");
+
+        config.validate().expect("recovered defaults are valid");
+        assert_eq!(
+            fs::read(&recovery.quarantined_path).expect("quarantined bytes"),
+            damaged
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn recovering_load_keeps_wrong_types_and_validation_failures_in_place() {
+        for (label, invalid) in [
+            (
+                "wrong-type",
+                "schema_version = 1\n[daemon]\ntrigger_queue_capacity = 'many'\n",
+            ),
+            (
+                "validation",
+                "schema_version = 1\n[daemon]\ntrigger_queue_capacity = 0\n",
+            ),
+        ] {
+            let directory = TestDirectory::new(label);
+            let path = directory.join(CONFIG_FILE_NAME);
+            fs::write(&path, invalid).expect("write semantically invalid config");
+
+            AppConfig::load_recovering(&path)
+                .expect_err("well-formed semantic failures must remain strict");
+
+            assert_eq!(
+                fs::read_to_string(&path).expect("original remains"),
+                invalid
+            );
+            assert_eq!(
+                fs::read_dir(&directory.0)
+                    .expect("read test directory")
+                    .count(),
+                1,
+                "semantic failures must not create quarantine files"
+            );
+        }
     }
 
     #[test]
