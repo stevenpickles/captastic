@@ -13,6 +13,12 @@ replacing its files; reopen Captastic from the Start Menu after the upgrade. The
 starts an elevated tray process from Chocolatey. Uninstall removes both command shims and the shortcut
 but preserves configuration and logs under `~/.captastic`.
 
+The Chocolatey package supports installation, upgrade, and removal by the same interactive
+Windows user. Deployment as `SYSTEM`, elevation with a different administrator account, and
+multi-user/fast-user-switching migration are not currently supported: Captastic's startup entry,
+configuration, and daemon control signal are deliberately scoped to one user session. Managed
+deployment tooling should stop Captastic in each affected user session before modifying files.
+
 If the current user installed Captastic previously with the portable package's `install.ps1`,
 the Chocolatey install invokes that installation's uninstaller first. This prevents the older
 daemon from retaining the session control event; the migration also preserves `~/.captastic`.

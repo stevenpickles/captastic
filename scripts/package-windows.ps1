@@ -1,7 +1,11 @@
+#Requires -Version 7.0
+
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
     [string]$Version,
+    [ValidateSet('x86_64', 'arm64')]
+    [string]$Architecture = 'x86_64',
     [string]$BinariesDirectory = (Join-Path $PSScriptRoot '..\target\dist'),
     [string]$OutputDirectory = (Join-Path $PSScriptRoot '..\dist')
 )
@@ -11,7 +15,7 @@ $repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $BinariesDirectory = [System.IO.Path]::GetFullPath($BinariesDirectory)
 $OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
 $artifactVersion = $Version -replace '[^A-Za-z0-9._-]', '-'
-$packageName = "captastic-$artifactVersion-windows-x86_64"
+$packageName = "captastic-$artifactVersion-windows-$Architecture"
 $packageDirectory = Join-Path $OutputDirectory $packageName
 $archive = Join-Path $OutputDirectory "$packageName.zip"
 
@@ -44,7 +48,11 @@ foreach ($script in @('install.ps1', 'uninstall.ps1')) {
 Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
 Compress-Archive -Path $packageDirectory -DestinationPath $archive -Force
 $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
-"$hash  $packageName.zip" | Set-Content -Encoding ascii "$archive.sha256"
+[System.IO.File]::WriteAllText(
+    "$archive.sha256",
+    "$hash  $packageName.zip`n",
+    [System.Text.Encoding]::ASCII
+)
 
 Write-Host "Portable package: $archive"
 Write-Host "SHA-256: $hash"
