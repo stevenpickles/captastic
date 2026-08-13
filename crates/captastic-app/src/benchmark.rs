@@ -11,6 +11,7 @@ use captastic_core::{
 };
 use serde::Serialize;
 
+use crate::build_info::{BuildInfo, BUILD_INFO};
 use crate::error::AppError;
 
 #[derive(Clone, Debug)]
@@ -29,7 +30,7 @@ pub struct BenchmarkOptions {
 pub struct EnvironmentFingerprint {
     pub os: &'static str,
     pub architecture: &'static str,
-    pub package_version: &'static str,
+    pub build: BuildInfo,
     pub debug_assertions: bool,
     pub displays: Vec<DisplayFingerprint>,
 }
@@ -168,7 +169,7 @@ pub fn run_with_backend(
     let events = recorder.into_events();
     let successes = options.iterations.saturating_sub(failures);
     let report = BenchmarkReport {
-        schema_version: 1,
+        schema_version: 2,
         backend: backend.name(),
         mode: options.mode.name().to_owned(),
         synthetic: backend.name() == "fake",
@@ -192,7 +193,7 @@ pub fn run_with_backend(
         environment: EnvironmentFingerprint {
             os: std::env::consts::OS,
             architecture: std::env::consts::ARCH,
-            package_version: env!("CARGO_PKG_VERSION"),
+            build: BUILD_INFO,
             debug_assertions: cfg!(debug_assertions),
             displays: backend
                 .displays()

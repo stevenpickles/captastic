@@ -2,10 +2,12 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use crate::build_info;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "captastic",
-    version,
+    version = build_info::BUILD_VERSION,
     about = "Fast native screenshot capture for Windows"
 )]
 pub struct Cli {
@@ -42,6 +44,11 @@ pub enum Command {
     },
     Capture(CaptureArgs),
     Benchmark(BenchmarkArgs),
+    /// Report the exact source and build identity.
+    Version {
+        #[arg(long)]
+        json: bool,
+    },
     Doctor {
         #[arg(long)]
         json: bool,
@@ -188,6 +195,13 @@ mod tests {
         let cli =
             Cli::try_parse_from(["captastic", "status", "--json"]).expect("explicit CLI command");
         assert!(matches!(cli.command, Some(Command::Status { json: true })));
+    }
+
+    #[test]
+    fn version_command_supports_structured_output() {
+        let cli = Cli::try_parse_from(["captastic", "version", "--json"])
+            .expect("structured version command");
+        assert!(matches!(cli.command, Some(Command::Version { json: true })));
     }
 
     #[test]

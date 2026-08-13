@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 mod benchmark;
+mod build_info;
 mod cli;
 #[cfg(windows)]
 mod clipboard;
@@ -56,7 +57,8 @@ fn main() {
         Ok(path) => {
             if let Some(path) = path {
                 log::info!(
-                    "Captastic started; persistent log file is {}",
+                    "Captastic {} started; persistent log file is {}",
+                    build_info::BUILD_VERSION,
                     path.display()
                 );
             }
@@ -127,10 +129,15 @@ fn run(cli: Cli) -> Result<(), AppError> {
         }
         Command::Capture(args) => capture(args),
         Command::Benchmark(args) => benchmark(args),
+        Command::Version { json } => version(json),
         Command::Doctor { json } => doctor(json),
         Command::Startup { command } => startup(command),
         Command::Config { command } => config(command),
     }
+}
+
+fn version(json_output: bool) -> Result<(), AppError> {
+    print_value(json_output, &build_info::BUILD_INFO)
 }
 
 #[cfg(windows)]
@@ -695,6 +702,7 @@ fn doctor(json_output: bool) -> Result<(), AppError> {
         json_output,
         &json!({
             "schema_version": 1,
+            "build": build_info::BUILD_INFO,
             "phase": 1,
             "platform": std::env::consts::OS,
             "fake_backend": "available",
