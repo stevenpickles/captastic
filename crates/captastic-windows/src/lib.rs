@@ -37,8 +37,9 @@ pub use hotkey::{HotkeyListener, HotkeySpec};
 pub use overlay::{
     clear_overlay_resource_cache, select_from_frozen_frame,
     select_from_frozen_frame_with_controller, select_from_frozen_frame_with_initial_tool,
-    select_from_frozen_frame_with_initial_tool_and_ui, InitialSelectionTool, NativeWindowHandle,
-    OverlayController, OverlaySelection, OverlayUiUpdate, SelectionKind,
+    select_from_frozen_frame_with_initial_tool_and_ui,
+    select_from_preview_source_with_initial_tool_and_ui, InitialSelectionTool, NativeWindowHandle,
+    OverlayController, OverlaySelection, OverlayUiUpdate, SelectionKind, SelectionPreviewSource,
 };
 #[cfg(windows)]
 pub use startup::{disable_startup, enable_startup, startup_command};

@@ -236,17 +236,69 @@ pub fn select_from_frozen_frame_with_initial_tool_and_ui(
     initial_tool: InitialSelectionTool,
     remembered_ui: Option<captastic_config::DisplayUiState>,
 ) -> Result<Option<OverlaySelection>, CaptureError> {
+    select_from_preview_source_with_initial_tool_and_ui(
+        SelectionPreviewSource::frozen(frame),
+        controller,
+        initial_tool,
+        remembered_ui,
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SelectionPreviewSource<'a> {
+    metadata: &'a FrameMetadata,
+    frozen_frame: Option<&'a CpuFrame>,
+}
+
+impl<'a> SelectionPreviewSource<'a> {
+    pub fn frozen(frame: &'a CpuFrame) -> Self {
+        Self {
+            metadata: &frame.metadata,
+            frozen_frame: Some(frame),
+        }
+    }
+
+    pub fn live(metadata: &'a FrameMetadata) -> Self {
+        Self {
+            metadata,
+            frozen_frame: None,
+        }
+    }
+
+    pub fn metadata(self) -> &'a FrameMetadata {
+        self.metadata
+    }
+
+    pub fn is_live(self) -> bool {
+        self.frozen_frame.is_none()
+    }
+}
+
+pub fn select_from_preview_source_with_initial_tool_and_ui(
+    preview_source: SelectionPreviewSource<'_>,
+    controller: &OverlayController,
+    initial_tool: InitialSelectionTool,
+    remembered_ui: Option<captastic_config::DisplayUiState>,
+) -> Result<Option<OverlaySelection>, CaptureError> {
     let preparation_started = Instant::now();
     if controller.inner.cancelled.load(Ordering::SeqCst) {
         return Ok(None);
     }
     let _dpi_context = ThreadDpiContext::enter_per_monitor_v2()?;
-    validate_frame(frame)?;
-    let source = frame.metadata.source_rect;
+    if let Some(frame) = preview_source.frozen_frame {
+        validate_frame(frame)?;
+    }
+    let metadata = preview_source.metadata;
+    let source = metadata.source_rect;
+    if source.width == 0 || source.height == 0 {
+        return Err(invalid_frame(
+            "selection source dimensions must be non-zero",
+        ));
+    }
     // SAFETY: Reads the current foreground window without retaining or mutating it.
     let previous_foreground = unsafe { GetForegroundWindow() };
-    let pixels = tight_pixels(frame)?;
-    let cached = take_overlay_resource_cache(frame.width, frame.height);
+    let pixels = preview_source.frozen_frame.map(tight_pixels).transpose()?;
+    let cached = take_overlay_resource_cache(source.width, source.height);
     let (
         surface,
         back_buffer,
@@ -256,7 +308,11 @@ pub fn select_from_frozen_frame_with_initial_tool_and_ui(
         region_cursor,
         font_resource,
     ) = if let Some(cached) = cached {
-        cached.surface.write_pixels(&pixels)?;
+        if let Some(pixels) = pixels.as_deref() {
+            cached.surface.write_pixels(pixels)?;
+        } else {
+            cached.surface.clear();
+        }
         (
             cached.surface,
             cached.back_buffer,
@@ -267,9 +323,14 @@ pub fn select_from_frozen_frame_with_initial_tool_and_ui(
             cached.font_resource,
         )
     } else {
+        let surface = if let Some(pixels) = pixels.as_deref() {
+            FrozenSurface::new(source.width, source.height, pixels)?
+        } else {
+            FrozenSurface::empty(source.width, source.height)?
+        };
         (
-            FrozenSurface::new(frame.width, frame.height, &pixels)?,
-            FrozenSurface::empty(frame.width, frame.height)?,
+            surface,
+            FrozenSurface::empty(source.width, source.height)?,
             FrozenSurface::new(1, 1, &[0, 0, 0, 255])?,
             None,
             None,
@@ -291,7 +352,7 @@ pub fn select_from_frozen_frame_with_initial_tool_and_ui(
             remembered_ui.region_source,
             remembered_ui.region_is_display_local,
             source,
-            frame.metadata.rotation_degrees,
+            metadata.rotation_degrees,
         )
         .unwrap_or_else(|| default_region_for_source(source)),
     );
@@ -335,7 +396,7 @@ pub fn select_from_frozen_frame_with_initial_tool_and_ui(
         toolbar_drag: None,
         releasing_pointer_capture: false,
         display_environment,
-        reference_metadata: frame.metadata.clone(),
+        reference_metadata: metadata.clone(),
         window_preview: None,
         window_thumbnails: Vec::new(),
         window_overview_cache: cached_overview_surface.map(|surface| WindowOverviewCache {
@@ -809,6 +870,11 @@ impl FrozenSurface {
         // SAFETY: bits addresses byte_length writable bytes owned by this surface's live DIB.
         unsafe { std::ptr::copy_nonoverlapping(pixels.as_ptr(), self.bits, self.byte_length) };
         Ok(())
+    }
+
+    fn clear(&self) {
+        // SAFETY: bits addresses byte_length writable bytes owned by this surface's live DIB.
+        unsafe { std::ptr::write_bytes(self.bits, 0, self.byte_length) };
     }
 
     fn allocate(width: u32, height: u32, pixels: Option<&[u8]>) -> Result<Self, CaptureError> {
