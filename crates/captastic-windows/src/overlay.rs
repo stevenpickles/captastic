@@ -50,14 +50,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow,
     GetLastActivePopup, GetMessageW, GetShellWindow, GetWindowLongPtrW, GetWindowRect,
     GetWindowTextLengthW, IsIconic, IsWindow, IsWindowVisible, LoadCursorW, PostMessageW,
-    PostQuitMessage, RegisterClassW, SetCursor, SetForegroundWindow, SetWindowLongPtrW, ShowWindow,
-    TranslateMessage, UnregisterClassW, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
-    GA_ROOTOWNER, GWLP_USERDATA, GWL_EXSTYLE, HCURSOR, ICONINFO, IDC_ARROW, IDC_CROSS, IDC_SIZEALL,
-    IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, MSG, SPI_SETLOGICALDPIOVERRIDE,
-    SPI_SETWORKAREA, SW_SHOW, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE,
+    PostQuitMessage, RegisterClassW, SetCursor, SetForegroundWindow, SetLayeredWindowAttributes,
+    SetWindowDisplayAffinity, SetWindowLongPtrW, ShowWindow, TranslateMessage, UnregisterClassW,
+    CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, GA_ROOTOWNER, GWLP_USERDATA, GWL_EXSTYLE,
+    HCURSOR, ICONINFO, IDC_ARROW, IDC_CROSS, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE,
+    IDC_SIZEWE, LWA_ALPHA, LWA_COLORKEY, MSG, SPI_SETLOGICALDPIOVERRIDE, SPI_SETWORKAREA, SW_SHOW,
+    WDA_EXCLUDEFROMCAPTURE, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE,
     WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WM_SETTINGCHANGE, WNDCLASSW,
-    WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 #[cfg(test)]
@@ -69,6 +70,8 @@ use crate::window_capture::{
 const CLASS_NAME: PCWSTR = w!("CaptasticFrozenSelectionOverlay");
 const DRAG_THRESHOLD: i32 = 4;
 const DIM_ALPHA: u8 = 128;
+const LIVE_OVERLAY_ALPHA: u8 = 224;
+const LIVE_TRANSPARENT_COLOR: COLORREF = COLORREF(0x00ff_00ff);
 const MIN_REGION_SIZE: i64 = 8;
 const REGION_CURSOR_SIZE: u32 = 64;
 const REGION_CURSOR_CENTER: i32 = REGION_CURSOR_SIZE as i32 / 2;
@@ -368,6 +371,7 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
     let (selection, selection_kind) = initial_selection(tool, last_region, source);
     let mut state = Box::new(OverlayState {
         source,
+        live_preview: preview_source.is_live(),
         surface,
         back_buffer,
         dimmer,
@@ -518,6 +522,7 @@ fn query_display_environment(source: Rect) -> DisplayEnvironment {
 
 struct OverlayState {
     source: Rect,
+    live_preview: bool,
     surface: FrozenSurface,
     back_buffer: FrozenSurface,
     dimmer: FrozenSurface,
@@ -1293,6 +1298,7 @@ fn run_overlay(
     }
     let class_guard = ClassRegistration { instance };
     let source = state.source;
+    let live_preview = state.live_preview;
     let width = i32::try_from(source.width)
         .map_err(|_| invalid_frame("overlay width exceeds Win32 limits"))?;
     let height = i32::try_from(source.height)
@@ -1302,7 +1308,13 @@ fn run_overlay(
     // the message loop exits; WM_NCCREATE stores it as window user data.
     let hwnd = unsafe {
         CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            WS_EX_TOPMOST
+                | WS_EX_TOOLWINDOW
+                | if live_preview {
+                    WS_EX_LAYERED
+                } else {
+                    Default::default()
+                },
             CLASS_NAME,
             w!("Captastic Selection"),
             WS_POPUP,
@@ -1321,6 +1333,32 @@ fn run_overlay(
         let state = unsafe { Box::from_raw(state_pointer) };
         let _ = cache_overlay_state(state);
         return Err(last_error("create_overlay_window"));
+    }
+    if live_preview {
+        // SAFETY: hwnd is a live top-level layered window owned by this process. The color key
+        // exposes the real desktop inside the active selection while the global alpha dims it.
+        let alpha_result = unsafe {
+            SetLayeredWindowAttributes(
+                hwnd,
+                LIVE_TRANSPARENT_COLOR,
+                LIVE_OVERLAY_ALPHA,
+                LWA_COLORKEY | LWA_ALPHA,
+            )
+        };
+        if let Err(error) = alpha_result {
+            // SAFETY: hwnd and state_pointer were created on this thread and are not published.
+            let _ = unsafe { DestroyWindow(hwnd) };
+            // SAFETY: no callback can access the state after DestroyWindow returns.
+            let state = unsafe { Box::from_raw(state_pointer) };
+            let _ = cache_overlay_state(state);
+            return Err(overlay_error("configure_live_overlay_alpha", error));
+        }
+        // Capture exclusion is defense in depth. Confirmation still destroys this window before
+        // asking the capture owner for pixels.
+        // SAFETY: hwnd is a live top-level window owned by this process.
+        if let Err(error) = unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) } {
+            log::warn!("live selection overlay could not be excluded from capture: {error}");
+        }
     }
     controller.inner.hwnd.store(hwnd.0, Ordering::SeqCst);
     if controller.inner.cancelled.load(Ordering::SeqCst) {
@@ -1941,6 +1979,8 @@ fn paint_state(device: HDC, state: &mut OverlayState) {
             draw_window_overview_static(&state.back_buffer, state);
         }
         draw_window_overview_interactive(state);
+    } else if state.live_preview {
+        paint_live_selection_background(state);
     } else {
         // SAFETY: Both memory contexts are live, compatible GDI DCs with selected DIBs. Compose
         // the entire visual off-screen so the visible overlay never sees a partial update.
@@ -1960,7 +2000,7 @@ fn paint_state(device: HDC, state: &mut OverlayState) {
     }
     // Window mode's dim wash is already part of its static overview cache. Other tools compose it
     // here so the selected region can subsequently restore its original frozen pixels.
-    if state.tool != CaptureTool::Window && state.dim_background {
+    if state.tool != CaptureTool::Window && state.dim_background && !state.live_preview {
         let _ = apply_dim_wash(
             state.back_buffer.device,
             state.dimmer.device,
@@ -1971,7 +2011,9 @@ fn paint_state(device: HDC, state: &mut OverlayState) {
     }
     if state.tool != CaptureTool::Window {
         if let Some(rect) = state.selection {
-            restore_highlight(state, rect);
+            if !state.live_preview {
+                restore_highlight(state, rect);
+            }
             draw_outline(state.back_buffer.device, state.source, rect);
             if state.selection_kind == Some(SelectionKind::Region) {
                 draw_resize_handles(
@@ -1999,6 +2041,48 @@ fn paint_state(device: HDC, state: &mut OverlayState) {
             SRCCOPY,
         )
     };
+}
+
+fn paint_live_selection_background(state: &OverlayState) {
+    let bounds = RECT {
+        left: 0,
+        top: 0,
+        right: state.back_buffer.width,
+        bottom: state.back_buffer.height,
+    };
+    let background = if state.dim_background {
+        COLORREF(0)
+    } else {
+        LIVE_TRANSPARENT_COLOR
+    };
+    fill_device_rect(state.back_buffer.device, bounds, background);
+
+    if let Some(selection) = state
+        .selection
+        .and_then(|rect| rect.intersection(state.source))
+    {
+        let local = RECT {
+            left: selection.x.saturating_sub(state.source.x),
+            top: selection.y.saturating_sub(state.source.y),
+            right: i32::try_from(selection.right().saturating_sub(i64::from(state.source.x)))
+                .unwrap_or(state.back_buffer.width),
+            bottom: i32::try_from(selection.bottom().saturating_sub(i64::from(state.source.y)))
+                .unwrap_or(state.back_buffer.height),
+        };
+        fill_device_rect(state.back_buffer.device, local, LIVE_TRANSPARENT_COLOR);
+    }
+}
+
+fn fill_device_rect(device: HDC, rect: RECT, color: COLORREF) {
+    // SAFETY: The brush is selected only by FillRect for this call and is deleted exactly once.
+    let brush = unsafe { CreateSolidBrush(color) };
+    if brush.0 == 0 {
+        return;
+    }
+    // SAFETY: device is a live memory DC and rect is bounded by the caller's paint surface.
+    let _ = unsafe { FillRect(device, &rect, brush) };
+    // SAFETY: brush is process-owned and no longer selected after FillRect returns.
+    unsafe { DeleteObject(brush) };
 }
 
 fn apply_dim_wash(destination: HDC, dimmer: HDC, width: i32, height: i32, alpha: u8) -> bool {
