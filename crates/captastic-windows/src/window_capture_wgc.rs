@@ -2,13 +2,15 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use captastic_core::{CaptureError, CaptureErrorKind};
-use windows::core::{factory, ComInterface, Error as WindowsError, IInspectable};
+use windows::core::{factory, ComInterface, Error as WindowsError, IInspectable, Interface};
 use windows::Foundation::TypedEventHandler;
 use windows::Graphics::Capture::{
     Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
+    IDirect3D11CaptureFramePoolStatics2, IGraphicsCaptureSessionStatics,
 };
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
+use windows::Graphics::SizeInt32;
 use windows::Win32::Foundation::{HMODULE, HWND};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
@@ -36,9 +38,7 @@ pub(crate) struct WgcWindowFrame {
 
 pub(crate) fn capture_window(hwnd: HWND) -> Result<WgcWindowFrame, CaptureError> {
     let _apartment = WinRtApartment::initialize()?;
-    if !GraphicsCaptureSession::IsSupported()
-        .map_err(|error| windows_error("check_support", error, false))?
-    {
+    if !wgc_session_is_supported().map_err(|error| windows_error("check_support", error, false))? {
         return Err(capture_error(
             CaptureErrorKind::Unsupported,
             "check_support",
@@ -67,7 +67,7 @@ pub(crate) fn capture_window(hwnd: HWND) -> Result<WgcWindowFrame, CaptureError>
         ));
     }
 
-    let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
+    let pool = wgc_create_free_threaded_frame_pool(
         &winrt_device,
         DirectXPixelFormat::B8G8R8A8UIntNormalized,
         2,
@@ -129,6 +129,51 @@ pub(crate) fn capture_window(hwnd: HWND) -> Result<WgcWindowFrame, CaptureError>
 
     let _ = resources.pool.RemoveFrameArrived(token);
     result
+}
+
+// The generated class-static convenience methods (GraphicsCaptureSession::IsSupported,
+// Direct3D11CaptureFramePool::CreateFreeThreaded) resolve their activation factory through
+// windows_core::imp::FactoryCache, which stores agile factories in process-wide statics and
+// never revalidates them. Captastic runs WGC on short-lived worker threads whose WinRtApartment
+// guard calls RoUninitialize on exit, which may unload the WinRT DLL that backs those cached
+// factories; a later worker then calls through a vtable pointing into unloaded code. The helpers
+// below therefore acquire an owned, uncached factory via windows::core::factory() for every call
+// and drop it before the apartment guard runs, so no factory outlives the apartment that
+// activated it. Do not replace these with the generated statics and do not cache the factories.
+
+fn wgc_session_is_supported() -> windows::core::Result<bool> {
+    let statics = factory::<GraphicsCaptureSession, IGraphicsCaptureSessionStatics>()?;
+    // SAFETY: Mirrors the generated binding: statics is a live IGraphicsCaptureSessionStatics
+    // whose IsSupported slot writes a bool into the initialized result__ storage.
+    unsafe {
+        let mut result__ = std::mem::zeroed();
+        (Interface::vtable(&statics).IsSupported)(Interface::as_raw(&statics), &mut result__)
+            .from_abi(result__)
+    }
+}
+
+fn wgc_create_free_threaded_frame_pool(
+    device: &IDirect3DDevice,
+    pixel_format: DirectXPixelFormat,
+    number_of_buffers: i32,
+    size: SizeInt32,
+) -> windows::core::Result<Direct3D11CaptureFramePool> {
+    let statics = factory::<Direct3D11CaptureFramePool, IDirect3D11CaptureFramePoolStatics2>()?;
+    // SAFETY: Mirrors the generated binding: statics is a live IDirect3D11CaptureFramePoolStatics2,
+    // device is a borrowed live IDirect3DDevice passed as its raw ABI pointer, and result__ is
+    // initialized storage that receives the new frame pool's owned reference.
+    unsafe {
+        let mut result__ = std::mem::zeroed();
+        (Interface::vtable(&statics).CreateFreeThreaded)(
+            Interface::as_raw(&statics),
+            Interface::as_raw(device),
+            pixel_format,
+            number_of_buffers,
+            size,
+            &mut result__,
+        )
+        .from_abi(result__)
+    }
 }
 
 struct WgcCaptureResources {
@@ -468,6 +513,64 @@ fn capture_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression test for the access violation caused by cached WinRT activation factories
+    /// outliving RoUninitialize. Each cycle mimics one window-render worker: a fresh thread
+    /// initializes an MTA, exercises both uncached statics helpers (session IsSupported and
+    /// free-threaded frame-pool creation over a real D3D/WinRT device), drops every factory
+    /// and WGC resource, and tears the apartment down before the next cycle begins. With the
+    /// process-wide FactoryCache this pattern could dereference a vtable in an unloaded
+    /// module; with owned factories every cycle must reactivate and succeed.
+    ///
+    /// Activating the Windows.Graphics.Capture factories is native and environment-dependent:
+    /// hosts without a compatible graphical session or the Windows Graphics Capture service
+    /// fail activation with 0x80070424 even though nothing on screen is ever read. Activation
+    /// failure is a test failure, never a silent pass, so the test is ignored by default.
+    /// Run it manually on a compatible interactive Windows machine with:
+    ///
+    /// cargo test --locked -p captastic-windows -- --ignored reacquires_wgc_statics_across_apartment_teardown
+    #[test]
+    #[ignore = "requires a compatible Windows graphical session and Windows Graphics Capture service"]
+    fn reacquires_wgc_statics_across_apartment_teardown() {
+        for cycle in 0..8 {
+            let worker = std::thread::Builder::new()
+                .name(format!("wgc-factory-stress-{cycle}"))
+                .spawn(|| -> Result<(), String> {
+                    let _apartment = WinRtApartment::initialize()
+                        .map_err(|error| format!("initialize WinRT apartment: {error}"))?;
+                    let supported = wgc_session_is_supported()
+                        .map_err(|error| format!("acquire/call session statics: {error}"))?;
+                    if !supported {
+                        return Err(
+                            "Windows Graphics Capture reports unsupported on this host".to_owned()
+                        );
+                    }
+                    let (_device, _context, winrt_device) = create_device()
+                        .map_err(|error| format!("create D3D/WinRT device: {error}"))?;
+                    let pool = wgc_create_free_threaded_frame_pool(
+                        &winrt_device,
+                        DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                        2,
+                        SizeInt32 {
+                            Width: 16,
+                            Height: 16,
+                        },
+                    )
+                    .map_err(|error| format!("acquire/call frame-pool statics: {error}"))?;
+                    let _ = pool.Close();
+                    // The pool, devices, and owned factories all drop here, before the
+                    // apartment guard calls RoUninitialize.
+                    Ok(())
+                })
+                .expect("spawn factory stress worker");
+            worker
+                .join()
+                .expect("factory stress worker must exit without crashing")
+                .unwrap_or_else(|error| {
+                    panic!("WGC factory lifecycle failed on cycle {cycle}: {error}")
+                });
+        }
+    }
 
     #[test]
     #[ignore = "requires CAPTASTIC_TEST_WGC_WINDOW_HANDLE naming a live interactive window"]
