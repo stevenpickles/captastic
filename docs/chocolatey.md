@@ -31,18 +31,29 @@ Run the canonical packaging command from an elevated PowerShell 7 (`pwsh`) promp
 ./scripts/build-packages.ps1
 ```
 
-The command resolves the package containing the `captastic` Cargo binary, uses its version, builds
-the `dist` Cargo profile, and creates the portable ZIP, its SHA-256 file, the Chocolatey package,
-and `artifacts.json` beneath `dist/`. The manifest records the version, Rust target, architecture,
-Chocolatey CLI version, source archive URL, filenames, and artifact hashes. Local, CI, and release
-packaging use this same command.
+The command resolves the package containing the `captastic` Cargo binary, uses its release version,
+builds the `dist` Cargo profile, and creates the portable ZIP, its SHA-256 file, the Chocolatey
+package, and `artifacts.json` beneath `dist/`. Schema 2 of the manifest distinguishes the package
+version from the version embedded in the executables and records the release core, build channel,
+full Git commit, revision count, source tag, dirty state, CI run provenance, Rust target,
+architecture, Chocolatey CLI version, source archive URL, filenames, and artifact hashes. Local,
+CI, and release packaging use this same command.
 
-Use `-PrereleaseLabel ci.123` for a CI package whose release core must still match the Cargo
-version. `-ReleaseTag v0.1.0` additionally proves that a release tag and Cargo version match and
-marks the manifest as publishable. `-BinariesDirectory` with `-SkipBuild` consumes binaries that
-were already built by CI. Portable ARM64 archives can be built with `-Architecture arm64`, but the
-Chocolatey package is intentionally restricted to x86_64 until its multi-architecture contract is
-defined.
+Use a label such as `-PrereleaseLabel ci.123.1.gabcdef123` for an incremental package whose release
+core must still match the Cargo version. GitHub Actions creates this label from the workflow run,
+attempt, and commit. `-ReleaseTag v0.1.0` additionally proves that the matching tag points at `HEAD`,
+the source is clean, the Cargo version matches, and both executables embed the exact formal version;
+only then is the manifest marked publishable. `-BinariesDirectory` with `-SkipBuild` consumes
+binaries already built by CI, but rejects them when their embedded commit differs from the source
+being packaged. Portable ARM64 archives can be built with `-Architecture arm64`, but the Chocolatey
+package is intentionally restricted to x86_64 until its multi-architecture contract is defined.
+
+The workspace version represents the next formal release. Advance it immediately after publishing
+a tag—for example, move from `0.1.0` to the intended `0.2.0` or `1.0.0` line—so subsequent `dev` and
+`ci` identifiers are prereleases of the correct future version. `captastic --version`, `captastic
+version --json`, and the Windows executable properties report the identity actually embedded in a
+package; `artifacts.json` records that as `buildVersion` even when a lifecycle test deliberately
+assigns two package versions to the same binaries.
 
 Run the isolated packaging suite before inspecting the artifacts:
 
@@ -82,7 +93,8 @@ preserved settings fixture, but it has no interactive desktop for the capture wo
 
 ## Release and publish
 
-The release workflow invokes `build-packages.ps1`, builds the portable ZIP first, then embeds that
+The release workflow checks out complete tag history, reports the embedded build identity, invokes
+`build-packages.ps1`, builds the portable ZIP first, then embeds that
 exact archive's contents in `captastic.<version>.nupkg`. The ZIP, checksum, Chocolatey package, and
 `artifacts.json` are uploaded explicitly; tagged builds also attach them to the GitHub release.
 `VERIFICATION.txt` records the direct tagged GitHub release archive URL and SHA-256 hashes for the
