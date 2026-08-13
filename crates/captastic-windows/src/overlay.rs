@@ -29,14 +29,14 @@ use windows::Win32::Graphics::Gdi::GetTextFaceW;
 use windows::Win32::Graphics::Gdi::{
     AddFontMemResourceEx, AlphaBlend, BeginPaint, BitBlt, CreateBitmap, CreateCompatibleDC,
     CreateDIBSection, CreateFontW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW,
-    Ellipse, EndPaint, FillRect, GdiFlush, GetMonitorInfoW, GetStockObject, GetTextExtentPoint32W,
-    InvalidateRect, LineTo, MonitorFromRect, MonitorFromWindow, MoveToEx, Rectangle,
-    RemoveFontMemResourceEx, RoundRect, SelectObject, SetBkMode, SetStretchBltMode, SetTextColor,
-    StretchBlt, UpdateWindow, AC_SRC_ALPHA, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
-    CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CENTER, DT_LEFT,
-    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_MEDIUM, HALFTONE, HBITMAP, HDC, HFONT, HGDIOBJ,
-    MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL, NULL_BRUSH, PAINTSTRUCT,
-    PS_SOLID, RGBQUAD, SRCCOPY, TRANSPARENT,
+    Ellipse, EndPaint, FillRect, GdiFlush, GetDC, GetMonitorInfoW, GetStockObject,
+    GetTextExtentPoint32W, InvalidateRect, LineTo, MonitorFromRect, MonitorFromWindow, MoveToEx,
+    Rectangle, ReleaseDC, RemoveFontMemResourceEx, RoundRect, SelectObject, SetBkMode,
+    SetStretchBltMode, SetTextColor, StretchBlt, UpdateWindow, AC_SRC_ALPHA, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_PITCH,
+    DIB_RGB_COLORS, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_MEDIUM,
+    HALFTONE, HBITMAP, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    MONITOR_DEFAULTTONULL, NULL_BRUSH, PAINTSTRUCT, PS_SOLID, RGBQUAD, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
@@ -51,11 +51,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow,
     GetLastActivePopup, GetMessageW, GetShellWindow, GetWindowLongPtrW, GetWindowRect,
     GetWindowTextLengthW, IsIconic, IsWindow, IsWindowVisible, LoadCursorW, PostMessageW,
-    PostQuitMessage, RegisterClassW, SetCursor, SetForegroundWindow, SetLayeredWindowAttributes,
-    SetWindowDisplayAffinity, SetWindowLongPtrW, ShowWindow, TranslateMessage, UnregisterClassW,
+    PostQuitMessage, RegisterClassW, SetCursor, SetForegroundWindow, SetWindowDisplayAffinity,
+    SetWindowLongPtrW, ShowWindow, TranslateMessage, UnregisterClassW, UpdateLayeredWindow,
     CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, GA_ROOTOWNER, GWLP_USERDATA, GWL_EXSTYLE,
     HCURSOR, ICONINFO, IDC_ARROW, IDC_CROSS, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE,
-    IDC_SIZEWE, LWA_ALPHA, LWA_COLORKEY, MSG, SPI_SETLOGICALDPIOVERRIDE, SPI_SETWORKAREA, SW_SHOW,
+    IDC_SIZEWE, MSG, SPI_SETLOGICALDPIOVERRIDE, SPI_SETWORKAREA, SW_SHOW, ULW_ALPHA,
     WDA_EXCLUDEFROMCAPTURE, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE,
     WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WM_SETTINGCHANGE, WNDCLASSW,
@@ -71,8 +71,8 @@ use crate::window_capture::{
 const CLASS_NAME: PCWSTR = w!("CaptasticFrozenSelectionOverlay");
 const DRAG_THRESHOLD: i32 = 4;
 const DIM_ALPHA: u8 = 128;
-const LIVE_OVERLAY_ALPHA: u8 = 224;
-const LIVE_TRANSPARENT_COLOR: COLORREF = COLORREF(0x00ff_00ff);
+const LIVE_HIT_TEST_ALPHA: u8 = 1;
+const _: () = assert!(LIVE_HIT_TEST_ALPHA > 0);
 const MIN_REGION_SIZE: i64 = 8;
 const REGION_CURSOR_SIZE: u32 = 64;
 const REGION_CURSOR_CENTER: i32 = REGION_CURSOR_SIZE as i32 / 2;
@@ -1361,23 +1361,18 @@ fn run_overlay(
         }
     }
     if live_preview {
-        // SAFETY: hwnd is a live top-level layered window owned by this process. The color key
-        // exposes the real desktop inside the active selection while the global alpha dims it.
-        let alpha_result = unsafe {
-            SetLayeredWindowAttributes(
-                hwnd,
-                LIVE_TRANSPARENT_COLOR,
-                LIVE_OVERLAY_ALPHA,
-                LWA_COLORKEY | LWA_ALPHA,
-            )
-        };
-        if let Err(error) = alpha_result {
+        // Build the first per-pixel layer before showing the window. This both establishes the
+        // layered presenter and validates it early enough for automatic frozen-mode fallback.
+        // SAFETY: state_pointer remains exclusively owned by this overlay thread.
+        let state = unsafe { &mut *state_pointer };
+        compose_overlay_state(state);
+        if let Err(error) = present_live_layer(hwnd, state) {
             // SAFETY: hwnd and state_pointer were created on this thread and are not published.
             let _ = unsafe { DestroyWindow(hwnd) };
             // SAFETY: no callback can access the state after DestroyWindow returns.
             let state = unsafe { Box::from_raw(state_pointer) };
             let _ = cache_overlay_state(state);
-            return Err(overlay_error("configure_live_overlay_alpha", error));
+            return Err(error);
         }
         // Capture exclusion is defense in depth. Confirmation still destroys this window before
         // asking the capture owner for pixels.
@@ -1967,7 +1962,14 @@ fn paint(hwnd: HWND, state_pointer: *mut OverlayState) {
         // SAFETY: The Box remains alive for the message loop. BeginPaint has completed before this
         // borrow is created, and the borrow ends before EndPaint can synchronously send messages.
         let state = unsafe { &mut *state_pointer };
-        paint_state(device, state);
+        compose_overlay_state(state);
+        if state.live_preview {
+            if let Err(error) = present_live_layer(hwnd, state) {
+                log::error!("live overlay presentation failed: {error}");
+            }
+        } else {
+            copy_overlay_to_paint_device(device, state);
+        }
     }
     // SAFETY: Balances BeginPaint for this exact hwnd/paint structure after releasing state.
     unsafe { EndPaint(hwnd, &paint) };
@@ -1987,7 +1989,7 @@ fn consume_self_initiated_capture_change(releasing_pointer_capture: &mut bool) -
     std::mem::take(releasing_pointer_capture)
 }
 
-fn paint_state(device: HDC, state: &mut OverlayState) {
+fn compose_overlay_state(state: &mut OverlayState) {
     let width = state.surface.width;
     if state.tool == CaptureTool::Window {
         let cache_matches = state
@@ -2065,13 +2067,16 @@ fn paint_state(device: HDC, state: &mut OverlayState) {
         }
     }
     draw_toolbar(state);
+}
+
+fn copy_overlay_to_paint_device(device: HDC, state: &OverlayState) {
     // SAFETY: The fully composed back buffer is copied to the live paint DC in one operation.
     let _ = unsafe {
         BitBlt(
             device,
             0,
             0,
-            width,
+            state.surface.width,
             state.surface.height,
             state.back_buffer.device,
             0,
@@ -2088,12 +2093,7 @@ fn paint_live_selection_background(state: &OverlayState) {
         right: state.back_buffer.width,
         bottom: state.back_buffer.height,
     };
-    let background = if state.dim_background {
-        COLORREF(0)
-    } else {
-        LIVE_TRANSPARENT_COLOR
-    };
-    fill_device_rect(state.back_buffer.device, bounds, background);
+    fill_device_rect(state.back_buffer.device, bounds, COLORREF(0));
 
     if let Some(selection) = state
         .selection
@@ -2107,7 +2107,100 @@ fn paint_live_selection_background(state: &OverlayState) {
             bottom: i32::try_from(selection.bottom().saturating_sub(i64::from(state.source.y)))
                 .unwrap_or(state.back_buffer.height),
         };
-        fill_device_rect(state.back_buffer.device, local, LIVE_TRANSPARENT_COLOR);
+        fill_device_rect(state.back_buffer.device, local, COLORREF(0));
+    }
+}
+
+fn present_live_layer(hwnd: HWND, state: &OverlayState) -> Result<(), CaptureError> {
+    prepare_live_layer_pixels(state);
+    let destination = POINT {
+        x: state.source.x,
+        y: state.source.y,
+    };
+    let source = POINT { x: 0, y: 0 };
+    let size = SIZE {
+        cx: state.back_buffer.width,
+        cy: state.back_buffer.height,
+    };
+    let blend = BLENDFUNCTION {
+        BlendOp: 0,
+        BlendFlags: 0,
+        SourceConstantAlpha: u8::MAX,
+        AlphaFormat: AC_SRC_ALPHA as u8,
+    };
+    // SAFETY: A null HWND obtains the desktop DC used only for palette matching during this call.
+    let screen = unsafe { GetDC(None) };
+    if screen.0 == 0 {
+        return Err(last_error("get_live_overlay_screen_dc"));
+    }
+    // SAFETY: hwnd is this process's live layered top-level window. The destination, size, source,
+    // blend, and selected back-buffer DIB remain valid for the duration of the call.
+    let result = unsafe {
+        UpdateLayeredWindow(
+            hwnd,
+            screen,
+            Some(&destination),
+            Some(&size),
+            state.back_buffer.device,
+            Some(&source),
+            COLORREF(0),
+            Some(&blend),
+            ULW_ALPHA,
+        )
+    };
+    // SAFETY: Balances the successful GetDC(None) above on this thread.
+    unsafe { ReleaseDC(None, screen) };
+    result.map_err(|error| overlay_error("present_live_overlay", error))
+}
+
+fn prepare_live_layer_pixels(state: &OverlayState) {
+    // SAFETY: Flushes this thread's queued GDI drawing before the CPU updates the DIB alpha bytes.
+    let _ = unsafe { GdiFlush() };
+    let width = state.back_buffer.width.max(0) as usize;
+    let height = state.back_buffer.height.max(0) as usize;
+    let selection = state
+        .selection
+        .and_then(|rect| rect.intersection(state.source))
+        .map(|rect| RECT {
+            left: rect.x.saturating_sub(state.source.x),
+            top: rect.y.saturating_sub(state.source.y),
+            right: i32::try_from(rect.right().saturating_sub(i64::from(state.source.x)))
+                .unwrap_or(state.back_buffer.width),
+            bottom: i32::try_from(rect.bottom().saturating_sub(i64::from(state.source.y)))
+                .unwrap_or(state.back_buffer.height),
+        });
+    // SAFETY: The back buffer uniquely owns this writable DIB on the overlay thread.
+    let pixels = unsafe {
+        std::slice::from_raw_parts_mut(state.back_buffer.bits, state.back_buffer.byte_length)
+    };
+    for y in 0..height {
+        for x in 0..width {
+            let offset = (y * width + x) * 4;
+            let colored = pixels[offset] != 0 || pixels[offset + 1] != 0 || pixels[offset + 2] != 0;
+            let in_selection = selection.is_some_and(|rect| {
+                x >= rect.left.max(0) as usize
+                    && x < rect.right.max(0) as usize
+                    && y >= rect.top.max(0) as usize
+                    && y < rect.bottom.max(0) as usize
+            });
+            pixels[offset + 3] =
+                live_pixel_alpha(state.tool, state.dim_background, in_selection, colored);
+        }
+    }
+}
+
+const fn live_pixel_alpha(
+    tool: CaptureTool,
+    dim_background: bool,
+    in_selection: bool,
+    colored: bool,
+) -> u8 {
+    if matches!(tool, CaptureTool::Window) || colored {
+        u8::MAX
+    } else if in_selection || !dim_background {
+        LIVE_HIT_TEST_ALPHA
+    } else {
+        DIM_ALPHA
     }
 }
 
@@ -4835,6 +4928,34 @@ mod tests {
                 width: 200,
                 height: 120,
             }
+        );
+    }
+
+    #[test]
+    fn live_selection_pixels_remain_hit_testable() {
+        assert_eq!(
+            live_pixel_alpha(CaptureTool::Region, true, true, false),
+            LIVE_HIT_TEST_ALPHA
+        );
+        assert_eq!(
+            live_pixel_alpha(CaptureTool::Region, true, false, false),
+            DIM_ALPHA
+        );
+        assert_eq!(
+            live_pixel_alpha(CaptureTool::Region, false, false, false),
+            LIVE_HIT_TEST_ALPHA
+        );
+    }
+
+    #[test]
+    fn live_window_chooser_and_drawn_controls_are_opaque() {
+        assert_eq!(
+            live_pixel_alpha(CaptureTool::Window, true, false, false),
+            u8::MAX
+        );
+        assert_eq!(
+            live_pixel_alpha(CaptureTool::Region, true, true, true),
+            u8::MAX
         );
     }
 
