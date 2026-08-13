@@ -22,7 +22,7 @@ use windows::core::{w, Error as WindowsError, PCWSTR};
 use windows::Win32::Foundation::{
     BOOL, COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
-use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use windows::Win32::Graphics::Dwm::{DwmFlush, DwmGetWindowAttribute, DWMWA_CLOAKED};
 #[cfg(test)]
 use windows::Win32::Graphics::Gdi::GetTextFaceW;
 use windows::Win32::Graphics::Gdi::{
@@ -587,6 +587,11 @@ pub fn clear_overlay_resource_cache() {
     OVERLAY_RESOURCE_CACHE.with(|cache| {
         cache.borrow_mut().take();
     });
+}
+
+pub fn flush_desktop_composition() -> Result<(), CaptureError> {
+    // SAFETY: DwmFlush has no pointer arguments and synchronizes this process's queued changes.
+    unsafe { DwmFlush() }.map_err(|error| overlay_error("flush_overlay_composition", error))
 }
 
 fn cache_overlay_state(state: Box<OverlayState>) -> Option<OverlaySelection> {

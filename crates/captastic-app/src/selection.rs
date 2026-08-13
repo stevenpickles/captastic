@@ -203,6 +203,12 @@ impl SelectionWorker {
                                 selection.selection_ns,
                             );
                             job.selection_offset_ns = Some(selection_offset_ns);
+                            if let Err(error) = captastic_windows::flush_desktop_composition() {
+                                log::warn!(
+                                    "selection {} could not synchronize overlay removal before capture: {error}",
+                                    job.capture_id.0
+                                );
+                            }
                             let request = LiveSelectionRequest {
                                 job,
                                 selection,
