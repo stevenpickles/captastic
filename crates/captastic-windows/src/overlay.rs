@@ -33,9 +33,9 @@ use windows::Win32::Graphics::Gdi::{
     GetTextExtentPoint32W, InvalidateRect, LineTo, MonitorFromRect, MonitorFromWindow, MoveToEx,
     Rectangle, ReleaseDC, RemoveFontMemResourceEx, RoundRect, SelectObject, SetBkMode,
     SetStretchBltMode, SetTextColor, StretchBlt, UpdateWindow, AC_SRC_ALPHA, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_PITCH,
-    DIB_RGB_COLORS, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_MEDIUM,
-    HALFTONE, HBITMAP, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, CAPTUREBLT, CLEARTYPE_QUALITY, DEFAULT_CHARSET,
+    DEFAULT_PITCH, DIB_RGB_COLORS, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+    FW_MEDIUM, HALFTONE, HBITMAP, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     MONITOR_DEFAULTTONULL, NULL_BRUSH, PAINTSTRUCT, PS_SOLID, RGBQUAD, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -344,6 +344,24 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
             PrivateFontResource::register()?,
         )
     };
+    if preview_source.is_live() {
+        // Live region selection exposes the desktop through the layered window and does not use
+        // this surface. Retain one pre-overlay desktop image, though, so switching to the opaque
+        // window chooser has real pixels from which to build its blurred backdrop.
+        if let Err(error) = capture_live_window_backdrop(&surface, source) {
+            log::warn!("live window backdrop capture failed: {error}; using a neutral background");
+            fill_device_rect(
+                surface.device,
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: surface.width,
+                    bottom: surface.height,
+                },
+                rgb(28, 28, 31),
+            );
+        }
+    }
     let display_environment = query_display_environment(source);
     let remembered_ui = remembered_ui.unwrap_or_default();
     let toolbar_position = remembered_toolbar_position(
@@ -2295,6 +2313,37 @@ fn update_window_preview(state: &mut OverlayState, target: Option<NativeWindowHa
         },
         Err(_) => Some(WindowPreviewState::Unavailable(handle)),
     };
+}
+
+fn capture_live_window_backdrop(
+    destination: &FrozenSurface,
+    source: Rect,
+) -> Result<(), CaptureError> {
+    // Capture before the overlay HWND is created, ensuring the visual-only backdrop cannot contain
+    // Captastic itself. CAPTUREBLT includes layered application windows in the desktop snapshot.
+    // SAFETY: A null HWND obtains the desktop DC, which remains live until the matching ReleaseDC.
+    let screen = unsafe { GetDC(None) };
+    if screen.0 == 0 {
+        return Err(last_error("get_live_window_backdrop_dc"));
+    }
+    // SAFETY: The destination DIB is at least source.width by source.height and both DCs remain
+    // valid for this synchronous copy. Physical desktop coordinates may legitimately be negative.
+    let copied = unsafe {
+        BitBlt(
+            destination.device,
+            0,
+            0,
+            destination.width,
+            destination.height,
+            screen,
+            source.x,
+            source.y,
+            SRCCOPY | CAPTUREBLT,
+        )
+    };
+    // SAFETY: Balances the successful GetDC(None) above on this thread.
+    unsafe { ReleaseDC(None, screen) };
+    copied.map_err(|error| overlay_error("capture_live_window_backdrop", error))
 }
 
 fn build_blurred_background(
