@@ -42,6 +42,7 @@ public static class CaptasticHookTestCli
         }
         if (args[0] == "status")
         {
+            Console.Error.WriteLine("fixture status completed");
             if (mode == "status-failure")
             {
                 return 7;
@@ -66,6 +67,7 @@ public static class CaptasticHookTestCli
         }
         if (args[0] == "stop")
         {
+            Console.Error.WriteLine("fixture stop completed");
             if (mode == "stop-failure")
             {
                 return 9;
