@@ -121,6 +121,8 @@ pub struct OverlaySelection {
     pub preparation_ns: u64,
     pub window_overview_ns: Option<u64>,
     pub window_preview_count: usize,
+    pub window_live_preview_count: usize,
+    pub window_frozen_preview_count: usize,
     pub window_preview_bytes: usize,
     pub(crate) window_frame: Option<CpuFrame>,
 }
@@ -1918,6 +1920,11 @@ fn confirm_overlay(state: &mut OverlayState) -> bool {
             preparation_ns: state.preparation_ns,
             window_overview_ns: state.window_overview_ns,
             window_preview_count: state.window_thumbnails.len(),
+            window_live_preview_count: state.live_window_thumbnails.len(),
+            window_frozen_preview_count: state
+                .window_thumbnails
+                .len()
+                .saturating_sub(state.live_window_thumbnails.len()),
             window_preview_bytes: state
                 .window_thumbnails
                 .iter()

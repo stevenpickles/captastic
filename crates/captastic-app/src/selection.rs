@@ -400,6 +400,8 @@ impl SelectionWorker {
                                     "overlay_preparation_ns": selection.preparation_ns,
                                         "window_overview_ns": selection.window_overview_ns,
                                         "window_preview_count": selection.window_preview_count,
+                                        "window_live_preview_count": selection.window_live_preview_count,
+                                        "window_frozen_preview_count": selection.window_frozen_preview_count,
                                         "window_preview_bytes": selection.window_preview_bytes,
                                     "materialization": materialization,
                                     "materialization_ns": materialize_ns,
