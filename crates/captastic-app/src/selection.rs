@@ -161,7 +161,7 @@ impl SelectionWorker {
                     &job.metadata.display_id.0,
                     job.remembered_ui.unwrap_or_default(),
                 );
-                let selection_was_confirmed = job.confirmed_selection.is_some();
+                let mut selection_was_confirmed = job.confirmed_selection.is_some();
                 let selection = if let Some(selection) = job.confirmed_selection.take() {
                     Ok(Some(selection))
                 } else {
@@ -196,6 +196,46 @@ impl SelectionWorker {
                         let selection_offset_ns = job
                             .selection_offset_ns
                             .unwrap_or_else(|| duration_ns(job.triggered_at.elapsed()));
+                        if job.frame.is_none()
+                            && selection.kind == captastic_windows::SelectionKind::Window
+                        {
+                            let Some(frame) = captastic_windows::captured_window_frame(&selection)
+                            else {
+                                finish_without_clipboard(
+                                    &mut job,
+                                    json_output,
+                                    "selection_failed",
+                                    "confirmed window selection did not retain its native frame",
+                                );
+                                continue;
+                            };
+                            job.recorder.record(
+                                job.capture_id,
+                                PerfEventKind::SelectionConfirmed,
+                                selection.selection_ns,
+                            );
+                            let ready_offset_ns = duration_ns(job.triggered_at.elapsed());
+                            job.recorder.record(
+                                job.capture_id,
+                                PerfEventKind::CaptureRequested,
+                                ready_offset_ns,
+                            );
+                            job.recorder.record(
+                                job.capture_id,
+                                PerfEventKind::NativeFrameReady,
+                                ready_offset_ns,
+                            );
+                            job.recorder.record(
+                                job.capture_id,
+                                PerfEventKind::CpuFrameReady,
+                                ready_offset_ns,
+                            );
+                            job.cpu_ready_offset_ns = Some(ready_offset_ns);
+                            job.metadata = frame.metadata.clone();
+                            job.frame = Some(frame);
+                            job.confirmation_anchored = true;
+                            selection_was_confirmed = true;
+                        }
                         if job.frame.is_none() {
                             job.recorder.record(
                                 job.capture_id,

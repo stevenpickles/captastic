@@ -48,4 +48,4 @@ pub use startup::{disable_startup, enable_startup, startup_command};
 #[cfg(windows)]
 pub use tray::{open_path, show_error_dialog, TrayEvent, TrayIcon};
 #[cfg(windows)]
-pub use window_capture::materialize_selection;
+pub use window_capture::{captured_window_frame, materialize_selection};
