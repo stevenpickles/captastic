@@ -2,13 +2,15 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use captastic_core::{CaptureError, CaptureErrorKind};
-use windows::core::{factory, ComInterface, Error as WindowsError, IInspectable};
+use windows::core::{factory, ComInterface, Error as WindowsError, IInspectable, Interface};
 use windows::Foundation::TypedEventHandler;
 use windows::Graphics::Capture::{
     Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
+    IDirect3D11CaptureFramePoolStatics2, IGraphicsCaptureSessionStatics,
 };
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
+use windows::Graphics::SizeInt32;
 use windows::Win32::Foundation::{HMODULE, HWND};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
@@ -36,9 +38,7 @@ pub(crate) struct WgcWindowFrame {
 
 pub(crate) fn capture_window(hwnd: HWND) -> Result<WgcWindowFrame, CaptureError> {
     let _apartment = WinRtApartment::initialize()?;
-    if !GraphicsCaptureSession::IsSupported()
-        .map_err(|error| windows_error("check_support", error, false))?
-    {
+    if !wgc_session_is_supported().map_err(|error| windows_error("check_support", error, false))? {
         return Err(capture_error(
             CaptureErrorKind::Unsupported,
             "check_support",
@@ -67,7 +67,7 @@ pub(crate) fn capture_window(hwnd: HWND) -> Result<WgcWindowFrame, CaptureError>
         ));
     }
 
-    let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
+    let pool = wgc_create_free_threaded_frame_pool(
         &winrt_device,
         DirectXPixelFormat::B8G8R8A8UIntNormalized,
         2,
@@ -129,6 +129,51 @@ pub(crate) fn capture_window(hwnd: HWND) -> Result<WgcWindowFrame, CaptureError>
 
     let _ = resources.pool.RemoveFrameArrived(token);
     result
+}
+
+// The generated class-static convenience methods (GraphicsCaptureSession::IsSupported,
+// Direct3D11CaptureFramePool::CreateFreeThreaded) resolve their activation factory through
+// windows_core::imp::FactoryCache, which stores agile factories in process-wide statics and
+// never revalidates them. Captastic runs WGC on short-lived worker threads whose WinRtApartment
+// guard calls RoUninitialize on exit, which may unload the WinRT DLL that backs those cached
+// factories; a later worker then calls through a vtable pointing into unloaded code. The helpers
+// below therefore acquire an owned, uncached factory via windows::core::factory() for every call
+// and drop it before the apartment guard runs, so no factory outlives the apartment that
+// activated it. Do not replace these with the generated statics and do not cache the factories.
+
+fn wgc_session_is_supported() -> windows::core::Result<bool> {
+    let statics = factory::<GraphicsCaptureSession, IGraphicsCaptureSessionStatics>()?;
+    // SAFETY: Mirrors the generated binding: statics is a live IGraphicsCaptureSessionStatics
+    // whose IsSupported slot writes a bool into the initialized result__ storage.
+    unsafe {
+        let mut result__ = std::mem::zeroed();
+        (Interface::vtable(&statics).IsSupported)(Interface::as_raw(&statics), &mut result__)
+            .from_abi(result__)
+    }
+}
+
+fn wgc_create_free_threaded_frame_pool(
+    device: &IDirect3DDevice,
+    pixel_format: DirectXPixelFormat,
+    number_of_buffers: i32,
+    size: SizeInt32,
+) -> windows::core::Result<Direct3D11CaptureFramePool> {
+    let statics = factory::<Direct3D11CaptureFramePool, IDirect3D11CaptureFramePoolStatics2>()?;
+    // SAFETY: Mirrors the generated binding: statics is a live IDirect3D11CaptureFramePoolStatics2,
+    // device is a borrowed live IDirect3DDevice passed as its raw ABI pointer, and result__ is
+    // initialized storage that receives the new frame pool's owned reference.
+    unsafe {
+        let mut result__ = std::mem::zeroed();
+        (Interface::vtable(&statics).CreateFreeThreaded)(
+            Interface::as_raw(&statics),
+            Interface::as_raw(device),
+            pixel_format,
+            number_of_buffers,
+            size,
+            &mut result__,
+        )
+        .from_abi(result__)
+    }
 }
 
 struct WgcCaptureResources {
