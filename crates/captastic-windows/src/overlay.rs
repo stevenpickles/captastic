@@ -1629,6 +1629,13 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                 match control {
                     ToolbarControl::Background if layout.bounds.contains(local) => {
                         state.options_open = false;
+                        if state.tool == CaptureTool::Window {
+                            // DWM thumbnails are compositor-managed and can cover overlay pixels.
+                            // Use frozen fallbacks while the toolbar is moving, then register only
+                            // previews that do not overlap its final position on button-up.
+                            state.live_window_thumbnails.clear();
+                            rebuild_window_overview_cache(state);
+                        }
                         state.toolbar_drag = Some(ToolbarDrag {
                             pointer_offset: POINT {
                                 x: local.x.saturating_sub(state.toolbar_position.x),
@@ -1643,7 +1650,13 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                     }
                     ToolbarControl::Window => activate_tool(state, CaptureTool::Window),
                     ToolbarControl::Region => activate_tool(state, CaptureTool::Region),
-                    ToolbarControl::Options => state.options_open = !state.options_open,
+                    ToolbarControl::Options => {
+                        state.options_open = !state.options_open;
+                        if state.tool == CaptureTool::Window {
+                            refresh_live_window_thumbnails(state);
+                            rebuild_window_overview_cache(state);
+                        }
+                    }
                     ToolbarControl::Capture => {
                         if confirm_overlay(state) {
                             close_overlay(hwnd);
@@ -1665,7 +1678,12 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                 return LRESULT(0);
             }
             state.hovered_control = None;
+            let options_were_open = state.options_open;
             state.options_open = false;
+            if options_were_open && state.tool == CaptureTool::Window {
+                refresh_live_window_thumbnails(state);
+                rebuild_window_overview_cache(state);
+            }
             if state.tool != CaptureTool::Region {
                 if state.tool == CaptureTool::Window {
                     state.selected_window = hit_test_window_thumbnail(state, local);
@@ -1751,6 +1769,10 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                     state.toolbar_position,
                     state.display_environment,
                 );
+                if state.tool == CaptureTool::Window {
+                    refresh_live_window_thumbnails(state);
+                    rebuild_window_overview_cache(state);
+                }
                 state.hovered_control = Some(ToolbarControl::Background);
                 set_arrow_cursor();
                 invalidate(hwnd);
@@ -1842,12 +1864,16 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             if consume_self_initiated_capture_change(&mut state.releasing_pointer_capture) {
                 return LRESULT(0);
             }
-            state.toolbar_drag = None;
+            let toolbar_dragging = state.toolbar_drag.take().is_some();
             state.resizing = None;
             state.moving_region = None;
             state.anchor = None;
             state.dragging = false;
             state.hovered_handle = None;
+            if toolbar_dragging && state.tool == CaptureTool::Window {
+                refresh_live_window_thumbnails(state);
+                rebuild_window_overview_cache(state);
+            }
             set_arrow_cursor();
             invalidate(hwnd);
             LRESULT(0)
@@ -2438,6 +2464,7 @@ fn refresh_live_window_thumbnails(state: &mut OverlayState) {
         return;
     }
 
+    let toolbar = ToolbarLayout::new(state.display_environment, state.toolbar_position);
     let rects = window_overview_rects(state);
     for (window, bounds) in state.window_thumbnails.iter().zip(rects) {
         let thumbnail = match DwmThumbnail::register(state.overlay_hwnd, HWND(window.handle.raw()))
@@ -2470,6 +2497,11 @@ fn refresh_live_window_thumbnails(state: &mut OverlayState) {
                 bottom: bounds.bottom,
             },
         );
+        if live_thumbnail_overlaps_chrome(destination, toolbar, state.options_open) {
+            // DWM thumbnails are composed above the destination window's own pixels. Keep this
+            // preview in the frozen overview instead so the toolbar and menu remain unobscured.
+            continue;
+        }
         if let Err(error) = thumbnail.show(destination, u8::MAX) {
             log::debug!(
                 "DWM preview update failed for window handle=0x{:X}; using frozen fallback: {error}",
@@ -2482,6 +2514,19 @@ fn refresh_live_window_thumbnails(state: &mut OverlayState) {
             thumbnail,
         });
     }
+}
+
+fn live_thumbnail_overlaps_chrome(
+    destination: RECT,
+    toolbar: ToolbarLayout,
+    options_open: bool,
+) -> bool {
+    rect_overlaps_ui(destination, toolbar.bounds)
+        || (options_open && rect_overlaps_ui(destination, toolbar.menu))
+}
+
+fn rect_overlaps_ui(rect: RECT, ui: UiRect) -> bool {
+    rect.left < ui.right && rect.right > ui.left && rect.top < ui.bottom && rect.bottom > ui.top
 }
 
 fn hide_live_window_thumbnails(state: &OverlayState) {
@@ -5153,6 +5198,42 @@ mod tests {
             Some(ToolbarControl::DimBackground)
         );
         assert_eq!(layout.hit_test(POINT { x: 10, y: 10 }, false), None);
+    }
+
+    #[test]
+    fn live_thumbnails_yield_to_visible_overlay_chrome() {
+        let environment = test_display_environment(1920, 1080, 1080, 96);
+        let layout = ToolbarLayout::new(environment, ToolbarLayout::default_origin(environment));
+        let menu_overlap = RECT {
+            left: layout.menu.left + 1,
+            top: layout.menu.top + 1,
+            right: layout.menu.right - 1,
+            bottom: layout.menu.bottom - 1,
+        };
+        let toolbar_overlap = RECT {
+            left: layout.bounds.left + 1,
+            top: layout.bounds.top + 1,
+            right: layout.bounds.right - 1,
+            bottom: layout.bounds.bottom - 1,
+        };
+
+        assert!(live_thumbnail_overlaps_chrome(menu_overlap, layout, true));
+        assert!(!live_thumbnail_overlaps_chrome(menu_overlap, layout, false));
+        assert!(live_thumbnail_overlaps_chrome(
+            toolbar_overlap,
+            layout,
+            false
+        ));
+        assert!(!live_thumbnail_overlaps_chrome(
+            RECT {
+                left: 8,
+                top: 8,
+                right: 64,
+                bottom: 64,
+            },
+            layout,
+            true
+        ));
     }
 
     #[test]
