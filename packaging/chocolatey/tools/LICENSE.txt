@@ -1,0 +1,15 @@
+Captastic is distributed under the terms of either of the following licenses,
+at the user's option:
+
+  * Apache License, Version 2.0
+  * MIT License
+
+The complete license texts are included in this Chocolatey package as
+tools/captastic/LICENSE-APACHE and tools/captastic/LICENSE-MIT. They are also
+available in the official source repository:
+
+https://github.com/stevenpickles/captastic
+
+Captastic is developed by the Captastic contributors. These licenses grant the
+right to redistribute the binaries embedded in this package subject to their
+respective terms.
