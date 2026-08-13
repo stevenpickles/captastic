@@ -59,28 +59,46 @@ jobs:
       - name: Build distribution workspace
         run: cargo build --locked --profile dist --workspace
 
-      - name: Run PowerShell packaging tests
+      - name: Run packaging tests
         if: runner.os == 'Windows'
         shell: pwsh
-        run: ./scripts/test-package-windows.ps1
+        run: ./scripts/test-packaging.ps1
 
-      - name: Validate Windows and Chocolatey packages
+      - name: Test Chocolatey hooks under Windows PowerShell
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./scripts/test-chocolatey-hooks.ps1
+
+      - name: Build lifecycle package versions
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
-          $version = "$($metadata.packages[0].version)-ci.${{ github.run_number }}"
-          $outputDirectory = Join-Path $PWD 'dist/ci'
-          $archive = ./scripts/package-windows.ps1 `
-            -Version $version `
-            -Architecture x86_64 `
+          $sourceUrl = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          ./scripts/build-packages.ps1 `
+            -PrereleaseLabel 'ci.${{ github.run_number }}.0' `
             -BinariesDirectory target/dist `
-            -OutputDirectory $outputDirectory
-          ./scripts/package-chocolatey.ps1 `
-            -Version $version `
-            -ArchivePath $archive `
-            -OutputDirectory $outputDirectory `
-            -SourceUrl "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            -OutputDirectory dist/lifecycle-initial `
+            -SourceUrl $sourceUrl `
+            -SkipBuild
+          ./scripts/test-artifact-manifest.ps1 `
+            -ManifestPath dist/lifecycle-initial/artifacts.json | Out-Null
+          ./scripts/build-packages.ps1 `
+            -PrereleaseLabel 'ci.${{ github.run_number }}.1' `
+            -BinariesDirectory target/dist `
+            -OutputDirectory dist/lifecycle-upgrade `
+            -SourceUrl $sourceUrl `
+            -SkipBuild
+          ./scripts/test-artifact-manifest.ps1 `
+            -ManifestPath dist/lifecycle-upgrade/artifacts.json | Out-Null
+
+      - name: Test Chocolatey package lifecycle
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./scripts/test-chocolatey-lifecycle.ps1 `
+            -InitialManifestPath dist/lifecycle-initial/artifacts.json `
+            -UpgradeManifestPath dist/lifecycle-upgrade/artifacts.json `
+            -AllowSystemChanges
 
   coverage:
     name: Windows HTML coverage

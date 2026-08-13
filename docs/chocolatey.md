@@ -25,18 +25,36 @@ daemon from retaining the session control event; the migration also preserves `~
 
 ## Build and test locally
 
-Build the distribution binaries and portable archive from an elevated PowerShell 7 (`pwsh`)
-prompt. The packaging scripts reject Windows PowerShell 5.1 because its ZIP entry separators are
-not portable:
+Run the canonical packaging command from an elevated PowerShell 7 (`pwsh`) prompt:
 
 ```powershell
-cargo build --locked --profile dist --workspace
-$archive = ./scripts/package-windows.ps1 -Version 0.1.0
-./scripts/package-chocolatey.ps1 -Version 0.1.0 -ArchivePath $archive
+./scripts/build-packages.ps1
 ```
 
-Both generated artifacts are written beneath `dist/`, which is excluded from Git. Inspect and
-test the package from that directory:
+The command resolves the package containing the `captastic` Cargo binary, uses its version, builds
+the `dist` Cargo profile, and creates the portable ZIP, its SHA-256 file, the Chocolatey package,
+and `artifacts.json` beneath `dist/`. The manifest records the version, Rust target, architecture,
+Chocolatey CLI version, source archive URL, filenames, and artifact hashes. Local, CI, and release
+packaging use this same command.
+
+Use `-PrereleaseLabel ci.123` for a CI package whose release core must still match the Cargo
+version. `-ReleaseTag v0.1.0` additionally proves that a release tag and Cargo version match and
+marks the manifest as publishable. `-BinariesDirectory` with `-SkipBuild` consumes binaries that
+were already built by CI. Portable ARM64 archives can be built with `-Architecture arm64`, but the
+Chocolatey package is intentionally restricted to x86_64 until its multi-architecture contract is
+defined.
+
+Run the isolated packaging suite before inspecting the artifacts:
+
+```powershell
+./scripts/test-packaging.ps1
+$manifest = Get-Content ./dist/artifacts.json -Raw | ConvertFrom-Json
+$manifest.artifacts
+./scripts/test-artifact-manifest.ps1 -ManifestPath ./dist/artifacts.json
+```
+
+The generated artifacts are excluded from Git. Install and inspect the package from its output
+directory:
 
 ```powershell
 choco install captastic --version 0.1.0 --source ./dist --yes
@@ -46,19 +64,33 @@ choco upgrade captastic --version 0.1.0 --source ./dist --yes --force
 choco uninstall captastic --yes
 ```
 
-Use a disposable Windows VM for the full install/upgrade/uninstall test before publishing. Check
-that the Start Menu entry launches the tray application, the global hotkey captures successfully,
-an upgrade stops the old daemon cleanly, and `~/.captastic` remains after uninstall.
+The destructive lifecycle test used by CI requires two locally built prerelease versions and an
+explicit opt-in because it changes the machine's installed Chocolatey state:
+
+```powershell
+./scripts/test-chocolatey-lifecycle.ps1 `
+    -InitialManifestPath ./dist/lifecycle-initial/artifacts.json `
+    -UpgradeManifestPath ./dist/lifecycle-upgrade/artifacts.json `
+    -AllowSystemChanges
+```
+
+Use a disposable interactive Windows VM for the final release check. Confirm that the Start Menu
+entry launches the tray application, the global hotkey captures successfully, an upgrade stops a
+running daemon cleanly, and `~/.captastic` remains after uninstall. Hosted CI verifies silent
+install, non-launching first install, shims, shortcut creation, upgrade, uninstall cleanup, and a
+preserved settings fixture, but it has no interactive desktop for the capture workflow.
 
 ## Release and publish
 
-The release workflow builds the portable ZIP first, then embeds that exact archive's contents in
-`captastic.<version>.nupkg`. Both packages and the ZIP checksum are uploaded as workflow artifacts;
-tagged builds also attach them to the GitHub release. `VERIFICATION.txt` records the source archive
-URL and SHA-256 hashes for the archive and both executables.
+The release workflow invokes `build-packages.ps1`, builds the portable ZIP first, then embeds that
+exact archive's contents in `captastic.<version>.nupkg`. The ZIP, checksum, Chocolatey package, and
+`artifacts.json` are uploaded explicitly; tagged builds also attach them to the GitHub release.
+`VERIFICATION.txt` records the direct tagged GitHub release archive URL and SHA-256 hashes for the
+archive and both executables. A tagged package build fails if given an indirect or non-release URL.
 
-The workflow does not publish to the Chocolatey community repository automatically. Once a tagged
-GitHub release and its artifacts have been checked, publish manually with an API key kept outside
+The workflow does not publish to the Chocolatey community repository automatically. Do not push a
+package until the tagged GitHub release exists, its direct download URLs work, its manifest hashes
+match, and the disposable-VM checklist passes. Then publish manually with an API key kept outside
 the repository:
 
 ```powershell
