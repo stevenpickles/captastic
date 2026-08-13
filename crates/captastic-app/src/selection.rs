@@ -8,7 +8,8 @@ use captastic_config::{
     CaptureRegion, CaptureRegionSource, ConfirmedRegion, HotkeyAction, HotkeyChord,
 };
 use captastic_core::{
-    validate_event_order, CaptureId, CpuFrame, EventRecorder, NativeFrame, PerfEventKind,
+    validate_event_order, CaptureId, CpuFrame, EventRecorder, FrameMetadata, NativeFrame,
+    PerfEventKind,
 };
 use serde_json::json;
 use std::sync::Mutex;
@@ -107,6 +108,7 @@ pub struct SelectionWorker {
 impl SelectionWorker {
     pub fn start(
         clipboard_sender: mpsc::SyncSender<crate::clipboard::ClipboardJob>,
+        capture_sender: mpsc::SyncSender<crate::daemon::CaptureCommand>,
         json_output: bool,
         queue_capacity: usize,
         confirmed_regions: ConfirmedRegionCache,
@@ -131,7 +133,7 @@ impl SelectionWorker {
                     if worker_stop_requested.load(Ordering::Acquire) {
                         break;
                     }
-                    let mut job = match receiver.recv_timeout(WORKER_RECEIVE_POLL) {
+                let mut job = match receiver.recv_timeout(WORKER_RECEIVE_POLL) {
                     Ok(job) => job,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
                         if worker_stop_requested.load(Ordering::Acquire) {
@@ -146,39 +148,105 @@ impl SelectionWorker {
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 };
                 cache_idle_started = Instant::now();
-                job.recorder.record(
-                    job.capture_id,
-                    PerfEventKind::SelectionStarted,
-                    offset_after_cpu(&job),
-                );
+                if let Some(error) = job.terminal_error.take() {
+                    finish_without_clipboard(
+                        &mut job,
+                        json_output,
+                        "selection_failed",
+                        &error,
+                    );
+                    continue;
+                }
                 let remembered_ui = worker_controller.remembered_ui(
-                    &job.frame.metadata.display_id.0,
+                    &job.metadata.display_id.0,
                     job.remembered_ui.unwrap_or_default(),
                 );
-                let selection = captastic_windows::select_from_frozen_frame_with_initial_tool_and_ui(
-                    &job.frame,
-                    &worker_controller,
-                    job.initial_tool,
-                    Some(remembered_ui),
-                );
+                let selection_was_confirmed = job.confirmed_selection.is_some();
+                let selection = if let Some(selection) = job.confirmed_selection.take() {
+                    Ok(Some(selection))
+                } else {
+                    job.recorder.record(
+                        job.capture_id,
+                        PerfEventKind::SelectionStarted,
+                        offset_after_cpu(&job),
+                    );
+                    let preview_source = job.frame.as_ref().map_or_else(
+                        || captastic_windows::SelectionPreviewSource::live(&job.metadata),
+                        captastic_windows::SelectionPreviewSource::frozen,
+                    );
+                    captastic_windows::select_from_preview_source_with_initial_tool_and_ui(
+                        preview_source,
+                        &worker_controller,
+                        job.initial_tool,
+                        Some(remembered_ui),
+                    )
+                };
                 match selection {
                     Ok(Some(selection)) => {
-                        if selection.kind == captastic_windows::SelectionKind::Region {
+                        if !selection_was_confirmed
+                            && selection.kind == captastic_windows::SelectionKind::Region
+                        {
                             remember_confirmed_region(
                                 &confirmed_regions,
                                 &worker_controller,
-                                &job.frame.metadata,
+                                &job.metadata,
                                 selection.rect,
                             );
                         }
-                        let selection_offset_ns = duration_ns(job.triggered_at.elapsed());
-                        job.recorder.record(
-                            job.capture_id,
-                            PerfEventKind::SelectionConfirmed,
-                            selection.selection_ns,
-                        );
+                        let selection_offset_ns = job
+                            .selection_offset_ns
+                            .unwrap_or_else(|| duration_ns(job.triggered_at.elapsed()));
+                        if job.frame.is_none() {
+                            job.recorder.record(
+                                job.capture_id,
+                                PerfEventKind::SelectionConfirmed,
+                                selection.selection_ns,
+                            );
+                            job.selection_offset_ns = Some(selection_offset_ns);
+                            let request = LiveSelectionRequest {
+                                job,
+                                selection,
+                                confirmed_at: Instant::now(),
+                            };
+                            if let Err(error) = capture_sender
+                                .try_send(crate::daemon::CaptureCommand::LiveSelection(Box::new(
+                                    request,
+                                )))
+                            {
+                                let command = match error {
+                                    mpsc::TrySendError::Full(command)
+                                    | mpsc::TrySendError::Disconnected(command) => command,
+                                };
+                                let crate::daemon::CaptureCommand::LiveSelection(request) = command
+                                else {
+                                    unreachable!("selection worker sends only live selections")
+                                };
+                                let mut job = request.job;
+                                finish_without_clipboard(
+                                    &mut job,
+                                    json_output,
+                                    "selection_failed",
+                                    "capture command queue was unavailable after confirmation",
+                                );
+                            }
+                            continue;
+                        }
+                        if !selection_was_confirmed {
+                            job.recorder.record(
+                                job.capture_id,
+                                PerfEventKind::SelectionConfirmed,
+                                selection.selection_ns,
+                            );
+                        }
+                        let frame = job
+                            .frame
+                            .as_ref()
+                            .expect("captured pixels exist after live selection resumes");
                         let materialize_started = Instant::now();
-                        let mut materialization = selection_materialization(selection.kind);
+                        let mut materialization = selection_materialization(
+                            selection.kind,
+                            job.confirmation_anchored,
+                        );
                         let mut gpu_materialization = None;
                         let mut gpu_fallback_error = None;
                         let gpu_result = if selection.kind == captastic_windows::SelectionKind::Region {
@@ -207,7 +275,7 @@ impl SelectionWorker {
                                 result.frame
                             }
                             Ok(Some(None)) | Ok(None) => {
-                                match captastic_windows::materialize_selection(&job.frame, &selection) {
+                                match captastic_windows::materialize_selection(frame, &selection) {
                                     Ok(frame) => frame,
                                     Err(error) => {
                                         finish_without_clipboard(
@@ -226,7 +294,7 @@ impl SelectionWorker {
                                     "selection {} GPU materialization failed; using CPU crop: {error}",
                                     job.capture_id.0
                                 ));
-                                match captastic_windows::materialize_selection(&job.frame, &selection) {
+                                match captastic_windows::materialize_selection(frame, &selection) {
                                     Ok(frame) => frame,
                                     Err(error) => {
                                         finish_without_clipboard(
@@ -271,6 +339,8 @@ impl SelectionWorker {
                                     "action": job.action,
                                     "chord": job.chord.map(|chord| chord.to_string()),
                                     "selection_interaction_ns": selection.selection_ns,
+                                    "preview_mode": if job.confirmation_anchored { "live" } else { "frozen" },
+                                    "capture_anchor": if job.confirmation_anchored { "confirmation" } else { "trigger" },
                                     "overlay_preparation_ns": selection.preparation_ns,
                                         "window_overview_ns": selection.window_overview_ns,
                                         "window_preview_count": selection.window_preview_count,
@@ -288,7 +358,9 @@ impl SelectionWorker {
                             triggered_at: job.triggered_at,
                             action: job.action,
                             chord: job.chord,
-                            cpu_ready_offset_ns: job.cpu_ready_offset_ns,
+                            cpu_ready_offset_ns: job
+                                .cpu_ready_offset_ns
+                                .unwrap_or_else(|| duration_ns(job.triggered_at.elapsed())),
                             source: job.source,
                             frame: selected_frame,
                             recorder: job.recorder,
@@ -409,12 +481,23 @@ pub struct SelectionJob {
     pub action: HotkeyAction,
     pub chord: Option<HotkeyChord>,
     pub initial_tool: captastic_windows::InitialSelectionTool,
-    pub cpu_ready_offset_ns: u64,
+    pub cpu_ready_offset_ns: Option<u64>,
     pub remembered_ui: Option<captastic_config::DisplayUiState>,
     pub source: &'static str,
-    pub frame: CpuFrame,
+    pub metadata: FrameMetadata,
+    pub frame: Option<CpuFrame>,
     pub native_frame: Option<Arc<dyn NativeFrame>>,
     pub recorder: EventRecorder,
+    pub confirmed_selection: Option<captastic_windows::OverlaySelection>,
+    pub terminal_error: Option<String>,
+    pub selection_offset_ns: Option<u64>,
+    pub confirmation_anchored: bool,
+}
+
+pub struct LiveSelectionRequest {
+    pub job: SelectionJob,
+    pub selection: captastic_windows::OverlaySelection,
+    pub confirmed_at: Instant,
 }
 
 pub enum SubmitError {
@@ -510,16 +593,23 @@ fn selection_kind(kind: captastic_windows::SelectionKind) -> &'static str {
     }
 }
 
-fn selection_materialization(kind: captastic_windows::SelectionKind) -> &'static str {
-    match kind {
-        captastic_windows::SelectionKind::Display => "frozen_display",
-        captastic_windows::SelectionKind::Region => "frozen_desktop_crop",
-        captastic_windows::SelectionKind::Window => "native_window_render",
+fn selection_materialization(
+    kind: captastic_windows::SelectionKind,
+    confirmation_anchored: bool,
+) -> &'static str {
+    match (kind, confirmation_anchored) {
+        (captastic_windows::SelectionKind::Display, true) => "confirmation_display",
+        (captastic_windows::SelectionKind::Region, true) => "confirmation_desktop_crop",
+        (captastic_windows::SelectionKind::Display, false) => "frozen_display",
+        (captastic_windows::SelectionKind::Region, false) => "frozen_desktop_crop",
+        (captastic_windows::SelectionKind::Window, _) => "native_window_render",
     }
 }
 
 fn offset_after_cpu(job: &SelectionJob) -> u64 {
-    duration_ns(job.triggered_at.elapsed()).saturating_sub(job.cpu_ready_offset_ns)
+    job.cpu_ready_offset_ns.map_or(0, |cpu_ready_offset_ns| {
+        duration_ns(job.triggered_at.elapsed()).saturating_sub(cpu_ready_offset_ns)
+    })
 }
 
 fn duration_ns(duration: std::time::Duration) -> u64 {
@@ -787,8 +877,10 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory).expect("create idle worker test directory");
         let (clipboard_sender, _clipboard_receiver) = mpsc::sync_channel(1);
+        let (capture_sender, _capture_receiver) = mpsc::sync_channel(1);
         let mut worker = SelectionWorker::start(
             clipboard_sender,
+            capture_sender,
             false,
             1,
             Arc::new(Mutex::new(BTreeMap::new())),
