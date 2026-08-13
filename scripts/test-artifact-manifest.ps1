@@ -12,8 +12,37 @@ if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
     throw "Artifact manifest is missing: $ManifestPath"
 }
 $manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
-if ($manifest.schemaVersion -ne 1) {
+if ($manifest.schemaVersion -ne 2) {
     throw "Unsupported artifact manifest schema version '$($manifest.schemaVersion)'."
+}
+if ([string]::IsNullOrWhiteSpace($manifest.workspaceVersion) -or
+    [string]::IsNullOrWhiteSpace($manifest.buildVersion) -or
+    $manifest.build.version -ne $manifest.buildVersion) {
+    throw 'Artifact manifest build version metadata is incomplete or inconsistent.'
+}
+$semverPattern = '^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$'
+if ($manifest.version -notmatch $semverPattern -or $manifest.buildVersion -notmatch $semverPattern) {
+    throw 'Artifact manifest package or build version is not valid SemVer.'
+}
+if (($manifest.version -split '-', 2)[0] -ne $manifest.workspaceVersion -or
+    ($manifest.buildVersion -split '-', 2)[0] -ne $manifest.workspaceVersion) {
+    throw 'Artifact manifest versions do not use the workspace version as their release core.'
+}
+if ($manifest.build.channel -notin @('release', 'ci', 'development')) {
+    throw "Unsupported artifact manifest build channel '$($manifest.build.channel)'."
+}
+if ($manifest.build.dirty -isnot [bool]) {
+    throw 'Artifact manifest build dirty flag must be Boolean.'
+}
+if (-not [string]::IsNullOrWhiteSpace($manifest.build.gitCommit) -and
+    $manifest.build.gitCommit -notmatch '^[0-9a-f]{40}$') {
+    throw "Artifact manifest Git commit is invalid: $($manifest.build.gitCommit)"
+}
+if ($manifest.publishable -and
+    ($manifest.build.channel -ne 'release' -or $manifest.build.dirty -or
+     $manifest.version -ne $manifest.workspaceVersion -or
+     $manifest.buildVersion -ne $manifest.workspaceVersion)) {
+    throw 'Publishable artifacts must be clean, exact-version release builds.'
 }
 if ($manifest.architecture -notin @('x86_64', 'arm64')) {
     throw "Unsupported artifact manifest architecture '$($manifest.architecture)'."

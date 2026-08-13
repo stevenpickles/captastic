@@ -42,7 +42,21 @@ fn main() -> io::Result<()> {
         .set_icon(WINDOWS_ICON)
         .set_manifest_file(WINDOWS_MANIFEST)
         .set("FileDescription", "Captastic screenshot capture")
-        .set("ProductName", "Captastic");
+        .set("ProductName", "Captastic")
+        .set("FileVersion", &identity.version)
+        .set("ProductVersion", &identity.version);
+    if let Some(commit) = identity.git_commit.as_deref() {
+        resource.set("Comments", &format!("Git commit: {commit}"));
+    }
+    if identity.channel != "release" {
+        resource
+            .set("PrivateBuild", &identity.version)
+            .set_version_info(
+                winresource::VersionInfo::FILEFLAGS,
+                winresource::VersionInfo::VS_FF_PRERELEASE
+                    | winresource::VersionInfo::VS_FF_PRIVATEBUILD,
+            );
+    }
     resource.compile()
 }
 
