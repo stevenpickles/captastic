@@ -105,6 +105,13 @@ pub enum ModeArg {
     Latest,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum PreviewArg {
+    Auto,
+    Live,
+    Frozen,
+}
+
 #[derive(Debug, Args)]
 pub struct CaptureArgs {
     #[arg(long, default_value = "fake")]
@@ -118,6 +125,9 @@ pub struct CaptureArgs {
     pub cpu_frame: bool,
     #[arg(long, action = clap::ArgAction::Set, default_value_t = false)]
     pub selection: bool,
+    /// Selection presenter: auto, live, or frozen.
+    #[arg(long, value_enum, default_value_t = PreviewArg::Auto)]
+    pub selection_preview: PreviewArg,
     #[arg(long, action = clap::ArgAction::Set, default_value_t = false)]
     pub clipboard: bool,
     #[arg(long)]
@@ -195,6 +205,31 @@ mod tests {
         let cli =
             Cli::try_parse_from(["captastic", "status", "--json"]).expect("explicit CLI command");
         assert!(matches!(cli.command, Some(Command::Status { json: true })));
+    }
+
+    #[test]
+    fn one_shot_selection_preview_is_explicit_and_defaults_to_auto() {
+        let cli = Cli::try_parse_from(["captastic", "capture", "--selection", "true"])
+            .expect("one-shot capture command");
+        let Some(Command::Capture(args)) = cli.command else {
+            panic!("capture command should be selected");
+        };
+        assert!(args.selection);
+        assert_eq!(args.selection_preview, PreviewArg::Auto);
+
+        let cli = Cli::try_parse_from([
+            "captastic",
+            "capture",
+            "--selection",
+            "true",
+            "--selection-preview",
+            "frozen",
+        ])
+        .expect("frozen one-shot capture command");
+        let Some(Command::Capture(args)) = cli.command else {
+            panic!("capture command should be selected");
+        };
+        assert_eq!(args.selection_preview, PreviewArg::Frozen);
     }
 
     #[test]

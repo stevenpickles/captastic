@@ -1274,7 +1274,7 @@ fn action_route(action: HotkeyAction) -> ActionRoute {
 }
 
 #[cfg(windows)]
-fn preview_metadata(
+pub(crate) fn preview_metadata(
     capture_id: CaptureId,
     source: &CaptureSource,
     displays: &[DisplayInfo],

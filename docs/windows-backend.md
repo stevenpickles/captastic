@@ -136,7 +136,7 @@ crop so capture reliability is unchanged.
 
 `selection_started`, `selection_confirmed`, and the legacy-named `crop_finished` event are recorded separately; JSON output identifies materialization as `frozen_display`, `frozen_desktop_crop`, or `native_window_render`. A one-frame selection queue prevents the overlay from exhausting the three-slot CPU pool. Ctrl+C posts `WM_CLOSE` through an overlay controller so shutdown does not wait for user input.
 
-Use `--selection false` for direct full-display clipboard capture. The one-shot command `captastic capture --backend dxgi --selection true --clipboard true` exercises one overlay and exits after confirmation or cancellation.
+Use `--selection false` for direct full-display clipboard capture. The one-shot command `captastic capture --backend dxgi --selection true --clipboard true` exercises one live overlay and exits after confirmation or cancellation. Pass `--selection-preview live` to require the live presenter or `--selection-preview frozen` to preserve trigger-time pixels; `auto` is the default.
 
 ## Smoke test
 
