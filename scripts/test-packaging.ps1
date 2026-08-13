@@ -235,14 +235,32 @@ try {
     }) | Select-Object -First 1
     $orchestratedVersion = "$($captasticPackage.version)-ci.packaging"
     $orchestratedOutput = Join-Path $testRoot 'orchestrated-output'
+    $orchestrationTarget = Join-Path $testRoot 'cargo-target'
+    $previousCargoTarget = $env:CARGO_TARGET_DIR
+    $previousBuildVersion = $env:CAPTASTIC_BUILD_VERSION
+    $previousGitDirty = $env:CAPTASTIC_GIT_DIRTY
+    $env:CARGO_TARGET_DIR = $orchestrationTarget
+    $env:CAPTASTIC_BUILD_VERSION = $orchestratedVersion
+    $env:CAPTASTIC_GIT_DIRTY = 'false'
+    & cargo build --locked --profile dist -p captastic-app --bins
+    if ($LASTEXITCODE -ne 0) {
+        throw "Building versioned packaging test binaries failed with exit code $LASTEXITCODE."
+    }
+    $orchestratedBinaries = Join-Path $orchestrationTarget 'dist'
     $result = & $orchestrationScript -Version $orchestratedVersion -Architecture x86_64 `
-        -BinariesDirectory $x64 -OutputDirectory $orchestratedOutput `
+        -BinariesDirectory $orchestratedBinaries -OutputDirectory $orchestratedOutput `
         -SourceUrl 'https://example.invalid/orchestrated.zip' -SkipBuild
+    $env:CARGO_TARGET_DIR = $previousCargoTarget
+    $env:CAPTASTIC_BUILD_VERSION = $previousBuildVersion
+    $env:CAPTASTIC_GIT_DIRTY = $previousGitDirty
     Assert-True (Test-Path -LiteralPath $result.ManifestPath -PathType Leaf) `
         'Canonical packaging command did not create artifacts.json.'
     $manifest = Get-Content -LiteralPath $result.ManifestPath -Raw | ConvertFrom-Json
-    Assert-True ($manifest.schemaVersion -eq 1) 'Artifact manifest schema version is incorrect.'
+    Assert-True ($manifest.schemaVersion -eq 2) 'Artifact manifest schema version is incorrect.'
     Assert-True ($manifest.version -eq $orchestratedVersion) 'Artifact manifest version is incorrect.'
+    Assert-True ($manifest.buildVersion -eq $orchestratedVersion) 'Artifact manifest build version is incorrect.'
+    Assert-True ($manifest.build.gitCommit -match '^[0-9a-f]{40}$') `
+        'Artifact manifest does not contain the embedded Git commit.'
     Assert-True ($manifest.architecture -eq 'x86_64') 'Artifact manifest architecture is incorrect.'
     Assert-True ($manifest.publishable -eq $false) 'CI artifact manifest was incorrectly marked publishable.'
     Assert-True (@($manifest.artifacts).Count -eq 3) 'Artifact manifest does not list all expected artifacts.'
@@ -259,8 +277,18 @@ try {
     } '*must exactly match*'
     Assert-ThrowsLike {
         & $orchestrationScript -PrereleaseLabel 'ci.missing-url' -Architecture x86_64 `
-            -BinariesDirectory $x64 -OutputDirectory (Join-Path $testRoot 'missing-source-url') -SkipBuild
+            -BinariesDirectory $orchestratedBinaries `
+            -OutputDirectory (Join-Path $testRoot 'missing-source-url') -SkipBuild
     } '*require an explicit source archive URL*'
+    $previousGitCommit = $env:CAPTASTIC_GIT_COMMIT
+    $env:CAPTASTIC_GIT_COMMIT = '0000000000000000000000000000000000000000'
+    Assert-ThrowsLike {
+        & $orchestrationScript -Version $orchestratedVersion -Architecture x86_64 `
+            -BinariesDirectory $orchestratedBinaries `
+            -OutputDirectory (Join-Path $testRoot 'stale-binaries') `
+            -SourceUrl 'https://example.invalid/stale.zip' -SkipBuild
+    } '*binaries were built from*current source is*'
+    $env:CAPTASTIC_GIT_COMMIT = $previousGitCommit
 
     Write-Host 'PowerShell packaging tests passed.'
 } finally {

@@ -41,6 +41,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
 
       - name: Install Rust 1.97.1
         uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
@@ -58,6 +60,11 @@ jobs:
 
       - name: Build distribution workspace
         run: cargo build --locked --profile dist --workspace
+
+      - name: Report distribution build identity
+        run: |
+          cargo run --locked --profile dist -p captastic-app -- --version
+          cargo run --locked --profile dist -p captastic-app -- version --json
 
       - name: Run packaging tests
         if: runner.os == 'Windows'
@@ -106,6 +113,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
 
       - name: Install Rust 1.97.1 with LLVM coverage tools
         uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
@@ -135,6 +144,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
 
       - name: Install Rust 1.97.1 with ARM64 target
         uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1

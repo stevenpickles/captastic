@@ -166,7 +166,8 @@ fn resolve_daemon_args_with_default(
 pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let args = resolve_daemon_args(args)?;
     log::info!(
-        "starting daemon backend={} display={} mode={:?} cpu_frame={} selection={} clipboard={}",
+        "starting daemon version={} backend={} display={} mode={:?} cpu_frame={} selection={} clipboard={}",
+        crate::build_info::BUILD_VERSION,
         args.backend,
         args.display_policy.as_config_value(),
         args.mode,

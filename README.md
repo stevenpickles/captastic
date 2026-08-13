@@ -13,6 +13,27 @@ cargo test --workspace
 cargo run -p captastic-app -- benchmark --backend fake --iterations 500 --json
 ```
 
+## Build identity
+
+The workspace version in `Cargo.toml` is the next intended formal release. Captastic augments that
+release core with source provenance for every untagged build:
+
+- Local builds use `<version>-dev.<revision-count>.g<short-commit>` and append `.dirty` when the
+  worktree has changes.
+- GitHub Actions builds use `<version>-ci.<run-number>.<run-attempt>.g<short-commit>`.
+- A clean build made from the matching `v<version>` tag uses the plain formal version.
+
+The revision count is the number of commits since the newest version tag, or the repository-wide
+count before the first version tag exists. The commit keeps builds from divergent branches
+unambiguous. After publishing a release, advance the workspace version to the next intended release
+before accepting further development; otherwise a prerelease would sort before the version that was
+just published.
+
+Use `captastic --version` for the compact identity or `captastic version --json` for the release
+version, full commit, revision count, channel, dirty state, target, profile, and CI provenance.
+Windows builds carry the same version and commit in their executable properties, and daemon startup
+logs and benchmark reports include the embedded identity.
+
 ## Continuous integration
 
 GitHub Actions checks formatting, rejects compiler and Clippy warnings, runs the workspace tests,
@@ -28,6 +49,7 @@ cargo run -p captastic-app -- doctor
 cargo run -p captastic-app -- displays --json
 cargo run -p captastic-app -- capture --backend fake --json
 cargo run -p captastic-app -- config validate --path captastic.example.toml
+cargo run -p captastic-app -- version --json
 cargo run -p captastic-app -- status --json
 cargo run -p captastic-app -- stop
 ```
@@ -74,8 +96,10 @@ captastic startup disable
 Tagged releases and manually dispatched release workflows produce a
 `captastic-<version>-windows-x86_64.zip` archive, its SHA-256 checksum, and a self-contained
 `captastic.<version>.nupkg` Chocolatey package. The repository's canonical local build command is
-`./scripts/build-packages.ps1`; it also writes `dist/artifacts.json` with the version, provenance,
-filenames, and hashes used by CI and releases. Chocolatey output is currently x86_64-only, while
+`./scripts/build-packages.ps1`; it also writes `dist/artifacts.json` with the package version,
+embedded build identity, source provenance, filenames, and hashes used by CI and releases. The
+packager verifies that both executables came from the current commit before consuming a skipped
+build. Chocolatey output is currently x86_64-only, while
 the portable package builder also supports ARM64. Extract the portable archive and run its
 current-user installer from PowerShell:
 
