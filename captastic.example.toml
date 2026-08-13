@@ -36,6 +36,9 @@ fake_frame_age_us = 1000
 [selection]
 enabled = true
 queue_capacity = 1
+# "auto" prefers a live compositor preview and falls back to the frozen capture path.
+# Use "live" to require confirmation-time capture or "frozen" for trigger-time pixels.
+preview = "auto"
 
 [clipboard]
 enabled = true
