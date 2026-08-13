@@ -186,7 +186,7 @@ fn resolve_build_identity() -> BuildIdentity {
         ci_run_attempt,
         ci_run_url,
         target: env::var("TARGET").expect("Cargo target triple"),
-        profile: env::var("PROFILE").expect("Cargo profile"),
+        profile: cargo_profile(),
     }
 }
 
@@ -233,6 +233,18 @@ fn write_build_info(identity: &BuildIdentity) -> io::Result<()> {
 fn repository_root() -> PathBuf {
     PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("Cargo manifest directory"))
         .join("../..")
+}
+
+fn cargo_profile() -> String {
+    let out_directory = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo output directory"));
+    out_directory
+        .ancestors()
+        .find(|path| path.file_name().is_some_and(|name| name == "build"))
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| env::var("PROFILE").expect("Cargo profile"))
 }
 
 fn revision_count(repository: &Path) -> Option<u64> {
