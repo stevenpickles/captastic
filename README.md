@@ -73,8 +73,11 @@ captastic startup disable
 
 Tagged releases and manually dispatched release workflows produce a
 `captastic-<version>-windows-x86_64.zip` archive, its SHA-256 checksum, and a self-contained
-`captastic.<version>.nupkg` Chocolatey package. Extract the portable archive and run its current-user
-installer from PowerShell:
+`captastic.<version>.nupkg` Chocolatey package. The repository's canonical local build command is
+`./scripts/build-packages.ps1`; it also writes `dist/artifacts.json` with the version, provenance,
+filenames, and hashes used by CI and releases. Chocolatey output is currently x86_64-only, while
+the portable package builder also supports ARM64. Extract the portable archive and run its
+current-user installer from PowerShell:
 
 ```powershell
 Unblock-File .\captastic-<version>-windows-x86_64.zip
