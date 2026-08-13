@@ -7,6 +7,8 @@ mod daemon_control;
 #[cfg(windows)]
 mod display_manager;
 #[cfg(windows)]
+mod dwm_thumbnail;
+#[cfg(windows)]
 mod dxgi;
 #[cfg(windows)]
 mod hotkey;
