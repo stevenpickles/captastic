@@ -5,7 +5,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use captastic_config::{
-    CaptureRegion, CaptureRegionSource, ConfirmedRegion, HotkeyAction, HotkeyChord,
+    CaptureRegion, CaptureRegionSource, ConfirmedRegion, HotkeyAction, HotkeyChord, PreviewMode,
 };
 use captastic_core::{
     validate_event_order, CaptureId, CpuFrame, EventRecorder, FrameMetadata, NativeFrame,
@@ -165,11 +165,6 @@ impl SelectionWorker {
                 let selection = if let Some(selection) = job.confirmed_selection.take() {
                     Ok(Some(selection))
                 } else {
-                    job.recorder.record(
-                        job.capture_id,
-                        PerfEventKind::SelectionStarted,
-                        offset_after_cpu(&job),
-                    );
                     let preview_source = job.frame.as_ref().map_or_else(
                         || captastic_windows::SelectionPreviewSource::live(&job.metadata),
                         captastic_windows::SelectionPreviewSource::frozen,
@@ -183,6 +178,13 @@ impl SelectionWorker {
                 };
                 match selection {
                     Ok(Some(selection)) => {
+                        if !selection_was_confirmed {
+                            job.recorder.record(
+                                job.capture_id,
+                                PerfEventKind::SelectionStarted,
+                                offset_after_cpu(&job),
+                            );
+                        }
                         if !selection_was_confirmed
                             && selection.kind == captastic_windows::SelectionKind::Region
                         {
@@ -385,8 +387,16 @@ impl SelectionWorker {
                                     "action": job.action,
                                     "chord": job.chord.map(|chord| chord.to_string()),
                                     "selection_interaction_ns": selection.selection_ns,
+                                    "requested_preview_mode": preview_mode(job.preview_mode),
                                     "preview_mode": if job.confirmation_anchored { "live" } else { "frozen" },
-                                    "capture_anchor": if job.confirmation_anchored { "confirmation" } else { "trigger" },
+                                    "preview_fallback_reason": job.preview_fallback_reason.as_deref(),
+                                    "capture_anchor": if job.confirmation_anchored {
+                                        "confirmation"
+                                    } else if job.preview_fallback_reason.is_some() {
+                                        "fallback"
+                                    } else {
+                                        "trigger"
+                                    },
                                     "overlay_preparation_ns": selection.preparation_ns,
                                         "window_overview_ns": selection.window_overview_ns,
                                         "window_preview_count": selection.window_preview_count,
@@ -426,6 +436,13 @@ impl SelectionWorker {
                         }
                     }
                     Ok(None) => {
+                        if !selection_was_confirmed {
+                            job.recorder.record(
+                                job.capture_id,
+                                PerfEventKind::SelectionStarted,
+                                offset_after_cpu(&job),
+                            );
+                        }
                         finish_without_clipboard(
                             &mut job,
                             json_output,
@@ -434,6 +451,51 @@ impl SelectionWorker {
                         );
                     }
                     Err(error) => {
+                        if job.frame.is_none()
+                            && job.preview_mode == PreviewMode::Auto
+                            && job.preview_fallback_reason.is_none()
+                        {
+                            crate::logging::warn(format_args!(
+                                "selection {} live presenter failed; reopening with a frozen preview: {error}",
+                                job.capture_id.0
+                            ));
+                            job.preview_fallback_reason = Some(error.to_string());
+                            let request = FrozenSelectionFallbackRequest {
+                                job,
+                                requested_at: Instant::now(),
+                            };
+                            if let Err(error) = capture_sender.try_send(
+                                crate::daemon::CaptureCommand::FrozenSelectionFallback(Box::new(
+                                    request,
+                                )),
+                            ) {
+                                let command = match error {
+                                    mpsc::TrySendError::Full(command)
+                                    | mpsc::TrySendError::Disconnected(command) => command,
+                                };
+                                let crate::daemon::CaptureCommand::FrozenSelectionFallback(
+                                    request,
+                                ) = command
+                                else {
+                                    unreachable!("selection worker sends only fallback captures")
+                                };
+                                let mut job = request.job;
+                                finish_without_clipboard(
+                                    &mut job,
+                                    json_output,
+                                    "selection_failed",
+                                    "capture command queue was unavailable for automatic preview fallback",
+                                );
+                            }
+                            continue;
+                        }
+                        if !selection_was_confirmed {
+                            job.recorder.record(
+                                job.capture_id,
+                                PerfEventKind::SelectionStarted,
+                                offset_after_cpu(&job),
+                            );
+                        }
                         finish_without_clipboard(
                             &mut job,
                             json_output,
@@ -538,12 +600,19 @@ pub struct SelectionJob {
     pub terminal_error: Option<String>,
     pub selection_offset_ns: Option<u64>,
     pub confirmation_anchored: bool,
+    pub preview_mode: PreviewMode,
+    pub preview_fallback_reason: Option<String>,
 }
 
 pub struct LiveSelectionRequest {
     pub job: SelectionJob,
     pub selection: captastic_windows::OverlaySelection,
     pub confirmed_at: Instant,
+}
+
+pub struct FrozenSelectionFallbackRequest {
+    pub job: SelectionJob,
+    pub requested_at: Instant,
 }
 
 pub enum SubmitError {
@@ -649,6 +718,14 @@ fn selection_materialization(
         (captastic_windows::SelectionKind::Display, false) => "frozen_display",
         (captastic_windows::SelectionKind::Region, false) => "frozen_desktop_crop",
         (captastic_windows::SelectionKind::Window, _) => "native_window_render",
+    }
+}
+
+fn preview_mode(mode: PreviewMode) -> &'static str {
+    match mode {
+        PreviewMode::Auto => "auto",
+        PreviewMode::Live => "live",
+        PreviewMode::Frozen => "frozen",
     }
 }
 

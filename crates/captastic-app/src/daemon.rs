@@ -375,6 +375,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                 action_route(trigger.action),
                                 metadata,
                                 &cached_ui,
+                                selection_preview,
                                 recorder,
                             ) {
                                 let _ = done_sender.send(Err(error));
@@ -468,6 +469,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                     &outcome.metadata,
                                     &capture_confirmed_regions,
                                     &cached_ui,
+                                    selection_preview,
                                     json_output,
                                     outcome.metadata.cpu_ready_offset_ns,
                                     outcome.frame,
@@ -624,6 +626,105 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                 let _ = crate::selection::finish_rejected(*job);
                                 crate::logging::warn(format_args!(
                                     "selection {} could not resume after confirmation capture",
+                                    capture_id.0
+                                ));
+                            }
+                        }
+                        if max_captures.is_some_and(|maximum| attempts >= maximum) {
+                            let _ = done_sender.send(Ok(()));
+                            break;
+                        }
+                    }
+                    CaptureCommand::FrozenSelectionFallback(mut request) => {
+                        let capture_id = request.job.capture_id;
+                        let capture_source = if request.job.metadata.display_id
+                            == DisplayId::virtual_desktop()
+                        {
+                            CaptureSource::VirtualDesktop
+                        } else {
+                            CaptureSource::Display(request.job.metadata.display_id.clone())
+                        };
+                        if backend.is_none() {
+                            request.job.terminal_error = Some(
+                                "capture engine is recovering during automatic preview fallback"
+                                    .to_owned(),
+                            );
+                            let _ = crate::selection::try_submit(
+                                selection_sender
+                                    .as_ref()
+                                    .expect("preview fallback requires its selection worker"),
+                                request.job,
+                            );
+                            continue;
+                        }
+                        let capture_request = CaptureRequest {
+                            id: capture_id,
+                            triggered_at: request.requested_at,
+                            source: capture_source,
+                            mode: mode.clone(),
+                            cpu_frame: true,
+                            retain_native_frame: true,
+                            cursor: CursorMode::Exclude,
+                        };
+                        let (capture_result, (), recovery_attempts, reinitialize_error) =
+                            capture_with_backend_recovery(
+                                &mut backend,
+                                |active_backend| {
+                                    let result = active_backend
+                                        .capture(&capture_request, &mut request.job.recorder);
+                                    (result, ())
+                                },
+                                || super::create_backend(&backend_name, &display_policy),
+                                thread::sleep,
+                                |attempt, delay, error| {
+                                    crate::logging::warn(format_args!(
+                                        "preview fallback capture {} lost the engine; retrying {}/{} in {:.0} ms: {error}",
+                                        capture_id.0,
+                                        attempt,
+                                        CAPTURE_RECOVERY_RETRIES,
+                                        delay.as_secs_f64() * 1_000.0
+                                    ));
+                                },
+                            );
+                        if let Some(reinitialize_error) = reinitialize_error {
+                            recovery = Some(BackendRecovery {
+                                failed_attempts: recovery_attempts,
+                                next_attempt: Instant::now() + recovery_delay(recovery_attempts),
+                            });
+                            crate::logging::warn(format_args!(
+                                "capture engine reinitialization failed during preview fallback {}: {reinitialize_error}",
+                                capture_id.0
+                            ));
+                        }
+                        match capture_result {
+                            Ok(outcome) => {
+                                request.job.cpu_ready_offset_ns = Some(duration_ns(
+                                    request.job.triggered_at,
+                                    Instant::now(),
+                                ));
+                                request.job.metadata = outcome.metadata;
+                                request.job.frame = outcome.frame;
+                                request.job.native_frame = outcome.native_frame;
+                                request.job.confirmation_anchored = false;
+                            }
+                            Err(error) => {
+                                if requires_backend_recovery(&error) && recovery.is_none() {
+                                    backend.take();
+                                    recovery = Some(BackendRecovery::immediate());
+                                }
+                                request.job.terminal_error = Some(error.to_string());
+                            }
+                        }
+                        let sender = selection_sender
+                            .as_ref()
+                            .expect("preview fallback requires its selection worker");
+                        match crate::selection::try_submit(sender, request.job) {
+                            Ok(()) => {}
+                            Err(crate::selection::SubmitError::Full(job))
+                            | Err(crate::selection::SubmitError::Disconnected(job)) => {
+                                let _ = crate::selection::finish_rejected(*job);
+                                crate::logging::warn(format_args!(
+                                    "selection {} could not resume with its frozen preview fallback",
                                     capture_id.0
                                 ));
                             }
@@ -1250,6 +1351,7 @@ fn preview_metadata(
 }
 
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 fn dispatch_live_selection(
     sender: &mpsc::SyncSender<crate::selection::SelectionJob>,
     capture_id: CaptureId,
@@ -1257,6 +1359,7 @@ fn dispatch_live_selection(
     route: ActionRoute,
     metadata: FrameMetadata,
     cached_ui: &UiConfig,
+    preview_mode: PreviewMode,
     recorder: EventRecorder,
 ) -> Result<&'static str, AppError> {
     let ActionRoute::Overlay(initial_tool) = route else {
@@ -1285,6 +1388,8 @@ fn dispatch_live_selection(
         terminal_error: None,
         selection_offset_ns: None,
         confirmation_anchored: true,
+        preview_mode,
+        preview_fallback_reason: None,
     };
     match crate::selection::try_submit(sender, job) {
         Ok(()) => Ok("live_selection_queued"),
@@ -1320,6 +1425,7 @@ fn dispatch_output(
     metadata: &FrameMetadata,
     confirmed_regions: &crate::selection::ConfirmedRegionCache,
     cached_ui: &UiConfig,
+    preview_mode: PreviewMode,
     json_output: bool,
     cpu_ready_offset_ns: Option<u64>,
     frame: Option<CpuFrame>,
@@ -1345,6 +1451,7 @@ fn dispatch_output(
                 frame,
                 native_frame,
                 recorder,
+                preview_mode,
             );
         }
         if action != HotkeyAction::LastWorkflow {
@@ -1420,6 +1527,7 @@ fn dispatch_output(
                     frame,
                     native_frame,
                     recorder,
+                    PreviewMode::Frozen,
                 );
             }
         }
@@ -1453,6 +1561,7 @@ fn dispatch_selection(
     frame: Option<CpuFrame>,
     native_frame: Option<Arc<dyn NativeFrame>>,
     recorder: EventRecorder,
+    preview_mode: PreviewMode,
 ) -> Result<&'static str, AppError> {
     let frame = frame.ok_or_else(|| {
         AppError::BackendUnavailable(
@@ -1481,6 +1590,8 @@ fn dispatch_selection(
         terminal_error: None,
         selection_offset_ns: None,
         confirmation_anchored: false,
+        preview_mode,
+        preview_fallback_reason: None,
     };
     match crate::selection::try_submit(sender, job) {
         Ok(()) => Ok("selection_queued"),
@@ -1704,6 +1815,7 @@ pub fn run(_args: DaemonArgs) -> Result<(), AppError> {
 pub(crate) enum CaptureCommand {
     Trigger(TriggerEvent),
     LiveSelection(Box<crate::selection::LiveSelectionRequest>),
+    FrozenSelectionFallback(Box<crate::selection::FrozenSelectionFallbackRequest>),
     Shutdown,
 }
 
