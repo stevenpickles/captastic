@@ -14,6 +14,7 @@ use layout::{
     ToolbarLayout, UiMetrics, UiRect, UiSize,
 };
 
+use crate::dwm_thumbnail::{fit_source_in_bounds, DwmThumbnail};
 use captastic_core::{
     CaptureError, CaptureErrorKind, CpuFrame, DisplayId, DisplayInfo, FrameMetadata, FrameOrigin,
     PixelFormat, Rect,
@@ -370,6 +371,7 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
     };
     let (selection, selection_kind) = initial_selection(tool, last_region, source);
     let mut state = Box::new(OverlayState {
+        overlay_hwnd: HWND(0),
         source,
         live_preview: preview_source.is_live(),
         surface,
@@ -403,6 +405,7 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
         reference_metadata: metadata.clone(),
         window_preview: None,
         window_thumbnails: Vec::new(),
+        live_window_thumbnails: Vec::new(),
         window_overview_cache: cached_overview_surface.map(|surface| WindowOverviewCache {
             surface,
             dim_background: false,
@@ -521,6 +524,7 @@ fn query_display_environment(source: Rect) -> DisplayEnvironment {
 }
 
 struct OverlayState {
+    overlay_hwnd: HWND,
     source: Rect,
     live_preview: bool,
     surface: FrozenSurface,
@@ -554,6 +558,7 @@ struct OverlayState {
     reference_metadata: FrameMetadata,
     window_preview: Option<WindowPreviewState>,
     window_thumbnails: Vec<WindowThumbnail>,
+    live_window_thumbnails: Vec<LiveWindowThumbnail>,
     window_overview_cache: Option<WindowOverviewCache>,
     region_cursor: RegionCursor,
     _font_resource: PrivateFontResource,
@@ -683,6 +688,11 @@ struct WindowThumbnail {
     handle: NativeWindowHandle,
     surface: FrozenSurface,
     corner_radius_px: f32,
+}
+
+struct LiveWindowThumbnail {
+    handle: NativeWindowHandle,
+    thumbnail: DwmThumbnail,
 }
 
 struct WindowOverviewCache {
@@ -1339,6 +1349,15 @@ fn run_overlay(
         let _ = cache_overlay_state(state);
         return Err(last_error("create_overlay_window"));
     }
+    // SAFETY: state_pointer remains exclusively owned by this overlay thread. Recording the HWND
+    // lets tool transitions register compositor previews against this top-level destination.
+    unsafe {
+        (*state_pointer).overlay_hwnd = hwnd;
+        if (*state_pointer).tool == CaptureTool::Window {
+            refresh_live_window_thumbnails(&mut *state_pointer);
+            rebuild_window_overview_cache(&mut *state_pointer);
+        }
+    }
     if live_preview {
         // SAFETY: hwnd is a live top-level layered window owned by this process. The color key
         // exposes the real desktop inside the active selection while the global alpha dims it.
@@ -1451,6 +1470,13 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
     // SAFETY: Retrieves only the pointer installed during WM_NCCREATE.
     let state_pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut OverlayState;
     if message == WM_NCDESTROY {
+        if !state_pointer.is_null() {
+            // SAFETY: WM_NCDESTROY runs on the owning overlay thread while the state allocation is
+            // still alive. Unregister compositor relationships before the destination is gone.
+            let state = unsafe { &mut *state_pointer };
+            state.live_window_thumbnails.clear();
+            state.overlay_hwnd = HWND(0);
+        }
         // SAFETY: Prevents any later callback from observing the state pointer.
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
         // SAFETY: Default non-client cleanup for this live window.
@@ -2299,10 +2325,81 @@ fn build_window_overview(state: &mut OverlayState) {
             pending = retry;
         }
     }
+    refresh_live_window_thumbnails(state);
     rebuild_window_overview_cache(state);
     if state.window_overview_ns.is_none() {
         state.window_overview_ns = Some(duration_ns(started.elapsed()));
     }
+}
+
+fn refresh_live_window_thumbnails(state: &mut OverlayState) {
+    state.live_window_thumbnails.clear();
+    if !state.live_preview || state.tool != CaptureTool::Window || state.overlay_hwnd.0 == 0 {
+        return;
+    }
+
+    let rects = window_overview_rects(state);
+    for (window, bounds) in state.window_thumbnails.iter().zip(rects) {
+        let thumbnail = match DwmThumbnail::register(state.overlay_hwnd, HWND(window.handle.raw()))
+        {
+            Ok(thumbnail) => thumbnail,
+            Err(error) => {
+                log::debug!(
+                    "DWM preview registration failed for window handle=0x{:X}; using frozen fallback: {error}",
+                    window.handle.raw()
+                );
+                continue;
+            }
+        };
+        let source_size = match thumbnail.source_size() {
+            Ok(size) => size,
+            Err(error) => {
+                log::debug!(
+                    "DWM preview size query failed for window handle=0x{:X}; using frozen fallback: {error}",
+                    window.handle.raw()
+                );
+                continue;
+            }
+        };
+        let destination = fit_source_in_bounds(
+            source_size,
+            RECT {
+                left: bounds.left,
+                top: bounds.top,
+                right: bounds.right,
+                bottom: bounds.bottom,
+            },
+        );
+        if let Err(error) = thumbnail.show(destination, u8::MAX) {
+            log::debug!(
+                "DWM preview update failed for window handle=0x{:X}; using frozen fallback: {error}",
+                window.handle.raw()
+            );
+            continue;
+        }
+        state.live_window_thumbnails.push(LiveWindowThumbnail {
+            handle: window.handle,
+            thumbnail,
+        });
+    }
+}
+
+fn hide_live_window_thumbnails(state: &OverlayState) {
+    for preview in &state.live_window_thumbnails {
+        if let Err(error) = preview.thumbnail.hide() {
+            log::debug!(
+                "DWM preview hide failed for window handle=0x{:X}: {error}",
+                preview.handle.raw()
+            );
+        }
+    }
+}
+
+fn has_live_window_thumbnail(state: &OverlayState, handle: NativeWindowHandle) -> bool {
+    state
+        .live_window_thumbnails
+        .iter()
+        .any(|preview| preview.handle == handle)
 }
 
 fn rebuild_window_overview_cache(state: &mut OverlayState) {
@@ -2707,6 +2804,9 @@ fn draw_window_overview_static(destination: &FrozenSurface, state: &OverlayState
     }
     let rects = window_overview_rects(state);
     for (thumbnail, rect) in state.window_thumbnails.iter().zip(rects) {
+        if has_live_window_thumbnail(state, thumbnail.handle) {
+            continue;
+        }
         let selected = state.selected_window == Some(thumbnail.handle);
         let preview = selected
             .then(|| ready_window_preview(state, Some(thumbnail.handle)))
@@ -4074,6 +4174,9 @@ fn activate_tool(state: &mut OverlayState, tool: CaptureTool) {
                 initial_selection(CaptureTool::Region, state.last_region, state.source);
         }
         CaptureTool::Region => {}
+    }
+    if tool != CaptureTool::Window {
+        hide_live_window_thumbnails(state);
     }
 }
 
