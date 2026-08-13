@@ -20,7 +20,9 @@ use captastic_core::{
     EventRecorder, PerfEventKind,
 };
 use clap::Parser;
-use cli::{BenchmarkArgs, Cli, Command, ConfigCommand, ModeArg, PreviewArg, StartupCommand};
+#[cfg(windows)]
+use cli::PreviewArg;
+use cli::{BenchmarkArgs, Cli, Command, ConfigCommand, ModeArg, StartupCommand};
 use error::AppError;
 use serde_json::json;
 
@@ -236,6 +238,8 @@ fn capture_with_preview_fallback(
     args: cli::CaptureArgs,
     preview_fallback_reason: Option<String>,
 ) -> Result<(), AppError> {
+    #[cfg(not(windows))]
+    let _ = preview_fallback_reason;
     if (args.selection || args.clipboard) && !args.cpu_frame {
         return Err(AppError::InvalidArgument(
             "selection and clipboard output require --cpu-frame true".to_owned(),
