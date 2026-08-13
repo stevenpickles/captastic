@@ -514,6 +514,34 @@ fn capture_error(
 mod tests {
     use super::*;
 
+    /// Regression test for the access violation caused by cached WinRT activation factories
+    /// outliving RoUninitialize. Each cycle mimics one window-render worker: a fresh thread
+    /// initializes an MTA, acquires an uncached GraphicsCaptureSession statics factory, calls
+    /// IsSupported, drops the factory, and tears the apartment down before the next cycle
+    /// begins. With the process-wide FactoryCache this pattern could dereference a vtable in an
+    /// unloaded module; with owned factories every cycle must reactivate and succeed.
+    #[test]
+    fn reacquires_wgc_statics_across_apartment_teardown() {
+        for cycle in 0..16 {
+            let worker = std::thread::Builder::new()
+                .name(format!("wgc-factory-stress-{cycle}"))
+                .spawn(|| {
+                    let _apartment =
+                        WinRtApartment::initialize().expect("initialize WinRT apartment");
+                    wgc_session_is_supported()
+                })
+                .expect("spawn factory stress worker");
+            let supported = worker
+                .join()
+                .expect("factory stress worker must exit without crashing");
+            // The supported/unsupported verdict depends on the host; only the call's
+            // success matters here.
+            supported.unwrap_or_else(|error| {
+                panic!("IsSupported failed on cycle {cycle}: {error}");
+            });
+        }
+    }
+
     #[test]
     #[ignore = "requires CAPTASTIC_TEST_WGC_WINDOW_HANDLE naming a live interactive window"]
     fn captures_live_window_without_desktop_composition() {
