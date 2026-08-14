@@ -618,13 +618,18 @@ impl<'a> WindowRenderBudget<'a> {
         let mut current = workers.load(Ordering::Acquire);
         loop {
             if current >= limit {
+                // Unlike the in-flight permit (reclaimed at the caller's timeout deadline), this
+                // worker-lifetime budget is only released when the spawned thread itself exits
+                // (see `Drop for WindowRenderBudget`, moved into the worker closure). If every
+                // slot is taken, an immediate retry cannot succeed until some worker — possibly
+                // one wedged in a foreign window procedure — finally returns.
                 return Err(capture_error(
                     CaptureErrorKind::BufferExhausted,
                     "start_window_render",
                     format!(
                         "{current} native window-render workers are still running; refusing to create an unbounded thread backlog"
                     ),
-                    true,
+                    false,
                     None,
                 ));
             }
@@ -1347,6 +1352,9 @@ mod tests {
         let error = WindowRenderBudget::acquire_from(&workers, 2).expect_err("worker cap");
         assert_eq!(error.kind, CaptureErrorKind::BufferExhausted);
         assert!(error.message.contains("unbounded thread backlog"));
+        // The budget is only reclaimed when a worker thread exits, so an immediate retry cannot
+        // succeed while the cap is held; unlike the in-flight permit, this must not be retryable.
+        assert!(!error.retryable);
 
         drop(first);
         let replacement = WindowRenderBudget::acquire_from(&workers, 2).expect("released slot");
