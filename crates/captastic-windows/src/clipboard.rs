@@ -81,7 +81,7 @@ impl ClipboardPublisher {
             ClipboardSession::open(self.window.hwnd, OPEN_TIMEOUT)?;
         // SAFETY: This thread owns the successfully opened clipboard session.
         unsafe { EmptyClipboard() }
-            .map_err(|error| clipboard_error("empty_clipboard", error, false))?;
+            .map_err(|error| clipboard_error("empty_clipboard", error, true))?;
         dib_memory.transfer_to_clipboard(CF_DIBV5_FORMAT)?;
         let png_payload_bytes = if let Some(png_memory) = png_memory {
             match png_memory.transfer_to_clipboard(self.png_format) {
