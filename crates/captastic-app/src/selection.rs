@@ -140,6 +140,17 @@ impl Drop for AttemptCompletion<'_> {
     }
 }
 
+/// Tells the daemon's main thread that a selection was abandoned, so the loss reaches the
+/// notification area instead of only the log. The job itself has already been closed out by its
+/// caller; this only carries the report.
+fn notify_dropped_selection(
+    notices: &mpsc::SyncSender<crate::daemon::DroppedSelection>,
+    capture_id: CaptureId,
+    reason: &'static str,
+) {
+    let _ = notices.try_send(crate::daemon::DroppedSelection { capture_id, reason });
+}
+
 pub struct SelectionWorker {
     sender: Option<mpsc::SyncSender<SelectionJob>>,
     controller: Option<captastic_windows::OverlayController>,
@@ -154,6 +165,7 @@ impl SelectionWorker {
     pub fn start(
         clipboard_sender: mpsc::SyncSender<crate::clipboard::ClipboardJob>,
         capture_sender: mpsc::SyncSender<crate::daemon::CaptureCommand>,
+        dropped_selections: mpsc::SyncSender<crate::daemon::DroppedSelection>,
         json_output: bool,
         queue_capacity: usize,
         confirmed_regions: ConfirmedRegionCache,
@@ -322,6 +334,11 @@ impl SelectionWorker {
                                         json_output,
                                         "selection_failed",
                                         "capture command queue was unavailable after confirmation",
+                                    );
+                                    notify_dropped_selection(
+                                        &dropped_selections,
+                                        job.capture_id,
+                                        "the capture command queue was unavailable after its selection was confirmed",
                                     );
                                 }
                             }
@@ -537,6 +554,11 @@ impl SelectionWorker {
                                         json_output,
                                         "selection_failed",
                                         "capture command queue was unavailable for automatic preview fallback",
+                                    );
+                                    notify_dropped_selection(
+                                        &dropped_selections,
+                                        job.capture_id,
+                                        "the capture command queue was unavailable for its automatic preview fallback",
                                     );
                                 }
                             }
@@ -1054,9 +1076,11 @@ mod tests {
         fs::create_dir_all(&directory).expect("create idle worker test directory");
         let (clipboard_sender, _clipboard_receiver) = mpsc::sync_channel(1);
         let (capture_sender, _capture_receiver) = mpsc::sync_channel(1);
+        let (dropped_sender, _dropped_receiver) = mpsc::sync_channel(1);
         let mut worker = SelectionWorker::start(
             clipboard_sender,
             capture_sender,
+            dropped_sender,
             false,
             1,
             Arc::new(Mutex::new(BTreeMap::new())),
