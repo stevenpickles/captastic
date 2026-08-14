@@ -96,6 +96,10 @@ impl DxgiBackend {
 
     pub fn new(display_id: &DisplayId) -> Result<Self, CaptureError> {
         let com = ComApartment::initialize()?;
+        // Sample the generation before enumerating so a display change that lands while we are
+        // building the backend cannot be swallowed: the stored value stays behind the counter and
+        // the first capture reports TopologyChanged instead of trusting stale DisplayInfo.
+        let generation_before_enumeration = display_configuration_generation();
         let outputs = enumerate_outputs()?;
         let displays: Vec<_> = outputs.iter().map(|output| output.info.clone()).collect();
         let selected_output = select_display_index(&displays, display_id).ok_or_else(|| {
@@ -205,7 +209,7 @@ impl DxgiBackend {
                 warm_stream: false,
             },
             qpc_frequency,
-            display_configuration_generation: display_configuration_generation(),
+            display_configuration_generation: generation_before_enumeration,
             _thread_affine: PhantomData,
         };
         Ok(backend)
