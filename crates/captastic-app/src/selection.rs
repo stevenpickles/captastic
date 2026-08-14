@@ -95,6 +95,62 @@ fn join_worker_until(join: JoinHandle<()>, name: &str, deadline: Instant) -> boo
     }
 }
 
+/// Reports a selection attempt back to the capture worker when it reaches a terminal state.
+///
+/// The selection worker ends attempts on many paths - cancellation, materialization failures,
+/// rejected clipboard hand-offs - and most of them simply `continue`. Reporting from `Drop` covers
+/// all of them, so the capture worker can retire a `--max-captures` budget that would otherwise
+/// wait forever for a cancelled overlay. Attempts handed back to the capture worker are deferred
+/// instead: they return here later and report exactly once.
+struct AttemptCompletion<'a> {
+    capture_sender: &'a mpsc::SyncSender<crate::daemon::CaptureCommand>,
+    capture_id: CaptureId,
+    report: bool,
+}
+
+impl<'a> AttemptCompletion<'a> {
+    fn new(
+        capture_sender: &'a mpsc::SyncSender<crate::daemon::CaptureCommand>,
+        capture_id: CaptureId,
+    ) -> Self {
+        Self {
+            capture_sender,
+            capture_id,
+            report: true,
+        }
+    }
+
+    fn handed_back(&mut self) {
+        self.report = false;
+    }
+}
+
+impl Drop for AttemptCompletion<'_> {
+    fn drop(&mut self) {
+        if !self.report {
+            return;
+        }
+        // A blocking send could deadlock against the capture worker submitting into this worker's
+        // queue; a lost notification only costs a `--max-captures` daemon its early exit.
+        let _ = self
+            .capture_sender
+            .try_send(crate::daemon::CaptureCommand::SelectionFinished(
+                self.capture_id,
+            ));
+    }
+}
+
+/// Tells the daemon's main thread that a selection was abandoned, so the loss reaches the
+/// notification area instead of only the log. The job itself has already been closed out by its
+/// caller; this only carries the report.
+fn notify_dropped_selection(
+    notices: &mpsc::SyncSender<crate::daemon::DroppedSelection>,
+    capture_id: CaptureId,
+    reason: &'static str,
+) {
+    let _ = notices.try_send(crate::daemon::DroppedSelection { capture_id, reason });
+}
+
 pub struct SelectionWorker {
     sender: Option<mpsc::SyncSender<SelectionJob>>,
     controller: Option<captastic_windows::OverlayController>,
@@ -109,6 +165,7 @@ impl SelectionWorker {
     pub fn start(
         clipboard_sender: mpsc::SyncSender<crate::clipboard::ClipboardJob>,
         capture_sender: mpsc::SyncSender<crate::daemon::CaptureCommand>,
+        dropped_selections: mpsc::SyncSender<crate::daemon::DroppedSelection>,
         json_output: bool,
         queue_capacity: usize,
         confirmed_regions: ConfirmedRegionCache,
@@ -148,6 +205,7 @@ impl SelectionWorker {
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 };
                 cache_idle_started = Instant::now();
+                let mut attempt = AttemptCompletion::new(&capture_sender, job.capture_id);
                 if let Some(error) = job.terminal_error.take() {
                     finish_without_clipboard(
                         &mut job,
@@ -256,26 +314,33 @@ impl SelectionWorker {
                                 selection,
                                 confirmed_at: Instant::now(),
                             };
-                            if let Err(error) = capture_sender
-                                .try_send(crate::daemon::CaptureCommand::LiveSelection(Box::new(
-                                    request,
-                                )))
-                            {
-                                let command = match error {
-                                    mpsc::TrySendError::Full(command)
-                                    | mpsc::TrySendError::Disconnected(command) => command,
-                                };
-                                let crate::daemon::CaptureCommand::LiveSelection(request) = command
-                                else {
-                                    unreachable!("selection worker sends only live selections")
-                                };
-                                let mut job = request.job;
-                                finish_without_clipboard(
-                                    &mut job,
-                                    json_output,
-                                    "selection_failed",
-                                    "capture command queue was unavailable after confirmation",
-                                );
+                            match capture_sender.try_send(
+                                crate::daemon::CaptureCommand::LiveSelection(Box::new(request)),
+                            ) {
+                                Ok(()) => attempt.handed_back(),
+                                Err(error) => {
+                                    let command = match error {
+                                        mpsc::TrySendError::Full(command)
+                                        | mpsc::TrySendError::Disconnected(command) => command,
+                                    };
+                                    let crate::daemon::CaptureCommand::LiveSelection(request) =
+                                        command
+                                    else {
+                                        unreachable!("selection worker sends only live selections")
+                                    };
+                                    let mut job = request.job;
+                                    finish_without_clipboard(
+                                        &mut job,
+                                        json_output,
+                                        "selection_failed",
+                                        "capture command queue was unavailable after confirmation",
+                                    );
+                                    notify_dropped_selection(
+                                        &dropped_selections,
+                                        job.capture_id,
+                                        "the capture command queue was unavailable after its selection was confirmed",
+                                    );
+                                }
                             }
                             continue;
                         }
@@ -466,28 +531,36 @@ impl SelectionWorker {
                                 job,
                                 requested_at: Instant::now(),
                             };
-                            if let Err(error) = capture_sender.try_send(
+                            match capture_sender.try_send(
                                 crate::daemon::CaptureCommand::FrozenSelectionFallback(Box::new(
                                     request,
                                 )),
                             ) {
-                                let command = match error {
-                                    mpsc::TrySendError::Full(command)
-                                    | mpsc::TrySendError::Disconnected(command) => command,
-                                };
-                                let crate::daemon::CaptureCommand::FrozenSelectionFallback(
-                                    request,
-                                ) = command
-                                else {
-                                    unreachable!("selection worker sends only fallback captures")
-                                };
-                                let mut job = request.job;
-                                finish_without_clipboard(
-                                    &mut job,
-                                    json_output,
-                                    "selection_failed",
-                                    "capture command queue was unavailable for automatic preview fallback",
-                                );
+                                Ok(()) => attempt.handed_back(),
+                                Err(error) => {
+                                    let command = match error {
+                                        mpsc::TrySendError::Full(command)
+                                        | mpsc::TrySendError::Disconnected(command) => command,
+                                    };
+                                    let crate::daemon::CaptureCommand::FrozenSelectionFallback(
+                                        request,
+                                    ) = command
+                                    else {
+                                        unreachable!("selection worker sends only fallback captures")
+                                    };
+                                    let mut job = request.job;
+                                    finish_without_clipboard(
+                                        &mut job,
+                                        json_output,
+                                        "selection_failed",
+                                        "capture command queue was unavailable for automatic preview fallback",
+                                    );
+                                    notify_dropped_selection(
+                                        &dropped_selections,
+                                        job.capture_id,
+                                        "the capture command queue was unavailable for its automatic preview fallback",
+                                    );
+                                }
                             }
                             continue;
                         }
@@ -1003,9 +1076,11 @@ mod tests {
         fs::create_dir_all(&directory).expect("create idle worker test directory");
         let (clipboard_sender, _clipboard_receiver) = mpsc::sync_channel(1);
         let (capture_sender, _capture_receiver) = mpsc::sync_channel(1);
+        let (dropped_sender, _dropped_receiver) = mpsc::sync_channel(1);
         let mut worker = SelectionWorker::start(
             clipboard_sender,
             capture_sender,
+            dropped_sender,
             false,
             1,
             Arc::new(Mutex::new(BTreeMap::new())),

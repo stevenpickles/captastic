@@ -274,6 +274,10 @@ fn capture_with_preview_fallback(
     let mut selection_value = None;
     #[cfg(not(windows))]
     let selection_value: Option<serde_json::Value> = None;
+    // The UI-state worker outlives the overlay so that persisting selection preferences never
+    // stands between a confirmed selection and the capture it produces.
+    #[cfg(windows)]
+    let mut ui_worker: Option<selection::OneShotUiStateWorker> = None;
     if args.selection {
         #[cfg(windows)]
         {
@@ -286,15 +290,15 @@ fn capture_with_preview_fallback(
             let ui_store = captastic_config::UiStateStore::for_default_config();
             let remembered_ui =
                 load_optional_one_shot_ui_state(&ui_store, &full_frame.metadata.display_id.0);
-            let ui_worker = selection::OneShotUiStateWorker::start(ui_store)?;
+            let worker = selection::OneShotUiStateWorker::start(ui_store)?;
             let selection = captastic_windows::select_from_frozen_frame_with_initial_tool_and_ui(
                 &full_frame,
-                ui_worker.controller(),
+                worker.controller(),
                 captastic_windows::InitialSelectionTool::Remembered,
                 Some(remembered_ui),
             )?;
-            ui_worker.finish()?;
             let Some(selection) = selection else {
+                finish_one_shot_ui_state(Some(worker));
                 recorder.record(request.id, PerfEventKind::AttemptFinished, 0);
                 captastic_core::validate_event_order(recorder.events())?;
                 let value = json!({
@@ -309,6 +313,7 @@ fn capture_with_preview_fallback(
                 }
                 return Ok(());
             };
+            ui_worker = Some(worker);
             recorder.record(
                 request.id,
                 PerfEventKind::SelectionConfirmed,
@@ -454,6 +459,8 @@ fn capture_with_preview_fallback(
     } else {
         log::info!("capture {} complete: {}", request.id.0, value);
     }
+    #[cfg(windows)]
+    finish_one_shot_ui_state(ui_worker);
     Ok(())
 }
 
@@ -480,10 +487,11 @@ fn capture_with_live_selection(mut args: cli::CaptureArgs) -> Result<(), AppErro
         captastic_windows::InitialSelectionTool::Remembered,
         Some(remembered_ui),
     );
-    ui_worker.finish()?;
     let selection = match selection_result {
         Ok(selection) => selection,
         Err(error) if args.selection_preview == PreviewArg::Auto => {
+            // The fallback capture starts its own worker, so this one must be retired first.
+            finish_one_shot_ui_state(Some(ui_worker));
             crate::logging::warn(format_args!(
                 "one-shot live presenter failed; retrying with a frozen preview: {error}"
             ));
@@ -491,10 +499,14 @@ fn capture_with_live_selection(mut args: cli::CaptureArgs) -> Result<(), AppErro
             args.selection_preview = PreviewArg::Frozen;
             return capture_with_preview_fallback(args, Some(reason));
         }
-        Err(error) => return Err(error.into()),
+        Err(error) => {
+            finish_one_shot_ui_state(Some(ui_worker));
+            return Err(error.into());
+        }
     };
     recorder.record(capture_id, PerfEventKind::SelectionStarted, 0);
     let Some(selection) = selection else {
+        finish_one_shot_ui_state(Some(ui_worker));
         recorder.record(capture_id, PerfEventKind::AttemptFinished, 0);
         captastic_core::validate_event_order(recorder.events())?;
         let value = json!({
@@ -654,7 +666,26 @@ fn capture_with_live_selection(mut args: cli::CaptureArgs) -> Result<(), AppErro
     } else {
         log::info!("capture {} complete: {}", capture_id.0, value);
     }
+    finish_one_shot_ui_state(Some(ui_worker));
     Ok(())
+}
+
+/// Retires the one-shot UI-state worker without letting a preference write failure destroy the
+/// capture it produced. The daemon treats the same failure as a non-fatal notification, so the
+/// one-shot command reports it and still exits successfully.
+#[cfg(windows)]
+fn finish_one_shot_ui_state(worker: Option<selection::OneShotUiStateWorker>) {
+    let Some(worker) = worker else {
+        return;
+    };
+    if let Err(error) = worker.finish() {
+        crate::logging::warn(format_args!("{}", one_shot_ui_state_warning(&error)));
+    }
+}
+
+#[cfg(windows)]
+fn one_shot_ui_state_warning(error: &AppError) -> String {
+    format!("Captastic could not save selection preferences. {error}")
 }
 
 #[cfg(windows)]
@@ -1028,6 +1059,42 @@ mod tests {
         );
 
         fs::remove_dir_all(directory).expect("remove directory at config path");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn one_shot_ui_state_persistence_failure_does_not_abort_the_capture() {
+        let directory = std::env::temp_dir().join(format!(
+            "captastic-one-shot-ui-finish-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("create directory at config path");
+        let store = captastic_config::UiStateStore::for_config(&directory);
+        let worker = selection::OneShotUiStateWorker::start(store).expect("start one-shot worker");
+        worker
+            .controller()
+            .submit_ui_update(captastic_windows::OverlayUiUpdate::ToolbarCenter {
+                display_id: "display-1".to_owned(),
+                center_x: 0.25,
+                center_y: 0.75,
+            });
+
+        // The capture is the product; retiring the worker reports the failed preference write
+        // instead of propagating it, so the surrounding capture path cannot exit with an error.
+        finish_one_shot_ui_state(Some(worker));
+
+        fs::remove_dir_all(directory).expect("remove directory at config path");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn one_shot_ui_state_warning_matches_the_daemon_phrasing() {
+        let warning = one_shot_ui_state_warning(&AppError::BackendUnavailable(
+            "failed to persist UI state: access is denied".to_owned(),
+        ));
+        assert!(warning.starts_with("Captastic could not save selection preferences."));
+        assert!(warning.contains("failed to persist UI state"));
     }
 
     #[test]

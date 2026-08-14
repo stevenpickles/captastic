@@ -290,6 +290,28 @@ fn capture_window_inner(
         );
         return capture_window_with_wgc(hwnd, reference_metadata, max_pixels, &visible_frame);
     }
+    if region_is_blank(surface.as_bytes(), capture_bounds, visible_bounds)? {
+        if probe_wgc_error.is_none() {
+            log::debug!(
+                "window handle=0x{:X} PrintWindow reported success but rendered a blank frame; trying Windows Graphics Capture",
+                handle.raw()
+            );
+            match capture_window_with_wgc(hwnd, reference_metadata, max_pixels, &visible_frame) {
+                Ok(capture) => return Ok(capture),
+                Err(error) => {
+                    log::debug!(
+                        "window handle=0x{:X} Windows Graphics Capture also failed after a blank PrintWindow render; keeping the blank PrintWindow frame: {error}",
+                        handle.raw()
+                    );
+                }
+            }
+        } else {
+            log::debug!(
+                "window handle=0x{:X} PrintWindow reported success but rendered a blank frame; Windows Graphics Capture already failed during the responsiveness probe, keeping the blank PrintWindow frame",
+                handle.raw()
+            );
+        }
+    }
     let (pixels, content_width, content_height, radius_scale) = if let Some(max_pixels) = max_pixels
     {
         let (width, height) =
@@ -790,6 +812,41 @@ fn crop_bgra(source: &[u8], source_bounds: Rect, crop: Rect) -> Result<Vec<u8>, 
     Ok(destination)
 }
 
+/// Returns true when every byte (including alpha) in `region` of a BGRA `source` buffer is zero.
+///
+/// `source` is expected to have been pre-cleared to zero before the render that produced it, so
+/// an all-zero region means the render painted nothing there. A genuinely all-black paint is
+/// indistinguishable from this by bytes alone (GDI never sets alpha), but treating it as blank is
+/// harmless: falling back to another capture path for a truly black window still yields black
+/// pixels. This scans the full region with an early exit per row, which is fine because the check
+/// is memory-bandwidth bound rather than CPU bound.
+fn region_is_blank(source: &[u8], source_bounds: Rect, region: Rect) -> Result<bool, CaptureError> {
+    let x = u32::try_from(region.x - source_bounds.x)
+        .map_err(|_| invalid_frame("visible frame starts outside the rendered window"))?;
+    let y = u32::try_from(region.y - source_bounds.y)
+        .map_err(|_| invalid_frame("visible frame starts outside the rendered window"))?;
+    let source_stride = source_bounds
+        .width
+        .checked_mul(4)
+        .ok_or_else(|| invalid_frame("rendered window stride overflowed"))?
+        as usize;
+    let row_len = region
+        .width
+        .checked_mul(4)
+        .ok_or_else(|| invalid_frame("visible window stride overflowed"))?
+        as usize;
+    for row in 0..region.height as usize {
+        let start = (y as usize + row)
+            .checked_mul(source_stride)
+            .and_then(|offset| offset.checked_add(x as usize * 4))
+            .ok_or_else(|| invalid_frame("visible window crop offset overflowed"))?;
+        if source[start..start + row_len].iter().any(|&byte| byte != 0) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn window_corner_radius(hwnd: HWND) -> f32 {
     // Maximized windows meet the monitor edges and DWM does not round them.
     // SAFETY: hwnd is the same live top-level window validated for the capture operation.
@@ -1069,11 +1126,15 @@ impl DibSurface {
         Ok(())
     }
 
-    fn copy_pixels(&self) -> Vec<u8> {
+    fn as_bytes(&self) -> &[u8] {
         // SAFETY: Flushes this thread's queued GDI drawing before CPU reads the DIB section.
         let _ = unsafe { GdiFlush() };
-        // SAFETY: The DIB owns byte_length initialized bytes and stays alive through this copy.
-        unsafe { std::slice::from_raw_parts(self.bits, self.byte_length) }.to_vec()
+        // SAFETY: The DIB owns byte_length initialized bytes and stays alive for the lifetime of &self.
+        unsafe { std::slice::from_raw_parts(self.bits, self.byte_length) }
+    }
+
+    fn copy_pixels(&self) -> Vec<u8> {
+        self.as_bytes().to_vec()
     }
 }
 
@@ -1160,6 +1221,7 @@ fn capture_error(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Instant;
 
     use super::*;
     use captastic_core::{
@@ -1235,11 +1297,12 @@ mod tests {
         release_sender.send(()).expect("release detached worker");
         drop(replacement);
         assert_eq!(active.load(Ordering::Acquire), 0);
-        for _ in 0..100 {
-            if workers.load(Ordering::Acquire) == 0 {
-                break;
-            }
-            thread::yield_now();
+        // The released worker still has to be scheduled before it drops its budget lease. Wait on
+        // wall-clock time, not a fixed yield count, so a preempted worker on a loaded CI runner
+        // cannot outlive the wait; the deadline only bounds a genuinely stuck release.
+        let release_deadline = Instant::now() + Duration::from_secs(10);
+        while workers.load(Ordering::Acquire) != 0 && Instant::now() < release_deadline {
+            thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(workers.load(Ordering::Acquire), 0);
     }
@@ -1251,10 +1314,14 @@ mod tests {
         let permit = WindowRenderPermit::acquire_from(active, 1).expect("render permit");
         let budget = WindowRenderBudget::acquire_from(workers, 1).expect("worker budget");
 
-        let error = run_bounded_window_render::<u8>(permit, budget, Duration::from_secs(1), || {
-            panic!("scripted render panic")
-        })
-        .expect_err("panic disconnects the bounded worker");
+        // The worker terminates promptly by panicking, so this timeout only bounds a broken
+        // harness. Keep it generous: a 1-second budget lost the race to thread spawn plus unwind
+        // on coverage-instrumented CI runners and misreported the panic as a Timeout.
+        let error =
+            run_bounded_window_render::<u8>(permit, budget, Duration::from_secs(60), || {
+                panic!("scripted render panic")
+            })
+            .expect_err("panic disconnects the bounded worker");
 
         assert_eq!(error.kind, CaptureErrorKind::NativeFailure);
         assert!(!error.retryable);
@@ -1318,6 +1385,49 @@ mod tests {
         )
         .expect("valid visible bounds");
         assert_eq!(cropped, [5, 5, 5, 0, 6, 6, 6, 0, 9, 9, 9, 0, 10, 10, 10, 0]);
+    }
+
+    #[test]
+    fn blank_region_detection_ignores_bytes_outside_the_visible_crop() {
+        let source_bounds = Rect {
+            x: 10,
+            y: 20,
+            width: 4,
+            height: 3,
+        };
+        // A window whose only non-zero pixel sits in the outer margin that visible_bounds crops
+        // away: the inner 2x2 region PrintWindow was supposed to paint stayed untouched.
+        let mut source = vec![0_u8; 4 * 3 * 4];
+        source[0] = 7;
+        let region = Rect {
+            x: 11,
+            y: 21,
+            width: 2,
+            height: 2,
+        };
+        assert!(region_is_blank(&source, source_bounds, region).expect("valid region"));
+    }
+
+    #[test]
+    fn blank_region_detection_flags_any_painted_pixel_in_the_crop() {
+        let source_bounds = Rect {
+            x: 10,
+            y: 20,
+            width: 4,
+            height: 3,
+        };
+        let mut source = vec![0_u8; 4 * 3 * 4];
+        // Non-zero alpha (no color) still counts as painted content, not a blank render.
+        let (row, column) = (1_usize, 1_usize);
+        let painted_offset = (row * 4 + column) * 4 + 3;
+        source[painted_offset] = 255;
+        let region = Rect {
+            x: 11,
+            y: 21,
+            width: 2,
+            height: 2,
+        };
+        assert!(!region_is_blank(&source, source_bounds, region).expect("valid region"));
     }
 
     #[test]

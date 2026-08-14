@@ -189,7 +189,6 @@ impl DxgiDisplayManager {
             metadata,
             frame,
             native_frame: None,
-            backend_duration: request.triggered_at.elapsed(),
         })
     }
 }

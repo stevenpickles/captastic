@@ -1,5 +1,10 @@
 # Multi-monitor capture plan
 
+**Status:** Delivered. Implementation slices 1–8 shipped (display policies, persistent identity,
+per-display UI state, mixed-DPI placement, rotation normalization, and same-adapter virtual-desktop
+composition); multi-adapter composition remains out of scope — see ROADMAP.md Milestone 1. This
+document is retained as the invariant reference for multi-monitor behavior.
+
 This document defines the implementation order and invariants for Captastic's
 multi-monitor capture work. Every slice must leave the workspace buildable and
 must include tests for behavior that does not require an interactive desktop.

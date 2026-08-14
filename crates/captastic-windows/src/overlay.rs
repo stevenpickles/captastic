@@ -19,6 +19,8 @@ use captastic_core::{
     CaptureError, CaptureErrorKind, CpuFrame, DisplayId, DisplayInfo, FrameMetadata, FrameOrigin,
     PixelFormat, Rect,
 };
+#[cfg(test)]
+use captastic_core::{CaptureId, CaptureMode, ColorSpace, TimingProvenance};
 use windows::core::{w, Error as WindowsError, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, BOOL, COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE,
@@ -41,7 +43,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::HiDpi::{
     GetDpiForMonitor, SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT,
@@ -50,24 +53,24 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE, VK_RETURN,
 };
-#[cfg(test)]
-use windows::Win32::UI::WindowsAndMessaging::WDA_MONITOR;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyCursor, DestroyWindow,
     DispatchMessageW, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow,
     GetLastActivePopup, GetMessageW, GetShellWindow, GetWindowDisplayAffinity, GetWindowLongPtrW,
     GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-    IsWindow, IsWindowVisible, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW,
-    SetCursor, SetForegroundWindow, SetWindowDisplayAffinity, SetWindowLongPtrW, ShowWindow,
-    TranslateMessage, UnregisterClassW, UpdateLayeredWindow, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW,
-    CS_VREDRAW, GA_ROOTOWNER, GWLP_USERDATA, GWL_EXSTYLE, HCURSOR, ICONINFO, IDC_ARROW, IDC_CROSS,
-    IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, MSG,
+    IsWindow, IsWindowVisible, LoadCursorW, PeekMessageW, PostMessageW, PostQuitMessage,
+    RegisterClassW, SetCursor, SetForegroundWindow, SetWindowDisplayAffinity, SetWindowLongPtrW,
+    ShowWindow, TranslateMessage, UnregisterClassW, UpdateLayeredWindow, CREATESTRUCTW, CS_DBLCLKS,
+    CS_HREDRAW, CS_VREDRAW, GA_ROOTOWNER, GWLP_USERDATA, GWL_EXSTYLE, HCURSOR, ICONINFO, IDC_ARROW,
+    IDC_CROSS, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, MSG, PM_REMOVE,
     SPI_SETLOGICALDPIOVERRIDE, SPI_SETWORKAREA, SW_SHOW, ULW_ALPHA, WDA_EXCLUDEFROMCAPTURE,
     WDA_NONE, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
     WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WM_SETTINGCHANGE, WNDCLASSW,
+    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_QUIT, WM_RBUTTONDOWN, WM_SETTINGCHANGE, WNDCLASSW,
     WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
+#[cfg(test)]
+use windows::Win32::UI::WindowsAndMessaging::{PM_NOREMOVE, WDA_MONITOR};
 
 #[cfg(test)]
 use crate::window_capture::scaled_dimensions;
@@ -860,10 +863,17 @@ impl Drop for PrivateFontResource {
 }
 
 impl WindowPreviewState {
-    fn handle(&self) -> NativeWindowHandle {
+    /// Whether this cached entry lets a click on `handle` skip another capture attempt.
+    ///
+    /// Only a ready preview of the same window qualifies. A previous failure is deliberately not
+    /// sticky: window captures fail transiently by design (the bounded render reports a retryable
+    /// timeout after 700 ms), so a click on a window that failed before tries again instead of
+    /// silently doing nothing. Retrying once per click is bounded by that timeout, and every click
+    /// is an explicit user action.
+    fn satisfies(&self, handle: NativeWindowHandle) -> bool {
         match self {
-            Self::Ready(preview) => preview.handle,
-            Self::Unavailable(handle) => *handle,
+            Self::Ready(preview) => preview.handle == handle,
+            Self::Unavailable(_) => false,
         }
     }
 }
@@ -1318,6 +1328,9 @@ fn run_overlay(
     state: Box<OverlayState>,
     controller: &OverlayController,
 ) -> Result<Option<OverlaySelection>, CaptureError> {
+    // Overlays run back to back on one long-lived selection thread. Start from a queue that cannot
+    // already be quitting, so an earlier run's teardown can never end this loop before it pumps.
+    drain_pending_quit();
     // SAFETY: No module name requests the current executable module.
     let module = unsafe { GetModuleHandleW(None) }
         .map_err(|error| overlay_error("get_module_handle", error))?;
@@ -1394,6 +1407,9 @@ fn run_overlay(
         if let Err(error) = present_live_layer(hwnd, state) {
             // SAFETY: hwnd and state_pointer were created on this thread and are not published.
             let _ = unsafe { DestroyWindow(hwnd) };
+            // The synchronous WM_DESTROY posted a quit that no message loop will consume. Leaving
+            // it queued would immediately end the frozen-mode fallback run on this same thread.
+            drain_pending_quit();
             // SAFETY: no callback can access the state after DestroyWindow returns.
             let state = unsafe { Box::from_raw(state_pointer) };
             let _ = cache_overlay_state(state);
@@ -1425,6 +1441,8 @@ fn run_overlay(
         if result.0 == -1 {
             // SAFETY: hwnd is still owned by this thread if message retrieval fails.
             let _ = unsafe { DestroyWindow(hwnd) };
+            // This loop is abandoning, so nothing will consume the quit that WM_DESTROY posted.
+            drain_pending_quit();
             // SAFETY: The callback will no longer access state after DestroyWindow returns.
             let state = unsafe { Box::from_raw(state_pointer) };
             controller.inner.hwnd.store(0, Ordering::SeqCst);
@@ -1450,6 +1468,19 @@ fn run_overlay(
     restore_input_context(previous_foreground);
     drop(class_guard);
     Ok(result)
+}
+
+/// Removes a pending `WM_QUIT` from this thread's queue, if one is waiting.
+///
+/// `DestroyWindow` dispatches `WM_DESTROY` synchronously, and the overlay window procedure answers
+/// it with `PostQuitMessage`. When an overlay tears down without running its message loop to the
+/// end, that quit stays latched on the thread as per-thread state and would end the very next
+/// overlay run before it pumped a single message. The filter matches only `WM_QUIT`, so no
+/// window message can be discarded by mistake.
+fn drain_pending_quit() {
+    let mut message = MSG::default();
+    // SAFETY: message is writable storage and this thread owns the queue being peeked.
+    let _ = unsafe { PeekMessageW(&mut message, None, WM_QUIT, WM_QUIT, PM_REMOVE) };
 }
 
 struct ClassRegistration {
@@ -2297,13 +2328,19 @@ fn update_window_preview(state: &mut OverlayState, target: Option<NativeWindowHa
     let Some(handle) = target else {
         return;
     };
-    if state
-        .window_preview
-        .as_ref()
-        .is_some_and(|preview| preview.handle() == handle)
-    {
-        return;
+    if let Some(cached) = &state.window_preview {
+        if cached.satisfies(handle) {
+            return;
+        }
+        if matches!(cached, WindowPreviewState::Unavailable(previous) if *previous == handle) {
+            log::debug!(
+                "retrying window preview for handle {:#x} after an earlier capture failure",
+                handle.raw()
+            );
+        }
     }
+    // A fresh attempt always replaces the cached entry: success stores Ready, another failure
+    // refreshes Unavailable, and no other overlay state is touched either way.
     state.window_preview = match capture_window_visual(handle, &state.reference_metadata) {
         Ok(capture) => match FrozenSurface::from_straight_alpha(
             capture.frame.width,
@@ -4122,18 +4159,24 @@ fn collect_window(hwnd: HWND, collector: &mut WindowCollector) {
     if hwnd == unsafe { GetShellWindow() } {
         return;
     }
+    // Reject Captastic's own windows before anything queries them. Captastic never offers them as
+    // capture targets, and a title query against a same-process window on another thread is a
+    // blocking WM_GETTEXT send: while it waits, this thread dispatches its incoming sent messages,
+    // which can re-enter the window procedure and re-borrow the overlay state that enumeration
+    // already holds mutably further down the stack.
+    if is_own_process_window(hwnd) {
+        return;
+    }
+    // Everything below this point is a foreign window, and every filter here reads window state
+    // directly instead of sending a message, so none of them can block on another thread.
     // SAFETY: hwnd is a top-level handle supplied synchronously by EnumWindows.
     let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
     // SAFETY: hwnd remains the same live enumerated top-level handle.
     let minimized = unsafe { IsIconic(hwnd) }.as_bool();
-    let title = window_text(hwnd);
     let class_name = window_class_name(hwnd);
     // SAFETY: Reads immutable extended-style bits from the enumerated window.
     let extended_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
     let forced_taskbar_window = extended_style & WS_EX_APPWINDOW.0 != 0;
-    let Some(title) = title else {
-        return;
-    };
     if !visible
         || minimized
         || is_cloaked_window(hwnd)
@@ -4143,6 +4186,12 @@ fn collect_window(hwnd: HWND, collector: &mut WindowCollector) {
     {
         return;
     }
+    // Only already-eligible foreign windows are titled. Across a process boundary GetWindowText
+    // copies the cached title instead of sending WM_GETTEXT, so it cannot wait on that window's
+    // thread; untitled windows stay excluded exactly as before.
+    let Some(title) = window_text(hwnd) else {
+        return;
+    };
     let display_affinity = window_display_affinity(hwnd);
     if !display_affinity_allows_capture(display_affinity) {
         log_window_candidate(
@@ -4238,6 +4287,21 @@ fn native_window_display_id(hwnd: HWND, displays: &[DisplayInfo]) -> Option<Disp
         .iter()
         .find(|display| display.bounds == bounds)
         .map(|display| display.id.clone())
+}
+
+/// Reports whether `hwnd` belongs to this process, so window enumeration can skip it.
+///
+/// A handle that no longer resolves to a thread counts as ours: it is useless as a capture target
+/// and must not be queried further.
+fn is_own_process_window(hwnd: HWND) -> bool {
+    let mut process_id = 0_u32;
+    // SAFETY: process_id is writable storage and hwnd is inspected synchronously.
+    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
+    if thread_id == 0 {
+        return true;
+    }
+    // SAFETY: GetCurrentProcessId has no preconditions and cannot fail.
+    process_id == unsafe { GetCurrentProcessId() }
 }
 
 fn is_cloaked_window(hwnd: HWND) -> bool {
@@ -4749,6 +4813,29 @@ fn duration_ns(duration: std::time::Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn draining_a_pending_quit_clears_the_thread_quit_flag() {
+        // The quit flag is per-thread state, so exercise it on a thread of its own.
+        thread::spawn(|| {
+            // SAFETY: Sets the quit flag on this test thread's own message queue.
+            unsafe { PostQuitMessage(0) };
+            let mut message = MSG::default();
+            // SAFETY: message is writable storage and the peek leaves the queue untouched.
+            let latched =
+                unsafe { PeekMessageW(&mut message, None, WM_QUIT, WM_QUIT, PM_NOREMOVE) };
+            assert!(latched.as_bool(), "expected a latched quit to drain");
+
+            drain_pending_quit();
+
+            // SAFETY: message is writable storage and the peek leaves the queue untouched.
+            let remaining =
+                unsafe { PeekMessageW(&mut message, None, WM_QUIT, WM_QUIT, PM_NOREMOVE) };
+            assert!(!remaining.as_bool(), "quit survived the drain");
+        })
+        .join()
+        .expect("quit drain thread panicked");
+    }
 
     #[test]
     fn self_initiated_capture_change_preserves_drag_completion_state() {
@@ -5593,6 +5680,20 @@ mod tests {
     }
 
     #[test]
+    fn enumeration_rejects_this_process_before_querying_a_window() {
+        // A handle that resolves to no thread is treated as ours, so nothing queries it further.
+        assert!(is_own_process_window(HWND(0)));
+        // SAFETY: Returns the shell desktop window handle for a process comparison only.
+        let shell = unsafe { GetShellWindow() };
+        if shell.0 != 0 {
+            assert!(
+                !is_own_process_window(shell),
+                "the shell window belongs to another process"
+            );
+        }
+    }
+
+    #[test]
     fn protected_windows_are_not_offered_for_capture() {
         assert!(display_affinity_allows_capture(None));
         assert!(display_affinity_allows_capture(Some(WDA_NONE.0)));
@@ -5864,6 +5965,67 @@ mod tests {
         OVERLAY_RESOURCE_CACHE.with(|cache| *cache.borrow_mut() = Some(resources));
         assert!(take_overlay_resource_cache(16, 16).is_none());
         clear_overlay_resource_cache();
+    }
+
+    fn ready_preview_state(handle: NativeWindowHandle) -> WindowPreviewState {
+        let metadata = FrameMetadata {
+            capture_id: CaptureId(1),
+            backend: "test".to_owned(),
+            display_id: DisplayId::primary(),
+            source_rect: Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            rotation_degrees: 0,
+            capture_mode: CaptureMode::Latest { max_age_ms: None },
+            presentation_offset_ns: Some(0),
+            timing_provenance: TimingProvenance::Synthetic,
+            native_ready_offset_ns: 0,
+            cpu_ready_offset_ns: Some(0),
+            frame_age_ns: Some(0),
+            frame_generation: Some(1),
+            copy_count: 1,
+            pool_slot: Some(0),
+        };
+        let frame = CpuFrame::new(
+            Arc::from(vec![0_u8; 4]),
+            1,
+            1,
+            4,
+            PixelFormat::Bgra8Unorm,
+            FrameOrigin::TopLeft,
+            ColorSpace::Srgb,
+            metadata,
+        )
+        .expect("test preview frame");
+        WindowPreviewState::Ready(Box::new(WindowPreview {
+            handle,
+            frame,
+            surface: FrozenSurface::empty(1, 1).expect("test preview surface"),
+            corner_radius_px: 0.0,
+        }))
+    }
+
+    #[test]
+    fn an_unavailable_window_preview_is_retried_on_the_next_click() {
+        let target = NativeWindowHandle::from_raw(11);
+        let other = NativeWindowHandle::from_raw(22);
+
+        let failed = WindowPreviewState::Unavailable(target);
+        assert!(
+            !failed.satisfies(target),
+            "a transient capture failure must not suppress the next attempt"
+        );
+        assert!(!failed.satisfies(other));
+
+        let ready = ready_preview_state(target);
+        assert!(
+            ready.satisfies(target),
+            "a ready preview is reused without recapturing"
+        );
+        assert!(!ready.satisfies(other));
     }
 
     #[test]

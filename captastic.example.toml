@@ -10,6 +10,7 @@ display = "pointer"
 trigger_queue_capacity = 4
 
 [hotkey]
+# "coalesce" is not implemented yet (roadmap milestone 4); repeat must remain "ignore".
 repeat = "ignore"
 
 # Omit an action to leave it disabled. The default registers only last_workflow.
@@ -25,7 +26,9 @@ mode = "latest"
 fresh_timeout_ms = 100
 max_frame_age_ms = 0
 cpu_frame = true
+# "include" is not implemented yet (roadmap milestone 4); cursor must remain "exclude".
 cursor = "exclude"
+# The CPU readback pool is currently fixed at three slots; buffer_slots must remain 3.
 buffer_slots = 3
 fake_width = 64
 fake_height = 64
@@ -45,7 +48,9 @@ enabled = true
 queue_capacity = 1
 
 [output]
+# File output is not implemented yet (roadmap milestone 4); enabled must remain false.
 enabled = false
+# "png" is the only supported format today.
 format = "png"
 queue_capacity = 2
 

@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::fmt::Debug;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -81,7 +81,6 @@ pub struct CaptureOutcome {
     pub metadata: FrameMetadata,
     pub frame: Option<CpuFrame>,
     pub native_frame: Option<Arc<dyn NativeFrame>>,
-    pub backend_duration: Duration,
 }
 
 pub trait CaptureBackend {

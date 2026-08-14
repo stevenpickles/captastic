@@ -6,7 +6,10 @@
 
 The current capture path supports:
 
-- primary-display enumeration;
+- pointer, primary, configured-display, and same-adapter virtual-desktop display policies, with the
+  display manager retaining a separate warm backend per usable output;
+- normalization of 0/90/180/270-degree display rotations into the top-left BGRA frame contract,
+  including rotated GPU-region mapping;
 - finite `AcquireNextFrame` waits;
 - OS presentation timestamps converted from QueryPerformanceCounter units;
 - rejection of frames presented before the trigger in `fresh` mode;
@@ -25,8 +28,8 @@ The current capture path supports:
 
 The current path deliberately rejects:
 
-- rotated CPU frames, until rotation normalization is implemented;
-- cursor inclusion, because DXGI may supply a separate hardware cursor that must be composed deliberately.
+- cursor inclusion, because DXGI may supply a separate hardware cursor that must be composed deliberately;
+- multi-adapter virtual-desktop topologies, which return a structured unsupported error.
 
 ## Resident hotkey path
 

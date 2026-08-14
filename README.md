@@ -108,13 +108,15 @@ Unblock-File .\captastic-<version>-windows-x86_64.zip
 # Extract the archive after unblocking it, then run:
 .\install.ps1
 .\install.ps1 -StartWithWindows
+.\install.ps1 -NoLaunch
 ```
 
 If the archive was extracted before it was unblocked, run
 `Get-ChildItem -Recurse | Unblock-File` inside the extracted directory before launching the scripts.
 
 The installer copies the CLI and console-free desktop launcher to
-`%LOCALAPPDATA%\Programs\Captastic`, creates a Start Menu shortcut, and starts the tray application.
+`%LOCALAPPDATA%\Programs\Captastic`, creates a per-user Start Menu shortcut, and starts the tray
+application; pass `-NoLaunch` to install without starting it.
 It does not require administrator privileges. Run the installed `uninstall.ps1` to stop Captastic,
 remove login startup and installed files, and preserve `~/.captastic` by default. Pass
 `-RemoveSettings` only when configuration and logs should also be deleted.
@@ -238,7 +240,8 @@ Copy the desired persistent ID into `captastic.toml` as
 `display = "display:windows-monitor-0123456789abcdef"`. The same value can be tested without
 editing configuration by passing `--display display:windows-monitor-0123456789abcdef` to
 `daemon`, `capture`, or `benchmark`. A missing or disconnected configured display produces an
-actionable error listing the IDs that remain attached.
+actionable error listing the IDs that remain attached. Note that only the daemon defaults to the
+pointer display; the one-shot `capture` and `benchmark` commands default `--display` to `primary`.
 
 Selection and clipboard output are enabled by default. Choose full display, window, or region from the toolbar. The `selection.preview` policy defaults to `auto`: it prefers the live presenter and reopens with a bounded frozen capture if live overlay setup fails. `live` requires confirmation-time behavior; `frozen` preserves trigger-time selection. Each monitor restores its last selected tool across daemon restarts, including a selection followed by cancellation. Region mode likewise restores that monitor's last adjusted rectangle whether or not it was captured; when no region has been adjusted on it yet, Captastic starts with a rectangle centered on the display at half its width and half its height. Saved rectangles keep their pixel dimensions and relative center after a resolution change; rotating a monitor rotates the center and swaps width and height before clamping the result to the new bounds. Switching away from Region mode preserves the live rectangle, and switching back restores it immediately. Drag the three-dot grip or any empty toolbar background to reposition the toolbar. Captastic stores its normalized center within that monitor's work area, scales the controls for the monitor's effective DPI, avoids taskbars, and restores the relative placement across resolution or scaling changes. Window mode arranges eligible application windows as independent, aspect-correct DWM thumbnails. A per-window static surface remains available when DWM registration fails; those fallback surfaces are capped at 1.2 megapixels to bound memory. Clicking a preview requests a fresh full-resolution native frame for clipboard output. DWM-cloaked placeholders, shell surfaces, the desktop, minimized windows, and windows rejected by both native capture backends are excluded. Captastic first requests `PrintWindow`; when Windows integrity isolation rejects that request, it uses programmatic Windows Graphics Capture so Task Manager and elevated command shells remain unoccluded and selectable without elevating Captastic. Region mode supports drawing, moving, and resizing with eight side/corner handles and displays exact pixel dimensions. Click **Capture** or press Enter to copy the selection; Esc or right-click cancels without discarding the selected tool or adjusted region. **Options** can toggle background dimming or cancel capture. Captastic takes Win32 mouse capture only for an active toolbar, draw, move, or resize drag and releases it at button-up; losing capture cancels the unfinished drag. This preserves completion when the pointer crosses the overlay edge, but software KVM behavior should be verified for the deployed input stack. Selection, materialization, PNG/DIB clipboard preparation, and clipboard timing remain outside native/CPU capture latency. Window rendering is isolated behind a 700 ms timeout and a two-slot active-work admission gate. A timed-out foreign call is detached and its active slot reclaimed so one bad target cannot permanently disable later captures. A separate eight-worker lifetime cap includes detached calls and rejects additional native renders until a worker exits, preventing permanently hung targets from creating an unbounded thread backlog. The WGC fallback waits for its first frame and performs bounded GPU readback entirely within that worker.
 

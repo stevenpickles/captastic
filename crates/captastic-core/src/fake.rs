@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::metrics::nanos_u64;
 use crate::{
@@ -200,7 +200,6 @@ impl CaptureBackend for FakeBackend {
         self.validate_request_capabilities(request)?;
         let display = self.requested_display(&request.source)?;
         self.attempts = self.attempts.saturating_add(1);
-        let started = Instant::now();
         recorder.record(request.id, PerfEventKind::CaptureRequested, 0);
 
         if let Some(failure) = self
@@ -302,7 +301,6 @@ impl CaptureBackend for FakeBackend {
             metadata,
             frame,
             native_frame: None,
-            backend_duration: started.elapsed(),
         })
     }
 }
@@ -315,6 +313,8 @@ fn sleep_if_nonzero(duration: Duration) {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
     use crate::{CaptureId, CaptureSource, CursorMode};
 

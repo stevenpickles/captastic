@@ -390,7 +390,6 @@ impl CaptureBackend for DxgiBackend {
                 metadata,
                 frame: cpu_frame,
                 native_frame,
-                backend_duration: request.triggered_at.elapsed(),
             });
         }
     }
@@ -487,7 +486,6 @@ impl DxgiBackend {
             metadata,
             frame: cpu_frame,
             native_frame,
-            backend_duration: request.triggered_at.elapsed(),
         })
     }
 
