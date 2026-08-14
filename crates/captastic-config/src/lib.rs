@@ -855,9 +855,10 @@ fn update_display_overlay_center(
         ));
     }
     let mut document = editable_document(source)?;
-    let state = &mut document["ui"]["displays"][display_id];
-    state["overlay_center_x"] = toml_edit::value(center_x);
-    state["overlay_center_y"] = toml_edit::value(center_y);
+    let display_path = format!("ui.displays.{display_id}");
+    let state = display_state(&mut document, display_id)?;
+    *ensure_table(state, &display_path, "overlay_center_x")? = toml_edit::value(center_x);
+    *ensure_table(state, &display_path, "overlay_center_y")? = toml_edit::value(center_y);
     if let Some(table) = state.as_table_like_mut() {
         table.remove("overlay_x");
         table.remove("overlay_y");
@@ -879,8 +880,10 @@ fn update_display_overlay_position(
     y: i32,
 ) -> Result<String, ConfigError> {
     let mut document = editable_document(source)?;
-    document["ui"]["displays"][display_id]["overlay_x"] = toml_edit::value(i64::from(x));
-    document["ui"]["displays"][display_id]["overlay_y"] = toml_edit::value(i64::from(y));
+    let display_path = format!("ui.displays.{display_id}");
+    let state = display_state(&mut document, display_id)?;
+    *ensure_table(state, &display_path, "overlay_x")? = toml_edit::value(i64::from(x));
+    *ensure_table(state, &display_path, "overlay_y")? = toml_edit::value(i64::from(y));
     Ok(document.to_string())
 }
 
@@ -913,24 +916,88 @@ fn update_display_interaction_state(
         ));
     }
     let mut document = editable_document(source)?;
-    let state = &mut document["ui"]["displays"][display_id];
-    state["last_capture_tool"] = toml_edit::value(tool.as_str());
+    let display_path = format!("ui.displays.{display_id}");
+    let state = display_state(&mut document, display_id)?;
+    *ensure_table(state, &display_path, "last_capture_tool")? = toml_edit::value(tool.as_str());
     if let Some(region) = region {
-        state["last_region"]["x"] = toml_edit::value(i64::from(region.x));
-        state["last_region"]["y"] = toml_edit::value(i64::from(region.y));
-        state["last_region"]["width"] = toml_edit::value(i64::from(region.width));
-        state["last_region"]["height"] = toml_edit::value(i64::from(region.height));
+        let region_path = format!("{display_path}.last_region");
+        *ensure_table(
+            ensure_table(state, &display_path, "last_region")?,
+            &region_path,
+            "x",
+        )? = toml_edit::value(i64::from(region.x));
+        *ensure_table(
+            ensure_table(state, &display_path, "last_region")?,
+            &region_path,
+            "y",
+        )? = toml_edit::value(i64::from(region.y));
+        *ensure_table(
+            ensure_table(state, &display_path, "last_region")?,
+            &region_path,
+            "width",
+        )? = toml_edit::value(i64::from(region.width));
+        *ensure_table(
+            ensure_table(state, &display_path, "last_region")?,
+            &region_path,
+            "height",
+        )? = toml_edit::value(i64::from(region.height));
         if let Some(region_source) = region_source {
-            state["last_region_source"]["width"] = toml_edit::value(i64::from(region_source.width));
-            state["last_region_source"]["height"] =
-                toml_edit::value(i64::from(region_source.height));
-            state["last_region_source"]["rotation_degrees"] =
-                toml_edit::value(i64::from(region_source.rotation_degrees));
+            let source_path = format!("{display_path}.last_region_source");
+            *ensure_table(
+                ensure_table(state, &display_path, "last_region_source")?,
+                &source_path,
+                "width",
+            )? = toml_edit::value(i64::from(region_source.width));
+            *ensure_table(
+                ensure_table(state, &display_path, "last_region_source")?,
+                &source_path,
+                "height",
+            )? = toml_edit::value(i64::from(region_source.height));
+            *ensure_table(
+                ensure_table(state, &display_path, "last_region_source")?,
+                &source_path,
+                "rotation_degrees",
+            )? = toml_edit::value(i64::from(region_source.rotation_degrees));
         } else if let Some(table) = state.as_table_like_mut() {
             table.remove("last_region_source");
         }
     }
     Ok(document.to_string())
+}
+
+/// Mutably indexes into `parent[key]`, mirroring the implicit-table creation that
+/// `toml_edit`'s panicking `Index`/`IndexMut` operators perform for an absent key
+/// (so the on-disk formatting for a normal, all-tables config is unaffected), but
+/// reporting a hand-edited scalar, array, or array-of-tables standing in for an
+/// expected table as a `ConfigError` instead of panicking. `parent_path` names
+/// `parent` itself for the error message. Erroring (rather than silently replacing
+/// the hand-edited value) is deliberate: a save must never destroy content a user
+/// put there on purpose.
+fn ensure_table<'a>(
+    parent: &'a mut toml_edit::Item,
+    parent_path: &str,
+    key: &str,
+) -> Result<&'a mut toml_edit::Item, ConfigError> {
+    parent.get_mut(key).ok_or_else(|| {
+        ConfigError::InvalidValue(format!(
+            "configuration key '{parent_path}' is not a table; remove or fix the hand-edited value"
+        ))
+    })
+}
+
+/// Resolves the `[ui.displays.<display_id>]` table used by every per-display
+/// UI-state writer, creating it (and `[ui]`/`[ui.displays]`) when absent, without
+/// panicking when a hand-edited config has replaced any segment of that path with a
+/// non-table value.
+fn display_state<'a>(
+    document: &'a mut toml_edit::Document,
+    display_id: &str,
+) -> Result<&'a mut toml_edit::Item, ConfigError> {
+    // Indexing the document root itself can never panic: `Document` always wraps a
+    // real `Table`, so `document["ui"]` only ever inserts-or-fetches.
+    let ui = &mut document["ui"];
+    let displays = ensure_table(ui, "ui", "displays")?;
+    ensure_table(displays, "ui.displays", display_id)
 }
 
 fn editable_document(source: &str) -> Result<toml_edit::Document, ConfigError> {
@@ -1337,8 +1404,9 @@ fn update_overlay_position(source: &str, x: i32, y: i32) -> Result<String, Confi
     } else {
         source.parse::<toml_edit::Document>()?
     };
-    document["ui"]["overlay_x"] = toml_edit::value(i64::from(x));
-    document["ui"]["overlay_y"] = toml_edit::value(i64::from(y));
+    let ui = &mut document["ui"];
+    *ensure_table(ui, "ui", "overlay_x")? = toml_edit::value(i64::from(x));
+    *ensure_table(ui, "ui", "overlay_y")? = toml_edit::value(i64::from(y));
     Ok(document.to_string())
 }
 
@@ -1362,15 +1430,45 @@ fn update_display_confirmed_region(
         ));
     }
     let mut document = editable_document(source_text)?;
-    let state = &mut document["ui"]["displays"][display_id];
-    state["last_confirmed_region"]["x"] = toml_edit::value(i64::from(region.x));
-    state["last_confirmed_region"]["y"] = toml_edit::value(i64::from(region.y));
-    state["last_confirmed_region"]["width"] = toml_edit::value(i64::from(region.width));
-    state["last_confirmed_region"]["height"] = toml_edit::value(i64::from(region.height));
-    state["last_confirmed_region_source"]["width"] = toml_edit::value(i64::from(source.width));
-    state["last_confirmed_region_source"]["height"] = toml_edit::value(i64::from(source.height));
-    state["last_confirmed_region_source"]["rotation_degrees"] =
-        toml_edit::value(i64::from(source.rotation_degrees));
+    let display_path = format!("ui.displays.{display_id}");
+    let state = display_state(&mut document, display_id)?;
+    let region_path = format!("{display_path}.last_confirmed_region");
+    *ensure_table(
+        ensure_table(state, &display_path, "last_confirmed_region")?,
+        &region_path,
+        "x",
+    )? = toml_edit::value(i64::from(region.x));
+    *ensure_table(
+        ensure_table(state, &display_path, "last_confirmed_region")?,
+        &region_path,
+        "y",
+    )? = toml_edit::value(i64::from(region.y));
+    *ensure_table(
+        ensure_table(state, &display_path, "last_confirmed_region")?,
+        &region_path,
+        "width",
+    )? = toml_edit::value(i64::from(region.width));
+    *ensure_table(
+        ensure_table(state, &display_path, "last_confirmed_region")?,
+        &region_path,
+        "height",
+    )? = toml_edit::value(i64::from(region.height));
+    let source_path = format!("{display_path}.last_confirmed_region_source");
+    *ensure_table(
+        ensure_table(state, &display_path, "last_confirmed_region_source")?,
+        &source_path,
+        "width",
+    )? = toml_edit::value(i64::from(source.width));
+    *ensure_table(
+        ensure_table(state, &display_path, "last_confirmed_region_source")?,
+        &source_path,
+        "height",
+    )? = toml_edit::value(i64::from(source.height));
+    *ensure_table(
+        ensure_table(state, &display_path, "last_confirmed_region_source")?,
+        &source_path,
+        "rotation_degrees",
+    )? = toml_edit::value(i64::from(source.rotation_degrees));
     Ok(document.to_string())
 }
 
@@ -1416,12 +1514,29 @@ fn update_capture_history(
     } else {
         source.parse::<toml_edit::Document>()?
     };
-    document["ui"]["last_capture_tool"] = toml_edit::value(tool.as_str());
+    let ui = &mut document["ui"];
+    *ensure_table(ui, "ui", "last_capture_tool")? = toml_edit::value(tool.as_str());
     if let Some(region) = region {
-        document["ui"]["last_region"]["x"] = toml_edit::value(i64::from(region.x));
-        document["ui"]["last_region"]["y"] = toml_edit::value(i64::from(region.y));
-        document["ui"]["last_region"]["width"] = toml_edit::value(i64::from(region.width));
-        document["ui"]["last_region"]["height"] = toml_edit::value(i64::from(region.height));
+        *ensure_table(
+            ensure_table(ui, "ui", "last_region")?,
+            "ui.last_region",
+            "x",
+        )? = toml_edit::value(i64::from(region.x));
+        *ensure_table(
+            ensure_table(ui, "ui", "last_region")?,
+            "ui.last_region",
+            "y",
+        )? = toml_edit::value(i64::from(region.y));
+        *ensure_table(
+            ensure_table(ui, "ui", "last_region")?,
+            "ui.last_region",
+            "width",
+        )? = toml_edit::value(i64::from(region.width));
+        *ensure_table(
+            ensure_table(ui, "ui", "last_region")?,
+            "ui.last_region",
+            "height",
+        )? = toml_edit::value(i64::from(region.height));
     }
     Ok(document.to_string())
 }
@@ -2406,6 +2521,49 @@ mod tests {
             .expect("load state without source");
         assert_eq!(state.region, Some(new_region));
         assert_eq!(state.region_source, None, "stale source must be removed");
+    }
+
+    #[test]
+    fn hand_edited_non_table_ui_state_is_rejected_without_panicking() {
+        for (source, offending_key) in [
+            ("ui = 5\n", "'ui'"),
+            ("[ui]\ndisplays = \"x\"\n", "'ui.displays'"),
+        ] {
+            let error = update_display_overlay_center(source, "main", 0.5, 0.5)
+                .expect_err("non-table ui state must be rejected, not panic");
+            assert!(matches!(error, ConfigError::InvalidValue(_)));
+            assert!(
+                error.to_string().contains(offending_key),
+                "error should name the offending key: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn hand_edited_scalar_ui_table_rejects_global_ui_state_writers_too() {
+        let error = update_capture_history("ui = 5\n", CaptureTool::Region, None)
+            .expect_err("scalar ui table must be rejected");
+        assert!(matches!(error, ConfigError::InvalidValue(_)));
+
+        let error = update_overlay_position("ui = 5\n", 10, 20)
+            .expect_err("scalar ui table must be rejected");
+        assert!(matches!(error, ConfigError::InvalidValue(_)));
+    }
+
+    #[test]
+    fn saving_over_a_hand_edited_scalar_ui_table_is_rejected_and_leaves_the_file_untouched() {
+        let directory = TestDirectory::new("scalar-ui-rejected");
+        let path = directory.join(CONFIG_FILE_NAME);
+        fs::write(&path, "ui = 5\n").expect("seed hand-edited config");
+        let store = UiStateStore::for_config(&path);
+
+        let error = store
+            .save_display_overlay_center("main", 0.5, 0.5)
+            .expect_err("scalar ui table must be rejected, not panic");
+        assert!(matches!(error, ConfigError::InvalidValue(_)));
+
+        let after = fs::read_to_string(&path).expect("read state after rejected save");
+        assert_eq!(after, "ui = 5\n", "rejected save must not modify the file");
     }
 
     #[test]
