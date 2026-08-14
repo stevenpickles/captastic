@@ -905,6 +905,13 @@ fn update_display_interaction_state(
     region: Option<CaptureRegion>,
     region_source: Option<CaptureRegionSource>,
 ) -> Result<String, ConfigError> {
+    if region.is_some_and(|region| region.width == 0 || region.height == 0)
+        || region_source.is_some_and(|source| source.width == 0 || source.height == 0)
+    {
+        return Err(ConfigError::InvalidValue(
+            "last_region and last_region_source dimensions must be greater than zero".to_owned(),
+        ));
+    }
     let mut document = editable_document(source)?;
     let state = &mut document["ui"]["displays"][display_id];
     state["last_capture_tool"] = toml_edit::value(tool.as_str());
@@ -913,11 +920,14 @@ fn update_display_interaction_state(
         state["last_region"]["y"] = toml_edit::value(i64::from(region.y));
         state["last_region"]["width"] = toml_edit::value(i64::from(region.width));
         state["last_region"]["height"] = toml_edit::value(i64::from(region.height));
-        if let Some(source) = region_source {
-            state["last_region_source"]["width"] = toml_edit::value(i64::from(source.width));
-            state["last_region_source"]["height"] = toml_edit::value(i64::from(source.height));
+        if let Some(region_source) = region_source {
+            state["last_region_source"]["width"] = toml_edit::value(i64::from(region_source.width));
+            state["last_region_source"]["height"] =
+                toml_edit::value(i64::from(region_source.height));
             state["last_region_source"]["rotation_degrees"] =
-                toml_edit::value(i64::from(source.rotation_degrees));
+                toml_edit::value(i64::from(region_source.rotation_degrees));
+        } else if let Some(table) = state.as_table_like_mut() {
+            table.remove("last_region_source");
         }
     }
     Ok(document.to_string())
@@ -1396,6 +1406,11 @@ fn update_capture_history(
     tool: CaptureTool,
     region: Option<CaptureRegion>,
 ) -> Result<String, ConfigError> {
+    if region.is_some_and(|region| region.width == 0 || region.height == 0) {
+        return Err(ConfigError::InvalidValue(
+            "last_region width and height must be greater than zero".to_owned(),
+        ));
+    }
     let mut document = if source.trim().is_empty() {
         toml_edit::Document::new()
     } else {
@@ -2251,6 +2266,146 @@ mod tests {
         let config: AppConfig = toml::from_str(&updated).expect("valid Captastic config");
         assert_eq!(config.ui.last_capture_tool, Some(CaptureTool::Region));
         assert_eq!(config.ui.last_region, Some(region));
+    }
+
+    #[test]
+    fn capture_history_rejects_a_zero_dimension_region() {
+        let region = CaptureRegion {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 100,
+        };
+        let error = update_capture_history("", CaptureTool::Region, Some(region))
+            .expect_err("zero-area region must be rejected");
+        assert!(matches!(error, ConfigError::InvalidValue(_)));
+    }
+
+    #[test]
+    fn display_interaction_state_rejects_zero_dimension_region_or_source() {
+        let region = CaptureRegion {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 100,
+        };
+        let source = CaptureRegionSource {
+            width: 1_920,
+            height: 1_080,
+            rotation_degrees: 0,
+        };
+        let error = update_display_interaction_state(
+            "",
+            "main",
+            CaptureTool::Region,
+            Some(region),
+            Some(source),
+        )
+        .expect_err("zero-area region must be rejected");
+        assert!(matches!(error, ConfigError::InvalidValue(_)));
+
+        let region = CaptureRegion {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 100,
+        };
+        let source = CaptureRegionSource {
+            width: 0,
+            height: 1_080,
+            rotation_degrees: 0,
+        };
+        let error = update_display_interaction_state(
+            "",
+            "main",
+            CaptureTool::Region,
+            Some(region),
+            Some(source),
+        )
+        .expect_err("zero-area source must be rejected");
+        assert!(matches!(error, ConfigError::InvalidValue(_)));
+    }
+
+    #[test]
+    fn saving_a_zero_dimension_region_is_rejected_and_leaves_the_file_untouched() {
+        let directory = TestDirectory::new("zero-region-rejected");
+        let path = directory.join(CONFIG_FILE_NAME);
+        let store = UiStateStore::for_config(&path);
+
+        let region = CaptureRegion {
+            x: 10,
+            y: 20,
+            width: 300,
+            height: 200,
+        };
+        let source = CaptureRegionSource {
+            width: 1_920,
+            height: 1_080,
+            rotation_degrees: 0,
+        };
+        store
+            .save_display_interaction_state("main", CaptureTool::Region, Some(region), Some(source))
+            .expect("save valid interaction state");
+        let before = fs::read_to_string(&path).expect("read persisted state");
+
+        let error = store
+            .save_display_interaction_state(
+                "main",
+                CaptureTool::Region,
+                Some(CaptureRegion {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 200,
+                }),
+                None,
+            )
+            .expect_err("zero-area region must be rejected");
+        assert!(matches!(error, ConfigError::InvalidValue(_)));
+
+        let after = fs::read_to_string(&path).expect("read state after rejected save");
+        assert_eq!(before, after, "rejected save must not modify the file");
+    }
+
+    #[test]
+    fn writing_a_region_without_a_source_clears_the_previous_source() {
+        let directory = TestDirectory::new("region-source-clears");
+        let path = directory.join(CONFIG_FILE_NAME);
+        let store = UiStateStore::for_config(&path);
+
+        let region = CaptureRegion {
+            x: 10,
+            y: 20,
+            width: 300,
+            height: 200,
+        };
+        let source = CaptureRegionSource {
+            width: 1_920,
+            height: 1_080,
+            rotation_degrees: 0,
+        };
+        store
+            .save_display_interaction_state("main", CaptureTool::Region, Some(region), Some(source))
+            .expect("save interaction state with a source");
+        let state = store
+            .load_display_ui_state("main")
+            .expect("load state with source");
+        assert_eq!(state.region_source, Some(source));
+
+        let new_region = CaptureRegion {
+            x: 5,
+            y: 5,
+            width: 640,
+            height: 480,
+        };
+        store
+            .save_display_interaction_state("main", CaptureTool::Region, Some(new_region), None)
+            .expect("save interaction state without a source");
+        let state = store
+            .load_display_ui_state("main")
+            .expect("load state without source");
+        assert_eq!(state.region, Some(new_region));
+        assert_eq!(state.region_source, None, "stale source must be removed");
     }
 
     #[test]
