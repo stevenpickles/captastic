@@ -1,6 +1,7 @@
-use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::marker::PhantomData;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -98,10 +99,6 @@ const REGION_CURSOR_CENTER: i32 = REGION_CURSOR_SIZE as i32 / 2;
 const WINDOW_THUMBNAIL_MAX_PIXELS: u64 = 1_200_000;
 const UI_FONT_HEIGHT: i32 = 21;
 const IOSKELEY_MONO_MEDIUM: &[u8] = include_bytes!("../assets/fonts/IoskeleyMono-Medium.ttf");
-
-thread_local! {
-    static OVERLAY_RESOURCE_CACHE: RefCell<Option<OverlayResourceCache>> = const { RefCell::new(None) };
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SelectionKind {
@@ -236,23 +233,37 @@ impl OverlayController {
 
 pub fn select_from_frozen_frame(
     frame: &CpuFrame,
+    resources: &mut OverlayResources,
 ) -> Result<Option<OverlaySelection>, CaptureError> {
-    select_from_frozen_frame_with_controller(frame, &OverlayController::new())
+    select_from_frozen_frame_with_controller(frame, &OverlayController::new(), resources)
 }
 
 pub fn select_from_frozen_frame_with_controller(
     frame: &CpuFrame,
     controller: &OverlayController,
+    resources: &mut OverlayResources,
 ) -> Result<Option<OverlaySelection>, CaptureError> {
-    select_from_frozen_frame_with_initial_tool(frame, controller, InitialSelectionTool::Remembered)
+    select_from_frozen_frame_with_initial_tool(
+        frame,
+        controller,
+        InitialSelectionTool::Remembered,
+        resources,
+    )
 }
 
 pub fn select_from_frozen_frame_with_initial_tool(
     frame: &CpuFrame,
     controller: &OverlayController,
     initial_tool: InitialSelectionTool,
+    resources: &mut OverlayResources,
 ) -> Result<Option<OverlaySelection>, CaptureError> {
-    select_from_frozen_frame_with_initial_tool_and_ui(frame, controller, initial_tool, None)
+    select_from_frozen_frame_with_initial_tool_and_ui(
+        frame,
+        controller,
+        initial_tool,
+        None,
+        resources,
+    )
 }
 
 pub fn select_from_frozen_frame_with_initial_tool_and_ui(
@@ -260,12 +271,14 @@ pub fn select_from_frozen_frame_with_initial_tool_and_ui(
     controller: &OverlayController,
     initial_tool: InitialSelectionTool,
     remembered_ui: Option<captastic_config::DisplayUiState>,
+    resources: &mut OverlayResources,
 ) -> Result<Option<OverlaySelection>, CaptureError> {
     select_from_preview_source_with_initial_tool_and_ui(
         SelectionPreviewSource::frozen(frame),
         controller,
         initial_tool,
         remembered_ui,
+        resources,
     )
 }
 
@@ -304,6 +317,7 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
     controller: &OverlayController,
     initial_tool: InitialSelectionTool,
     remembered_ui: Option<captastic_config::DisplayUiState>,
+    resources: &mut OverlayResources,
 ) -> Result<Option<OverlaySelection>, CaptureError> {
     let preparation_started = Instant::now();
     if controller.inner.cancelled.load(Ordering::SeqCst) {
@@ -323,7 +337,7 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
     // SAFETY: Reads the current foreground window without retaining or mutating it.
     let previous_foreground = unsafe { GetForegroundWindow() };
     let pixels = preview_source.frozen_frame.map(tight_pixels).transpose()?;
-    let cached = take_overlay_resource_cache(source.width, source.height);
+    let cached = resources.take_matching(source.width, source.height);
     let (
         surface,
         back_buffer,
@@ -463,7 +477,7 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
     if tool == CaptureTool::Window {
         build_window_overview(&mut state);
     }
-    run_overlay(state, controller)
+    run_overlay(state, controller, resources)
 }
 
 struct ThreadDpiContext {
@@ -606,18 +620,35 @@ struct OverlayResourceCache {
     font_resource: PrivateFontResource,
 }
 
-fn take_overlay_resource_cache(width: u32, height: u32) -> Option<OverlayResourceCache> {
-    OVERLAY_RESOURCE_CACHE.with(|cache| {
-        cache.borrow_mut().take().filter(|resources| {
-            resources.surface.width == width as i32 && resources.surface.height == height as i32
-        })
-    })
+/// Reusable GDI-backed overlay resources: the frozen and composition surfaces, the blur and
+/// chooser caches, the region cursor, and the process-private font registration - roughly three
+/// full-display DIB allocations when warm. The caller that runs overlays owns one instance and
+/// passes it into every run; dropping or [`clear`](Self::clear)ing it releases everything at
+/// once. Thread-affine: every handle inside was created on the owning thread and the `Drop`
+/// impls must run there, which the `!Send` marker enforces.
+#[derive(Default)]
+pub struct OverlayResources {
+    cache: Option<OverlayResourceCache>,
+    _thread_affine: PhantomData<Rc<()>>,
 }
 
-pub fn clear_overlay_resource_cache() {
-    OVERLAY_RESOURCE_CACHE.with(|cache| {
-        cache.borrow_mut().take();
-    });
+impl OverlayResources {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Releases every cached surface and resource immediately.
+    pub fn clear(&mut self) {
+        self.cache = None;
+    }
+
+    /// Hands out the cached resources only when they match the requested dimensions exactly;
+    /// a resolution change drops the stale allocation instead of resizing it.
+    fn take_matching(&mut self, width: u32, height: u32) -> Option<OverlayResourceCache> {
+        self.cache.take().filter(|resources| {
+            resources.surface.width == width as i32 && resources.surface.height == height as i32
+        })
+    }
 }
 
 pub fn flush_desktop_composition() -> Result<(), CaptureError> {
@@ -625,7 +656,10 @@ pub fn flush_desktop_composition() -> Result<(), CaptureError> {
     unsafe { DwmFlush() }.map_err(|error| overlay_error("flush_overlay_composition", error))
 }
 
-fn cache_overlay_state(state: Box<OverlayState>) -> Option<OverlaySelection> {
+fn cache_overlay_state(
+    state: Box<OverlayState>,
+    resources: &mut OverlayResources,
+) -> Option<OverlaySelection> {
     let OverlayState {
         result,
         surface,
@@ -640,16 +674,14 @@ fn cache_overlay_state(state: Box<OverlayState>) -> Option<OverlaySelection> {
     } = *state;
     let blurred_background = blurred_background.or(cached_blurred_background);
     let overview_surface = window_overview_cache.map(|cache| cache.surface);
-    OVERLAY_RESOURCE_CACHE.with(|cache| {
-        *cache.borrow_mut() = Some(OverlayResourceCache {
-            surface,
-            back_buffer,
-            dimmer,
-            blurred_background,
-            overview_surface,
-            region_cursor,
-            font_resource: _font_resource,
-        });
+    resources.cache = Some(OverlayResourceCache {
+        surface,
+        back_buffer,
+        dimmer,
+        blurred_background,
+        overview_surface,
+        region_cursor,
+        font_resource: _font_resource,
     });
     result
 }
@@ -1201,6 +1233,7 @@ fn apply_overlay_ui_update(
 fn run_overlay(
     state: Box<OverlayState>,
     controller: &OverlayController,
+    resources: &mut OverlayResources,
 ) -> Result<Option<OverlaySelection>, CaptureError> {
     // Overlays run back to back on one long-lived selection thread. Start from a queue that cannot
     // already be quitting, so an earlier run's teardown can never end this loop before it pumps.
@@ -1260,7 +1293,7 @@ fn run_overlay(
     if hwnd.0 == 0 {
         // SAFETY: Window creation failed, so Win32 did not retain the state allocation.
         let state = unsafe { Box::from_raw(state_pointer) };
-        let _ = cache_overlay_state(state);
+        let _ = cache_overlay_state(state, resources);
         return Err(last_error("create_overlay_window"));
     }
     // SAFETY: state_pointer remains exclusively owned by this overlay thread. Recording the HWND
@@ -1286,7 +1319,7 @@ fn run_overlay(
             drain_pending_quit();
             // SAFETY: no callback can access the state after DestroyWindow returns.
             let state = unsafe { Box::from_raw(state_pointer) };
-            let _ = cache_overlay_state(state);
+            let _ = cache_overlay_state(state, resources);
             return Err(error);
         }
         // Capture exclusion is defense in depth. Confirmation still destroys this window before
@@ -1321,7 +1354,7 @@ fn run_overlay(
             let state = unsafe { Box::from_raw(state_pointer) };
             controller.inner.hwnd.store(0, Ordering::SeqCst);
             let previous_foreground = state.previous_foreground;
-            let _ = cache_overlay_state(state);
+            let _ = cache_overlay_state(state, resources);
             restore_input_context(previous_foreground);
             return Err(last_error("overlay_message_loop"));
         }
@@ -1338,7 +1371,7 @@ fn run_overlay(
     let state = unsafe { Box::from_raw(state_pointer) };
     controller.inner.hwnd.store(0, Ordering::SeqCst);
     let previous_foreground = state.previous_foreground;
-    let result = cache_overlay_state(state);
+    let result = cache_overlay_state(state, resources);
     restore_input_context(previous_foreground);
     drop(class_guard);
     Ok(result)
@@ -5541,9 +5574,9 @@ mod tests {
     }
 
     #[test]
-    fn overlay_resource_cache_reuses_matching_surfaces_and_rejects_other_sizes() {
-        clear_overlay_resource_cache();
-        let resources = OverlayResourceCache {
+    fn overlay_resources_reuse_matching_surfaces_and_reject_other_sizes() {
+        let mut resources = OverlayResources::new();
+        resources.cache = Some(OverlayResourceCache {
             surface: FrozenSurface::empty(8, 8).expect("surface"),
             back_buffer: FrozenSurface::empty(8, 8).expect("back buffer"),
             dimmer: FrozenSurface::new(1, 1, &[0, 0, 0, 255]).expect("dimmer"),
@@ -5551,12 +5584,23 @@ mod tests {
             overview_surface: None,
             region_cursor: RegionCursor::create(),
             font_resource: PrivateFontResource::register().expect("font"),
-        };
-        OVERLAY_RESOURCE_CACHE.with(|cache| *cache.borrow_mut() = Some(resources));
-        let resources = take_overlay_resource_cache(8, 8).expect("matching cache");
-        OVERLAY_RESOURCE_CACHE.with(|cache| *cache.borrow_mut() = Some(resources));
-        assert!(take_overlay_resource_cache(16, 16).is_none());
-        clear_overlay_resource_cache();
+        });
+        let cached = resources.take_matching(8, 8).expect("matching cache");
+        resources.cache = Some(cached);
+        // A resolution change must drop the stale allocation rather than hand it out.
+        assert!(resources.take_matching(16, 16).is_none());
+        assert!(resources.cache.is_none(), "the mismatch consumed the cache");
+        resources.cache = Some(OverlayResourceCache {
+            surface: FrozenSurface::empty(8, 8).expect("surface"),
+            back_buffer: FrozenSurface::empty(8, 8).expect("back buffer"),
+            dimmer: FrozenSurface::new(1, 1, &[0, 0, 0, 255]).expect("dimmer"),
+            blurred_background: None,
+            overview_surface: None,
+            region_cursor: RegionCursor::create(),
+            font_resource: PrivateFontResource::register().expect("font"),
+        });
+        resources.clear();
+        assert!(resources.take_matching(8, 8).is_none());
     }
 
     fn ready_preview_state(handle: NativeWindowHandle) -> WindowPreviewState {

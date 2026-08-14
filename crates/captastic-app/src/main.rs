@@ -291,11 +291,14 @@ fn capture_with_preview_fallback(
             let remembered_ui =
                 load_optional_one_shot_ui_state(&ui_store, &full_frame.metadata.display_id.0);
             let worker = selection::OneShotUiStateWorker::start(ui_store)?;
+            // One-shot: the resources live for this single run and drop with it.
+            let mut overlay_resources = captastic_windows::OverlayResources::new();
             let selection = captastic_windows::select_from_frozen_frame_with_initial_tool_and_ui(
                 &full_frame,
                 worker.controller(),
                 captastic_windows::InitialSelectionTool::Remembered,
                 Some(remembered_ui),
+                &mut overlay_resources,
             )?;
             let Some(selection) = selection else {
                 finish_one_shot_ui_state(Some(worker));
@@ -481,11 +484,17 @@ fn capture_with_live_selection(mut args: cli::CaptureArgs) -> Result<(), AppErro
     let ui_store = captastic_config::UiStateStore::for_default_config();
     let remembered_ui = load_optional_one_shot_ui_state(&ui_store, &metadata.display_id.0);
     let ui_worker = selection::OneShotUiStateWorker::start(ui_store)?;
+    // One-shot: fresh resources per attempt. A live-presenter failure falls back into
+    // capture_with_preview_fallback, whose frozen attempt allocates its own set - the old
+    // thread_local handed the failed attempt's surfaces across that boundary, an optimization
+    // this ownership model deliberately gives up on the rare error path.
+    let mut overlay_resources = captastic_windows::OverlayResources::new();
     let selection_result = captastic_windows::select_from_preview_source_with_initial_tool_and_ui(
         captastic_windows::SelectionPreviewSource::live(&metadata),
         ui_worker.controller(),
         captastic_windows::InitialSelectionTool::Remembered,
         Some(remembered_ui),
+        &mut overlay_resources,
     );
     let selection = match selection_result {
         Ok(selection) => selection,

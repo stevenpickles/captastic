@@ -37,11 +37,11 @@ pub use dxgi::{enumerate_displays, materialize_native_region, DxgiBackend, GpuMa
 pub use hotkey::{HotkeyListener, HotkeySpec};
 #[cfg(windows)]
 pub use overlay::{
-    clear_overlay_resource_cache, flush_desktop_composition, select_from_frozen_frame,
-    select_from_frozen_frame_with_controller, select_from_frozen_frame_with_initial_tool,
-    select_from_frozen_frame_with_initial_tool_and_ui,
+    flush_desktop_composition, select_from_frozen_frame, select_from_frozen_frame_with_controller,
+    select_from_frozen_frame_with_initial_tool, select_from_frozen_frame_with_initial_tool_and_ui,
     select_from_preview_source_with_initial_tool_and_ui, InitialSelectionTool, NativeWindowHandle,
-    OverlayController, OverlaySelection, OverlayUiUpdate, SelectionKind, SelectionPreviewSource,
+    OverlayController, OverlayResources, OverlaySelection, OverlayUiUpdate, SelectionKind,
+    SelectionPreviewSource,
 };
 #[cfg(windows)]
 pub use startup::{disable_startup, enable_startup, startup_command};
