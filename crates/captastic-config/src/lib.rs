@@ -581,6 +581,16 @@ impl AppConfig {
         validate_capacity("selection.queue_capacity", self.selection.queue_capacity)?;
         validate_capacity("clipboard.queue_capacity", self.clipboard.queue_capacity)?;
         validate_capacity("output.queue_capacity", self.output.queue_capacity)?;
+        if self.output.enabled {
+            return Err(ConfigError::InvalidValue(
+                "output.enabled: file output is not implemented yet (roadmap milestone 4); remove the override".to_owned(),
+            ));
+        }
+        if !matches!(self.output.format.as_str(), "png") {
+            return Err(ConfigError::InvalidValue(
+                "output.format must be png".to_owned(),
+            ));
+        }
         if self.metrics.ring_capacity == 0 || self.metrics.ring_capacity > 10_000_000 {
             return Err(ConfigError::InvalidValue(
                 "metrics.ring_capacity must be between 1 and 10000000".to_owned(),
@@ -595,9 +605,9 @@ impl AppConfig {
                 "fake frame dimensions must be between 1 and 16384".to_owned(),
             ));
         }
-        if self.capture.buffer_slots < 2 || self.capture.buffer_slots > 16 {
+        if self.capture.buffer_slots != 3 {
             return Err(ConfigError::InvalidValue(
-                "capture.buffer_slots must be between 2 and 16".to_owned(),
+                "capture.buffer_slots: the CPU readback pool is currently fixed at three slots; remove the override".to_owned(),
             ));
         }
         if !matches!(self.capture.mode.as_str(), "fresh" | "latest") {
@@ -605,9 +615,24 @@ impl AppConfig {
                 "capture.mode must be fresh or latest".to_owned(),
             ));
         }
+        if !matches!(self.capture.cursor.as_str(), "include" | "exclude") {
+            return Err(ConfigError::InvalidValue(
+                "capture.cursor must be include or exclude".to_owned(),
+            ));
+        }
+        if self.capture.cursor == "include" {
+            return Err(ConfigError::InvalidValue(
+                "capture.cursor: include is not implemented yet (roadmap milestone 4); capture.cursor must be include or exclude, but only exclude is currently supported".to_owned(),
+            ));
+        }
         if !matches!(self.hotkey.repeat.as_str(), "ignore" | "coalesce") {
             return Err(ConfigError::InvalidValue(
                 "hotkey.repeat must be ignore or coalesce".to_owned(),
+            ));
+        }
+        if self.hotkey.repeat == "coalesce" {
+            return Err(ConfigError::InvalidValue(
+                "hotkey.repeat: coalesce is not implemented yet (roadmap milestone 4); hotkey.repeat must be ignore or coalesce, but only ignore is currently supported".to_owned(),
             ));
         }
         self.hotkey.resolved_bindings()?;
@@ -2472,6 +2497,66 @@ mod tests {
                 Err(ConfigError::InvalidValue(_))
             ));
         }
+    }
+
+    #[test]
+    fn rejects_output_enabled_as_not_implemented() {
+        let mut config = AppConfig::default();
+        config.output.enabled = true;
+        let error = config.validate().expect_err("output.enabled is dormant");
+        assert!(matches!(error, ConfigError::InvalidValue(_)));
+        assert!(error.to_string().contains("output.enabled"));
+    }
+
+    #[test]
+    fn rejects_unknown_output_format() {
+        let mut config = AppConfig::default();
+        config.output.format = "jpeg".to_owned();
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidValue(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_capture_buffer_slots_other_than_the_fixed_default() {
+        let mut config = AppConfig::default();
+        assert_eq!(config.capture.buffer_slots, 3);
+        for value in [2, 4, 16] {
+            config.capture.buffer_slots = value;
+            assert!(matches!(
+                config.validate(),
+                Err(ConfigError::InvalidValue(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_capture_cursor_mode() {
+        let mut config = AppConfig::default();
+        config.capture.cursor = "auto".to_owned();
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidValue(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_capture_cursor_include_as_not_implemented() {
+        let mut config = AppConfig::default();
+        config.capture.cursor = "include".to_owned();
+        let error = config.validate().expect_err("cursor include is dormant");
+        assert!(matches!(error, ConfigError::InvalidValue(_)));
+        assert!(error.to_string().contains("capture.cursor"));
+    }
+
+    #[test]
+    fn rejects_hotkey_repeat_coalesce_as_not_implemented() {
+        let mut config = AppConfig::default();
+        config.hotkey.repeat = "coalesce".to_owned();
+        let error = config.validate().expect_err("repeat coalesce is dormant");
+        assert!(matches!(error, ConfigError::InvalidValue(_)));
+        assert!(error.to_string().contains("hotkey.repeat"));
     }
 
     #[test]
