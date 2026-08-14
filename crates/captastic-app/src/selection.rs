@@ -144,11 +144,11 @@ impl Drop for AttemptCompletion<'_> {
 /// notification area instead of only the log. The job itself has already been closed out by its
 /// caller; this only carries the report.
 fn notify_dropped_selection(
-    notices: &mpsc::SyncSender<crate::daemon::DroppedSelection>,
+    notices: &mpsc::SyncSender<crate::daemon::DaemonNotice>,
     capture_id: CaptureId,
     reason: &'static str,
 ) {
-    let _ = notices.try_send(crate::daemon::DroppedSelection { capture_id, reason });
+    let _ = notices.try_send(crate::daemon::DaemonNotice::DroppedSelection { capture_id, reason });
 }
 
 pub struct SelectionWorker {
@@ -165,7 +165,7 @@ impl SelectionWorker {
     pub fn start(
         clipboard_sender: mpsc::SyncSender<crate::clipboard::ClipboardJob>,
         capture_sender: mpsc::SyncSender<crate::daemon::CaptureCommand>,
-        dropped_selections: mpsc::SyncSender<crate::daemon::DroppedSelection>,
+        notices: mpsc::SyncSender<crate::daemon::DaemonNotice>,
         json_output: bool,
         queue_capacity: usize,
         confirmed_regions: ConfirmedRegionCache,
@@ -336,7 +336,7 @@ impl SelectionWorker {
                                         "capture command queue was unavailable after confirmation",
                                     );
                                     notify_dropped_selection(
-                                        &dropped_selections,
+                                        &notices,
                                         job.capture_id,
                                         "the capture command queue was unavailable after its selection was confirmed",
                                     );
@@ -556,7 +556,7 @@ impl SelectionWorker {
                                         "capture command queue was unavailable for automatic preview fallback",
                                     );
                                     notify_dropped_selection(
-                                        &dropped_selections,
+                                        &notices,
                                         job.capture_id,
                                         "the capture command queue was unavailable for its automatic preview fallback",
                                     );
