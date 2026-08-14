@@ -106,25 +106,34 @@ impl HotkeyListener {
                     return;
                 }
 
+                // Latched once the callback panics so later deliveries are skipped instead of
+                // re-invoking a closure that may have panicked mid-mutation. The loop keeps
+                // running after that so WM_QUIT is still observed and unregister_all still runs
+                // on the way out; tearing the loop down early here would leave the registrations
+                // in place with nothing left to clean them up.
+                let mut callback_poisoned = false;
                 loop {
                     // SAFETY: message is valid writable storage. This thread owns its message loop.
                     let result = unsafe { GetMessageW(&mut message, None, 0, 0) };
-                    if result.0 == -1 || result.0 == 0 || message.message == WM_QUIT {
+                    if result.0 == -1 {
+                        let error = windows::core::Error::from_win32();
+                        log::error!(
+                            "hotkey message loop stopped because GetMessageW failed; registered \
+                             hotkeys will stop responding until the listener restarts: {error}"
+                        );
                         break;
                     }
-                    if message.message == WM_HOTKEY {
-                        let received_at = Instant::now();
-                        if let Some(spec) = registered
-                            .iter()
-                            .find(|spec| message.wParam.0 == spec.id as usize)
-                        {
-                            let action = spec.action();
-                            let chord = spec.chord();
-                            let _ = catch_unwind(AssertUnwindSafe(|| {
-                                on_hotkey(action, chord, received_at);
-                            }));
-                        }
+                    // GetMessageW returns exactly 0 when it retrieved WM_QUIT, so that is the
+                    // only quit signal this loop needs to check for.
+                    if result.0 == 0 {
+                        break;
                     }
+                    dispatch_hotkey_message(
+                        &registered,
+                        &message,
+                        &mut callback_poisoned,
+                        &mut on_hotkey,
+                    );
                 }
 
                 unregister_all(&registered, &mut registry);
@@ -203,6 +212,47 @@ fn join_hotkey_worker_until(join: JoinHandle<()>, deadline: Instant) -> bool {
     }
 }
 
+/// Handles one native message on the hotkey thread's loop: ignores anything that is not a
+/// registered chord, and otherwise invokes `on_hotkey` behind a panic boundary.
+///
+/// If `on_hotkey` has already panicked once (`*poisoned == true`), the callback is not invoked
+/// again — a `FnMut` closure caught mid-mutation by `catch_unwind` cannot be trusted to still
+/// hold a consistent state, so re-entering it risks a second, possibly worse, failure. The caller
+/// keeps its message loop running regardless so WM_QUIT is still observed and hotkeys still get
+/// unregistered on the way out.
+fn dispatch_hotkey_message<F>(
+    registered: &[HotkeySpec],
+    message: &MSG,
+    poisoned: &mut bool,
+    on_hotkey: &mut F,
+) where
+    F: FnMut(HotkeyAction, HotkeyChord, Instant),
+{
+    if message.message != WM_HOTKEY {
+        return;
+    }
+    let received_at = Instant::now();
+    let Some(spec) = registered
+        .iter()
+        .find(|spec| message.wParam.0 == spec.id as usize)
+    else {
+        return;
+    };
+    if *poisoned {
+        return;
+    }
+    let action = spec.action();
+    let chord = spec.chord();
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| on_hotkey(action, chord, received_at))) {
+        *poisoned = true;
+        log::error!(
+            "hotkey callback panicked while handling {action} ({chord}); further hotkey \
+             deliveries will be ignored until the listener restarts: {}",
+            panic_message(&*payload)
+        );
+    }
+}
+
 trait Registry {
     type Error;
 
@@ -264,6 +314,18 @@ fn registration_error(failure: RegistrationFailure<windows::core::Error>) -> Cap
         message: format!("failed to register action {action} with chord {chord}: {error}"),
         retryable: false,
         native_code: Some(i64::from(error.code().0)),
+    }
+}
+
+/// Extracts a human-readable message from a caught panic payload, mirroring the common
+/// `&str`/`String` shapes produced by `panic!` and friends.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        message
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.as_str()
+    } else {
+        "non-string panic payload"
     }
 }
 
@@ -359,6 +421,49 @@ mod tests {
         let registered = register_all(&specs, &mut registry).expect("registrations succeed");
         unregister_all(&registered, &mut registry);
         assert_eq!(registry.unregistered, vec![specs[1].id, specs[0].id]);
+    }
+
+    #[test]
+    fn hotkey_callback_panic_latches_and_further_deliveries_are_skipped() {
+        let spec = HotkeySpec::from_binding(binding(HotkeyAction::Window, "Ctrl+F11"));
+        let registered = [spec];
+        let calls = std::cell::Cell::new(0_u32);
+        let mut on_hotkey = |_action: HotkeyAction, _chord: HotkeyChord, _received_at: Instant| {
+            calls.set(calls.get() + 1);
+            panic!("scripted hotkey callback panic");
+        };
+        let message = MSG {
+            message: WM_HOTKEY,
+            wParam: WPARAM(spec.id as usize),
+            ..MSG::default()
+        };
+        let mut poisoned = false;
+
+        dispatch_hotkey_message(&registered, &message, &mut poisoned, &mut on_hotkey);
+        assert!(poisoned);
+        assert_eq!(calls.get(), 1);
+
+        // The callback must not be invoked again once poisoned by an earlier panic.
+        dispatch_hotkey_message(&registered, &message, &mut poisoned, &mut on_hotkey);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn unregistered_hotkey_ids_are_ignored() {
+        let spec = HotkeySpec::from_binding(binding(HotkeyAction::Window, "Ctrl+F11"));
+        let registered = [spec];
+        let mut poisoned = false;
+        let mut on_hotkey = |_action: HotkeyAction, _chord: HotkeyChord, _received_at: Instant| {
+            panic!("on_hotkey must not be invoked for an unregistered id");
+        };
+        let message = MSG {
+            message: WM_HOTKEY,
+            wParam: WPARAM((spec.id + 1) as usize),
+            ..MSG::default()
+        };
+
+        dispatch_hotkey_message(&registered, &message, &mut poisoned, &mut on_hotkey);
+        assert!(!poisoned);
     }
 
     #[test]
