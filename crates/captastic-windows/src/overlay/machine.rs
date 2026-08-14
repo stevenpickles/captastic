@@ -12,7 +12,7 @@ use windows::Win32::Foundation::POINT;
 use captastic_core::Rect;
 
 use super::layout::{DisplayEnvironment, ToolbarControl, ToolbarLayout, UiMetrics};
-use super::{NativeWindowHandle, SelectionKind};
+use super::{NativeWindowHandle, SelectionKind, WindowCandidate};
 
 pub(super) const DRAG_THRESHOLD: i32 = 4;
 pub(super) const MIN_REGION_SIZE: i64 = 8;
@@ -103,18 +103,27 @@ pub(super) struct OverlayModel {
     pub(super) dim_background: bool,
     pub(super) hovered_control: Option<ToolbarControl>,
     pub(super) pointer_local: Option<POINT>,
+    /// The window-chooser candidate under the pointer. The shell owns the thumbnail
+    /// inventory and supplies hit results through inputs; the machine owns the decision.
+    pub(super) hovered: Option<WindowCandidate>,
 }
 
 /// A translated window message. The shell decodes `LPARAM`/`WPARAM`/message identity; the
 /// machine never sees Win32 encodings.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum OverlayInput {
-    /// Pointer moved to a screen-space point. Routed here unless the window-chooser hover pass
-    /// (not yet modeled) owns the message.
-    PointerMoved { point: POINT },
-    /// Primary button pressed outside the toolbar while the region tool is active. The shell's
-    /// router has already dispatched toolbar hits and non-region tools to unmodeled paths.
-    PointerDown { point: POINT },
+    /// Pointer moved to a screen-space point. Under the Window tool the shell resolves the
+    /// thumbnail under the pointer (it owns the inventory) and passes the candidate along.
+    PointerMoved {
+        point: POINT,
+        window_hover: Option<WindowCandidate>,
+    },
+    /// Primary button pressed. Under the Window tool the shell resolves which thumbnail slot
+    /// (if any) the press landed on.
+    PointerDown {
+        point: POINT,
+        window_slot: Option<NativeWindowHandle>,
+    },
     /// Primary button released. Fully modeled for every tool.
     PointerUp { point: POINT },
     /// Primary button double-clicked anywhere.
@@ -122,6 +131,9 @@ pub(super) enum OverlayInput {
     /// Pointer capture was taken by another window. Self-initiated releases are consumed by the
     /// shell's protocol flag and never reach the machine.
     PointerCaptureLost,
+    /// The shell finished a requested window-preview update: `rect` is the captured frame's
+    /// source rectangle when a ready preview now backs the selected window, `None` otherwise.
+    WindowPreviewResolved { rect: Option<Rect> },
     /// Enter pressed.
     ConfirmRequested,
     /// Escape, right-click, or an external close request.
@@ -166,8 +178,6 @@ pub(super) enum OverlayEffect {
     /// Release pointer capture. The shell owns the `releasing_pointer_capture` protocol flag
     /// that distinguishes the resulting self-generated `WM_CAPTURECHANGED` from a real loss.
     ReleasePointer,
-    /// Clear the window-chooser hover highlight (shell-owned state, not yet modeled).
-    ClearWindowHover,
     /// Clear the dimension-label placement hysteresis (render-scratch state).
     ClearDimensionLabel,
     /// Clear the captured frame backing a window selection (shell-owned pixels).
@@ -185,6 +195,12 @@ pub(super) enum OverlayEffect {
     /// synchronously today (M21 — the overlay blocks while it runs); the machine only decides
     /// when it happens.
     BuildWindowOverview,
+    /// Capture (or retry) the preview for the given window and feed the outcome back as
+    /// [`OverlayInput::WindowPreviewResolved`]. Synchronous and blocking in the shell today
+    /// (M21); the non-sticky retry semantics live in the shell's preview cache.
+    UpdateWindowPreview {
+        window: Option<NativeWindowHandle>,
+    },
     /// Persist the toolbar's resting position for this display.
     PersistToolbarCenter {
         position: POINT,
@@ -200,8 +216,12 @@ pub(super) enum OverlayEffect {
 /// Advances the model by one input and returns the effects the shell must apply, in order.
 pub(super) fn transition(model: &mut OverlayModel, input: OverlayInput) -> Vec<OverlayEffect> {
     match input {
-        OverlayInput::PointerMoved { point } => pointer_moved(model, point),
-        OverlayInput::PointerDown { point } => pointer_down(model, point),
+        OverlayInput::PointerMoved {
+            point,
+            window_hover,
+        } => pointer_moved(model, point, window_hover),
+        OverlayInput::PointerDown { point, window_slot } => pointer_down(model, point, window_slot),
+        OverlayInput::WindowPreviewResolved { rect } => window_preview_resolved(model, rect),
         OverlayInput::PointerUp { point } => pointer_up(model, point),
         OverlayInput::DoubleClicked { point } => double_clicked(model, point),
         OverlayInput::PointerCaptureLost => pointer_capture_lost(model),
@@ -215,7 +235,11 @@ pub(super) fn transition(model: &mut OverlayModel, input: OverlayInput) -> Vec<O
     }
 }
 
-fn pointer_moved(model: &mut OverlayModel, point: POINT) -> Vec<OverlayEffect> {
+fn pointer_moved(
+    model: &mut OverlayModel,
+    point: POINT,
+    window_hover: Option<WindowCandidate>,
+) -> Vec<OverlayEffect> {
     let local = local_point(model.source, point);
     model.pointer_local = Some(local);
     let mut effects = Vec::new();
@@ -229,7 +253,7 @@ fn pointer_moved(model: &mut OverlayModel, point: POINT) -> Vec<OverlayEffect> {
         );
         model.hovered_control = Some(ToolbarControl::Background);
         model.hovered_handle = None;
-        effects.push(OverlayEffect::ClearWindowHover);
+        model.hovered = None;
         effects.push(OverlayEffect::SetCursor(CursorIntent::Arrow));
         effects.push(OverlayEffect::Invalidate);
         return effects;
@@ -241,7 +265,7 @@ fn pointer_moved(model: &mut OverlayModel, point: POINT) -> Vec<OverlayEffect> {
         .then(|| layout.hit_test(local, model.options_open))
         .flatten();
     if model.hovered_control.is_some() {
-        effects.push(OverlayEffect::ClearWindowHover);
+        model.hovered = None;
         effects.push(OverlayEffect::SetCursor(CursorIntent::Arrow));
     } else if let Some(resize) = model.resizing {
         model.selection = Some(resize_region(
@@ -270,7 +294,7 @@ fn pointer_moved(model: &mut OverlayModel, point: POINT) -> Vec<OverlayEffect> {
             model.selection = rect_from_points(model.source, anchor, point);
             model.selection_kind = Some(SelectionKind::Region);
             model.selected_window = None;
-            effects.push(OverlayEffect::ClearWindowHover);
+            model.hovered = None;
         }
         model.hovered_handle = None;
         effects.push(OverlayEffect::SetCursor(CursorIntent::Crosshair));
@@ -280,7 +304,7 @@ fn pointer_moved(model: &mut OverlayModel, point: POINT) -> Vec<OverlayEffect> {
         model.hovered_handle = model.selection.and_then(|selection| {
             hit_test_resize_handle(selection, point, model.display_environment.metrics)
         });
-        effects.push(OverlayEffect::ClearWindowHover);
+        model.hovered = None;
         if model.hovered_handle.is_none()
             && model
                 .selection
@@ -292,8 +316,12 @@ fn pointer_moved(model: &mut OverlayModel, point: POINT) -> Vec<OverlayEffect> {
                 model.hovered_handle,
             )));
         }
+    } else if model.tool == CaptureTool::Window {
+        model.hovered = window_hover;
+        model.hovered_handle = None;
+        effects.push(OverlayEffect::SetCursor(CursorIntent::Arrow));
     } else {
-        effects.push(OverlayEffect::ClearWindowHover);
+        model.hovered = None;
         model.hovered_handle = None;
         if model.tool == CaptureTool::Region {
             effects.push(OverlayEffect::SetCursor(CursorIntent::Crosshair));
@@ -301,21 +329,43 @@ fn pointer_moved(model: &mut OverlayModel, point: POINT) -> Vec<OverlayEffect> {
             effects.push(OverlayEffect::SetCursor(CursorIntent::Arrow));
         }
     }
-    effects.push(OverlayEffect::Invalidate);
+    // Window-tool hover repaints are the shell's policy: it skips the repaint entirely when
+    // neither the hovered slot nor the hovered control changed, and otherwise forces a
+    // synchronous paint. Every other tool repaints on each move, as before.
+    if model.tool != CaptureTool::Window {
+        effects.push(OverlayEffect::Invalidate);
+    }
     effects
 }
 
-fn pointer_down(model: &mut OverlayModel, point: POINT) -> Vec<OverlayEffect> {
+fn pointer_down(
+    model: &mut OverlayModel,
+    point: POINT,
+    window_slot: Option<NativeWindowHandle>,
+) -> Vec<OverlayEffect> {
     let local = local_point(model.source, point);
     let layout = ToolbarLayout::new(model.display_environment, model.toolbar_position);
     if let Some(control) = layout.hit_test(local, model.options_open) {
         return toolbar_control_pressed(model, control, layout.bounds.contains(local), local);
     }
-    // The shell's router sends non-toolbar presses here only for the region tool; the Window
-    // click-select path is not yet modeled.
-    debug_assert_eq!(model.tool, CaptureTool::Region);
     model.hovered_control = None;
+    let options_were_open = model.options_open;
     model.options_open = false;
+    match model.tool {
+        CaptureTool::Window => {
+            let mut effects = Vec::new();
+            if options_were_open {
+                effects.push(OverlayEffect::RefreshWindowChrome);
+            }
+            model.selected_window = window_slot;
+            effects.push(OverlayEffect::UpdateWindowPreview {
+                window: window_slot,
+            });
+            return effects;
+        }
+        CaptureTool::FullDisplay => return vec![OverlayEffect::Invalidate],
+        CaptureTool::Region => {}
+    }
     let existing_region = (model.selection_kind == Some(SelectionKind::Region))
         .then_some(model.selection)
         .flatten();
@@ -355,8 +405,8 @@ fn pointer_down(model: &mut OverlayModel, point: POINT) -> Vec<OverlayEffect> {
         model.selection_kind = None;
         model.selected_window = None;
         model.hovered_handle = None;
+        model.hovered = None;
         vec![
-            OverlayEffect::ClearWindowHover,
             OverlayEffect::ClearDimensionLabel,
             OverlayEffect::SetCursor(CursorIntent::Crosshair),
             OverlayEffect::CapturePointer,
@@ -441,9 +491,9 @@ pub(super) fn activate_tool(model: &mut OverlayModel, tool: CaptureTool) -> Vec<
         model.selection_kind = None;
         model.selected_window = None;
         model.hovered_handle = None;
+        model.hovered = None;
         effects.push(OverlayEffect::ClearDimensionLabel);
         effects.push(OverlayEffect::ClearSelectedWindowFrame);
-        effects.push(OverlayEffect::ClearWindowHover);
     }
     model.tool = tool;
     model.options_open = false;
@@ -533,6 +583,22 @@ fn pointer_up(model: &mut OverlayModel, point: POINT) -> Vec<OverlayEffect> {
     }
     effects.push(OverlayEffect::Invalidate);
     effects
+}
+
+fn window_preview_resolved(model: &mut OverlayModel, rect: Option<Rect>) -> Vec<OverlayEffect> {
+    model.selection = rect;
+    model.selection_kind = rect.map(|_| SelectionKind::Window);
+    if model.selection.is_some() {
+        // A ready preview confirms immediately; the shell attaches the captured frame.
+        confirm(model)
+    } else {
+        // Not ready (or empty space): stay in the chooser. The preview cache deliberately does
+        // not latch failures, so the next click retries.
+        vec![
+            OverlayEffect::RebuildOverviewCache,
+            OverlayEffect::Invalidate,
+        ]
+    }
 }
 
 fn double_clicked(model: &mut OverlayModel, point: POINT) -> Vec<OverlayEffect> {
@@ -847,6 +913,7 @@ mod tests {
             dim_background: true,
             hovered_control: None,
             pointer_local: None,
+            hovered: None,
         }
     }
 
@@ -879,6 +946,7 @@ mod tests {
             &mut model,
             OverlayInput::PointerDown {
                 point: point(100, 100),
+                window_slot: None,
             },
         );
         assert!(model.anchor.is_some());
@@ -897,6 +965,7 @@ mod tests {
             &mut model,
             OverlayInput::PointerMoved {
                 point: point(103, 100),
+                window_hover: None,
             },
         );
         assert!(!model.dragging);
@@ -907,6 +976,7 @@ mod tests {
             &mut model,
             OverlayInput::PointerMoved {
                 point: point(104, 100),
+                window_hover: None,
             },
         );
         assert!(model.dragging);
@@ -914,6 +984,7 @@ mod tests {
             &mut model,
             OverlayInput::PointerMoved {
                 point: point(300, 240),
+                window_hover: None,
             },
         );
         assert_eq!(model.selection_kind, Some(SelectionKind::Region));
@@ -947,12 +1018,14 @@ mod tests {
             &mut model,
             OverlayInput::PointerDown {
                 point: point(100, 100),
+                window_slot: None,
             },
         );
         transition(
             &mut model,
             OverlayInput::PointerMoved {
                 point: point(102, 101),
+                window_hover: None,
             },
         );
         let effects = transition(
@@ -983,6 +1056,7 @@ mod tests {
             &mut model,
             OverlayInput::PointerDown {
                 point: point(300, 300),
+                window_slot: None,
             },
         );
         let resize = model
@@ -1002,6 +1076,7 @@ mod tests {
             &mut model,
             OverlayInput::PointerMoved {
                 point: point(340, 360),
+                window_hover: None,
             },
         );
         assert_eq!(
@@ -1049,6 +1124,7 @@ mod tests {
             &mut model,
             OverlayInput::PointerDown {
                 point: point(180, 160),
+                window_slot: None,
             },
         );
         assert!(model.moving_region.is_some());
@@ -1057,6 +1133,7 @@ mod tests {
             &mut model,
             OverlayInput::PointerMoved {
                 point: point(230, 200),
+                window_hover: None,
             },
         );
         transition(
@@ -1084,12 +1161,14 @@ mod tests {
             &mut model,
             OverlayInput::PointerDown {
                 point: point(100, 100),
+                window_slot: None,
             },
         );
         transition(
             &mut model,
             OverlayInput::PointerMoved {
                 point: point(200, 200),
+                window_hover: None,
             },
         );
         assert!(model.dragging);
@@ -1119,12 +1198,14 @@ mod tests {
             &mut model,
             OverlayInput::PointerDown {
                 point: point(10, 10),
+                window_slot: None,
             },
         );
         transition(
             &mut model,
             OverlayInput::PointerMoved {
                 point: point(90, 60),
+                window_hover: None,
             },
         );
         let effects = transition(
@@ -1247,6 +1328,7 @@ mod tests {
             &mut model,
             OverlayInput::PointerMoved {
                 point: point(500, 400),
+                window_hover: None,
             },
         );
         assert_eq!(model.hovered_control, Some(ToolbarControl::Background));
@@ -1397,7 +1479,13 @@ mod tests {
                 x: model.source.x + local.x,
                 y: model.source.y + local.y,
             };
-            let effects = transition(&mut model, OverlayInput::PointerDown { point: screen });
+            let effects = transition(
+                &mut model,
+                OverlayInput::PointerDown {
+                    point: screen,
+                    window_slot: None,
+                },
+            );
             assert_eq!(model.hovered_control, Some(expected));
             assert_eq!(model.anchor, None, "{expected:?}");
             assert!(!model.dragging, "{expected:?}");
@@ -1427,6 +1515,9 @@ mod tests {
                 model.selection_kind = kind;
                 model.last_region = Some(region);
                 model.options_open = true;
+                model.hovered = Some(WindowCandidate {
+                    handle: NativeWindowHandle::from_raw(0x42),
+                });
 
                 let effects = activate_tool(&mut model, to);
                 let changed = from != to;
@@ -1474,11 +1565,8 @@ mod tests {
                     assert_eq!(model.last_region, Some(region), "{from:?}->{to:?}");
                 }
                 assert_eq!(model.selected_window, None);
-                assert_eq!(
-                    has_effect(&effects, |e| matches!(e, OverlayEffect::ClearWindowHover)),
-                    changed,
-                    "{from:?}->{to:?}"
-                );
+                // The hover highlight only survives a same-tool re-activation.
+                assert_eq!(model.hovered.is_none(), changed, "{from:?}->{to:?}");
             }
         }
     }
@@ -1490,7 +1578,13 @@ mod tests {
             model.tool = tool;
             let layout = layout_for(&model);
             let local = center(layout.drag_handle);
-            let effects = transition(&mut model, OverlayInput::PointerDown { point: local });
+            let effects = transition(
+                &mut model,
+                OverlayInput::PointerDown {
+                    point: local,
+                    window_slot: None,
+                },
+            );
             let drag = model.toolbar_drag.expect("drag-handle press starts a drag");
             assert_eq!(drag.pointer_offset.x, local.x - model.toolbar_position.x);
             assert!(!model.options_open);
@@ -1525,6 +1619,7 @@ mod tests {
             &mut model,
             OverlayInput::PointerDown {
                 point: center(layout.options),
+                window_slot: None,
             },
         );
         assert!(model.options_open);
@@ -1538,6 +1633,7 @@ mod tests {
             &mut model,
             OverlayInput::PointerDown {
                 point: menu_background,
+                window_slot: None,
             },
         );
         assert!(model.options_open);
@@ -1549,13 +1645,20 @@ mod tests {
             &mut model,
             OverlayInput::PointerDown {
                 point: center(layout.options),
+                window_slot: None,
             },
         );
         assert!(!model.options_open);
 
         // An outside press under the region tool closes the menu too.
         model.options_open = true;
-        transition(&mut model, OverlayInput::PointerDown { point: point(5, 5) });
+        transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point: point(5, 5),
+                window_slot: None,
+            },
+        );
         assert!(!model.options_open);
     }
 
@@ -1570,6 +1673,7 @@ mod tests {
                 &mut model,
                 OverlayInput::PointerDown {
                     point: center(layout.options),
+                    window_slot: None,
                 },
             );
             assert_eq!(model.options_open, expected_open);
@@ -1590,6 +1694,7 @@ mod tests {
             &mut model,
             OverlayInput::PointerDown {
                 point: center(layout.dim_background),
+                window_slot: None,
             },
         );
         assert_eq!(model.dim_background, !dimmed_before);
@@ -1607,7 +1712,13 @@ mod tests {
         let capture = center(layout.capture);
 
         let mut without = region_model();
-        let effects = transition(&mut without, OverlayInput::PointerDown { point: capture });
+        let effects = transition(
+            &mut without,
+            OverlayInput::PointerDown {
+                point: capture,
+                window_slot: None,
+            },
+        );
         assert!(
             effects.is_empty(),
             "no selection: nothing to do, no repaint"
@@ -1621,7 +1732,13 @@ mod tests {
             height: 40,
         });
         with.selection_kind = Some(SelectionKind::Region);
-        let effects = transition(&mut with, OverlayInput::PointerDown { point: capture });
+        let effects = transition(
+            &mut with,
+            OverlayInput::PointerDown {
+                point: capture,
+                window_slot: None,
+            },
+        );
         assert!(matches!(
             close_outcome(&effects),
             Some(CloseOutcome::Confirmed { .. })
@@ -1646,6 +1763,7 @@ mod tests {
             &mut model,
             OverlayInput::PointerDown {
                 point: center(layout.cancel),
+                window_slot: None,
             },
         );
         assert_eq!(persisted_region(&effects), Some(Some(region)));
@@ -1653,6 +1771,207 @@ mod tests {
             close_outcome(&effects),
             Some(CloseOutcome::Cancelled)
         ));
+    }
+
+    fn candidate(raw: isize) -> WindowCandidate {
+        WindowCandidate {
+            handle: NativeWindowHandle::from_raw(raw),
+        }
+    }
+
+    #[test]
+    fn a_window_slot_click_requests_a_preview_and_confirms_when_it_resolves() {
+        let mut model = region_model();
+        model.tool = CaptureTool::Window;
+        let handle = NativeWindowHandle::from_raw(0x1234);
+
+        let effects = transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point: point(400, 300),
+                window_slot: Some(handle),
+            },
+        );
+        assert_eq!(model.selected_window, Some(handle));
+        assert!(has_effect(&effects, |e| matches!(
+            e,
+            OverlayEffect::UpdateWindowPreview {
+                window: Some(window)
+            } if *window == handle
+        )));
+        assert!(
+            close_outcome(&effects).is_none(),
+            "nothing closes before the preview resolves"
+        );
+
+        let frame_rect = Rect {
+            x: 200,
+            y: 150,
+            width: 640,
+            height: 480,
+        };
+        let effects = transition(
+            &mut model,
+            OverlayInput::WindowPreviewResolved {
+                rect: Some(frame_rect),
+            },
+        );
+        assert_eq!(model.selection, Some(frame_rect));
+        assert_eq!(model.selection_kind, Some(SelectionKind::Window));
+        assert_eq!(
+            persisted_region(&effects),
+            Some(None),
+            "window confirms do not persist a region"
+        );
+        match close_outcome(&effects) {
+            Some(CloseOutcome::Confirmed { kind, window, rect }) => {
+                assert_eq!(kind, SelectionKind::Window);
+                assert_eq!(window, Some(handle));
+                assert_eq!(rect, frame_rect);
+            }
+            other => panic!("expected a confirmed close, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unresolved_preview_stays_in_the_chooser_for_a_retry() {
+        let mut model = region_model();
+        model.tool = CaptureTool::Window;
+        let handle = NativeWindowHandle::from_raw(0x1234);
+
+        for _ in 0..2 {
+            let effects = transition(
+                &mut model,
+                OverlayInput::PointerDown {
+                    point: point(400, 300),
+                    window_slot: Some(handle),
+                },
+            );
+            // Every click re-requests the preview: the shell's cache is deliberately
+            // non-sticky about failures, so the machine must always ask again.
+            assert!(has_effect(&effects, |e| matches!(
+                e,
+                OverlayEffect::UpdateWindowPreview { .. }
+            )));
+
+            let effects = transition(
+                &mut model,
+                OverlayInput::WindowPreviewResolved { rect: None },
+            );
+            assert_eq!(model.selection, None);
+            assert_eq!(model.selection_kind, None);
+            assert!(close_outcome(&effects).is_none());
+            assert!(has_effect(&effects, |e| matches!(
+                e,
+                OverlayEffect::RebuildOverviewCache
+            )));
+            assert!(has_effect(&effects, |e| matches!(
+                e,
+                OverlayEffect::Invalidate
+            )));
+        }
+    }
+
+    #[test]
+    fn an_empty_space_window_click_clears_the_selection_target() {
+        let mut model = region_model();
+        model.tool = CaptureTool::Window;
+        model.selected_window = Some(NativeWindowHandle::from_raw(0x1234));
+
+        let effects = transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point: point(400, 300),
+                window_slot: None,
+            },
+        );
+        assert_eq!(model.selected_window, None);
+        assert!(has_effect(&effects, |e| matches!(
+            e,
+            OverlayEffect::UpdateWindowPreview { window: None }
+        )));
+    }
+
+    #[test]
+    fn window_hover_tracks_the_supplied_candidate_without_forcing_a_repaint() {
+        let mut model = region_model();
+        model.tool = CaptureTool::Window;
+
+        let effects = transition(
+            &mut model,
+            OverlayInput::PointerMoved {
+                point: point(400, 300),
+                window_hover: Some(candidate(0x77)),
+            },
+        );
+        assert_eq!(
+            model.hovered.map(|c| c.handle),
+            Some(NativeWindowHandle::from_raw(0x77))
+        );
+        assert_eq!(model.pointer_local, Some(point(400, 300)));
+        // Repaint policy belongs to the shell in the window pass; the machine stays silent.
+        assert!(!has_effect(&effects, |e| matches!(
+            e,
+            OverlayEffect::Invalidate
+        )));
+        assert!(has_effect(&effects, |e| matches!(
+            e,
+            OverlayEffect::SetCursor(CursorIntent::Arrow)
+        )));
+
+        // Hovering the toolbar overrides the window hover.
+        let layout = layout_for(&model);
+        let effects = transition(
+            &mut model,
+            OverlayInput::PointerMoved {
+                point: center(layout.capture),
+                window_hover: Some(candidate(0x77)),
+            },
+        );
+        assert_eq!(model.hovered_control, Some(ToolbarControl::Capture));
+        assert!(model.hovered.is_none());
+        assert!(!has_effect(&effects, |e| matches!(
+            e,
+            OverlayEffect::Invalidate
+        )));
+
+        // Leaving every slot clears the hover.
+        transition(
+            &mut model,
+            OverlayInput::PointerMoved {
+                point: point(10, 10),
+                window_hover: None,
+            },
+        );
+        assert!(model.hovered.is_none());
+    }
+
+    #[test]
+    fn an_outside_click_under_the_window_tool_closes_options_and_refreshes() {
+        let mut model = region_model();
+        model.tool = CaptureTool::Window;
+        model.options_open = true;
+
+        let effects = transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point: point(400, 300),
+                window_slot: None,
+            },
+        );
+        assert!(!model.options_open);
+        assert_eq!(model.hovered_control, None);
+        let kinds: Vec<_> = effects
+            .iter()
+            .map(|effect| match effect {
+                OverlayEffect::RefreshWindowChrome => "refresh",
+                OverlayEffect::UpdateWindowPreview { .. } => "preview",
+                _ => "other",
+            })
+            .collect();
+        // The chrome refresh from closing the menu runs before the preview request, as the
+        // legacy handler ordered it.
+        assert_eq!(kinds, ["refresh", "preview"]);
     }
 
     #[test]

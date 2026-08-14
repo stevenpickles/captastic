@@ -15,11 +15,14 @@ use layout::{
     ToolbarLayout, UiMetrics, UiRect, UiSize,
 };
 #[cfg(test)]
-use machine::{contains, hit_test_resize_handle, move_region, rect_from_points, resize_region};
 use machine::{
-    default_region_for_source, fit_region_to_source, initial_selection, latest_interaction_region,
-    local_point, transition, CaptureTool, CloseOutcome, CursorIntent, OverlayEffect, OverlayInput,
-    OverlayModel, ResizeHandle,
+    contains, hit_test_resize_handle, latest_interaction_region, move_region, rect_from_points,
+    resize_region,
+};
+use machine::{
+    default_region_for_source, fit_region_to_source, initial_selection, local_point, transition,
+    CaptureTool, CloseOutcome, CursorIntent, OverlayEffect, OverlayInput, OverlayModel,
+    ResizeHandle,
 };
 
 use crate::dwm_thumbnail::{fit_source_in_bounds, DwmThumbnail};
@@ -426,6 +429,7 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
             dim_background: true,
             hovered_control: None,
             pointer_local: None,
+            hovered: None,
         },
         overlay_hwnd: HWND(0),
         live_preview: preview_source.is_live(),
@@ -436,7 +440,6 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
         cached_blurred_background: blurred_background,
         window_assets_ready: false,
         windows: None,
-        hovered: None,
         dimension_label_placement: None,
         selected_window_frame: None,
         releasing_pointer_capture: false,
@@ -573,7 +576,6 @@ struct OverlayState {
     cached_blurred_background: Option<FrozenSurface>,
     window_assets_ready: bool,
     windows: Option<Vec<WindowCandidate>>,
-    hovered: Option<WindowCandidate>,
     dimension_label_placement: Option<DimensionLabelPlacement>,
     selected_window_frame: Option<CpuFrame>,
     /// Shell-side protocol flag distinguishing a self-initiated `ReleaseCapture` round trip from
@@ -984,7 +986,7 @@ impl Drop for FrozenSurface {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct WindowCandidate {
     handle: NativeWindowHandle,
 }
@@ -1439,39 +1441,32 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             )
         }
         WM_MOUSEMOVE => {
-            // Route through the machine unless the window-chooser hover pass (not yet modeled)
-            // owns this message: Window tool with no active toolbar drag. Region drags exist
-            // only in the region tool, so the machine covers every other combination.
-            let routed = {
+            let (point, window_pass) = {
                 // SAFETY: The borrow ends with this block, before run_machine derives its own.
                 let state = unsafe { &*state_pointer };
-                let point = screen_point(state.model.source, lparam);
-                (state.model.toolbar_drag.is_some() || state.model.tool != CaptureTool::Window)
-                    .then_some(point)
+                (
+                    screen_point(state.model.source, lparam),
+                    state.model.tool == CaptureTool::Window && state.model.toolbar_drag.is_none(),
+                )
             };
-            if let Some(point) = routed {
-                return run_machine(hwnd, state_pointer, OverlayInput::PointerMoved { point });
+            if !window_pass {
+                return run_machine(
+                    hwnd,
+                    state_pointer,
+                    OverlayInput::PointerMoved {
+                        point,
+                        window_hover: None,
+                    },
+                );
             }
-            // Legacy window-chooser hover pass, untouched by stage A of the extraction.
-            // SAFETY: The Box remains alive for the message loop. The last state access occurs
-            // before UpdateWindow can synchronously dispatch WM_PAINT and reborrow the pointer.
-            let state = unsafe { &mut *state_pointer };
-            let point = screen_point(state.model.source, lparam);
-            let local = local_point(state.model.source, point);
-            state.model.pointer_local = Some(local);
-            let previous_hovered = state.hovered.map(|candidate| candidate.handle);
-            let previous_control = state.model.hovered_control;
-            let layout = ToolbarLayout::new(
-                state.model.display_environment,
-                state.model.toolbar_position,
-            );
-            state.model.hovered_control = layout.hit_test(local, state.model.options_open);
-            if state.model.hovered_control.is_some() {
-                state.hovered = None;
-                set_arrow_cursor();
-            } else {
-                let hovered_handle = hit_test_window_thumbnail(state, local);
-                state.hovered = hovered_handle.and_then(|handle| {
+            // Window-tool hover pass: the shell resolves the thumbnail under the pointer (it
+            // owns the inventory) and owns the paint policy - skip the repaint entirely when
+            // nothing changed, otherwise force the now-cheap cached hover paint synchronously.
+            let (input, previous) = {
+                // SAFETY: The borrow ends with this block, before run_machine derives its own.
+                let state = unsafe { &*state_pointer };
+                let local = local_point(state.model.source, point);
+                let window_hover = hit_test_window_thumbnail(state, local).and_then(|handle| {
                     state.windows.as_ref().and_then(|windows| {
                         windows
                             .iter()
@@ -1479,12 +1474,28 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                             .find(|candidate| candidate.handle == handle)
                     })
                 });
-                state.model.hovered_handle = None;
-                set_arrow_cursor();
-            }
-            if previous_hovered == state.hovered.map(|candidate| candidate.handle)
-                && previous_control == state.model.hovered_control
-            {
+                (
+                    OverlayInput::PointerMoved {
+                        point,
+                        window_hover,
+                    },
+                    (
+                        state.model.hovered.map(|candidate| candidate.handle),
+                        state.model.hovered_control,
+                    ),
+                )
+            };
+            run_machine(hwnd, state_pointer, input);
+            let unchanged = {
+                // SAFETY: run_machine has returned; the borrow ends with this block.
+                let state = unsafe { &*state_pointer };
+                previous
+                    == (
+                        state.model.hovered.map(|candidate| candidate.handle),
+                        state.model.hovered_control,
+                    )
+            };
+            if unchanged {
                 return LRESULT(0);
             }
             invalidate(hwnd);
@@ -1493,55 +1504,17 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
-            let routed = {
+            let input = {
                 // SAFETY: The borrow ends with this block, before run_machine derives its own.
                 let state = unsafe { &*state_pointer };
                 let point = screen_point(state.model.source, lparam);
                 let local = local_point(state.model.source, point);
-                let layout = ToolbarLayout::new(
-                    state.model.display_environment,
-                    state.model.toolbar_position,
-                );
-                let toolbar_hit = layout.hit_test(local, state.model.options_open).is_some();
-                (toolbar_hit || state.model.tool == CaptureTool::Region).then_some(point)
+                let window_slot = (state.model.tool == CaptureTool::Window)
+                    .then(|| hit_test_window_thumbnail(state, local))
+                    .flatten();
+                OverlayInput::PointerDown { point, window_slot }
             };
-            if let Some(point) = routed {
-                return run_machine(hwnd, state_pointer, OverlayInput::PointerDown { point });
-            }
-            // Legacy Window click-select / FullDisplay outside-click path (stage O-C).
-            // SAFETY: The Box remains alive for the message loop; the borrow ends before
-            // close_overlay can dispatch destruction messages in the confirming branch.
-            let state = unsafe { &mut *state_pointer };
-            let point = screen_point(state.model.source, lparam);
-            let local = local_point(state.model.source, point);
-            state.model.hovered_control = None;
-            let options_were_open = state.model.options_open;
-            state.model.options_open = false;
-            if options_were_open && state.model.tool == CaptureTool::Window {
-                refresh_live_window_thumbnails(state);
-                rebuild_window_overview_cache(state);
-            }
-            if state.model.tool == CaptureTool::Window {
-                state.model.selected_window = hit_test_window_thumbnail(state, local);
-                update_window_preview(state, state.model.selected_window);
-                state.selected_window_frame =
-                    ready_window_preview(state, state.model.selected_window)
-                        .map(|preview| preview.frame.clone());
-                state.model.selection = state
-                    .selected_window_frame
-                    .as_ref()
-                    .map(|frame| frame.metadata.source_rect);
-                state.model.selection_kind = state.model.selection.map(|_| SelectionKind::Window);
-                if state.model.selection.is_some() {
-                    if confirm_overlay(state) {
-                        close_overlay(hwnd);
-                    }
-                    return LRESULT(0);
-                }
-                rebuild_window_overview_cache(state);
-            }
-            invalidate(hwnd);
-            LRESULT(0)
+            run_machine(hwnd, state_pointer, input)
         }
         WM_LBUTTONUP => {
             let point = {
@@ -1593,46 +1566,6 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             // SAFETY: Standard handling for messages Captastic does not consume.
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
-    }
-}
-
-fn remember_overlay_state(state: &mut OverlayState) {
-    let region = latest_interaction_region(
-        state.model.tool,
-        state.model.selection,
-        state.model.selection_kind,
-        state.model.last_region,
-    );
-    remember_overlay_interaction(
-        state.ui_updates.as_ref(),
-        &state.reference_metadata.display_id,
-        state.model.source,
-        state.model.tool,
-        region,
-        state.reference_metadata.rotation_degrees,
-    );
-    state.model.last_region = region;
-}
-
-fn confirm_overlay(state: &mut OverlayState) -> bool {
-    if let (Some(rect), Some(kind)) = (state.model.selection, state.model.selection_kind) {
-        let window_frame = if kind == SelectionKind::Window {
-            state.selected_window_frame.clone()
-        } else {
-            None
-        };
-        let rect = window_frame
-            .as_ref()
-            .map(|frame| frame.metadata.source_rect)
-            .unwrap_or(rect);
-        debug_assert_eq!(state.model.tool, CaptureTool::from_selection_kind(kind));
-        remember_overlay_state(state);
-        let window = state.model.selected_window;
-        let selection = build_overlay_selection(state, rect, kind, window, window_frame);
-        state.result = Some(selection);
-        true
-    } else {
-        false
     }
 }
 
@@ -1708,10 +1641,6 @@ fn apply_overlay_effects(
                 // SAFETY: ReleaseCapture has returned, so no borrow spans its callback.
                 unsafe { (*state_pointer).releasing_pointer_capture = false };
             }
-            OverlayEffect::ClearWindowHover => {
-                // SAFETY: Local mutation on the owning thread; nothing is dispatched.
-                unsafe { (*state_pointer).hovered = None };
-            }
             OverlayEffect::ClearDimensionLabel => {
                 // SAFETY: Local mutation on the owning thread; nothing is dispatched.
                 unsafe { (*state_pointer).dimension_label_placement = None };
@@ -1741,6 +1670,28 @@ fn apply_overlay_effects(
                 // SAFETY: The borrow ends before the next effect.
                 let state = unsafe { &mut *state_pointer };
                 build_window_overview(state);
+            }
+            OverlayEffect::UpdateWindowPreview { window } => {
+                let rect = {
+                    // The 700 ms blocking capture attempt stays synchronous here (M21); the
+                    // non-sticky Unavailable retry lives in update_window_preview's cache.
+                    // SAFETY: The borrow ends before the feedback transition derives its own.
+                    let state = unsafe { &mut *state_pointer };
+                    update_window_preview(state, window);
+                    state.selected_window_frame =
+                        ready_window_preview(state, window).map(|preview| preview.frame.clone());
+                    state
+                        .selected_window_frame
+                        .as_ref()
+                        .map(|frame| frame.metadata.source_rect)
+                };
+                // Feed the outcome back so the machine decides confirm versus stay-in-chooser.
+                // SAFETY: The Box remains alive; this borrow ends at the semicolon.
+                let effects = transition(
+                    unsafe { &mut (*state_pointer).model },
+                    OverlayInput::WindowPreviewResolved { rect },
+                );
+                apply_overlay_effects(hwnd, state_pointer, effects);
             }
             OverlayEffect::RefreshWindowChrome => {
                 // SAFETY: The borrow ends before the next effect. DWM thumbnail registration
@@ -2864,7 +2815,8 @@ fn draw_window_overview_interactive(state: &OverlayState) {
     let rects = window_overview_rects(state);
     for (thumbnail, rect) in state.window_thumbnails.iter().zip(rects) {
         let selected = state.model.selected_window == Some(thumbnail.handle);
-        let hovered = state.hovered.map(|candidate| candidate.handle) == Some(thumbnail.handle);
+        let hovered =
+            state.model.hovered.map(|candidate| candidate.handle) == Some(thumbnail.handle);
         if selected || hovered {
             let color = if selected {
                 rgb(45, 125, 246)
