@@ -783,9 +783,18 @@ fn intersect_rect(first: Rect, second: Rect) -> Option<Rect> {
 }
 
 fn crop_bgra(source: &[u8], source_bounds: Rect, crop: Rect) -> Result<Vec<u8>, CaptureError> {
-    let x = u32::try_from(crop.x - source_bounds.x)
+    if crop.x < source_bounds.x
+        || crop.y < source_bounds.y
+        || crop.right() > source_bounds.right()
+        || crop.bottom() > source_bounds.bottom()
+    {
+        return Err(invalid_frame(
+            "visible frame crop rect is not contained within the rendered window",
+        ));
+    }
+    let x = u32::try_from(i64::from(crop.x) - i64::from(source_bounds.x))
         .map_err(|_| invalid_frame("visible frame starts outside the rendered window"))?;
-    let y = u32::try_from(crop.y - source_bounds.y)
+    let y = u32::try_from(i64::from(crop.y) - i64::from(source_bounds.y))
         .map_err(|_| invalid_frame("visible frame starts outside the rendered window"))?;
     let source_stride = source_bounds
         .width
@@ -1385,6 +1394,95 @@ mod tests {
         )
         .expect("valid visible bounds");
         assert_eq!(cropped, [5, 5, 5, 0, 6, 6, 6, 0, 9, 9, 9, 0, 10, 10, 10, 0]);
+    }
+
+    #[test]
+    fn crop_touching_the_source_edges_exactly_succeeds() {
+        let source_bounds = Rect {
+            x: 10,
+            y: 20,
+            width: 4,
+            height: 3,
+        };
+        let source = vec![0_u8; 4 * 3 * 4];
+        let cropped = crop_bgra(&source, source_bounds, source_bounds)
+            .expect("a crop equal to the full source bounds is contained");
+        assert_eq!(cropped.len(), source.len());
+    }
+
+    #[test]
+    fn crop_exceeding_the_source_width_by_one_is_rejected() {
+        let source_bounds = Rect {
+            x: 10,
+            y: 20,
+            width: 4,
+            height: 3,
+        };
+        let source = vec![0_u8; 4 * 3 * 4];
+        let crop = Rect {
+            x: 11,
+            width: 4,
+            ..source_bounds
+        };
+        let error = crop_bgra(&source, source_bounds, crop)
+            .expect_err("a crop reaching past the right edge must not panic on a bad slice");
+        assert!(!error.retryable);
+    }
+
+    #[test]
+    fn crop_exceeding_the_source_height_by_one_is_rejected() {
+        let source_bounds = Rect {
+            x: 10,
+            y: 20,
+            width: 4,
+            height: 3,
+        };
+        let source = vec![0_u8; 4 * 3 * 4];
+        let crop = Rect {
+            y: 21,
+            height: 3,
+            ..source_bounds
+        };
+        let error = crop_bgra(&source, source_bounds, crop)
+            .expect_err("a crop reaching past the bottom edge must not panic on a bad slice");
+        assert!(!error.retryable);
+    }
+
+    #[test]
+    fn crop_starting_before_the_source_origin_is_rejected() {
+        let source_bounds = Rect {
+            x: 10,
+            y: 20,
+            width: 4,
+            height: 3,
+        };
+        let source = vec![0_u8; 4 * 3 * 4];
+        let crop = Rect {
+            x: 9,
+            ..source_bounds
+        };
+        crop_bgra(&source, source_bounds, crop)
+            .expect_err("a crop starting outside the source bounds must be rejected");
+    }
+
+    #[test]
+    fn zero_area_crop_returns_an_empty_buffer_without_panicking() {
+        let source_bounds = Rect {
+            x: 10,
+            y: 20,
+            width: 4,
+            height: 3,
+        };
+        let source = vec![0_u8; 4 * 3 * 4];
+        let crop = Rect {
+            x: 11,
+            y: 21,
+            width: 0,
+            height: 0,
+        };
+        let cropped =
+            crop_bgra(&source, source_bounds, crop).expect("a zero-area crop is still contained");
+        assert!(cropped.is_empty());
     }
 
     #[test]
