@@ -19,9 +19,10 @@ use captastic_core::{
     CaptureError, CaptureErrorKind, CpuFrame, DisplayId, DisplayInfo, FrameMetadata, FrameOrigin,
     PixelFormat, Rect,
 };
-use windows::core::{w, Error as WindowsError, PCWSTR};
+use windows::core::{w, Error as WindowsError, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    BOOL, COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+    CloseHandle, BOOL, COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE,
+    WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{DwmFlush, DwmGetWindowAttribute, DWMWA_CLOAKED};
 #[cfg(test)]
@@ -39,6 +40,9 @@ use windows::Win32::Graphics::Gdi::{
     MONITOR_DEFAULTTONULL, NULL_BRUSH, PAINTSTRUCT, PS_SOLID, RGBQUAD, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::Win32::UI::HiDpi::{
     GetDpiForMonitor, SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT,
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, MDT_EFFECTIVE_DPI,
@@ -46,19 +50,22 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE, VK_RETURN,
 };
+#[cfg(test)]
+use windows::Win32::UI::WindowsAndMessaging::WDA_MONITOR;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyCursor, DestroyWindow,
     DispatchMessageW, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow,
-    GetLastActivePopup, GetMessageW, GetShellWindow, GetWindowLongPtrW, GetWindowRect,
-    GetWindowTextLengthW, IsIconic, IsWindow, IsWindowVisible, LoadCursorW, PostMessageW,
-    PostQuitMessage, RegisterClassW, SetCursor, SetForegroundWindow, SetWindowDisplayAffinity,
-    SetWindowLongPtrW, ShowWindow, TranslateMessage, UnregisterClassW, UpdateLayeredWindow,
-    CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, GA_ROOTOWNER, GWLP_USERDATA, GWL_EXSTYLE,
-    HCURSOR, ICONINFO, IDC_ARROW, IDC_CROSS, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE,
-    IDC_SIZEWE, MSG, SPI_SETLOGICALDPIOVERRIDE, SPI_SETWORKAREA, SW_SHOW, ULW_ALPHA,
-    WDA_EXCLUDEFROMCAPTURE, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE,
-    WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WM_SETTINGCHANGE, WNDCLASSW,
+    GetLastActivePopup, GetMessageW, GetShellWindow, GetWindowDisplayAffinity, GetWindowLongPtrW,
+    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+    IsWindow, IsWindowVisible, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW,
+    SetCursor, SetForegroundWindow, SetWindowDisplayAffinity, SetWindowLongPtrW, ShowWindow,
+    TranslateMessage, UnregisterClassW, UpdateLayeredWindow, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW,
+    CS_VREDRAW, GA_ROOTOWNER, GWLP_USERDATA, GWL_EXSTYLE, HCURSOR, ICONINFO, IDC_ARROW, IDC_CROSS,
+    IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, MSG,
+    SPI_SETLOGICALDPIOVERRIDE, SPI_SETWORKAREA, SW_SHOW, ULW_ALPHA, WDA_EXCLUDEFROMCAPTURE,
+    WDA_NONE, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
+    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WM_SETTINGCHANGE, WNDCLASSW,
     WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
@@ -4119,19 +4126,33 @@ fn collect_window(hwnd: HWND, collector: &mut WindowCollector) {
     let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
     // SAFETY: hwnd remains the same live enumerated top-level handle.
     let minimized = unsafe { IsIconic(hwnd) }.as_bool();
-    // SAFETY: Reading the title length does not retain the enumerated handle.
-    let has_title = unsafe { GetWindowTextLengthW(hwnd) } != 0;
+    let title = window_text(hwnd);
+    let class_name = window_class_name(hwnd);
     // SAFETY: Reads immutable extended-style bits from the enumerated window.
     let extended_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
     let forced_taskbar_window = extended_style & WS_EX_APPWINDOW.0 != 0;
+    let Some(title) = title else {
+        return;
+    };
     if !visible
         || minimized
-        || !has_title
         || is_cloaked_window(hwnd)
-        || is_shell_surface(hwnd)
+        || class_name.as_deref().is_some_and(is_shell_window_class)
         || !window_styles_allow_task_switcher(extended_style)
         || (!forced_taskbar_window && !is_root_owner_task_window(hwnd))
     {
+        return;
+    }
+    let display_affinity = window_display_affinity(hwnd);
+    if !display_affinity_allows_capture(display_affinity) {
+        log_window_candidate(
+            hwnd,
+            "rejected-protected",
+            &title,
+            class_name.as_deref(),
+            extended_style,
+            display_affinity,
+        );
         return;
     }
     let mut native = RECT::default();
@@ -4153,6 +4174,14 @@ fn collect_window(hwnd: HWND, collector: &mut WindowCollector) {
             return;
         };
         if visible_bounds.width >= 16 && visible_bounds.height >= 16 {
+            log_window_candidate(
+                hwnd,
+                "accepted",
+                &title,
+                class_name.as_deref(),
+                extended_style,
+                display_affinity,
+            );
             collector.windows.push(WindowCandidate {
                 handle: NativeWindowHandle(hwnd.0),
             });
@@ -4226,14 +4255,94 @@ fn is_cloaked_window(hwnd: HWND) -> bool {
         && cloaked != 0
 }
 
-fn is_shell_surface(hwnd: HWND) -> bool {
+fn window_text(hwnd: HWND) -> Option<String> {
+    // SAFETY: Reads the current title length without retaining the enumerated handle.
+    let length = unsafe { GetWindowTextLengthW(hwnd) };
+    if length <= 0 {
+        return None;
+    }
+    let mut title = vec![0_u16; length as usize + 1];
+    // SAFETY: title is writable UTF-16 storage and hwnd is inspected synchronously.
+    let copied = unsafe { GetWindowTextW(hwnd, &mut title) };
+    (copied > 0).then(|| String::from_utf16_lossy(&title[..copied as usize]))
+}
+
+fn window_class_name(hwnd: HWND) -> Option<String> {
     let mut class_name = [0_u16; 256];
     // SAFETY: class_name is writable UTF-16 storage and hwnd is used synchronously.
     let length = unsafe { GetClassNameW(hwnd, &mut class_name) };
     if length <= 0 {
-        return false;
+        return None;
     }
-    is_shell_window_class(&String::from_utf16_lossy(&class_name[..length as usize]))
+    Some(String::from_utf16_lossy(&class_name[..length as usize]))
+}
+
+fn window_display_affinity(hwnd: HWND) -> Option<u32> {
+    let mut affinity = WDA_NONE.0;
+    // SAFETY: affinity is writable storage and hwnd is a live top-level enumeration candidate.
+    unsafe { GetWindowDisplayAffinity(hwnd, &mut affinity) }
+        .ok()
+        .map(|_| affinity)
+}
+
+const fn display_affinity_allows_capture(affinity: Option<u32>) -> bool {
+    match affinity {
+        Some(value) => value == WDA_NONE.0,
+        None => true,
+    }
+}
+
+fn log_window_candidate(
+    hwnd: HWND,
+    decision: &str,
+    title: &str,
+    class_name: Option<&str>,
+    extended_style: u32,
+    display_affinity: Option<u32>,
+) {
+    if !log::log_enabled!(log::Level::Debug) {
+        return;
+    }
+    let process = window_process_name(hwnd);
+    let affinity = display_affinity
+        .map(|value| format!("0x{value:08X}"))
+        .unwrap_or_else(|| "unknown".to_owned());
+    log::debug!(
+        "window chooser candidate decision={decision} handle=0x{:X} title={title:?} class={:?} process={:?} ex_style=0x{extended_style:08X} display_affinity={affinity}",
+        hwnd.0,
+        class_name.unwrap_or("<unknown>"),
+        process.as_deref().unwrap_or("<unknown>"),
+    );
+}
+
+fn window_process_name(hwnd: HWND) -> Option<String> {
+    let mut process_id = 0_u32;
+    // SAFETY: process_id is writable storage and hwnd is queried synchronously.
+    if unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) } == 0 || process_id == 0 {
+        return None;
+    }
+    // SAFETY: Opens a query-only handle to the owner process without inheriting it.
+    let process =
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }.ok()?;
+    let mut path = vec![0_u16; 32_768];
+    let mut length = path.len() as u32;
+    // SAFETY: path and length are writable storage and process remains live through the call.
+    let queried = unsafe {
+        QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(path.as_mut_ptr()),
+            &mut length,
+        )
+    };
+    // SAFETY: Closes the query-only process handle exactly once after its last use.
+    let _ = unsafe { CloseHandle(process) };
+    queried.ok()?;
+    let path = String::from_utf16_lossy(&path[..length as usize]);
+    std::path::Path::new(&path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
 }
 
 fn is_shell_window_class(class_name: &str) -> bool {
@@ -5481,6 +5590,17 @@ mod tests {
             WS_EX_TOOLWINDOW.0 | WS_EX_APPWINDOW.0
         ));
         assert!(window_styles_allow_task_switcher(0));
+    }
+
+    #[test]
+    fn protected_windows_are_not_offered_for_capture() {
+        assert!(display_affinity_allows_capture(None));
+        assert!(display_affinity_allows_capture(Some(WDA_NONE.0)));
+        assert!(!display_affinity_allows_capture(Some(WDA_MONITOR.0)));
+        assert!(!display_affinity_allows_capture(Some(
+            WDA_EXCLUDEFROMCAPTURE.0
+        )));
+        assert!(!display_affinity_allows_capture(Some(u32::MAX)));
     }
 
     #[test]
