@@ -150,6 +150,13 @@ impl DxgiDisplayManager {
         if let Some(error) = &self.virtual_topology_error {
             return Err(error.clone());
         }
+        validate_virtual_desktop_request(request)?;
+        if request.retain_native_frame {
+            log::debug!(
+                "capture {} composes the virtual desktop from CPU readbacks; no native frame is retained",
+                request.id.0
+            );
+        }
         recorder.record(request.id, PerfEventKind::CaptureRequested, 0);
         let mut frames = Vec::with_capacity(self.sessions.len());
         for session in &mut self.sessions {
@@ -183,13 +190,7 @@ impl DxgiDisplayManager {
         recorder.record(request.id, PerfEventKind::CpuFrameReady, cpu_ready_ns);
         frame.metadata.native_ready_offset_ns = native_ready_ns;
         frame.metadata.cpu_ready_offset_ns = Some(cpu_ready_ns);
-        let metadata = frame.metadata.clone();
-        let frame = request.cpu_frame.then_some(frame);
-        Ok(CaptureOutcome {
-            metadata,
-            frame,
-            native_frame: None,
-        })
+        Ok(virtual_desktop_outcome(frame, request.cpu_frame))
     }
 }
 
@@ -516,6 +517,41 @@ fn display_containing_point(displays: &[DisplayInfo], x: i32, y: i32) -> Option<
 
 fn duration_ns(nanos: u128) -> u64 {
     u64::try_from(nanos).unwrap_or(u64::MAX)
+}
+
+/// Rejects virtual-desktop requests the composite path cannot answer with anything usable.
+///
+/// The composite is assembled from per-display CPU readbacks, so there is no native frame to
+/// retain. A caller that also opted out of the CPU frame would otherwise receive a successful
+/// outcome carrying neither, which reads as an empty capture rather than an unsupported one.
+/// Requests that keep `cpu_frame` still succeed: they get the composite and materialize regions
+/// from it on the CPU.
+fn validate_virtual_desktop_request(request: &CaptureRequest) -> Result<(), CaptureError> {
+    if request.retain_native_frame && !request.cpu_frame {
+        return Err(manager_error(
+            CaptureErrorKind::Unsupported,
+            "capture_virtual_desktop",
+            "virtual-desktop capture composes CPU readbacks and cannot retain a native frame; request cpu_frame to receive the composite",
+            false,
+        ));
+    }
+    Ok(())
+}
+
+/// Wraps the composite so the metadata only describes what the caller actually receives.
+fn virtual_desktop_outcome(composite: CpuFrame, cpu_frame: bool) -> CaptureOutcome {
+    let mut metadata = composite.metadata.clone();
+    let frame = cpu_frame.then_some(composite);
+    if frame.is_none() {
+        // The composite returns to the bounded pool as it drops, so naming its slot would point
+        // telemetry at storage the very next capture is free to overwrite.
+        metadata.pool_slot = None;
+    }
+    CaptureOutcome {
+        metadata,
+        frame,
+        native_frame: None,
+    }
 }
 
 fn validate_virtual_topology(
@@ -981,6 +1017,60 @@ mod tests {
             compose_virtual_desktop(&[source], display.bounds, &request(), &mut pool).unwrap_err();
         assert_eq!(error.kind, CaptureErrorKind::BufferExhausted);
         drop(leased);
+    }
+
+    #[test]
+    fn retaining_a_native_frame_without_a_cpu_frame_is_rejected() {
+        let mut retain_only = request();
+        retain_only.retain_native_frame = true;
+        retain_only.cpu_frame = false;
+        let error = validate_virtual_desktop_request(&retain_only)
+            .expect_err("the composite path can return neither frame");
+        assert_eq!(error.kind, CaptureErrorKind::Unsupported);
+        assert_eq!(error.operation, "capture_virtual_desktop");
+        assert!(!error.retryable);
+        assert!(error.message.contains("cannot retain a native frame"));
+
+        // Requests that still take the composite keep working; they crop it on the CPU.
+        let mut retain_with_cpu = request();
+        retain_with_cpu.retain_native_frame = true;
+        assert!(validate_virtual_desktop_request(&retain_with_cpu).is_ok());
+        assert!(validate_virtual_desktop_request(&request()).is_ok());
+        let mut metadata_only = request();
+        metadata_only.cpu_frame = false;
+        assert!(validate_virtual_desktop_request(&metadata_only).is_ok());
+    }
+
+    #[test]
+    fn a_discarded_composite_does_not_name_a_pool_slot() {
+        let only = display(
+            "a",
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            0,
+            true,
+        );
+        let mut pool = CompositeBufferPool::new(1);
+        let composite =
+            compose_virtual_desktop(&[solid_frame(&only, 1)], only.bounds, &request(), &mut pool)
+                .unwrap();
+        assert_eq!(composite.metadata.pool_slot, Some(0));
+
+        let kept = virtual_desktop_outcome(composite.clone(), true);
+        assert!(kept.frame.is_some());
+        assert_eq!(kept.metadata.pool_slot, Some(0));
+        drop(kept);
+
+        let dropped = virtual_desktop_outcome(composite, false);
+        assert!(dropped.frame.is_none());
+        assert!(dropped.native_frame.is_none());
+        assert_eq!(dropped.metadata.pool_slot, None);
+        // The slot is genuinely free again, so metadata naming it would have been a lie.
+        assert!(pool.available_index(4).is_some());
     }
 
     #[test]

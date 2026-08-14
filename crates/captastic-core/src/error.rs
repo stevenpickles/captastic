@@ -27,13 +27,20 @@ pub struct CaptureError {
 }
 
 impl CaptureError {
+    /// Builds an error for a deterministic, synthetic (test/fake-backend) failure.
+    ///
+    /// These are raised for conditions like a configured injected failure or an arithmetic
+    /// overflow while building a fake frame: the same input always reproduces the same failure,
+    /// so an immediate retry cannot succeed. `retryable` is therefore always `false`; callers
+    /// that need a scripted *retryable* failure should construct a `CaptureError` (or, in
+    /// `captastic-core::fake`, a `FakeFailure`) directly with the flag they want.
     pub fn synthetic(message: impl Into<String>) -> Self {
         Self {
             kind: CaptureErrorKind::NativeFailure,
             backend: "fake",
             operation: "capture",
             message: message.into(),
-            retryable: true,
+            retryable: false,
             native_code: None,
         }
     }
@@ -70,4 +77,19 @@ pub enum MetricsError {
         previous_rank: u8,
         current_rank: u8,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn synthetic_failures_are_not_retryable() {
+        // A synthetic failure reproduces deterministically from the same input (a configured
+        // injected failure, an arithmetic overflow while building a fake frame, ...), so an
+        // immediate retry can never turn it into a success.
+        let error = CaptureError::synthetic("configured deterministic failure");
+        assert!(!error.retryable);
+        assert_eq!(error.kind, CaptureErrorKind::NativeFailure);
+    }
 }

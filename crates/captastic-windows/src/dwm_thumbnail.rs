@@ -69,11 +69,18 @@ pub(crate) fn fit_source_in_bounds(source: SIZE, bounds: RECT) -> RECT {
     let bounds_width = i64::from((bounds.right - bounds.left).max(1));
     let bounds_height = i64::from((bounds.bottom - bounds.top).max(1));
 
+    // Integer division above rounds toward zero, so an extreme aspect ratio (e.g. a source many
+    // times wider than it is tall, fitted into a near-square destination) can otherwise round the
+    // short dimension down to 0, producing a zero-area destination rect. Clamp to 1 so the
+    // thumbnail always occupies at least a sliver rather than disappearing.
     let (width, height) = if source_width * bounds_height > bounds_width * source_height {
-        (bounds_width, (bounds_width * source_height) / source_width)
+        (
+            bounds_width,
+            ((bounds_width * source_height) / source_width).max(1),
+        )
     } else {
         (
-            (bounds_height * source_width) / source_height,
+            ((bounds_height * source_width) / source_height).max(1),
             bounds_height,
         )
     };
@@ -135,5 +142,37 @@ mod tests {
                 bottom: 420,
             }
         );
+    }
+
+    #[test]
+    fn extremely_wide_source_keeps_a_nonzero_height() {
+        let fitted = fit_source_in_bounds(
+            SIZE { cx: 100_000, cy: 1 },
+            RECT {
+                left: 0,
+                top: 0,
+                right: 10,
+                bottom: 10,
+            },
+        );
+
+        assert!(fitted.bottom - fitted.top >= 1, "{fitted:?}");
+        assert!(fitted.right - fitted.left >= 1, "{fitted:?}");
+    }
+
+    #[test]
+    fn extremely_tall_source_keeps_a_nonzero_width() {
+        let fitted = fit_source_in_bounds(
+            SIZE { cx: 1, cy: 100_000 },
+            RECT {
+                left: 0,
+                top: 0,
+                right: 10,
+                bottom: 10,
+            },
+        );
+
+        assert!(fitted.right - fitted.left >= 1, "{fitted:?}");
+        assert!(fitted.bottom - fitted.top >= 1, "{fitted:?}");
     }
 }

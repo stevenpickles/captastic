@@ -96,6 +96,10 @@ impl DxgiBackend {
 
     pub fn new(display_id: &DisplayId) -> Result<Self, CaptureError> {
         let com = ComApartment::initialize()?;
+        // Sample the generation before enumerating so a display change that lands while we are
+        // building the backend cannot be swallowed: the stored value stays behind the counter and
+        // the first capture reports TopologyChanged instead of trusting stale DisplayInfo.
+        let generation_before_enumeration = display_configuration_generation();
         let outputs = enumerate_outputs()?;
         let displays: Vec<_> = outputs.iter().map(|output| output.info.clone()).collect();
         let selected_output = select_display_index(&displays, display_id).ok_or_else(|| {
@@ -205,7 +209,7 @@ impl DxgiBackend {
                 warm_stream: false,
             },
             qpc_frequency,
-            display_configuration_generation: display_configuration_generation(),
+            display_configuration_generation: generation_before_enumeration,
             _thread_affine: PhantomData,
         };
         Ok(backend)
@@ -374,6 +378,7 @@ impl CaptureBackend for DxgiBackend {
                     recorder,
                 )?)
             } else {
+                self.ensure_device_present("capture_fresh")?;
                 None
             };
             let native_frame = native_texture.map(|texture| {
@@ -385,7 +390,18 @@ impl CaptureBackend for DxgiBackend {
                     metadata: metadata.clone(),
                 }) as Arc<dyn NativeFrame>
             });
-            acquired.release()?;
+            // The capture is already complete here: the CPU pixels are copied and the snapshot is
+            // an independent texture, so a failing ReleaseFrame reports that the duplication
+            // session is going away, not that these pixels are bad. Discarding a good frame over
+            // it helps nobody -- the next acquire raises ACCESS_LOST on its own and drives
+            // recovery from there. Device loss is not hidden by this: the readback reports it
+            // through Map, and the native-only branch above asks the device directly.
+            if let Err(error) = acquired.release() {
+                log::warn!(
+                    "capture {} could not release its duplication frame; returning the completed capture anyway: {error}",
+                    request.id.0
+                );
+            }
             return Ok(CaptureOutcome {
                 metadata,
                 frame: cpu_frame,
@@ -471,6 +487,7 @@ impl DxgiBackend {
                 recorder,
             )?)
         } else {
+            self.ensure_device_present("capture_latest")?;
             None
         };
         let native_frame = native_texture.map(|texture| {
@@ -766,6 +783,20 @@ impl DxgiBackend {
             .expect("staging initialized")
             .texture
             .clone())
+    }
+
+    /// Reports a device loss that the silent copies on the native-only path would otherwise hide.
+    ///
+    /// `CopyResource` returns `()`, so when the caller skips the CPU readback nothing between the
+    /// acquire and the returned snapshot carries an HRESULT: a TDR in that window would surface as
+    /// a successful capture holding undefined pixels, and recovery would never run. The readback
+    /// path gets this for free because `Map` fails with `DXGI_ERROR_DEVICE_REMOVED`.
+    fn ensure_device_present(&self, operation: &'static str) -> Result<(), CaptureError> {
+        // SAFETY: the device is a live COM interface owned by this backend for its whole lifetime.
+        match unsafe { self.device.GetDeviceRemovedReason() } {
+            Ok(()) => Ok(()),
+            Err(reason) => Err(device_removed_error(operation, reason)),
+        }
     }
 
     fn snapshot_texture(
@@ -1995,6 +2026,23 @@ fn map_windows_error(operation: &'static str, error: WindowsError) -> CaptureErr
     )
 }
 
+/// Classifies a `GetDeviceRemovedReason` failure as the loss it always is.
+///
+/// The reason code is not the code the rest of the backend sees: calls made after a TDR fail with
+/// `DXGI_ERROR_DEVICE_REMOVED`, while the reason behind it is usually `DEVICE_HUNG`, `DEVICE_RESET`
+/// or `DRIVER_INTERNAL_ERROR`. Running those through `map_windows_error` would demote two of them
+/// to a non-retryable `NativeFailure` and skip backend recovery, so any non-success reason is
+/// reported as `DeviceRemoved` with the reason preserved as the native code.
+fn device_removed_error(operation: &'static str, reason: WindowsError) -> CaptureError {
+    capture_error(
+        CaptureErrorKind::DeviceRemoved,
+        operation,
+        format!("the D3D11 device was lost during capture: {reason}"),
+        true,
+        Some(i64::from(reason.code().0)),
+    )
+}
+
 fn capture_error(
     kind: CaptureErrorKind,
     operation: &'static str,
@@ -2195,6 +2243,32 @@ mod tests {
     #[test]
     fn frame_size_overflow_is_rejected() {
         assert!(frame_byte_len(u32::MAX, u32::MAX).is_err());
+    }
+
+    #[test]
+    fn every_device_removal_reason_triggers_recovery() {
+        use windows::Win32::Graphics::Dxgi::{
+            DXGI_ERROR_DEVICE_HUNG, DXGI_ERROR_DRIVER_INTERNAL_ERROR,
+        };
+
+        for reason in [
+            DXGI_ERROR_DEVICE_HUNG,
+            DXGI_ERROR_DEVICE_RESET,
+            DXGI_ERROR_DEVICE_REMOVED,
+            DXGI_ERROR_DRIVER_INTERNAL_ERROR,
+        ] {
+            let error = device_removed_error("capture_fresh", WindowsError::from(reason));
+            assert_eq!(error.kind, CaptureErrorKind::DeviceRemoved);
+            assert_eq!(error.operation, "capture_fresh");
+            assert!(error.retryable);
+            assert_eq!(error.native_code, Some(i64::from(reason.0)));
+        }
+        // The generic mapping is not a substitute: it reads a hang as an ordinary native failure,
+        // which callers do not recover from.
+        assert_eq!(
+            map_windows_error("capture_fresh", WindowsError::from(DXGI_ERROR_DEVICE_HUNG)).kind,
+            CaptureErrorKind::NativeFailure
+        );
     }
 
     #[test]

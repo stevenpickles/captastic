@@ -47,6 +47,10 @@ const COMMAND_EXIT: usize = 1_006;
 const SESSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(4);
 const TRAY_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const TRAY_STOP_POLL: Duration = Duration::from_millis(5);
+const TRAY_ADD_ATTEMPTS: u32 = 4;
+const TRAY_ADD_RETRY_DELAY: Duration = Duration::from_millis(250);
+/// `HRESULT_FROM_WIN32(ERROR_TIMEOUT)`: the notification area server was too busy to answer.
+const HRESULT_ERROR_TIMEOUT: i32 = 0x8007_05B4_u32 as i32;
 
 #[derive(Clone, Debug)]
 pub enum TrayEvent {
@@ -307,14 +311,14 @@ fn run_tray(
         let _ = unsafe { UnregisterClassW(CLASS_NAME, instance) };
         return Err(last_error("create_tray_window"));
     }
-    if let Err(error) = add_tray_icon(hwnd, icon, false) {
-        // SAFETY: hwnd is the live hidden window on this thread.
-        let _ = unsafe { DestroyWindow(hwnd) };
-        // SAFETY: DestroyWindow has completed all callbacks and cleared the stored pointer.
-        let _ = unsafe { Box::from_raw(state_pointer) };
-        // SAFETY: No window remains for this registered class.
-        let _ = unsafe { UnregisterClassW(CLASS_NAME, instance) };
-        return Err(error);
+    if let Err(error) = add_tray_icon_with_retry(hwnd, icon, false) {
+        // Destroying the window here would also destroy the only listener for the TaskbarCreated
+        // broadcast, so a single failed add would cost the icon for the rest of the session. The
+        // daemon already runs without a tray, so keep the window and its message loop alive in a
+        // degraded state and let the existing TaskbarCreated handler restore the icon later.
+        log::error!(
+            "failed to register the tray icon; running without it until the shell broadcasts TaskbarCreated: {error}"
+        );
     }
     // SAFETY: Called on the tray thread after its message queue and hidden window exist.
     let thread_id = unsafe { GetCurrentThreadId() };
@@ -420,7 +424,9 @@ fn tray_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPAR
         (message == state.taskbar_created).then_some((state.icon, state.paused))
     };
     if let Some((icon, paused)) = taskbar_state {
-        if let Err(error) = add_tray_icon(hwnd, icon, paused) {
+        // A restarting shell is exactly the load that makes NIM_ADD time out, so this retries on
+        // the tray thread. The worst-case stall is bounded and this thread has no other work.
+        if let Err(error) = add_tray_icon_with_retry(hwnd, icon, paused) {
             log::warn!("failed to restore tray icon after Explorer restart: {error}");
         }
         return LRESULT(0);
@@ -638,9 +644,45 @@ fn add_tray_icon(
     let data = tray_data(hwnd, icon, paused, NIF_MESSAGE | NIF_ICON | NIF_TIP);
     // SAFETY: data is fully initialized and hwnd is the live tray notification owner.
     if !unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool() {
-        return Err(last_error("add_tray_icon"));
+        return Err(shell_notify_error(
+            "add_tray_icon",
+            WindowsError::from_win32(),
+        ));
     }
     Ok(())
+}
+
+fn add_tray_icon_with_retry(
+    hwnd: HWND,
+    icon: windows::Win32::UI::WindowsAndMessaging::HICON,
+    paused: bool,
+) -> Result<(), CaptureError> {
+    retry_tray_icon_add(|| add_tray_icon(hwnd, icon, paused), thread::sleep)
+}
+
+/// Retries a timed-out `NIM_ADD` a bounded number of times.
+///
+/// Shell_NotifyIcon is documented to fail with `ERROR_TIMEOUT` when the notification area server
+/// is still starting up - the exact condition a daemon launched at logon runs into - and Microsoft
+/// recommends sleeping briefly and retrying rather than treating the failure as final. Only errors
+/// classified as retryable are repeated; a genuine failure (bad window, bad icon) fails at once.
+fn retry_tray_icon_add(
+    mut add: impl FnMut() -> Result<(), CaptureError>,
+    mut wait: impl FnMut(Duration),
+) -> Result<(), CaptureError> {
+    let mut attempt = 1_u32;
+    loop {
+        match add() {
+            Err(error) if error.retryable && attempt < TRAY_ADD_ATTEMPTS => {
+                log::warn!(
+                    "the notification area was busy on tray icon attempt {attempt} of {TRAY_ADD_ATTEMPTS}; retrying: {error}"
+                );
+                attempt = attempt.saturating_add(1);
+                wait(TRAY_ADD_RETRY_DELAY);
+            }
+            result => return result,
+        }
+    }
 }
 
 fn modify_tray_tooltip(hwnd: HWND, paused: bool) -> Result<(), CaptureError> {
@@ -812,6 +854,23 @@ fn last_error(operation: &'static str) -> CaptureError {
     native_error(operation, WindowsError::from_win32())
 }
 
+/// Classifies a Shell_NotifyIconW failure, keeping the `retryable` flag truthful: a busy
+/// notification-area server reports `ERROR_TIMEOUT` and is worth another attempt, while every
+/// other failure is a permanent misuse of the API and must not be retried.
+fn shell_notify_error(operation: &'static str, error: WindowsError) -> CaptureError {
+    if error.code().0 == HRESULT_ERROR_TIMEOUT {
+        return CaptureError {
+            kind: CaptureErrorKind::Timeout,
+            backend: "windows-tray",
+            operation,
+            message: format!("the notification area did not respond in time: {error}"),
+            retryable: true,
+            native_code: Some(i64::from(error.code().0)),
+        };
+    }
+    native_error(operation, error)
+}
+
 fn native_error(operation: &'static str, error: WindowsError) -> CaptureError {
     CaptureError {
         kind: CaptureErrorKind::NativeFailure,
@@ -837,6 +896,7 @@ fn tray_error(operation: &'static str, message: impl Into<String>) -> CaptureErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::core::HRESULT;
 
     #[test]
     fn session_shutdown_is_routed_only_after_windows_commits_it() {
@@ -908,6 +968,87 @@ mod tests {
         drop(receiver);
         // A disconnected receiver must not panic or block either.
         dispatch_tray_event(&sender, TrayEvent::Exit);
+    }
+
+    #[test]
+    fn a_busy_notification_area_is_classified_as_retryable() {
+        let busy = shell_notify_error(
+            "add_tray_icon",
+            WindowsError::from(HRESULT(HRESULT_ERROR_TIMEOUT)),
+        );
+        assert_eq!(busy.kind, CaptureErrorKind::Timeout);
+        assert!(busy.retryable);
+        assert_eq!(busy.native_code, Some(i64::from(HRESULT_ERROR_TIMEOUT)));
+
+        let denied = shell_notify_error(
+            "add_tray_icon",
+            WindowsError::from(HRESULT(0x8007_0005_u32 as i32)),
+        );
+        assert_eq!(denied.kind, CaptureErrorKind::NativeFailure);
+        assert!(!denied.retryable);
+    }
+
+    #[test]
+    fn a_timed_out_icon_add_is_retried_to_its_bounded_limit() {
+        let mut attempts = 0_u32;
+        let mut waits = Vec::new();
+        let result = retry_tray_icon_add(
+            || {
+                attempts = attempts.saturating_add(1);
+                Err(shell_notify_error(
+                    "add_tray_icon",
+                    WindowsError::from(HRESULT(HRESULT_ERROR_TIMEOUT)),
+                ))
+            },
+            |delay| waits.push(delay),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(attempts, TRAY_ADD_ATTEMPTS);
+        assert_eq!(
+            waits,
+            vec![TRAY_ADD_RETRY_DELAY; TRAY_ADD_ATTEMPTS as usize - 1]
+        );
+    }
+
+    #[test]
+    fn a_transient_icon_add_failure_still_produces_an_icon() {
+        let mut attempts = 0_u32;
+        let result = retry_tray_icon_add(
+            || {
+                attempts = attempts.saturating_add(1);
+                if attempts < 3 {
+                    Err(shell_notify_error(
+                        "add_tray_icon",
+                        WindowsError::from(HRESULT(HRESULT_ERROR_TIMEOUT)),
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {},
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn a_permanent_icon_add_failure_is_not_retried() {
+        let mut attempts = 0_u32;
+        let result = retry_tray_icon_add(
+            || {
+                attempts = attempts.saturating_add(1);
+                Err(shell_notify_error(
+                    "add_tray_icon",
+                    WindowsError::from(HRESULT(0x8007_0006_u32 as i32)),
+                ))
+            },
+            |_| panic!("a permanent failure must not wait"),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(attempts, 1);
     }
 
     #[test]

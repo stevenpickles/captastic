@@ -17,6 +17,9 @@ use std::sync::Mutex;
 use crate::error::AppError;
 
 const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(1);
+/// Slice of a stop budget held back from the selection join for the UI-state thread, whose final
+/// write is the only part of a selection that outlives the process.
+const UI_STATE_STOP_RESERVE: Duration = Duration::from_millis(250);
 const WORKER_STOP_POLL: Duration = Duration::from_millis(5);
 const WORKER_RECEIVE_POLL: Duration = Duration::from_millis(50);
 const RESOURCE_CACHE_IDLE: Duration = Duration::from_secs(30);
@@ -144,11 +147,11 @@ impl Drop for AttemptCompletion<'_> {
 /// notification area instead of only the log. The job itself has already been closed out by its
 /// caller; this only carries the report.
 fn notify_dropped_selection(
-    notices: &mpsc::SyncSender<crate::daemon::DroppedSelection>,
+    notices: &mpsc::SyncSender<crate::daemon::DaemonNotice>,
     capture_id: CaptureId,
     reason: &'static str,
 ) {
-    let _ = notices.try_send(crate::daemon::DroppedSelection { capture_id, reason });
+    let _ = notices.try_send(crate::daemon::DaemonNotice::DroppedSelection { capture_id, reason });
 }
 
 pub struct SelectionWorker {
@@ -165,7 +168,7 @@ impl SelectionWorker {
     pub fn start(
         clipboard_sender: mpsc::SyncSender<crate::clipboard::ClipboardJob>,
         capture_sender: mpsc::SyncSender<crate::daemon::CaptureCommand>,
-        dropped_selections: mpsc::SyncSender<crate::daemon::DroppedSelection>,
+        notices: mpsc::SyncSender<crate::daemon::DaemonNotice>,
         json_output: bool,
         queue_capacity: usize,
         confirmed_regions: ConfirmedRegionCache,
@@ -336,7 +339,7 @@ impl SelectionWorker {
                                         "capture command queue was unavailable after confirmation",
                                     );
                                     notify_dropped_selection(
-                                        &dropped_selections,
+                                        &notices,
                                         job.capture_id,
                                         "the capture command queue was unavailable after its selection was confirmed",
                                     );
@@ -556,7 +559,7 @@ impl SelectionWorker {
                                         "capture command queue was unavailable for automatic preview fallback",
                                     );
                                     notify_dropped_selection(
-                                        &dropped_selections,
+                                        &notices,
                                         job.capture_id,
                                         "the capture command queue was unavailable for its automatic preview fallback",
                                     );
@@ -638,15 +641,38 @@ impl SelectionWorker {
 
     fn stop_inner(&mut self, deadline: Instant) {
         self.request_stop();
+        // `request_stop` already dropped this side's update sender, so the UI-state thread is
+        // winding down in parallel and only needs a moment to write once the selection thread
+        // releases its own sender. Joining the selection thread against the full deadline could
+        // spend all of it, so hold the last slice back for the write that must reach disk.
+        let selection_deadline =
+            crate::daemon::reserved_deadline(Instant::now(), deadline, UI_STATE_STOP_RESERVE);
         let mut selection_stopped = true;
         if let Some(join) = self.join.take() {
-            if !join_worker_until(join, "selection", deadline) {
+            if !join_worker_until(join, "selection", selection_deadline) {
                 selection_stopped = false;
             }
         }
         if let Some(join) = self.ui_join.take() {
             if selection_stopped {
-                join_worker_until(join, "UI-state persistence", deadline);
+                // Reserving is not enough on its own: an earlier teardown step may already have
+                // overrun the shared deadline. This is the only shutdown step that writes user
+                // state to disk, so it is guaranteed its slice, overrunning by at most the reserve
+                // and staying well inside the tray's session-shutdown drain window.
+                let ui_deadline = crate::daemon::guaranteed_deadline(
+                    Instant::now(),
+                    deadline,
+                    UI_STATE_STOP_RESERVE,
+                );
+                join_worker_until(join, "UI-state persistence", ui_deadline);
+            } else {
+                // The detached selection thread still owns an overlay-update sender, so the
+                // UI-state thread can never see its channel close and joining it would only burn
+                // what is left of the deadline. The loss is real, so it is stated rather than
+                // implied by the selection worker's own detach log.
+                crate::logging::warn(format_args!(
+                    "UI-state persistence was not joined because the selection worker had to be detached; unsaved toolbar and region updates are lost"
+                ));
             }
         }
     }
@@ -961,6 +987,44 @@ mod tests {
         release_sender
             .send(())
             .expect("release detached test worker");
+    }
+
+    #[test]
+    fn the_selection_join_never_consumes_the_ui_state_flush_budget() {
+        let now = Instant::now();
+        let deadline = now + WORKER_STOP_TIMEOUT;
+
+        let selection_deadline =
+            crate::daemon::reserved_deadline(now, deadline, UI_STATE_STOP_RESERVE);
+
+        // Both stages must get a real slice: a reserve as large as the budget would starve the
+        // selection join instead, and no reserve would starve the flush that outlives the process.
+        assert!(UI_STATE_STOP_RESERVE < WORKER_STOP_TIMEOUT);
+        assert!(selection_deadline > now);
+        assert_eq!(
+            deadline.saturating_duration_since(selection_deadline),
+            UI_STATE_STOP_RESERVE
+        );
+    }
+
+    #[test]
+    fn the_ui_state_flush_still_gets_a_slice_after_the_budget_is_spent() {
+        let base = Instant::now();
+        // Everything before the flush overran the shared deadline by ten seconds.
+        let now = base + Duration::from_secs(10);
+
+        let ui_deadline = crate::daemon::guaranteed_deadline(now, base, UI_STATE_STOP_RESERVE);
+
+        assert_eq!(
+            ui_deadline.saturating_duration_since(now),
+            UI_STATE_STOP_RESERVE
+        );
+        // A budget that is still healthy is left alone rather than shortened to the minimum.
+        let healthy = now + WORKER_STOP_TIMEOUT;
+        assert_eq!(
+            crate::daemon::guaranteed_deadline(now, healthy, UI_STATE_STOP_RESERVE),
+            healthy
+        );
     }
 
     #[test]

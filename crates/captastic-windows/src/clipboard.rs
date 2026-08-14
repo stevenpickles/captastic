@@ -9,7 +9,7 @@ use captastic_core::{
 };
 use windows::core::w;
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
-use windows::Win32::Graphics::Gdi::{BITMAPV5HEADER, BI_BITFIELDS, LCS_GM_IMAGES};
+use windows::Win32::Graphics::Gdi::{BITMAPV5HEADER, BI_RGB, LCS_GM_IMAGES};
 #[cfg(test)]
 use windows::Win32::System::DataExchange::GetClipboardData;
 use windows::Win32::System::DataExchange::{
@@ -81,7 +81,7 @@ impl ClipboardPublisher {
             ClipboardSession::open(self.window.hwnd, OPEN_TIMEOUT)?;
         // SAFETY: This thread owns the successfully opened clipboard session.
         unsafe { EmptyClipboard() }
-            .map_err(|error| clipboard_error("empty_clipboard", error, false))?;
+            .map_err(|error| clipboard_error("empty_clipboard", error, true))?;
         dib_memory.transfer_to_clipboard(CF_DIBV5_FORMAT)?;
         let png_payload_bytes = if let Some(png_memory) = png_memory {
             match png_memory.transfer_to_clipboard(self.png_format) {
@@ -312,7 +312,16 @@ impl DibV5Layout {
             bV5Height: -height,
             bV5Planes: 1,
             bV5BitCount: 32,
-            bV5Compression: BI_BITFIELDS,
+            // BI_RGB, not BI_BITFIELDS: the channel layout below is exactly the BI_RGB default
+            // for 32bpp DIBs (B in the low byte, R in the high byte), so BI_BITFIELDS would add
+            // no information while inviting the well-known ambiguity among DIB consumers about
+            // whether pixel data starts immediately after the header or after an appended
+            // BITFIELDS mask triple. bV5RedMask/bV5GreenMask/bV5BlueMask are therefore
+            // informative only; BI_RGB readers ignore them and assume this same default layout.
+            // bV5AlphaMask is left set for V5-aware consumers that read alpha out of a
+            // BITMAPV5HEADER regardless of bV5Compression (e.g. via bV5AlphaMask being nonzero
+            // signals straight alpha is present in the fourth byte of each pixel).
+            bV5Compression: BI_RGB,
             bV5SizeImage: size_image,
             bV5RedMask: 0x00ff_0000,
             bV5GreenMask: 0x0000_ff00,
@@ -359,6 +368,13 @@ impl DibV5Layout {
     }
 }
 
+// The maximum payload of a single DEFLATE stored (uncompressed) block: the block's LEN field
+// is a u16, so a block can never hold more than u16::MAX bytes. `push_stored_byte` and
+// `flush_stored_block` both key off this constant directly rather than a `Vec`'s `capacity()`,
+// since `Vec::with_capacity` is permitted to over-allocate and comparing against the live
+// capacity would silently let a block grow past the u16::MAX the LEN field can express.
+const STORED_BLOCK_LIMIT: usize = u16::MAX as usize;
+
 fn encode_png(frame: &CpuFrame) -> Result<Vec<u8>, CaptureError> {
     if frame.format != PixelFormat::Bgra8Unorm || frame.origin != FrameOrigin::TopLeft {
         return Err(unsupported(
@@ -382,9 +398,8 @@ fn encode_png(frame: &CpuFrame) -> Result<Vec<u8>, CaptureError> {
         .checked_add(1)
         .and_then(|row| row.checked_mul(frame.height as usize))
         .ok_or_else(|| invalid_frame("PNG scanline buffer overflowed"))?;
-    const BLOCK_BYTES: usize = u16::MAX as usize;
     // A terminal block is always emitted, including when the raw byte count ends on a boundary.
-    let block_count = raw_length / BLOCK_BYTES + 1;
+    let block_count = raw_length / STORED_BLOCK_LIMIT + 1;
     let compressed_length = raw_length
         .checked_add(block_count.saturating_mul(5))
         .and_then(|length| length.checked_add(6))
@@ -404,7 +419,7 @@ fn encode_png(frame: &CpuFrame) -> Result<Vec<u8>, CaptureError> {
     png.extend_from_slice(b"IDAT");
     let idat_payload_start = png.len();
     png.extend_from_slice(&[0x78, 0x01]);
-    let mut block = Vec::with_capacity(BLOCK_BYTES);
+    let mut block = Vec::with_capacity(STORED_BLOCK_LIMIT);
     let mut adler = Adler32::new();
     for row in 0..frame.height as usize {
         push_stored_byte(&mut png, &mut block, 0, &mut adler);
@@ -428,12 +443,20 @@ fn encode_png(frame: &CpuFrame) -> Result<Vec<u8>, CaptureError> {
 fn push_stored_byte(destination: &mut Vec<u8>, block: &mut Vec<u8>, byte: u8, adler: &mut Adler32) {
     adler.update(byte);
     block.push(byte);
-    if block.len() == block.capacity() {
+    // Compare against the fixed STORED_BLOCK_LIMIT, not `block.capacity()`: `Vec::with_capacity`
+    // is only a lower bound on the allocation, so a capacity-based check could let `block` grow
+    // past u16::MAX bytes before flushing, which `flush_stored_block` cannot express in the
+    // DEFLATE stored-block LEN field.
+    if block.len() == STORED_BLOCK_LIMIT {
         flush_stored_block(destination, block, false);
     }
 }
 
 fn flush_stored_block(destination: &mut Vec<u8>, block: &mut Vec<u8>, final_block: bool) {
+    assert!(
+        block.len() <= STORED_BLOCK_LIMIT,
+        "DEFLATE stored block exceeds the u16 LEN field limit"
+    );
     destination.push(u8::from(final_block));
     let length = block.len() as u16;
     destination.extend_from_slice(&length.to_le_bytes());
@@ -699,6 +722,106 @@ mod tests {
         assert!(png.windows(4).any(|window| window == b"IDAT"));
         assert!(png.windows(5).any(|window| window == [0, 30, 20, 10, 64]));
         assert_eq!(&png[png.len() - 8..png.len() - 4], b"IEND");
+    }
+
+    /// Decodes the stored-block-only zlib stream `encode_png` emits: a 2-byte zlib header,
+    /// one or more DEFLATE stored blocks (final-flag byte, LE `LEN`, LE `NLEN`, `LEN` literal
+    /// bytes), then a 4-byte big-endian Adler-32 trailer. Returns the reassembled raw bytes
+    /// alongside the number of stored blocks consumed, so tests can assert both content and
+    /// that a multi-block boundary was actually exercised.
+    fn inflate_stored_blocks(zlib: &[u8]) -> (Vec<u8>, usize) {
+        assert!(zlib.len() >= 2, "zlib stream missing its 2-byte header");
+        let mut cursor = &zlib[2..];
+        let mut raw = Vec::new();
+        let mut block_count = 0;
+        loop {
+            assert!(cursor.len() >= 5, "truncated stored-block header");
+            let final_block = cursor[0] != 0;
+            let len = u16::from_le_bytes([cursor[1], cursor[2]]);
+            let nlen = u16::from_le_bytes([cursor[3], cursor[4]]);
+            assert_eq!(
+                len, !nlen,
+                "stored-block LEN/NLEN one's-complement mismatch"
+            );
+            assert!(
+                len as usize <= STORED_BLOCK_LIMIT,
+                "stored block exceeds the u16 LEN field limit"
+            );
+            cursor = &cursor[5..];
+            let len = len as usize;
+            assert!(cursor.len() >= len, "stored block body truncated");
+            raw.extend_from_slice(&cursor[..len]);
+            cursor = &cursor[len..];
+            block_count += 1;
+            if final_block {
+                break;
+            }
+        }
+        assert_eq!(
+            cursor.len(),
+            4,
+            "expected exactly the Adler-32 trailer after the final block"
+        );
+        let adler = u32::from_be_bytes(cursor.try_into().expect("4 trailer bytes"));
+        let mut recomputed = Adler32::new();
+        for &byte in &raw {
+            recomputed.update(byte);
+        }
+        assert_eq!(
+            adler,
+            recomputed.finish(),
+            "Adler-32 trailer does not match the payload"
+        );
+        (raw, block_count)
+    }
+
+    #[test]
+    fn png_stored_block_framing_round_trips_across_a_block_boundary() {
+        // width=16384 => row_bytes = 65536, so a single row's filter byte plus pixel bytes
+        // (65537 raw bytes) exceeds STORED_BLOCK_LIMIT (65535) and forces `encode_png` to split
+        // the row across two DEFLATE stored blocks. This is the exact boundary M41 covers:
+        // `Vec::with_capacity(STORED_BLOCK_LIMIT)` is permitted to over-allocate, so a flush
+        // decision keyed off `capacity()` instead of the fixed limit could silently grow a block
+        // past what the stored-block LEN field (a u16) can represent.
+        let width = 16_384_u32;
+        let mut pixels = Vec::with_capacity(width as usize * 4);
+        for i in 0..width {
+            let i = i as u8;
+            pixels.extend_from_slice(&[
+                i.wrapping_mul(7),
+                i.wrapping_mul(13),
+                i.wrapping_mul(17),
+                255,
+            ]);
+        }
+        let frame = frame(width, 1, width * 4, pixels.clone());
+
+        let png = encode_png(&frame).expect("PNG payload");
+
+        let idat_pos = png
+            .windows(4)
+            .position(|window| window == b"IDAT")
+            .expect("IDAT chunk present");
+        let idat_length = u32::from_be_bytes(
+            png[idat_pos - 4..idat_pos]
+                .try_into()
+                .expect("4 length bytes"),
+        ) as usize;
+        let idat_payload = &png[idat_pos + 4..idat_pos + 4 + idat_length];
+        assert_eq!(&idat_payload[..2], &[0x78, 0x01], "zlib header");
+
+        let (raw, block_count) = inflate_stored_blocks(idat_payload);
+        assert!(
+            block_count >= 2,
+            "expected the oversized row to span multiple stored blocks, got {block_count}"
+        );
+
+        let mut expected_raw = Vec::with_capacity(1 + pixels.len());
+        expected_raw.push(0); // PNG "none" filter byte.
+        for pixel in pixels.chunks_exact(4) {
+            expected_raw.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+        }
+        assert_eq!(raw, expected_raw);
     }
 
     #[test]

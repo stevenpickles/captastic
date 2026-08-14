@@ -15,6 +15,29 @@ const CAPTURE_WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const CAPTURE_WORKER_STOP_POLL: Duration = Duration::from_millis(5);
 #[cfg(windows)]
 const DAEMON_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+/// Slice of the shutdown budget held back from the capture-worker join for the worker teardown
+/// that follows it. The selection worker's UI-state thread performs the final toolbar and region
+/// write, so a capture worker that refuses to stop must not be able to spend the whole deadline
+/// and take that write down with the process.
+#[cfg(windows)]
+const WORKER_TEARDOWN_RESERVE: Duration = Duration::from_millis(500);
+
+/// Splits a shutdown budget: returns the deadline an earlier join must respect so that `reserve`
+/// is left for the teardown that follows it. A budget already shorter than the reserve collapses
+/// to `now`, which still lets an already-finished worker be joined without any waiting.
+#[cfg(windows)]
+pub(crate) fn reserved_deadline(now: Instant, deadline: Instant, reserve: Duration) -> Instant {
+    deadline.checked_sub(reserve).unwrap_or(now).max(now)
+}
+
+/// The other half of [`reserved_deadline`]: returns a deadline that is never sooner than
+/// `now + minimum`, so a step that must run cannot be handed a budget of zero by everything that
+/// ran before it. Reserving alone cannot promise that, because an earlier stage may already have
+/// overrun the shared deadline.
+#[cfg(windows)]
+pub(crate) fn guaranteed_deadline(now: Instant, deadline: Instant, minimum: Duration) -> Instant {
+    deadline.max(now + minimum)
+}
 
 #[cfg(windows)]
 fn join_capture_worker_until(join: thread::JoinHandle<()>, deadline: Instant) {
@@ -57,6 +80,12 @@ use crate::DisplayPolicy;
 
 #[cfg(windows)]
 const CAPTURE_RECOVERY_RETRIES: u32 = 3;
+
+/// Consecutive failed capture-engine reinitializations before the outage reaches the notification
+/// area. The backoff before the third failure totals well under a second, so a blip the engine
+/// recovers from on its own never balloons at the user, while a real outage does.
+#[cfg(windows)]
+const BACKEND_OUTAGE_NOTICE_ATTEMPTS: u32 = 3;
 
 #[cfg(windows)]
 struct ResolvedDaemonArgs {
@@ -208,11 +237,11 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         .then(|| crate::clipboard::ClipboardWorker::start(args.json, args.clipboard_queue_capacity))
         .transpose()?;
     let (command_sender, command_receiver) = mpsc::sync_channel(args.trigger_queue_capacity);
-    // Both workers can be forced to abandon a selection; the main thread owns the notification
-    // area, so drops travel to it on their own bounded channel rather than through the capture
-    // command queue that is already full whenever this happens.
-    let (dropped_selection_sender, dropped_selection_receiver) =
-        mpsc::sync_channel::<DroppedSelection>(args.selection_queue_capacity.max(1));
+    // Both workers can be forced to abandon work the user asked for; the main thread owns the
+    // notification area, so notices travel to it on their own bounded channel rather than through
+    // the capture command queue that is already full or stalled whenever this happens.
+    let (notice_sender, notice_receiver) =
+        mpsc::sync_channel::<DaemonNotice>(args.selection_queue_capacity.max(1));
     let confirmed_regions = Arc::new(Mutex::new(args.confirmed_regions.clone()));
     let mut selection_worker = args
         .selection
@@ -223,7 +252,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                     .expect("selection requires clipboard")
                     .submitter(),
                 command_sender.clone(),
-                dropped_selection_sender.clone(),
+                notice_sender.clone(),
                 args.json,
                 args.selection_queue_capacity,
                 confirmed_regions.clone(),
@@ -250,7 +279,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let max_captures = args.max_captures;
     let json_output = args.json;
     let capture_confirmed_regions = confirmed_regions.clone();
-    let capture_dropped_selections = dropped_selection_sender.clone();
+    let capture_notices = notice_sender.clone();
     let cached_ui = args.ui.clone();
 
     let capture_join = thread::Builder::new()
@@ -277,6 +306,9 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             let mut selections_in_flight = 0_usize;
             let mut next_capture_id = 1_u64;
             let mut recovery: Option<BackendRecovery> = None;
+            // Tracks whether the user has already been told about the current outage, so the
+            // unbounded retry loop raises exactly one notice per outage and one on its recovery.
+            let mut recovery_notified = false;
             loop {
                 if worker_stop_requested.load(Ordering::Acquire) {
                     let _ = done_sender.send(Ok(()));
@@ -300,6 +332,10 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                         Ok(replacement) => {
                             backend = Some(replacement);
                             recovery = None;
+                            if std::mem::take(&mut recovery_notified) {
+                                let _ = capture_notices
+                                    .try_send(DaemonNotice::CaptureEngineRecovered);
+                            }
                             log::info!("capture engine reinitialized; validation is deferred until capture");
                         }
                         Err(error) => {
@@ -313,6 +349,14 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                 "capture engine reinitialization failed; retrying in {:.0} ms: {error}",
                                 recovery_delay(state.failed_attempts).as_secs_f64() * 1_000.0
                             ));
+                            // The retry loop has no ceiling, so without this the user would watch
+                            // hotkeys disappear into a recovering engine with nothing on screen.
+                            if backend_outage_needs_notice(state.failed_attempts, recovery_notified)
+                            {
+                                recovery_notified = true;
+                                let _ = capture_notices
+                                    .try_send(DaemonNotice::CaptureEngineUnavailable);
+                            }
                         }
                     }
                 }
@@ -598,7 +642,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                     // The attempt ends here, so it can no longer report completion.
                                     selections_in_flight = selections_in_flight.saturating_sub(1);
                                     report_dropped_selection(
-                                        &capture_dropped_selections,
+                                        &capture_notices,
                                         job,
                                         "its confirmed selection could not be queued while the capture engine was recovering",
                                     );
@@ -675,7 +719,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                             | Err(crate::selection::SubmitError::Disconnected(job)) => {
                                 selections_in_flight = selections_in_flight.saturating_sub(1);
                                 report_dropped_selection(
-                                    &capture_dropped_selections,
+                                    &capture_notices,
                                     job,
                                     "it could not resume after its confirmation capture",
                                 );
@@ -708,7 +752,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                     // The attempt ends here, so it can no longer report completion.
                                     selections_in_flight = selections_in_flight.saturating_sub(1);
                                     report_dropped_selection(
-                                        &capture_dropped_selections,
+                                        &capture_notices,
                                         job,
                                         "its preview fallback could not be queued while the capture engine was recovering",
                                     );
@@ -783,7 +827,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                             | Err(crate::selection::SubmitError::Disconnected(job)) => {
                                 selections_in_flight = selections_in_flight.saturating_sub(1);
                                 report_dropped_selection(
-                                    &capture_dropped_selections,
+                                    &capture_notices,
                                     job,
                                     "it could not resume with its frozen preview fallback",
                                 );
@@ -949,7 +993,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let mut shutdown_deadline = None;
     let mut tray_shutdown_requested = false;
     let mut last_persistence_notification: Option<String> = None;
-    let mut last_dropped_selection_notification: Option<String> = None;
+    let mut last_notice_message: Option<String> = None;
     let mut daemon_result = Ok(());
     loop {
         let session_shutdown_requested = tray
@@ -1029,18 +1073,16 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                         }
                     }
                 }
-                while let Ok(dropped) = dropped_selection_receiver.try_recv() {
-                    let message = dropped_selection_message(&dropped);
-                    if last_dropped_selection_notification.as_deref() == Some(message.as_str()) {
+                while let Ok(notice) = notice_receiver.try_recv() {
+                    let message = notice.message();
+                    if last_notice_message.as_deref() == Some(message.as_str()) {
                         continue;
                     }
-                    last_dropped_selection_notification = Some(message.clone());
+                    last_notice_message = Some(message.clone());
                     if let Some(tray) = tray.as_ref() {
-                        if let Err(error) = tray
-                            .show_error_with_title("Captastic could not finish a capture", message)
-                        {
+                        if let Err(error) = tray.show_error_with_title(notice.title(), message) {
                             crate::logging::warn(format_args!(
-                                "failed to surface a dropped selection in the notification area: {error}"
+                                "failed to surface a daemon notice in the notification area: {error}"
                             ));
                         }
                     }
@@ -1144,7 +1186,13 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     }
     let hotkey_stop_error = hotkey.stop_before(teardown_deadline).err();
     let _ = command_sender.try_send(CaptureCommand::Shutdown);
-    join_capture_worker_until(capture_join, teardown_deadline);
+    // The workers below are stopped serially against one shared deadline, so the capture join runs
+    // against a reserved-back deadline instead of the full one; the selection worker splits its
+    // own slice again to guarantee the UI-state flush a moment to reach disk.
+    join_capture_worker_until(
+        capture_join,
+        reserved_deadline(Instant::now(), teardown_deadline, WORKER_TEARDOWN_RESERVE),
+    );
     let persistence_failures = selection_worker
         .take()
         .map_or_else(Vec::new, |worker| worker.stop_before(teardown_deadline));
@@ -1162,10 +1210,10 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             "shutdown retained UI-state persistence failure in the persistent log: {failure}"
         ));
     }
-    for dropped in dropped_selection_receiver.try_iter() {
+    for notice in notice_receiver.try_iter() {
         crate::logging::warn(format_args!(
-            "shutdown retained a dropped selection in the persistent log: {}",
-            dropped_selection_message(&dropped)
+            "shutdown retained a daemon notice in the persistent log: {}",
+            notice.message()
         ));
     }
     console_shutdown.signal_drained();
@@ -1275,6 +1323,14 @@ impl BackendRecovery {
 fn recovery_delay(failed_attempts: u32) -> Duration {
     let exponent = failed_attempts.saturating_sub(1).min(5);
     Duration::from_millis(50_u64.saturating_mul(1_u64 << exponent)).min(Duration::from_secs(2))
+}
+
+/// True when a failed reinitialization is the one that must raise `CaptureEngineUnavailable`: the
+/// outage has persisted past its threshold and has not been announced yet. Later failures in the
+/// same outage stay silent, so the unbounded retry loop cannot turn into balloon spam.
+#[cfg(windows)]
+fn backend_outage_needs_notice(failed_attempts: u32, already_notified: bool) -> bool {
+    !already_notified && failed_attempts >= BACKEND_OUTAGE_NOTICE_ATTEMPTS
 }
 
 #[cfg(windows)]
@@ -1968,29 +2024,60 @@ pub(crate) enum CaptureCommand {
     Shutdown,
 }
 
-/// A confirmed or in-progress selection that a full queue forced the daemon to abandon. The user
-/// asked for a capture and will get nothing, so this is surfaced in the notification area next to
-/// clipboard and preference failures instead of only reaching the log.
+/// Something the user asked for that will not happen, raised by a worker thread for the main
+/// thread to surface in the notification area next to clipboard and preference failures instead of
+/// only reaching the log.
 #[cfg(windows)]
-pub(crate) struct DroppedSelection {
-    pub capture_id: CaptureId,
-    /// A clause completing "... was not completed because {reason}".
-    pub reason: &'static str,
+pub(crate) enum DaemonNotice {
+    /// A confirmed or in-progress selection that a full queue forced the daemon to abandon. The
+    /// user asked for a capture and will get nothing.
+    DroppedSelection {
+        capture_id: CaptureId,
+        /// A clause completing "... was not completed because {reason}".
+        reason: &'static str,
+    },
+    /// The capture engine could not be rebuilt after several consecutive attempts, so every
+    /// trigger is being ignored while the retry loop keeps running. This deliberately carries no
+    /// attempt count: the rendered message has to stay byte-identical across repeats so the main
+    /// loop's dedupe collapses a long outage into a single balloon.
+    CaptureEngineUnavailable,
+    /// The capture engine came back after `CaptureEngineUnavailable` was raised.
+    CaptureEngineRecovered,
 }
 
 #[cfg(windows)]
-fn dropped_selection_message(dropped: &DroppedSelection) -> String {
-    format!(
-        "Capture {} was not completed because {}.",
-        dropped.capture_id.0, dropped.reason
-    )
+impl DaemonNotice {
+    fn title(&self) -> &'static str {
+        match self {
+            Self::DroppedSelection { .. } => "Captastic could not finish a capture",
+            Self::CaptureEngineUnavailable => "Captastic cannot capture right now",
+            Self::CaptureEngineRecovered => "Captastic can capture again",
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            Self::DroppedSelection { capture_id, reason } => format!(
+                "Capture {} was not completed because {}.",
+                capture_id.0, reason
+            ),
+            Self::CaptureEngineUnavailable => {
+                "The capture engine is unavailable and Captastic is still retrying. Captures are \
+                 ignored until it recovers."
+                    .to_owned()
+            }
+            Self::CaptureEngineRecovered => {
+                "The capture engine recovered. Captures are running again.".to_owned()
+            }
+        }
+    }
 }
 
 /// Ends a selection attempt the daemon could not hand back to its worker: the perf record is
 /// closed, the drop is logged, and the user is told through the notification area.
 #[cfg(windows)]
 fn report_dropped_selection(
-    notices: &mpsc::SyncSender<DroppedSelection>,
+    notices: &mpsc::SyncSender<DaemonNotice>,
     job: Box<crate::selection::SelectionJob>,
     reason: &'static str,
 ) {
@@ -2005,7 +2092,7 @@ fn report_dropped_selection(
         "selection {} was dropped because {reason}",
         capture_id.0
     ));
-    let _ = notices.try_send(DroppedSelection { capture_id, reason });
+    let _ = notices.try_send(DaemonNotice::DroppedSelection { capture_id, reason });
 }
 
 #[cfg(windows)]
@@ -2333,7 +2420,7 @@ mod tests {
 
     #[test]
     fn dropped_selections_are_surfaced_with_their_reason() {
-        let (sender, receiver) = mpsc::sync_channel::<DroppedSelection>(1);
+        let (sender, receiver) = mpsc::sync_channel::<DaemonNotice>(1);
 
         report_dropped_selection(
             &sender,
@@ -2341,17 +2428,23 @@ mod tests {
             "it could not resume after its confirmation capture",
         );
 
-        let dropped = receiver.try_recv().expect("dropped selection notice");
-        assert_eq!(dropped.capture_id, CaptureId(7));
+        let notice = receiver.try_recv().expect("dropped selection notice");
+        assert!(matches!(
+            notice,
+            DaemonNotice::DroppedSelection {
+                capture_id: CaptureId(7),
+                ..
+            }
+        ));
         assert_eq!(
-            dropped_selection_message(&dropped),
+            notice.message(),
             "Capture 7 was not completed because it could not resume after its confirmation capture."
         );
     }
 
     #[test]
     fn a_full_notice_queue_never_blocks_the_capture_worker() {
-        let (sender, receiver) = mpsc::sync_channel::<DroppedSelection>(1);
+        let (sender, receiver) = mpsc::sync_channel::<DaemonNotice>(1);
 
         for id in [1_u64, 2] {
             report_dropped_selection(
@@ -2363,11 +2456,94 @@ mod tests {
 
         // The queued notice survives and the overflow is discarded; neither call may block the
         // capture worker, which is the thread that drains the selection queue.
-        assert_eq!(
-            receiver.try_recv().expect("first notice").capture_id,
-            CaptureId(1)
-        );
+        assert!(matches!(
+            receiver.try_recv().expect("first notice"),
+            DaemonNotice::DroppedSelection {
+                capture_id: CaptureId(1),
+                ..
+            }
+        ));
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_slow_capture_join_cannot_spend_the_whole_shutdown_budget() {
+        let now = Instant::now();
+        let teardown_deadline = now + DAEMON_SHUTDOWN_TIMEOUT;
+
+        let capture_deadline = reserved_deadline(now, teardown_deadline, WORKER_TEARDOWN_RESERVE);
+
+        // The capture join stops early enough that the selection worker - and behind it the
+        // UI-state flush - still has the reserve to work with.
+        assert_eq!(
+            capture_deadline,
+            teardown_deadline - WORKER_TEARDOWN_RESERVE
+        );
+        assert_eq!(
+            teardown_deadline.saturating_duration_since(capture_deadline),
+            WORKER_TEARDOWN_RESERVE
+        );
+        assert!(WORKER_TEARDOWN_RESERVE < DAEMON_SHUTDOWN_TIMEOUT);
+    }
+
+    #[test]
+    fn an_exhausted_shutdown_budget_reserves_nothing_and_waits_for_nothing() {
+        let base = Instant::now();
+        // A deadline that has already passed, expressed without subtracting from a real Instant.
+        let now = base + Duration::from_secs(10);
+
+        // Neither an expired deadline nor a budget shorter than the reserve may produce a deadline
+        // in the future or in the past: both collapse to now, which still joins finished workers.
+        assert_eq!(reserved_deadline(now, base, WORKER_TEARDOWN_RESERVE), now);
+        assert_eq!(
+            reserved_deadline(
+                now,
+                now + WORKER_TEARDOWN_RESERVE / 2,
+                WORKER_TEARDOWN_RESERVE
+            ),
+            now
+        );
+        assert_eq!(
+            reserved_deadline(now, now + WORKER_TEARDOWN_RESERVE, WORKER_TEARDOWN_RESERVE),
+            now
+        );
+    }
+
+    #[test]
+    fn a_persistent_capture_engine_outage_is_announced_once() {
+        // Nothing is said while the engine might still recover on its own.
+        for failed_attempts in 1..BACKEND_OUTAGE_NOTICE_ATTEMPTS {
+            assert!(!backend_outage_needs_notice(failed_attempts, false));
+        }
+        assert!(backend_outage_needs_notice(
+            BACKEND_OUTAGE_NOTICE_ATTEMPTS,
+            false
+        ));
+        // The retry loop has no ceiling, so every later failure in the same outage must stay
+        // silent rather than balloon again.
+        for failed_attempts in [
+            BACKEND_OUTAGE_NOTICE_ATTEMPTS,
+            BACKEND_OUTAGE_NOTICE_ATTEMPTS + 1,
+            u32::MAX,
+        ] {
+            assert!(!backend_outage_needs_notice(failed_attempts, true));
+        }
+    }
+
+    #[test]
+    fn capture_engine_notices_dedupe_across_an_outage_but_not_across_its_recovery() {
+        let unavailable = DaemonNotice::CaptureEngineUnavailable.message();
+        // The outage notice carries no attempt count, so a repeat is byte-identical and the main
+        // loop's last-message dedupe swallows it.
+        assert_eq!(
+            unavailable,
+            DaemonNotice::CaptureEngineUnavailable.message()
+        );
+        assert_ne!(unavailable, DaemonNotice::CaptureEngineRecovered.message());
+        assert_ne!(
+            DaemonNotice::CaptureEngineUnavailable.title(),
+            DaemonNotice::CaptureEngineRecovered.title()
+        );
     }
 
     #[test]
