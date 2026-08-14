@@ -50,24 +50,24 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE, VK_RETURN,
 };
-#[cfg(test)]
-use windows::Win32::UI::WindowsAndMessaging::WDA_MONITOR;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyCursor, DestroyWindow,
     DispatchMessageW, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow,
     GetLastActivePopup, GetMessageW, GetShellWindow, GetWindowDisplayAffinity, GetWindowLongPtrW,
     GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-    IsWindow, IsWindowVisible, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW,
-    SetCursor, SetForegroundWindow, SetWindowDisplayAffinity, SetWindowLongPtrW, ShowWindow,
-    TranslateMessage, UnregisterClassW, UpdateLayeredWindow, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW,
-    CS_VREDRAW, GA_ROOTOWNER, GWLP_USERDATA, GWL_EXSTYLE, HCURSOR, ICONINFO, IDC_ARROW, IDC_CROSS,
-    IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, MSG,
+    IsWindow, IsWindowVisible, LoadCursorW, PeekMessageW, PostMessageW, PostQuitMessage,
+    RegisterClassW, SetCursor, SetForegroundWindow, SetWindowDisplayAffinity, SetWindowLongPtrW,
+    ShowWindow, TranslateMessage, UnregisterClassW, UpdateLayeredWindow, CREATESTRUCTW, CS_DBLCLKS,
+    CS_HREDRAW, CS_VREDRAW, GA_ROOTOWNER, GWLP_USERDATA, GWL_EXSTYLE, HCURSOR, ICONINFO, IDC_ARROW,
+    IDC_CROSS, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, MSG, PM_REMOVE,
     SPI_SETLOGICALDPIOVERRIDE, SPI_SETWORKAREA, SW_SHOW, ULW_ALPHA, WDA_EXCLUDEFROMCAPTURE,
     WDA_NONE, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
     WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WM_SETTINGCHANGE, WNDCLASSW,
+    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_QUIT, WM_RBUTTONDOWN, WM_SETTINGCHANGE, WNDCLASSW,
     WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
+#[cfg(test)]
+use windows::Win32::UI::WindowsAndMessaging::{PM_NOREMOVE, WDA_MONITOR};
 
 #[cfg(test)]
 use crate::window_capture::scaled_dimensions;
@@ -1318,6 +1318,9 @@ fn run_overlay(
     state: Box<OverlayState>,
     controller: &OverlayController,
 ) -> Result<Option<OverlaySelection>, CaptureError> {
+    // Overlays run back to back on one long-lived selection thread. Start from a queue that cannot
+    // already be quitting, so an earlier run's teardown can never end this loop before it pumps.
+    drain_pending_quit();
     // SAFETY: No module name requests the current executable module.
     let module = unsafe { GetModuleHandleW(None) }
         .map_err(|error| overlay_error("get_module_handle", error))?;
@@ -1394,6 +1397,9 @@ fn run_overlay(
         if let Err(error) = present_live_layer(hwnd, state) {
             // SAFETY: hwnd and state_pointer were created on this thread and are not published.
             let _ = unsafe { DestroyWindow(hwnd) };
+            // The synchronous WM_DESTROY posted a quit that no message loop will consume. Leaving
+            // it queued would immediately end the frozen-mode fallback run on this same thread.
+            drain_pending_quit();
             // SAFETY: no callback can access the state after DestroyWindow returns.
             let state = unsafe { Box::from_raw(state_pointer) };
             let _ = cache_overlay_state(state);
@@ -1425,6 +1431,8 @@ fn run_overlay(
         if result.0 == -1 {
             // SAFETY: hwnd is still owned by this thread if message retrieval fails.
             let _ = unsafe { DestroyWindow(hwnd) };
+            // This loop is abandoning, so nothing will consume the quit that WM_DESTROY posted.
+            drain_pending_quit();
             // SAFETY: The callback will no longer access state after DestroyWindow returns.
             let state = unsafe { Box::from_raw(state_pointer) };
             controller.inner.hwnd.store(0, Ordering::SeqCst);
@@ -1450,6 +1458,19 @@ fn run_overlay(
     restore_input_context(previous_foreground);
     drop(class_guard);
     Ok(result)
+}
+
+/// Removes a pending `WM_QUIT` from this thread's queue, if one is waiting.
+///
+/// `DestroyWindow` dispatches `WM_DESTROY` synchronously, and the overlay window procedure answers
+/// it with `PostQuitMessage`. When an overlay tears down without running its message loop to the
+/// end, that quit stays latched on the thread as per-thread state and would end the very next
+/// overlay run before it pumped a single message. The filter matches only `WM_QUIT`, so no
+/// window message can be discarded by mistake.
+fn drain_pending_quit() {
+    let mut message = MSG::default();
+    // SAFETY: message is writable storage and this thread owns the queue being peeked.
+    let _ = unsafe { PeekMessageW(&mut message, None, WM_QUIT, WM_QUIT, PM_REMOVE) };
 }
 
 struct ClassRegistration {
@@ -4749,6 +4770,29 @@ fn duration_ns(duration: std::time::Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn draining_a_pending_quit_clears_the_thread_quit_flag() {
+        // The quit flag is per-thread state, so exercise it on a thread of its own.
+        thread::spawn(|| {
+            // SAFETY: Sets the quit flag on this test thread's own message queue.
+            unsafe { PostQuitMessage(0) };
+            let mut message = MSG::default();
+            // SAFETY: message is writable storage and the peek leaves the queue untouched.
+            let latched =
+                unsafe { PeekMessageW(&mut message, None, WM_QUIT, WM_QUIT, PM_NOREMOVE) };
+            assert!(latched.as_bool(), "expected a latched quit to drain");
+
+            drain_pending_quit();
+
+            // SAFETY: message is writable storage and the peek leaves the queue untouched.
+            let remaining =
+                unsafe { PeekMessageW(&mut message, None, WM_QUIT, WM_QUIT, PM_NOREMOVE) };
+            assert!(!remaining.as_bool(), "quit survived the drain");
+        })
+        .join()
+        .expect("quit drain thread panicked");
+    }
 
     #[test]
     fn self_initiated_capture_change_preserves_drag_completion_state() {
