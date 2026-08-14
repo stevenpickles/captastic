@@ -303,11 +303,11 @@ fn run_tray(
         )
     };
     if hwnd.0 == 0 {
-        // SAFETY: Window creation failed, so no callback can retain the state allocation.
-        let _ = unsafe { Box::from_raw(state_pointer) };
-        // SAFETY: Balances the successful class registration; no class window was created.
-        let _ = unsafe { UnregisterClassW(CLASS_NAME, instance) };
-        return Err(last_error("create_tray_window"));
+        let creation_error = last_error("create_tray_window");
+        // SAFETY: Window creation failed, so no callback retains the allocation and there is no
+        // window or icon to destroy.
+        unsafe { tear_down_tray_window(None, state_pointer, instance) };
+        return Err(creation_error);
     }
     let startup_icon_added = match add_tray_icon_with_retry(hwnd, icon, false) {
         Ok(()) => true,
@@ -338,13 +338,9 @@ fn run_tray(
     // SAFETY: Called on the tray thread after its message queue and hidden window exist.
     let thread_id = unsafe { GetCurrentThreadId() };
     if ready_sender.send(Ok((thread_id, hwnd.0))).is_err() {
-        delete_tray_icon(hwnd);
-        // SAFETY: hwnd is the live hidden window on this thread.
-        let _ = unsafe { DestroyWindow(hwnd) };
-        // SAFETY: DestroyWindow has completed all callbacks and cleared the stored pointer.
-        let _ = unsafe { Box::from_raw(state_pointer) };
-        // SAFETY: No window remains for this registered class.
-        let _ = unsafe { UnregisterClassW(CLASS_NAME, instance) };
+        // SAFETY: hwnd is the live hidden window on this thread and the state Box has no
+        // outstanding borrows once the send has failed.
+        unsafe { tear_down_tray_window(Some(hwnd), state_pointer, instance) };
         return Ok(());
     }
 
@@ -365,14 +361,38 @@ fn run_tray(
         }
     };
 
-    delete_tray_icon(hwnd);
-    // SAFETY: hwnd belongs to this thread and is destroyed before state and class cleanup.
-    let _ = unsafe { DestroyWindow(hwnd) };
-    // SAFETY: Window destruction completed every callback and cleared the stored state pointer.
-    let _ = unsafe { Box::from_raw(state_pointer) };
-    // SAFETY: No window remains for this class.
-    let _ = unsafe { UnregisterClassW(CLASS_NAME, instance) };
+    // SAFETY: The message loop has ended, so no callback is executing and the state Box has no
+    // outstanding borrows; hwnd belongs to this thread.
+    unsafe { tear_down_tray_window(Some(hwnd), state_pointer, instance) };
     loop_result
+}
+
+/// Tears down the tray window's native resources in their one required order: the notification
+/// icon before its owning window, the window before the state allocation its callbacks dereference,
+/// and the class only after no window of the class remains. Every `run_tray` exit path funnels
+/// through here so the ordering cannot drift between them.
+///
+/// # Safety
+///
+/// Must run on the tray thread. `state_pointer` must be the live allocation created by `run_tray`
+/// with no outstanding borrows, and is freed here. `hwnd`, when present, must be the tray window
+/// owning that allocation; when `None`, window creation failed and no icon or window exists.
+unsafe fn tear_down_tray_window(
+    hwnd: Option<HWND>,
+    state_pointer: *mut TrayState,
+    instance: HINSTANCE,
+) {
+    if let Some(hwnd) = hwnd {
+        delete_tray_icon(hwnd);
+        // SAFETY: hwnd is the live hidden window on this thread; destruction runs its callbacks
+        // to completion and clears the stored state pointer.
+        let _ = unsafe { DestroyWindow(hwnd) };
+    }
+    // SAFETY: Either window destruction completed every callback or no window ever existed, so
+    // nothing can dereference the allocation again.
+    let _ = unsafe { Box::from_raw(state_pointer) };
+    // SAFETY: No window remains for this registered class.
+    let _ = unsafe { UnregisterClassW(CLASS_NAME, instance) };
 }
 
 /// Runtime owned by the tray thread: the Win32 handles and channels the effects need, plus the
