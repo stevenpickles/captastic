@@ -323,18 +323,16 @@ fn run_tray(
             false
         }
     };
-    {
-        // SAFETY: The window is live and no other borrow of the state exists on this thread.
-        let state = unsafe { &mut *state_pointer };
-        // IconAddCompleted only records the icon state; it never emits effects, so the empty
-        // effect list is dropped rather than routed through the applier.
-        let _ = machine::transition(
-            &mut state.model,
-            machine::TrayInput::IconAddCompleted {
-                restored: startup_icon_added,
-            },
-        );
-    }
+    // Recording the add outcome goes through the same input path as every other transition so
+    // its effects run too (a successful add drains the notification queue - empty at startup,
+    // but the machine should not rely on that here).
+    let _ = run_tray_input(
+        hwnd,
+        state_pointer,
+        machine::TrayInput::IconAddCompleted {
+            restored: startup_icon_added,
+        },
+    );
     // SAFETY: Called on the tray thread after its message queue and hidden window exist.
     let thread_id = unsafe { GetCurrentThreadId() };
     if ready_sender.send(Ok((thread_id, hwnd.0))).is_err() {
@@ -551,12 +549,16 @@ mod machine {
                 Handled,
             ),
             TrayInput::IconAddCompleted { restored } => {
-                model.icon = if restored {
-                    IconState::Present
+                if restored {
+                    model.icon = IconState::Present;
+                    // Flush anything that queued while the icon was missing, and heal any
+                    // notification whose TRAY_SHOW_ERROR post failed after its queue push
+                    // succeeded. An empty drain is a no-op, so this is safe unconditionally.
+                    (vec![TrayEffect::DrainNotifications], Handled)
                 } else {
-                    IconState::Degraded
-                };
-                (Vec::new(), Handled)
+                    model.icon = IconState::Degraded;
+                    (Vec::new(), Handled)
+                }
             }
             TrayInput::DisplayChanged => (
                 vec![TrayEffect::MarkDisplayConfigurationChanged(
@@ -586,15 +588,20 @@ mod machine {
             ),
             TrayInput::Menu(TrayMenuCommand::Pause) => {
                 model.paused = !model.paused;
-                (
-                    vec![
-                        TrayEffect::ModifyTooltip {
-                            paused: model.paused,
-                        },
-                        TrayEffect::SendEvent(TrayEvent::PausedChanged(model.paused)),
-                    ],
-                    Handled,
-                )
+                let mut effects = Vec::new();
+                // NIM_MODIFY against a missing icon can only fail; the pause itself still
+                // happens and the daemon still hears it. No refresh is owed on restore: the
+                // tooltip is an input to NIM_ADD, and AddIcon snapshots the live pause flag when
+                // TaskbarCreated arrives, so the re-added icon is born with the right text.
+                if model.icon == IconState::Present {
+                    effects.push(TrayEffect::ModifyTooltip {
+                        paused: model.paused,
+                    });
+                }
+                effects.push(TrayEffect::SendEvent(TrayEvent::PausedChanged(
+                    model.paused,
+                )));
+                (effects, Handled)
             }
             TrayInput::Menu(TrayMenuCommand::OpenConfig) => {
                 (vec![TrayEffect::SendEvent(TrayEvent::OpenConfig)], Handled)
@@ -614,7 +621,17 @@ mod machine {
                 model.startup_enabled = enabled;
                 (Vec::new(), Handled)
             }
-            TrayInput::NotificationsPosted => (vec![TrayEffect::DrainNotifications], Handled),
+            TrayInput::NotificationsPosted => {
+                if model.icon == IconState::Present {
+                    (vec![TrayEffect::DrainNotifications], Handled)
+                } else {
+                    // Draining now would burn every queued notification against an icon that
+                    // cannot show balloons. Leave them in the bounded queue; a successful re-add
+                    // drains them (IconAddCompleted), so an outage delays notifications instead
+                    // of destroying them.
+                    (Vec::new(), Handled)
+                }
+            }
             TrayInput::QueryEndSession => {
                 let effects = if model.session == SessionPhase::Idle {
                     model.session = SessionPhase::QueryReceived;
@@ -1550,6 +1567,7 @@ mod tests {
     #[test]
     fn pausing_updates_the_tooltip_before_the_daemon_hears_about_it() {
         let mut model = TrayModel::new(false);
+        model.icon = IconState::Present;
         let (effects, _) = transition(&mut model, TrayInput::Menu(TrayMenuCommand::Pause));
         assert!(model.paused);
         assert_eq!(
@@ -1666,7 +1684,12 @@ mod tests {
             assert_eq!(effects, vec![TrayEffect::AddIcon { paused: true }]);
 
             let (effects, _) = transition(&mut model, TrayInput::IconAddCompleted { restored });
-            assert!(effects.is_empty());
+            if restored {
+                // A fresh icon immediately drains whatever queued while it was missing.
+                assert_eq!(effects, vec![TrayEffect::DrainNotifications]);
+            } else {
+                assert!(effects.is_empty());
+            }
             assert_eq!(model.icon, expected, "{initial:?} restored={restored}");
         }
     }
@@ -1682,6 +1705,68 @@ mod tests {
         // Only actual destruction ends the message loop; the daemon owns the WM_QUIT decision.
         let (effects, _) = transition(&mut model, TrayInput::Destroyed);
         assert_eq!(effects, vec![TrayEffect::PostQuit]);
+    }
+
+    #[test]
+    fn nim_modify_effects_are_suppressed_while_the_icon_is_missing() {
+        for icon in [IconState::Absent, IconState::Degraded] {
+            let mut model = TrayModel::new(false);
+            model.icon = icon;
+            // The pause decision still happens and the daemon still hears it; only the tooltip
+            // write against the nonexistent icon is suppressed.
+            let (effects, _) = transition(&mut model, TrayInput::Menu(TrayMenuCommand::Pause));
+            assert!(model.paused);
+            assert_eq!(
+                effects,
+                vec![TrayEffect::SendEvent(TrayEvent::PausedChanged(true))],
+                "{icon:?}"
+            );
+
+            // Posted notifications stay queued instead of being drained into failing balloons.
+            let (effects, _) = transition(&mut model, TrayInput::NotificationsPosted);
+            assert!(effects.is_empty(), "{icon:?}");
+        }
+
+        // With the icon present both effects flow unchanged.
+        let mut model = TrayModel::new(false);
+        model.icon = IconState::Present;
+        let (effects, _) = transition(&mut model, TrayInput::Menu(TrayMenuCommand::Pause));
+        assert_eq!(
+            effects,
+            vec![
+                TrayEffect::ModifyTooltip { paused: true },
+                TrayEffect::SendEvent(TrayEvent::PausedChanged(true)),
+            ]
+        );
+        let (effects, _) = transition(&mut model, TrayInput::NotificationsPosted);
+        assert_eq!(effects, vec![TrayEffect::DrainNotifications]);
+    }
+
+    #[test]
+    fn a_restored_icon_flushes_notifications_queued_during_the_outage() {
+        let mut model = TrayModel::new(false);
+        model.icon = IconState::Degraded;
+        let (effects, _) = transition(&mut model, TrayInput::IconAddCompleted { restored: true });
+        assert_eq!(effects, vec![TrayEffect::DrainNotifications]);
+        assert_eq!(model.icon, IconState::Present);
+
+        // A failed re-add keeps everything suppressed and the queue intact.
+        model.icon = IconState::Degraded;
+        let (effects, _) = transition(&mut model, TrayInput::IconAddCompleted { restored: false });
+        assert!(effects.is_empty());
+        assert_eq!(model.icon, IconState::Degraded);
+    }
+
+    #[test]
+    fn a_taskbar_restore_carries_pause_state_changed_while_degraded() {
+        // The tooltip is an input to NIM_ADD itself: AddIcon snapshots the live pause flag when
+        // TaskbarCreated arrives, so the re-added icon is born with the right text and no
+        // post-restore ModifyTooltip refresh is owed for the writes suppressed during the outage.
+        let mut model = TrayModel::new(false);
+        model.icon = IconState::Degraded;
+        let _ = transition(&mut model, TrayInput::Menu(TrayMenuCommand::Pause));
+        let (effects, _) = transition(&mut model, TrayInput::TaskbarCreated);
+        assert_eq!(effects, vec![TrayEffect::AddIcon { paused: true }]);
     }
 
     #[test]
