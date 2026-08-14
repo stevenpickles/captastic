@@ -15,6 +15,29 @@ const CAPTURE_WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const CAPTURE_WORKER_STOP_POLL: Duration = Duration::from_millis(5);
 #[cfg(windows)]
 const DAEMON_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+/// Slice of the shutdown budget held back from the capture-worker join for the worker teardown
+/// that follows it. The selection worker's UI-state thread performs the final toolbar and region
+/// write, so a capture worker that refuses to stop must not be able to spend the whole deadline
+/// and take that write down with the process.
+#[cfg(windows)]
+const WORKER_TEARDOWN_RESERVE: Duration = Duration::from_millis(500);
+
+/// Splits a shutdown budget: returns the deadline an earlier join must respect so that `reserve`
+/// is left for the teardown that follows it. A budget already shorter than the reserve collapses
+/// to `now`, which still lets an already-finished worker be joined without any waiting.
+#[cfg(windows)]
+pub(crate) fn reserved_deadline(now: Instant, deadline: Instant, reserve: Duration) -> Instant {
+    deadline.checked_sub(reserve).unwrap_or(now).max(now)
+}
+
+/// The other half of [`reserved_deadline`]: returns a deadline that is never sooner than
+/// `now + minimum`, so a step that must run cannot be handed a budget of zero by everything that
+/// ran before it. Reserving alone cannot promise that, because an earlier stage may already have
+/// overrun the shared deadline.
+#[cfg(windows)]
+pub(crate) fn guaranteed_deadline(now: Instant, deadline: Instant, minimum: Duration) -> Instant {
+    deadline.max(now + minimum)
+}
 
 #[cfg(windows)]
 fn join_capture_worker_until(join: thread::JoinHandle<()>, deadline: Instant) {
@@ -1163,7 +1186,13 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     }
     let hotkey_stop_error = hotkey.stop_before(teardown_deadline).err();
     let _ = command_sender.try_send(CaptureCommand::Shutdown);
-    join_capture_worker_until(capture_join, teardown_deadline);
+    // The workers below are stopped serially against one shared deadline, so the capture join runs
+    // against a reserved-back deadline instead of the full one; the selection worker splits its
+    // own slice again to guarantee the UI-state flush a moment to reach disk.
+    join_capture_worker_until(
+        capture_join,
+        reserved_deadline(Instant::now(), teardown_deadline, WORKER_TEARDOWN_RESERVE),
+    );
     let persistence_failures = selection_worker
         .take()
         .map_or_else(Vec::new, |worker| worker.stop_before(teardown_deadline));
@@ -2435,6 +2464,49 @@ mod tests {
             }
         ));
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_slow_capture_join_cannot_spend_the_whole_shutdown_budget() {
+        let now = Instant::now();
+        let teardown_deadline = now + DAEMON_SHUTDOWN_TIMEOUT;
+
+        let capture_deadline = reserved_deadline(now, teardown_deadline, WORKER_TEARDOWN_RESERVE);
+
+        // The capture join stops early enough that the selection worker - and behind it the
+        // UI-state flush - still has the reserve to work with.
+        assert_eq!(
+            capture_deadline,
+            teardown_deadline - WORKER_TEARDOWN_RESERVE
+        );
+        assert_eq!(
+            teardown_deadline.saturating_duration_since(capture_deadline),
+            WORKER_TEARDOWN_RESERVE
+        );
+        assert!(WORKER_TEARDOWN_RESERVE < DAEMON_SHUTDOWN_TIMEOUT);
+    }
+
+    #[test]
+    fn an_exhausted_shutdown_budget_reserves_nothing_and_waits_for_nothing() {
+        let base = Instant::now();
+        // A deadline that has already passed, expressed without subtracting from a real Instant.
+        let now = base + Duration::from_secs(10);
+
+        // Neither an expired deadline nor a budget shorter than the reserve may produce a deadline
+        // in the future or in the past: both collapse to now, which still joins finished workers.
+        assert_eq!(reserved_deadline(now, base, WORKER_TEARDOWN_RESERVE), now);
+        assert_eq!(
+            reserved_deadline(
+                now,
+                now + WORKER_TEARDOWN_RESERVE / 2,
+                WORKER_TEARDOWN_RESERVE
+            ),
+            now
+        );
+        assert_eq!(
+            reserved_deadline(now, now + WORKER_TEARDOWN_RESERVE, WORKER_TEARDOWN_RESERVE),
+            now
+        );
     }
 
     #[test]
