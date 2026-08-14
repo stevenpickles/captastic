@@ -390,7 +390,18 @@ impl CaptureBackend for DxgiBackend {
                     metadata: metadata.clone(),
                 }) as Arc<dyn NativeFrame>
             });
-            acquired.release()?;
+            // The capture is already complete here: the CPU pixels are copied and the snapshot is
+            // an independent texture, so a failing ReleaseFrame reports that the duplication
+            // session is going away, not that these pixels are bad. Discarding a good frame over
+            // it helps nobody -- the next acquire raises ACCESS_LOST on its own and drives
+            // recovery from there. Device loss is not hidden by this: the readback reports it
+            // through Map, and the native-only branch above asks the device directly.
+            if let Err(error) = acquired.release() {
+                log::warn!(
+                    "capture {} could not release its duplication frame; returning the completed capture anyway: {error}",
+                    request.id.0
+                );
+            }
             return Ok(CaptureOutcome {
                 metadata,
                 frame: cpu_frame,
