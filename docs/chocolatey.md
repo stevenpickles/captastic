@@ -4,7 +4,9 @@ Captastic's Chocolatey package is self-contained: the release executables, licen
 documentation, and example configuration are embedded in the `.nupkg`. Installation and
 upgrades therefore do not download or execute a second installer. The package exposes both
 `captastic.exe` and `captastic-desktop.exe` on `PATH` and adds the console-free desktop launcher
-to the Start Menu.
+to the all-users Start Menu (`CommonPrograms`); the portable installer's shortcut is per-user
+instead. The all-users shortcut is a Chocolatey packaging convention only — the installed startup
+entry, configuration, and daemon control remain scoped to the installing user's session.
 
 The package intentionally does not launch Captastic on its first installation. Start it from
 the Start Menu, then use the tray menu or `captastic startup enable` if it should start with
@@ -68,12 +70,14 @@ The generated artifacts are excluded from Git. Install and inspect the package f
 directory:
 
 ```powershell
-choco install captastic --version 0.1.0 --source ./dist --yes
+choco install captastic --version <version> --source ./dist --yes
 captastic doctor
 Get-Command captastic, captastic-desktop
-choco upgrade captastic --version 0.1.0 --source ./dist --yes --force
+choco upgrade captastic --version <version> --source ./dist --yes --force
 choco uninstall captastic --yes
 ```
+
+Substitute `<version>` with the package version reported in `dist/artifacts.json`.
 
 The destructive lifecycle test used by CI requires two locally built prerelease versions and an
 explicit opt-in because it changes the machine's installed Chocolatey state:
@@ -106,7 +110,7 @@ match, and the disposable-VM checklist passes. Then publish manually with an API
 the repository:
 
 ```powershell
-choco push ./dist/captastic.0.1.0.nupkg `
+choco push ./dist/captastic.<version>.nupkg `
     --source https://push.chocolatey.org/ `
     --api-key $env:CHOCOLATEY_API_KEY
 ```
