@@ -267,10 +267,20 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             let mut backend = Some(backend);
 
             let mut attempts = 0_usize;
+            let mut selections_in_flight = 0_usize;
             let mut next_capture_id = 1_u64;
             let mut recovery: Option<BackendRecovery> = None;
             loop {
                 if worker_stop_requested.load(Ordering::Acquire) {
+                    let _ = done_sender.send(Ok(()));
+                    break;
+                }
+                // Every path that increments `attempts` returns to the top of the loop, so the
+                // capture limit is evaluated here instead of inside individual command branches.
+                // Attempts still owned by the selection worker hold the daemon open, because
+                // shutting down cancels the overlay a user is still interacting with.
+                if capture_limit_reached(max_captures, attempts, selections_in_flight) {
+                    log::info!("capture limit of {attempts} attempt(s) reached; stopping daemon");
                     let _ = done_sender.send(Ok(()));
                     break;
                 }
@@ -315,6 +325,14 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                 };
                 match command {
                     CaptureCommand::Trigger(trigger) => {
+                        if capture_budget_exhausted(max_captures, attempts) {
+                            // Only reachable while an earlier attempt is still selecting; the loop
+                            // stops as soon as that attempt reports back.
+                            log::info!(
+                                "trigger ignored because the capture limit of {attempts} attempt(s) is already spent"
+                            );
+                            continue;
+                        }
                         attempts = attempts.saturating_add(1);
                         let capture_id = CaptureId(next_capture_id);
                         next_capture_id = next_capture_id.saturating_add(1);
@@ -368,7 +386,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                 continue;
                             };
                             let recorder = trigger_recorder(capture_id, &trigger);
-                            if let Err(error) = dispatch_live_selection(
+                            let output_status = match dispatch_live_selection(
                                 sender,
                                 capture_id,
                                 &trigger,
@@ -378,13 +396,20 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                 selection_preview,
                                 recorder,
                             ) {
-                                let _ = done_sender.send(Err(error));
-                                break;
+                                Ok(status) => status,
+                                Err(error) => {
+                                    let _ = done_sender.send(Err(error));
+                                    break;
+                                }
+                            };
+                            if queued_to_selection_worker(output_status) {
+                                selections_in_flight = selections_in_flight.saturating_add(1);
                             }
                             log::info!(
-                                "capture {} action={} output=live_selection_queued",
+                                "capture {} action={} output={}",
                                 capture_id.0,
-                                trigger.action
+                                trigger.action,
+                                output_status
                             );
                             continue;
                         }
@@ -482,6 +507,9 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                         break;
                                     }
                                 };
+                                if queued_to_selection_worker(output_status) {
+                                    selections_in_flight = selections_in_flight.saturating_add(1);
+                                }
                                 log::info!(
                                     "capture {} action={}: native {:.3} ms, CPU {} output={} bytes={:?}",
                                     capture_id.0,
@@ -528,10 +556,6 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                 }
                             }
                         }
-                        if max_captures.is_some_and(|maximum| attempts >= maximum) {
-                            let _ = done_sender.send(Ok(()));
-                            break;
-                        }
                     }
                     CaptureCommand::LiveSelection(mut request) => {
                         let capture_id = request.job.capture_id;
@@ -548,12 +572,17 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                     .to_owned(),
                             );
                             request.job.confirmed_selection = Some(request.selection);
-                            let _ = crate::selection::try_submit(
+                            if crate::selection::try_submit(
                                 selection_sender
                                     .as_ref()
                                     .expect("live selection requires its worker"),
                                 request.job,
-                            );
+                            )
+                            .is_err()
+                            {
+                                // The attempt ends here, so it can no longer report completion.
+                                selections_in_flight = selections_in_flight.saturating_sub(1);
+                            }
                             continue;
                         }
                         let capture_request = CaptureRequest {
@@ -624,15 +653,12 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                             Err(crate::selection::SubmitError::Full(job))
                             | Err(crate::selection::SubmitError::Disconnected(job)) => {
                                 let _ = crate::selection::finish_rejected(*job);
+                                selections_in_flight = selections_in_flight.saturating_sub(1);
                                 crate::logging::warn(format_args!(
                                     "selection {} could not resume after confirmation capture",
                                     capture_id.0
                                 ));
                             }
-                        }
-                        if max_captures.is_some_and(|maximum| attempts >= maximum) {
-                            let _ = done_sender.send(Ok(()));
-                            break;
                         }
                     }
                     CaptureCommand::FrozenSelectionFallback(mut request) => {
@@ -649,12 +675,17 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                 "capture engine is recovering during automatic preview fallback"
                                     .to_owned(),
                             );
-                            let _ = crate::selection::try_submit(
+                            if crate::selection::try_submit(
                                 selection_sender
                                     .as_ref()
                                     .expect("preview fallback requires its selection worker"),
                                 request.job,
-                            );
+                            )
+                            .is_err()
+                            {
+                                // The attempt ends here, so it can no longer report completion.
+                                selections_in_flight = selections_in_flight.saturating_sub(1);
+                            }
                             continue;
                         }
                         let capture_request = CaptureRequest {
@@ -723,16 +754,21 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                             Err(crate::selection::SubmitError::Full(job))
                             | Err(crate::selection::SubmitError::Disconnected(job)) => {
                                 let _ = crate::selection::finish_rejected(*job);
+                                selections_in_flight = selections_in_flight.saturating_sub(1);
                                 crate::logging::warn(format_args!(
                                     "selection {} could not resume with its frozen preview fallback",
                                     capture_id.0
                                 ));
                             }
                         }
-                        if max_captures.is_some_and(|maximum| attempts >= maximum) {
-                            let _ = done_sender.send(Ok(()));
-                            break;
-                        }
+                    }
+                    CaptureCommand::SelectionFinished(capture_id) => {
+                        selections_in_flight = selections_in_flight.saturating_sub(1);
+                        log::debug!(
+                            "selection {} finished; {} selection attempt(s) still in flight",
+                            capture_id.0,
+                            selections_in_flight
+                        );
                     }
                     CaptureCommand::Shutdown => {
                         let _ = done_sender.send(Ok(()));
@@ -1271,6 +1307,32 @@ fn action_route(action: HotkeyAction) -> ActionRoute {
         HotkeyAction::FullDisplay => ActionRoute::FullDisplay,
         HotkeyAction::RepeatLastRegion => ActionRoute::RepeatLastRegion,
     }
+}
+
+/// Reports whether `--max-captures` has been satisfied. `attempts` counts triggers the capture
+/// worker has dequeued, so `maximum` attempts are permitted and the daemon stops once the last of
+/// them has finished; attempts the selection worker still owns are not finished yet.
+#[cfg(windows)]
+fn capture_limit_reached(
+    max_captures: Option<usize>,
+    attempts: usize,
+    selections_in_flight: usize,
+) -> bool {
+    selections_in_flight == 0 && capture_budget_exhausted(max_captures, attempts)
+}
+
+/// Reports whether every permitted attempt has already been dispatched. Attempts may still be
+/// running when this is true, so it gates new triggers rather than shutdown.
+#[cfg(windows)]
+fn capture_budget_exhausted(max_captures: Option<usize>, attempts: usize) -> bool {
+    max_captures.is_some_and(|maximum| attempts >= maximum)
+}
+
+/// Reports whether a dispatch status means the attempt is now owned by the selection worker and
+/// will report its own completion.
+#[cfg(windows)]
+fn queued_to_selection_worker(output_status: &str) -> bool {
+    matches!(output_status, "selection_queued" | "live_selection_queued")
 }
 
 #[cfg(windows)]
@@ -1816,6 +1878,10 @@ pub(crate) enum CaptureCommand {
     Trigger(TriggerEvent),
     LiveSelection(Box<crate::selection::LiveSelectionRequest>),
     FrozenSelectionFallback(Box<crate::selection::FrozenSelectionFallbackRequest>),
+    /// Reports that an attempt handed to the selection worker reached a terminal state, including
+    /// cancellation, which produces no other command. Without it the capture worker could never
+    /// observe that a `--max-captures` attempt had finished.
+    SelectionFinished(CaptureId),
     Shutdown,
 }
 
@@ -2022,6 +2088,48 @@ mod tests {
         assert!(!resolved.backend.is_empty());
         assert_eq!(resolved.startup_warnings.len(), 1);
         assert!(resolved.startup_warnings[0].contains("quarantined"));
+    }
+
+    #[test]
+    fn capture_limit_permits_exactly_the_requested_attempts() {
+        assert!(!capture_limit_reached(None, 99, 0));
+        assert!(!capture_limit_reached(Some(2), 1, 0));
+        assert!(capture_limit_reached(Some(2), 2, 0));
+        // Every dispatched trigger counts, including ones dropped while the engine recovers or
+        // routed to a live overlay, so the limit is reached without a completed capture.
+        assert!(capture_limit_reached(Some(1), 1, 0));
+    }
+
+    #[test]
+    fn capture_limit_waits_for_attempts_the_selection_worker_still_owns() {
+        // A live overlay is still on screen: stopping now would cancel the user's selection.
+        assert!(!capture_limit_reached(Some(1), 1, 1));
+        // Cancelling the overlay reports the attempt back, which is what releases the daemon.
+        assert!(capture_limit_reached(Some(1), 1, 0));
+    }
+
+    #[test]
+    fn spent_capture_budget_rejects_further_triggers() {
+        assert!(!capture_budget_exhausted(None, 5));
+        assert!(!capture_budget_exhausted(Some(2), 1));
+        assert!(capture_budget_exhausted(Some(2), 2));
+        assert!(capture_budget_exhausted(Some(2), 3));
+    }
+
+    #[test]
+    fn only_queued_selection_dispatches_stay_in_flight() {
+        assert!(queued_to_selection_worker("selection_queued"));
+        assert!(queued_to_selection_worker("live_selection_queued"));
+        for finished_inline in [
+            "selection_queue_full",
+            "selection_worker_disconnected",
+            "disabled",
+            "queued",
+            "queue_full",
+            "worker_disconnected",
+        ] {
+            assert!(!queued_to_selection_worker(finished_inline));
+        }
     }
 
     #[test]
