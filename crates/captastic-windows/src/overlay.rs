@@ -17,8 +17,9 @@ use layout::{
 #[cfg(test)]
 use machine::{contains, hit_test_resize_handle, move_region, rect_from_points, resize_region};
 use machine::{
-    latest_interaction_region, local_point, transition, CaptureTool, CloseOutcome, CursorIntent,
-    OverlayEffect, OverlayInput, OverlayModel, ResizeHandle, ToolbarDrag,
+    default_region_for_source, fit_region_to_source, initial_selection, latest_interaction_region,
+    local_point, transition, CaptureTool, CloseOutcome, CursorIntent, OverlayEffect, OverlayInput,
+    OverlayModel, ResizeHandle,
 };
 
 use crate::dwm_thumbnail::{fit_source_in_bounds, DwmThumbnail};
@@ -1010,23 +1011,6 @@ fn remembered_toolbar_position(
         .map(|origin| ToolbarLayout::clamp_origin(environment, origin))
 }
 
-fn initial_selection(
-    tool: CaptureTool,
-    last_region: Option<Rect>,
-    source: Rect,
-) -> (Option<Rect>, Option<SelectionKind>) {
-    match tool {
-        CaptureTool::FullDisplay => (Some(source), Some(SelectionKind::Display)),
-        CaptureTool::Window => (None, None),
-        CaptureTool::Region => {
-            let region = last_region
-                .map(|region| fit_region_to_source(region, source))
-                .unwrap_or_else(|| default_region_for_source(source));
-            (Some(region), Some(SelectionKind::Region))
-        }
-    }
-}
-
 fn remembered_last_region(
     region: Option<captastic_config::CaptureRegion>,
     previous_source: Option<captastic_config::CaptureRegionSource>,
@@ -1129,36 +1113,6 @@ fn remember_overlay_interaction(
     };
     if let Some(sink) = ui_updates {
         sink.submit(update);
-    }
-}
-
-fn default_region_for_source(source: Rect) -> Rect {
-    let width = (source.width / 2).max(1);
-    let height = (source.height / 2).max(1);
-    Rect {
-        x: source
-            .x
-            .saturating_add(((source.width - width) / 2).min(i32::MAX as u32) as i32),
-        y: source
-            .y
-            .saturating_add(((source.height - height) / 2).min(i32::MAX as u32) as i32),
-        width,
-        height,
-    }
-}
-
-fn fit_region_to_source(region: Rect, source: Rect) -> Rect {
-    let width = region.width.min(source.width);
-    let height = region.height.min(source.height);
-    let source_right = i64::from(source.x) + i64::from(source.width);
-    let source_bottom = i64::from(source.y) + i64::from(source.height);
-    let maximum_x = source_right - i64::from(width);
-    let maximum_y = source_bottom - i64::from(height);
-    Rect {
-        x: i64::from(region.x).clamp(i64::from(source.x), maximum_x) as i32,
-        y: i64::from(region.y).clamp(i64::from(source.y), maximum_y) as i32,
-        width,
-        height,
     }
 }
 
@@ -1539,73 +1493,27 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
-            // SAFETY: The Box remains alive for the message loop. SetCapture does not dispatch an
-            // overlay callback while capture is still owned by this window; destruction is only
-            // requested after the final state access in the confirming branches.
+            let routed = {
+                // SAFETY: The borrow ends with this block, before run_machine derives its own.
+                let state = unsafe { &*state_pointer };
+                let point = screen_point(state.model.source, lparam);
+                let local = local_point(state.model.source, point);
+                let layout = ToolbarLayout::new(
+                    state.model.display_environment,
+                    state.model.toolbar_position,
+                );
+                let toolbar_hit = layout.hit_test(local, state.model.options_open).is_some();
+                (toolbar_hit || state.model.tool == CaptureTool::Region).then_some(point)
+            };
+            if let Some(point) = routed {
+                return run_machine(hwnd, state_pointer, OverlayInput::PointerDown { point });
+            }
+            // Legacy Window click-select / FullDisplay outside-click path (stage O-C).
+            // SAFETY: The Box remains alive for the message loop; the borrow ends before
+            // close_overlay can dispatch destruction messages in the confirming branch.
             let state = unsafe { &mut *state_pointer };
             let point = screen_point(state.model.source, lparam);
             let local = local_point(state.model.source, point);
-            let layout = ToolbarLayout::new(
-                state.model.display_environment,
-                state.model.toolbar_position,
-            );
-            if let Some(control) = layout.hit_test(local, state.model.options_open) {
-                state.model.anchor = None;
-                state.model.dragging = false;
-                state.model.resizing = None;
-                state.model.moving_region = None;
-                state.model.hovered_control = Some(control);
-                match control {
-                    ToolbarControl::Background if layout.bounds.contains(local) => {
-                        state.model.options_open = false;
-                        if state.model.tool == CaptureTool::Window {
-                            // DWM thumbnails are compositor-managed and can cover overlay pixels.
-                            // Use frozen fallbacks while the toolbar is moving, then register only
-                            // previews that do not overlap its final position on button-up.
-                            state.live_window_thumbnails.clear();
-                            rebuild_window_overview_cache(state);
-                        }
-                        state.model.toolbar_drag = Some(ToolbarDrag {
-                            pointer_offset: POINT {
-                                x: local.x.saturating_sub(state.model.toolbar_position.x),
-                                y: local.y.saturating_sub(state.model.toolbar_position.y),
-                            },
-                        });
-                        capture_pointer(hwnd);
-                    }
-                    ToolbarControl::Background => {}
-                    ToolbarControl::FullDisplay => {
-                        activate_tool(state, CaptureTool::FullDisplay);
-                    }
-                    ToolbarControl::Window => activate_tool(state, CaptureTool::Window),
-                    ToolbarControl::Region => activate_tool(state, CaptureTool::Region),
-                    ToolbarControl::Options => {
-                        state.model.options_open = !state.model.options_open;
-                        if state.model.tool == CaptureTool::Window {
-                            refresh_live_window_thumbnails(state);
-                            rebuild_window_overview_cache(state);
-                        }
-                    }
-                    ToolbarControl::Capture => {
-                        if confirm_overlay(state) {
-                            close_overlay(hwnd);
-                        }
-                        return LRESULT(0);
-                    }
-                    ToolbarControl::DimBackground => {
-                        state.model.dim_background = !state.model.dim_background;
-                    }
-                    ToolbarControl::ClipboardDestination => {}
-                    ToolbarControl::Cancel => {
-                        cancel_overlay(state);
-                        close_overlay(hwnd);
-                        return LRESULT(0);
-                    }
-                }
-                set_arrow_cursor();
-                invalidate(hwnd);
-                return LRESULT(0);
-            }
             state.model.hovered_control = None;
             let options_were_open = state.model.options_open;
             state.model.options_open = false;
@@ -1613,32 +1521,27 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                 refresh_live_window_thumbnails(state);
                 rebuild_window_overview_cache(state);
             }
-            if state.model.tool != CaptureTool::Region {
-                if state.model.tool == CaptureTool::Window {
-                    state.model.selected_window = hit_test_window_thumbnail(state, local);
-                    update_window_preview(state, state.model.selected_window);
-                    state.selected_window_frame =
-                        ready_window_preview(state, state.model.selected_window)
-                            .map(|preview| preview.frame.clone());
-                    state.model.selection = state
-                        .selected_window_frame
-                        .as_ref()
-                        .map(|frame| frame.metadata.source_rect);
-                    state.model.selection_kind =
-                        state.model.selection.map(|_| SelectionKind::Window);
-                    if state.model.selection.is_some() {
-                        if confirm_overlay(state) {
-                            close_overlay(hwnd);
-                        }
-                        return LRESULT(0);
+            if state.model.tool == CaptureTool::Window {
+                state.model.selected_window = hit_test_window_thumbnail(state, local);
+                update_window_preview(state, state.model.selected_window);
+                state.selected_window_frame =
+                    ready_window_preview(state, state.model.selected_window)
+                        .map(|preview| preview.frame.clone());
+                state.model.selection = state
+                    .selected_window_frame
+                    .as_ref()
+                    .map(|frame| frame.metadata.source_rect);
+                state.model.selection_kind = state.model.selection.map(|_| SelectionKind::Window);
+                if state.model.selection.is_some() {
+                    if confirm_overlay(state) {
+                        close_overlay(hwnd);
                     }
-                    rebuild_window_overview_cache(state);
+                    return LRESULT(0);
                 }
-                invalidate(hwnd);
-                return LRESULT(0);
+                rebuild_window_overview_cache(state);
             }
-            // Region tool, no toolbar hit: the drag dispatch is fully modeled.
-            run_machine(hwnd, state_pointer, OverlayInput::PointerDown { point })
+            invalidate(hwnd);
+            LRESULT(0)
         }
         WM_LBUTTONUP => {
             let point = {
@@ -1813,6 +1716,32 @@ fn apply_overlay_effects(
                 // SAFETY: Local mutation on the owning thread; nothing is dispatched.
                 unsafe { (*state_pointer).dimension_label_placement = None };
             }
+            OverlayEffect::ClearSelectedWindowFrame => {
+                // SAFETY: Local mutation on the owning thread; nothing is dispatched.
+                unsafe { (*state_pointer).selected_window_frame = None };
+            }
+            OverlayEffect::ClearLiveThumbnails => {
+                // SAFETY: The borrow ends before the next effect; unregistering DWM thumbnails
+                // does not dispatch messages into this window procedure.
+                unsafe { (*state_pointer).live_window_thumbnails.clear() };
+            }
+            OverlayEffect::HideLiveThumbnails => {
+                // SAFETY: Shared borrow released at the block's end.
+                let state = unsafe { &*state_pointer };
+                hide_live_window_thumbnails(state);
+            }
+            OverlayEffect::RebuildOverviewCache => {
+                // SAFETY: The borrow ends before the next effect.
+                let state = unsafe { &mut *state_pointer };
+                rebuild_window_overview_cache(state);
+            }
+            OverlayEffect::BuildWindowOverview => {
+                // Deliberately synchronous: the chooser blocks the pump while thumbnails render
+                // (M21), and this stage preserves that timing exactly.
+                // SAFETY: The borrow ends before the next effect.
+                let state = unsafe { &mut *state_pointer };
+                build_window_overview(state);
+            }
             OverlayEffect::RefreshWindowChrome => {
                 // SAFETY: The borrow ends before the next effect. DWM thumbnail registration
                 // does not dispatch messages into this window procedure.
@@ -1869,10 +1798,6 @@ fn apply_overlay_effects(
             }
         }
     }
-}
-
-fn cancel_overlay(state: &mut OverlayState) {
-    remember_overlay_state(state);
 }
 
 fn close_overlay(hwnd: HWND) {
@@ -4380,51 +4305,6 @@ fn screen_point(source: Rect, lparam: LPARAM) -> POINT {
     POINT {
         x: source.x.saturating_add(x),
         y: source.y.saturating_add(y),
-    }
-}
-
-fn activate_tool(state: &mut OverlayState, tool: CaptureTool) {
-    state.model.anchor = None;
-    state.model.dragging = false;
-    state.model.resizing = None;
-    state.model.moving_region = None;
-    let tool_changed = state.model.tool != tool;
-    if tool_changed {
-        state.model.last_region = latest_interaction_region(
-            state.model.tool,
-            state.model.selection,
-            state.model.selection_kind,
-            state.model.last_region,
-        );
-        state.dimension_label_placement = None;
-        state.model.selection = None;
-        state.model.selection_kind = None;
-        state.model.selected_window = None;
-        state.selected_window_frame = None;
-        state.hovered = None;
-        state.model.hovered_handle = None;
-    }
-    state.model.tool = tool;
-    state.model.options_open = false;
-    match tool {
-        CaptureTool::FullDisplay => {
-            state.model.selection = Some(state.model.source);
-            state.model.selection_kind = Some(SelectionKind::Display);
-            state.model.selected_window = None;
-            state.selected_window_frame = None;
-        }
-        CaptureTool::Window => build_window_overview(state),
-        CaptureTool::Region if tool_changed => {
-            (state.model.selection, state.model.selection_kind) = initial_selection(
-                CaptureTool::Region,
-                state.model.last_region,
-                state.model.source,
-            );
-        }
-        CaptureTool::Region => {}
-    }
-    if tool != CaptureTool::Window {
-        hide_live_window_thumbnails(state);
     }
 }
 

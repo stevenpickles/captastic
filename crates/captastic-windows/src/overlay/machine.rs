@@ -170,8 +170,21 @@ pub(super) enum OverlayEffect {
     ClearWindowHover,
     /// Clear the dimension-label placement hysteresis (render-scratch state).
     ClearDimensionLabel,
+    /// Clear the captured frame backing a window selection (shell-owned pixels).
+    ClearSelectedWindowFrame,
     /// Re-register live thumbnails and rebuild the window-overview cache.
     RefreshWindowChrome,
+    /// Unregister every live DWM thumbnail so frozen fallbacks paint instead. Used while the
+    /// toolbar is being dragged, because compositor-managed previews can cover overlay pixels.
+    ClearLiveThumbnails,
+    /// Hide (but keep registered) every live DWM thumbnail; leaving the Window tool.
+    HideLiveThumbnails,
+    /// Rebuild the composed window-overview surface from current thumbnails and chrome.
+    RebuildOverviewCache,
+    /// Enumerate windows and render their thumbnails for the chooser. The shell applies this
+    /// synchronously today (M21 — the overlay blocks while it runs); the machine only decides
+    /// when it happens.
+    BuildWindowOverview,
     /// Persist the toolbar's resting position for this display.
     PersistToolbarCenter {
         position: POINT,
@@ -293,6 +306,13 @@ fn pointer_moved(model: &mut OverlayModel, point: POINT) -> Vec<OverlayEffect> {
 }
 
 fn pointer_down(model: &mut OverlayModel, point: POINT) -> Vec<OverlayEffect> {
+    let local = local_point(model.source, point);
+    let layout = ToolbarLayout::new(model.display_environment, model.toolbar_position);
+    if let Some(control) = layout.hit_test(local, model.options_open) {
+        return toolbar_control_pressed(model, control, layout.bounds.contains(local), local);
+    }
+    // The shell's router sends non-toolbar presses here only for the region tool; the Window
+    // click-select path is not yet modeled.
     debug_assert_eq!(model.tool, CaptureTool::Region);
     model.hovered_control = None;
     model.options_open = false;
@@ -343,6 +363,108 @@ fn pointer_down(model: &mut OverlayModel, point: POINT) -> Vec<OverlayEffect> {
             OverlayEffect::Invalidate,
         ]
     }
+}
+
+fn toolbar_control_pressed(
+    model: &mut OverlayModel,
+    control: ToolbarControl,
+    in_toolbar_bounds: bool,
+    local: POINT,
+) -> Vec<OverlayEffect> {
+    model.anchor = None;
+    model.dragging = false;
+    model.resizing = None;
+    model.moving_region = None;
+    model.hovered_control = Some(control);
+    let mut effects = Vec::new();
+    match control {
+        ToolbarControl::Background if in_toolbar_bounds => {
+            model.options_open = false;
+            if model.tool == CaptureTool::Window {
+                // DWM thumbnails are compositor-managed and can cover overlay pixels. Use frozen
+                // fallbacks while the toolbar is moving, then register only previews that do not
+                // overlap its final position on button-up.
+                effects.push(OverlayEffect::ClearLiveThumbnails);
+                effects.push(OverlayEffect::RebuildOverviewCache);
+            }
+            model.toolbar_drag = Some(ToolbarDrag {
+                pointer_offset: POINT {
+                    x: local.x.saturating_sub(model.toolbar_position.x),
+                    y: local.y.saturating_sub(model.toolbar_position.y),
+                },
+            });
+            effects.push(OverlayEffect::CapturePointer);
+        }
+        ToolbarControl::Background => {}
+        ToolbarControl::FullDisplay => {
+            effects.extend(activate_tool(model, CaptureTool::FullDisplay));
+        }
+        ToolbarControl::Window => effects.extend(activate_tool(model, CaptureTool::Window)),
+        ToolbarControl::Region => effects.extend(activate_tool(model, CaptureTool::Region)),
+        ToolbarControl::Options => {
+            model.options_open = !model.options_open;
+            if model.tool == CaptureTool::Window {
+                effects.push(OverlayEffect::RefreshWindowChrome);
+            }
+        }
+        // Capture and Cancel end the run without touching the cursor or repainting: the window
+        // is being destroyed (or, for a selection-less capture press, nothing changed).
+        ToolbarControl::Capture => return confirm(model),
+        ToolbarControl::DimBackground => {
+            model.dim_background = !model.dim_background;
+        }
+        ToolbarControl::ClipboardDestination => {}
+        ToolbarControl::Cancel => return cancel(model),
+    }
+    effects.push(OverlayEffect::SetCursor(CursorIntent::Arrow));
+    effects.push(OverlayEffect::Invalidate);
+    effects
+}
+
+/// Switches the active tool, restoring or resetting the selection to match, and returns the
+/// window-chooser side work the shell must run for the transition.
+pub(super) fn activate_tool(model: &mut OverlayModel, tool: CaptureTool) -> Vec<OverlayEffect> {
+    model.anchor = None;
+    model.dragging = false;
+    model.resizing = None;
+    model.moving_region = None;
+    let tool_changed = model.tool != tool;
+    let mut effects = Vec::new();
+    if tool_changed {
+        model.last_region = latest_interaction_region(
+            model.tool,
+            model.selection,
+            model.selection_kind,
+            model.last_region,
+        );
+        model.selection = None;
+        model.selection_kind = None;
+        model.selected_window = None;
+        model.hovered_handle = None;
+        effects.push(OverlayEffect::ClearDimensionLabel);
+        effects.push(OverlayEffect::ClearSelectedWindowFrame);
+        effects.push(OverlayEffect::ClearWindowHover);
+    }
+    model.tool = tool;
+    model.options_open = false;
+    match tool {
+        CaptureTool::FullDisplay => {
+            model.selection = Some(model.source);
+            model.selection_kind = Some(SelectionKind::Display);
+            model.selected_window = None;
+            effects.push(OverlayEffect::ClearSelectedWindowFrame);
+        }
+        CaptureTool::Window => effects.push(OverlayEffect::BuildWindowOverview),
+        CaptureTool::Region if tool_changed => {
+            (model.selection, model.selection_kind) =
+                initial_selection(CaptureTool::Region, model.last_region, model.source);
+        }
+        CaptureTool::Region => {}
+    }
+    if tool != CaptureTool::Window {
+        effects.push(OverlayEffect::HideLiveThumbnails);
+    }
+    effects
 }
 
 fn pointer_up(model: &mut OverlayModel, point: POINT) -> Vec<OverlayEffect> {
@@ -482,6 +604,53 @@ pub(super) fn local_point(source: Rect, point: POINT) -> POINT {
     POINT {
         x: point.x.saturating_sub(source.x),
         y: point.y.saturating_sub(source.y),
+    }
+}
+
+pub(super) fn initial_selection(
+    tool: CaptureTool,
+    last_region: Option<Rect>,
+    source: Rect,
+) -> (Option<Rect>, Option<SelectionKind>) {
+    match tool {
+        CaptureTool::FullDisplay => (Some(source), Some(SelectionKind::Display)),
+        CaptureTool::Window => (None, None),
+        CaptureTool::Region => {
+            let region = last_region
+                .map(|region| fit_region_to_source(region, source))
+                .unwrap_or_else(|| default_region_for_source(source));
+            (Some(region), Some(SelectionKind::Region))
+        }
+    }
+}
+
+pub(super) fn default_region_for_source(source: Rect) -> Rect {
+    let width = (source.width / 2).max(1);
+    let height = (source.height / 2).max(1);
+    Rect {
+        x: source
+            .x
+            .saturating_add(((source.width - width) / 2).min(i32::MAX as u32) as i32),
+        y: source
+            .y
+            .saturating_add(((source.height - height) / 2).min(i32::MAX as u32) as i32),
+        width,
+        height,
+    }
+}
+
+pub(super) fn fit_region_to_source(region: Rect, source: Rect) -> Rect {
+    let width = region.width.min(source.width);
+    let height = region.height.min(source.height);
+    let source_right = i64::from(source.x) + i64::from(source.width);
+    let source_bottom = i64::from(source.y) + i64::from(source.height);
+    let maximum_x = source_right - i64::from(width);
+    let maximum_y = source_bottom - i64::from(height);
+    Rect {
+        x: i64::from(region.x).clamp(i64::from(source.x), maximum_x) as i32,
+        y: i64::from(region.y).clamp(i64::from(source.y), maximum_y) as i32,
+        width,
+        height,
     }
 }
 
@@ -1180,6 +1349,309 @@ mod tests {
         assert!(matches!(
             close_outcome(&effects),
             Some(CloseOutcome::Confirmed { .. })
+        ));
+    }
+
+    fn center(rect: super::super::layout::UiRect) -> POINT {
+        POINT {
+            x: (rect.left + rect.right) / 2,
+            y: (rect.top + rect.bottom) / 2,
+        }
+    }
+
+    fn layout_for(model: &OverlayModel) -> ToolbarLayout {
+        ToolbarLayout::new(model.display_environment, model.toolbar_position)
+    }
+
+    #[test]
+    fn every_toolbar_control_dispatches_with_drags_cleared() {
+        // (control point, expected hovered_control, closes) driven through the real hit test so
+        // the dispatch table stays honest against layout changes.
+        let model = region_model();
+        let layout = layout_for(&model);
+        let cases = [
+            (
+                center(layout.drag_handle),
+                ToolbarControl::Background,
+                false,
+            ),
+            (
+                center(layout.full_display),
+                ToolbarControl::FullDisplay,
+                false,
+            ),
+            (center(layout.window), ToolbarControl::Window, false),
+            (center(layout.region), ToolbarControl::Region, false),
+            (center(layout.options), ToolbarControl::Options, false),
+            (center(layout.capture), ToolbarControl::Capture, false),
+            (center(layout.cancel), ToolbarControl::Cancel, true),
+        ];
+        for (local, expected, closes) in cases {
+            let mut model = region_model();
+            // The cancel row only hits while the options menu is open.
+            model.options_open = expected == ToolbarControl::Cancel;
+            // Give the machine an active drag to prove every dispatch clears it.
+            model.anchor = Some(point(1, 1));
+            model.dragging = true;
+            let screen = POINT {
+                x: model.source.x + local.x,
+                y: model.source.y + local.y,
+            };
+            let effects = transition(&mut model, OverlayInput::PointerDown { point: screen });
+            assert_eq!(model.hovered_control, Some(expected));
+            assert_eq!(model.anchor, None, "{expected:?}");
+            assert!(!model.dragging, "{expected:?}");
+            assert_eq!(close_outcome(&effects).is_some(), closes, "{expected:?}");
+        }
+    }
+
+    #[test]
+    fn the_tool_switch_matrix_restores_and_resets_selections() {
+        let tools = [
+            CaptureTool::FullDisplay,
+            CaptureTool::Window,
+            CaptureTool::Region,
+        ];
+        let region = Rect {
+            x: 100,
+            y: 100,
+            width: 300,
+            height: 200,
+        };
+        for from in tools {
+            for to in tools {
+                let mut model = region_model();
+                model.tool = from;
+                let (selection, kind) = initial_selection(from, Some(region), model.source);
+                model.selection = selection;
+                model.selection_kind = kind;
+                model.last_region = Some(region);
+                model.options_open = true;
+
+                let effects = activate_tool(&mut model, to);
+                let changed = from != to;
+
+                assert_eq!(model.tool, to, "{from:?}->{to:?}");
+                assert!(!model.options_open, "{from:?}->{to:?}");
+                match to {
+                    CaptureTool::FullDisplay => {
+                        assert_eq!(model.selection, Some(model.source));
+                        assert_eq!(model.selection_kind, Some(SelectionKind::Display));
+                        assert!(has_effect(&effects, |e| matches!(
+                            e,
+                            OverlayEffect::ClearSelectedWindowFrame
+                        )));
+                    }
+                    CaptureTool::Window => {
+                        if changed {
+                            assert_eq!(model.selection, None);
+                            assert_eq!(model.selection_kind, None);
+                        }
+                        assert!(has_effect(&effects, |e| matches!(
+                            e,
+                            OverlayEffect::BuildWindowOverview
+                        )));
+                        assert!(!has_effect(&effects, |e| matches!(
+                            e,
+                            OverlayEffect::HideLiveThumbnails
+                        )));
+                    }
+                    CaptureTool::Region => {
+                        // Region restores the latest interaction region on a switch and leaves
+                        // an existing selection alone on re-activation.
+                        assert_eq!(model.selection, Some(region), "{from:?}->{to:?}");
+                        assert_eq!(model.selection_kind, Some(SelectionKind::Region));
+                    }
+                }
+                if to != CaptureTool::Window {
+                    assert!(has_effect(&effects, |e| matches!(
+                        e,
+                        OverlayEffect::HideLiveThumbnails
+                    )));
+                }
+                // Leaving a region selection behind records it for the next region activation.
+                if changed && from == CaptureTool::Region {
+                    assert_eq!(model.last_region, Some(region), "{from:?}->{to:?}");
+                }
+                assert_eq!(model.selected_window, None);
+                assert_eq!(
+                    has_effect(&effects, |e| matches!(e, OverlayEffect::ClearWindowHover)),
+                    changed,
+                    "{from:?}->{to:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_toolbar_drag_start_clears_live_thumbnails_only_under_the_window_tool() {
+        for (tool, expects_clear) in [(CaptureTool::Window, true), (CaptureTool::Region, false)] {
+            let mut model = region_model();
+            model.tool = tool;
+            let layout = layout_for(&model);
+            let local = center(layout.drag_handle);
+            let effects = transition(&mut model, OverlayInput::PointerDown { point: local });
+            let drag = model.toolbar_drag.expect("drag-handle press starts a drag");
+            assert_eq!(drag.pointer_offset.x, local.x - model.toolbar_position.x);
+            assert!(!model.options_open);
+            assert!(has_effect(&effects, |e| matches!(
+                e,
+                OverlayEffect::CapturePointer
+            )));
+            assert_eq!(
+                has_effect(&effects, |e| matches!(
+                    e,
+                    OverlayEffect::ClearLiveThumbnails
+                )),
+                expects_clear,
+                "{tool:?}"
+            );
+            assert_eq!(
+                has_effect(&effects, |e| matches!(
+                    e,
+                    OverlayEffect::RebuildOverviewCache
+                )),
+                expects_clear,
+                "{tool:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_options_menu_toggles_and_its_background_is_inert() {
+        let mut model = region_model();
+        let layout = layout_for(&model);
+        transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point: center(layout.options),
+            },
+        );
+        assert!(model.options_open);
+
+        // A menu-background press keeps the menu open and starts no drag.
+        let menu_background = POINT {
+            x: layout.menu.left + 2,
+            y: layout.menu.top + 2,
+        };
+        let effects = transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point: menu_background,
+            },
+        );
+        assert!(model.options_open);
+        assert!(model.toolbar_drag.is_none());
+        assert!(close_outcome(&effects).is_none());
+
+        // Pressing Options again closes it.
+        transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point: center(layout.options),
+            },
+        );
+        assert!(!model.options_open);
+
+        // An outside press under the region tool closes the menu too.
+        model.options_open = true;
+        transition(&mut model, OverlayInput::PointerDown { point: point(5, 5) });
+        assert!(!model.options_open);
+    }
+
+    #[test]
+    fn options_under_the_window_tool_refreshes_chrome_on_both_edges() {
+        for expected_open in [true, false] {
+            let mut model = region_model();
+            model.tool = CaptureTool::Window;
+            model.options_open = !expected_open;
+            let layout = layout_for(&model);
+            let effects = transition(
+                &mut model,
+                OverlayInput::PointerDown {
+                    point: center(layout.options),
+                },
+            );
+            assert_eq!(model.options_open, expected_open);
+            assert!(has_effect(&effects, |e| matches!(
+                e,
+                OverlayEffect::RefreshWindowChrome
+            )));
+        }
+    }
+
+    #[test]
+    fn dim_background_toggles_without_closing_the_menu() {
+        let mut model = region_model();
+        model.options_open = true;
+        let dimmed_before = model.dim_background;
+        let layout = layout_for(&model);
+        let effects = transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point: center(layout.dim_background),
+            },
+        );
+        assert_eq!(model.dim_background, !dimmed_before);
+        assert!(
+            model.options_open,
+            "the menu stays open for further toggles"
+        );
+        assert_eq!(model.hovered_control, Some(ToolbarControl::DimBackground));
+        assert!(close_outcome(&effects).is_none());
+    }
+
+    #[test]
+    fn the_capture_button_confirms_only_with_a_selection() {
+        let layout = layout_for(&region_model());
+        let capture = center(layout.capture);
+
+        let mut without = region_model();
+        let effects = transition(&mut without, OverlayInput::PointerDown { point: capture });
+        assert!(
+            effects.is_empty(),
+            "no selection: nothing to do, no repaint"
+        );
+
+        let mut with = region_model();
+        with.selection = Some(Rect {
+            x: 10,
+            y: 10,
+            width: 40,
+            height: 40,
+        });
+        with.selection_kind = Some(SelectionKind::Region);
+        let effects = transition(&mut with, OverlayInput::PointerDown { point: capture });
+        assert!(matches!(
+            close_outcome(&effects),
+            Some(CloseOutcome::Confirmed { .. })
+        ));
+        assert!(persisted_region(&effects).is_some());
+    }
+
+    #[test]
+    fn the_cancel_row_persists_and_closes() {
+        let mut model = region_model();
+        model.options_open = true;
+        let region = Rect {
+            x: 30,
+            y: 30,
+            width: 60,
+            height: 60,
+        };
+        model.selection = Some(region);
+        model.selection_kind = Some(SelectionKind::Region);
+        let layout = layout_for(&model);
+        let effects = transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point: center(layout.cancel),
+            },
+        );
+        assert_eq!(persisted_region(&effects), Some(Some(region)));
+        assert!(matches!(
+            close_outcome(&effects),
+            Some(CloseOutcome::Cancelled)
         ));
     }
 
