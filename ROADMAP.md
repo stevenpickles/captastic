@@ -323,22 +323,16 @@ state required by their caller.
 
 ### Resolve dormant configuration and telemetry surfaces
 
+**Status:** Largely complete. Configuration validation now rejects non-default values for
+`[output]`, `hotkey.repeat = "coalesce"`, `capture.cursor = "include"`, and non-default
+`capture.buffer_slots` with actionable not-implemented-yet errors, covered by unit tests, and the
+write-only `backend_duration` field was removed from the capture outcome. Each rejection lifts when
+its milestone implements the feature. Remaining: inventory and remove legacy UI-state save/load
+entry points superseded by `UiStateStore`.
+
 **Why:** Accepted-but-unused settings create false product contracts and make cross-platform
 backends inherit behavior that does not exist. Write-only telemetry has the same maintenance cost
 without diagnostic value.
-
-- Either implement `hotkey.repeat = "coalesce"` with bounded, documented semantics or reject/remove
-  it with a migration note.
-- Implement `[output]` only through Milestone 4's bounded asynchronous output worker; until then,
-  reject unsupported non-default values rather than silently accepting them.
-- Apply the same reject-or-implement treatment to `capture.cursor` (a free-form string that is
-  never validated or consumed — `CursorMode::Exclude` is hardcoded at every request site) and
-  `capture.buffer_slots` (validated 2–16 but never read; the DXGI pool hardcodes three slots).
-- Inventory and remove legacy UI-state save/load entry points superseded by `UiStateStore`.
-- Either expose `backend_duration` in structured results/diagnostics with a precise timing contract
-  or remove it from the public capture outcome.
-- Add compatibility tests proving obsolete or unsupported configuration receives an actionable
-  error instead of being silently ignored.
 
 **Exit criteria:** Every documented configuration value changes observable behavior, every public
 metric has a consumer and timing definition, and platform backends do not need to emulate dead
@@ -379,36 +373,27 @@ Authenticode is deliberately not on the near-term critical path. Until signing i
 
 ## Recommended implementation order
 
-Rotated-output normalization and same-adapter virtual-desktop composition shipped in PRs #8–#9;
-the order below reflects the 2026-08 code, architecture, and roadmap review.
+Rotated-output normalization and same-adapter virtual-desktop composition shipped in PRs #8–#9.
+The verified findings from the 2026-08 code, architecture, and roadmap review — the three confirmed
+High defects, the silent-drop and sticky-failure paths, the config write guards, and the dormant
+configuration/telemetry surfaces — were remediated on the review branch itself. The order below
+reflects what remains.
 
-1. Remediate the verified review findings: the confirmed High-severity defects (one-shot
-   persistence failures discarding confirmed captures, the stale-`WM_QUIT` overlay fallback defeat,
-   the cross-thread window-text aliasing path) plus the small user-visible fixes around silent
-   drops and sticky failure states.
-2. Resolve the dormant configuration and telemetry surfaces (the backlog above) so every documented
-   setting changes observable behavior before Milestone 4 activates `[output]`.
-3. Extract the overlay and tray message state machines (the backlog above) — the prerequisite for
+1. Extract the overlay and tray message state machines (the backlog above) — the prerequisite for
    Milestone 6 and the highest-leverage reduction of the current defect stream.
-4. Add asynchronous file output and capture history (Milestone 4), starting with its listed
+2. Add asynchronous file output and capture history (Milestone 4), starting with its listed
    prerequisites.
-5. Complete Milestone 1 (multi-adapter composition and the hardware validation matrix) — this can
-   proceed in parallel with items 2–3.
-6. Build capture-quality completeness and performance evidence (Milestone 5).
-7. Add annotation/pinning or cross-platform work, based on audience demand (existing decision gate).
+3. Complete Milestone 1 (multi-adapter composition and the hardware validation matrix) — this can
+   proceed in parallel with item 1.
+4. Build capture-quality completeness and performance evidence (Milestone 5).
+5. Add annotation/pinning or cross-platform work, based on audience demand (existing decision gate).
 
 ## Recommended next branch
 
-Use a review-remediation branch to land the verified findings from the 2026-08 review before any
-milestone work:
-
-1. Fix the three confirmed High findings (one-shot UI-state persistence aborting confirmed
-   captures; stale `WM_QUIT` poisoning the frozen-preview fallback; pre-filter cross-thread window
-   text retrieval inside the overlay window procedure).
-2. Close the silent-drop paths: dropped confirmed selections during backend recovery, discarded
-   tray events including Exit, silent hotkey-thread death, and blank-frame `PrintWindow` results
-   that skip the WGC fallback.
-3. Guard the config write paths that can persist state the strict loader rejects, and the
-   `toml_edit` indexing panics on hand-edited files.
-4. Follow with the dormant-configuration-surfaces branch, then the overlay state-machine
-   extraction.
+Extract the overlay and tray message state machines (the architecture hardening backlog above).
+The 2026-08 review independently confirmed it as the highest-leverage investment: the defect
+stream, the largest unsafe surface, and every Milestone 6 feature converge on the overlay module,
+and the extraction pays for itself in table-driven transition tests that today's shape cannot
+support. Remaining Medium findings from the review (window-capture alpha and geometry parity,
+timeout budgets, log-rotation coexistence, shutdown-budget reservation, live-mode chrome
+visibility) are candidates to batch alongside or after it.
