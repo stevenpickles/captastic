@@ -19,6 +19,8 @@ use captastic_core::{
     CaptureError, CaptureErrorKind, CpuFrame, DisplayId, DisplayInfo, FrameMetadata, FrameOrigin,
     PixelFormat, Rect,
 };
+#[cfg(test)]
+use captastic_core::{CaptureId, CaptureMode, ColorSpace, TimingProvenance};
 use windows::core::{w, Error as WindowsError, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, BOOL, COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE,
@@ -861,10 +863,17 @@ impl Drop for PrivateFontResource {
 }
 
 impl WindowPreviewState {
-    fn handle(&self) -> NativeWindowHandle {
+    /// Whether this cached entry lets a click on `handle` skip another capture attempt.
+    ///
+    /// Only a ready preview of the same window qualifies. A previous failure is deliberately not
+    /// sticky: window captures fail transiently by design (the bounded render reports a retryable
+    /// timeout after 700 ms), so a click on a window that failed before tries again instead of
+    /// silently doing nothing. Retrying once per click is bounded by that timeout, and every click
+    /// is an explicit user action.
+    fn satisfies(&self, handle: NativeWindowHandle) -> bool {
         match self {
-            Self::Ready(preview) => preview.handle,
-            Self::Unavailable(handle) => *handle,
+            Self::Ready(preview) => preview.handle == handle,
+            Self::Unavailable(_) => false,
         }
     }
 }
@@ -2319,13 +2328,19 @@ fn update_window_preview(state: &mut OverlayState, target: Option<NativeWindowHa
     let Some(handle) = target else {
         return;
     };
-    if state
-        .window_preview
-        .as_ref()
-        .is_some_and(|preview| preview.handle() == handle)
-    {
-        return;
+    if let Some(cached) = &state.window_preview {
+        if cached.satisfies(handle) {
+            return;
+        }
+        if matches!(cached, WindowPreviewState::Unavailable(previous) if *previous == handle) {
+            log::debug!(
+                "retrying window preview for handle {:#x} after an earlier capture failure",
+                handle.raw()
+            );
+        }
     }
+    // A fresh attempt always replaces the cached entry: success stores Ready, another failure
+    // refreshes Unavailable, and no other overlay state is touched either way.
     state.window_preview = match capture_window_visual(handle, &state.reference_metadata) {
         Ok(capture) => match FrozenSurface::from_straight_alpha(
             capture.frame.width,
@@ -5950,6 +5965,67 @@ mod tests {
         OVERLAY_RESOURCE_CACHE.with(|cache| *cache.borrow_mut() = Some(resources));
         assert!(take_overlay_resource_cache(16, 16).is_none());
         clear_overlay_resource_cache();
+    }
+
+    fn ready_preview_state(handle: NativeWindowHandle) -> WindowPreviewState {
+        let metadata = FrameMetadata {
+            capture_id: CaptureId(1),
+            backend: "test".to_owned(),
+            display_id: DisplayId::primary(),
+            source_rect: Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            rotation_degrees: 0,
+            capture_mode: CaptureMode::Latest { max_age_ms: None },
+            presentation_offset_ns: Some(0),
+            timing_provenance: TimingProvenance::Synthetic,
+            native_ready_offset_ns: 0,
+            cpu_ready_offset_ns: Some(0),
+            frame_age_ns: Some(0),
+            frame_generation: Some(1),
+            copy_count: 1,
+            pool_slot: Some(0),
+        };
+        let frame = CpuFrame::new(
+            Arc::from(vec![0_u8; 4]),
+            1,
+            1,
+            4,
+            PixelFormat::Bgra8Unorm,
+            FrameOrigin::TopLeft,
+            ColorSpace::Srgb,
+            metadata,
+        )
+        .expect("test preview frame");
+        WindowPreviewState::Ready(Box::new(WindowPreview {
+            handle,
+            frame,
+            surface: FrozenSurface::empty(1, 1).expect("test preview surface"),
+            corner_radius_px: 0.0,
+        }))
+    }
+
+    #[test]
+    fn an_unavailable_window_preview_is_retried_on_the_next_click() {
+        let target = NativeWindowHandle::from_raw(11);
+        let other = NativeWindowHandle::from_raw(22);
+
+        let failed = WindowPreviewState::Unavailable(target);
+        assert!(
+            !failed.satisfies(target),
+            "a transient capture failure must not suppress the next attempt"
+        );
+        assert!(!failed.satisfies(other));
+
+        let ready = ready_preview_state(target);
+        assert!(
+            ready.satisfies(target),
+            "a ready preview is reused without recapturing"
+        );
+        assert!(!ready.satisfies(other));
     }
 
     #[test]
