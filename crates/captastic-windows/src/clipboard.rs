@@ -9,7 +9,7 @@ use captastic_core::{
 };
 use windows::core::w;
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
-use windows::Win32::Graphics::Gdi::{BITMAPV5HEADER, BI_BITFIELDS, LCS_GM_IMAGES};
+use windows::Win32::Graphics::Gdi::{BITMAPV5HEADER, BI_RGB, LCS_GM_IMAGES};
 #[cfg(test)]
 use windows::Win32::System::DataExchange::GetClipboardData;
 use windows::Win32::System::DataExchange::{
@@ -312,7 +312,16 @@ impl DibV5Layout {
             bV5Height: -height,
             bV5Planes: 1,
             bV5BitCount: 32,
-            bV5Compression: BI_BITFIELDS,
+            // BI_RGB, not BI_BITFIELDS: the channel layout below is exactly the BI_RGB default
+            // for 32bpp DIBs (B in the low byte, R in the high byte), so BI_BITFIELDS would add
+            // no information while inviting the well-known ambiguity among DIB consumers about
+            // whether pixel data starts immediately after the header or after an appended
+            // BITFIELDS mask triple. bV5RedMask/bV5GreenMask/bV5BlueMask are therefore
+            // informative only; BI_RGB readers ignore them and assume this same default layout.
+            // bV5AlphaMask is left set for V5-aware consumers that read alpha out of a
+            // BITMAPV5HEADER regardless of bV5Compression (e.g. via bV5AlphaMask being nonzero
+            // signals straight alpha is present in the fourth byte of each pixel).
+            bV5Compression: BI_RGB,
             bV5SizeImage: size_image,
             bV5RedMask: 0x00ff_0000,
             bV5GreenMask: 0x0000_ff00,
