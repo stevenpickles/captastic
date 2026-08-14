@@ -12,8 +12,8 @@ mod layout;
 mod machine;
 
 use layout::{
-    layout_dimension_label, DimensionLabelPlacement, DisplayEnvironment, ToolbarControl,
-    ToolbarLayout, UiMetrics, UiRect, UiSize,
+    layout_dimension_label, DimensionLabelPlacement, DisplayEnvironment, OverviewLayoutTokens,
+    ToolbarControl, ToolbarLayout, UiMetrics, UiRect, UiSize,
 };
 #[cfg(test)]
 use machine::{
@@ -2566,39 +2566,42 @@ fn window_overview_rects(state: &OverlayState) -> Vec<UiRect> {
         .iter()
         .map(|thumbnail| (thumbnail.surface.width, thumbnail.surface.height))
         .collect();
-    layout_floating_windows(state.surface.width, state.surface.height, &dimensions)
+    layout_floating_windows(
+        state.surface.width,
+        state.surface.height,
+        state.model.display_environment.metrics,
+        &dimensions,
+    )
 }
 
 fn layout_floating_windows(
     client_width: i32,
     client_height: i32,
+    metrics: UiMetrics,
     dimensions: &[(i32, i32)],
 ) -> Vec<UiRect> {
     if dimensions.is_empty() {
         return Vec::new();
     }
-    let left = 70;
-    let top = 64;
-    let available_width = (client_width - left * 2).max(200);
-    let available_height = (client_height - top - 160).max(160);
-    let gap = 28;
+    let tokens = metrics.overview_tokens();
+    let available_width = (client_width - tokens.margin_x * 2).max(tokens.min_available_width);
+    let available_height =
+        (client_height - tokens.top - tokens.bottom_reserve).max(tokens.min_available_height);
     let columns = (1..=dimensions.len())
         .max_by_key(|&candidate| {
             minimum_row_height(
                 available_width,
                 available_height,
-                gap,
+                tokens,
                 candidate,
                 dimensions,
             )
         })
         .unwrap_or(1);
     layout_floating_windows_with_columns(
-        left,
-        top,
+        tokens,
         available_width,
         available_height,
-        gap,
         columns,
         dimensions,
     )
@@ -2607,12 +2610,13 @@ fn layout_floating_windows(
 fn minimum_row_height(
     available_width: i32,
     available_height: i32,
-    gap: i32,
+    tokens: OverviewLayoutTokens,
     columns: usize,
     dimensions: &[(i32, i32)],
 ) -> i32 {
     let rows = dimensions.len().div_ceil(columns);
-    let row_slot_height = ((available_height - gap * (rows as i32 - 1)) / rows as i32).max(60);
+    let row_slot_height = ((available_height - tokens.gap * (rows as i32 - 1)) / rows as i32)
+        .max(tokens.min_row_height);
     dimensions
         .chunks(columns)
         .map(|row_dimensions| {
@@ -2620,7 +2624,8 @@ fn minimum_row_height(
                 .iter()
                 .map(|&(width, height)| f64::from(width) / f64::from(height.max(1)))
                 .sum();
-            let width_without_gaps = available_width - gap * (row_dimensions.len() as i32 - 1);
+            let width_without_gaps =
+                available_width - tokens.gap * (row_dimensions.len() as i32 - 1);
             f64::from(row_slot_height)
                 .min(f64::from(width_without_gaps.max(1)) / aspect_sum.max(0.01))
                 .round() as i32
@@ -2630,16 +2635,16 @@ fn minimum_row_height(
 }
 
 fn layout_floating_windows_with_columns(
-    left: i32,
-    top: i32,
+    tokens: OverviewLayoutTokens,
     available_width: i32,
     available_height: i32,
-    gap: i32,
     columns: usize,
     dimensions: &[(i32, i32)],
 ) -> Vec<UiRect> {
     let rows = dimensions.len().div_ceil(columns);
-    let row_slot_height = ((available_height - gap * (rows as i32 - 1)) / rows as i32).max(60);
+    let row_slot_height = ((available_height - tokens.gap * (rows as i32 - 1)) / rows as i32)
+        .max(tokens.min_row_height);
+    let minimum_window = f64::from(tokens.min_window_size);
     let mut result = Vec::with_capacity(dimensions.len());
     for row in 0..rows {
         let start = row * columns;
@@ -2649,21 +2654,23 @@ fn layout_floating_windows_with_columns(
             .iter()
             .map(|&(width, height)| f64::from(width) / f64::from(height.max(1)))
             .sum();
-        let width_without_gaps = available_width - gap * (row_dimensions.len() as i32 - 1);
+        let width_without_gaps = available_width - tokens.gap * (row_dimensions.len() as i32 - 1);
         let height_from_width = f64::from(width_without_gaps.max(1)) / aspect_sum.max(0.01);
-        let window_height = f64::from(row_slot_height).min(height_from_width).max(40.0);
+        let window_height = f64::from(row_slot_height)
+            .min(height_from_width)
+            .max(minimum_window);
         let widths: Vec<i32> = row_dimensions
             .iter()
             .map(|&(width, height)| {
                 (window_height * f64::from(width) / f64::from(height.max(1)))
                     .round()
-                    .max(40.0) as i32
+                    .max(minimum_window) as i32
             })
             .collect();
-        let row_width = widths.iter().sum::<i32>() + gap * (widths.len() as i32 - 1);
-        let mut x = left + (available_width - row_width) / 2;
-        let y = top
-            + row as i32 * (row_slot_height + gap)
+        let row_width = widths.iter().sum::<i32>() + tokens.gap * (widths.len() as i32 - 1);
+        let mut x = tokens.margin_x + (available_width - row_width) / 2;
+        let y = tokens.top
+            + row as i32 * (row_slot_height + tokens.gap)
             + (row_slot_height - window_height.round() as i32) / 2;
         for width in widths {
             result.push(UiRect {
@@ -2672,7 +2679,7 @@ fn layout_floating_windows_with_columns(
                 right: x + width,
                 bottom: y + window_height.round() as i32,
             });
-            x += width + gap;
+            x += width + tokens.gap;
         }
     }
     result
@@ -2893,13 +2900,14 @@ fn centered_rect(x: i32, y: i32, radius: i32) -> RECT {
 
 fn draw_window_overview_static(destination: &FrozenSurface, state: &OverlayState) {
     if state.window_thumbnails.is_empty() {
+        let tokens = state.model.display_environment.metrics.overview_tokens();
         draw_text(
             destination.device,
             UiRect {
-                left: 70,
-                top: 64,
-                right: state.surface.width - 70,
-                bottom: 118,
+                left: tokens.margin_x,
+                top: tokens.top,
+                right: state.surface.width - tokens.margin_x,
+                bottom: tokens.empty_state_bottom,
             },
             "No capturable application windows",
             rgb(220, 220, 224),
@@ -5336,7 +5344,8 @@ mod tests {
     #[test]
     fn window_overview_arranges_independent_surfaces_in_centered_rows() {
         let dimensions = vec![(1600, 900); 5];
-        let rectangles = layout_floating_windows(1920, 1080, &dimensions);
+        let rectangles =
+            layout_floating_windows(1920, 1080, UiMetrics::new(UiMetrics::BASE_DPI), &dimensions);
         assert_eq!(rectangles.len(), dimensions.len());
         assert!(rectangles[0].right < rectangles[1].left);
         assert_eq!(
@@ -5359,6 +5368,40 @@ mod tests {
             let height = rectangle.bottom - rectangle.top;
             (width * 9 - height * 16).abs() <= 16
         }));
+    }
+
+    #[test]
+    fn overview_layout_scales_with_monitor_dpi_and_clears_the_toolbar_band() {
+        let dimensions = vec![(1600, 900); 5];
+        // 200% scaling on a 4K display: the margins must scale with the toolbar's metrics so
+        // the bottom thumbnail row cannot collide with the (equally scaled) toolbar band.
+        let metrics = UiMetrics::new(192);
+        let tokens = metrics.overview_tokens();
+        assert_eq!(tokens.margin_x, 140);
+        assert_eq!(tokens.top, 128);
+        assert_eq!(tokens.bottom_reserve, 320);
+        let rectangles = layout_floating_windows(3840, 2160, metrics, &dimensions);
+        assert_eq!(rectangles.len(), dimensions.len());
+        assert!(rectangles.iter().all(|rectangle| {
+            rectangle.left >= tokens.margin_x
+                && rectangle.top >= tokens.top
+                && rectangle.right <= 3840 - tokens.margin_x
+                && rectangle.bottom <= 2160 - tokens.bottom_reserve
+        }));
+
+        // Base DPI is the identity, so default-DPI layouts do not shift: the scaled geometry
+        // at 200% on a doubled client matches the 100% layout doubled, rounding aside.
+        let base =
+            layout_floating_windows(1920, 1080, UiMetrics::new(UiMetrics::BASE_DPI), &dimensions);
+        // Per-rect rounding (window height, per-column width, centering) can drift a few
+        // pixels as columns accumulate; the bound stays far below one gap width, so any
+        // structural divergence (different column count) would still fail loudly.
+        for (scaled, base) in rectangles.iter().zip(&base) {
+            assert!((scaled.left - base.left * 2).abs() <= 6);
+            assert!((scaled.top - base.top * 2).abs() <= 6);
+            assert!((scaled.right - base.right * 2).abs() <= 6);
+            assert!((scaled.bottom - base.bottom * 2).abs() <= 6);
+        }
     }
 
     #[test]
