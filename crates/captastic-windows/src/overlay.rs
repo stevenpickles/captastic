@@ -41,7 +41,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::HiDpi::{
     GetDpiForMonitor, SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT,
@@ -4143,18 +4144,24 @@ fn collect_window(hwnd: HWND, collector: &mut WindowCollector) {
     if hwnd == unsafe { GetShellWindow() } {
         return;
     }
+    // Reject Captastic's own windows before anything queries them. Captastic never offers them as
+    // capture targets, and a title query against a same-process window on another thread is a
+    // blocking WM_GETTEXT send: while it waits, this thread dispatches its incoming sent messages,
+    // which can re-enter the window procedure and re-borrow the overlay state that enumeration
+    // already holds mutably further down the stack.
+    if is_own_process_window(hwnd) {
+        return;
+    }
+    // Everything below this point is a foreign window, and every filter here reads window state
+    // directly instead of sending a message, so none of them can block on another thread.
     // SAFETY: hwnd is a top-level handle supplied synchronously by EnumWindows.
     let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
     // SAFETY: hwnd remains the same live enumerated top-level handle.
     let minimized = unsafe { IsIconic(hwnd) }.as_bool();
-    let title = window_text(hwnd);
     let class_name = window_class_name(hwnd);
     // SAFETY: Reads immutable extended-style bits from the enumerated window.
     let extended_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
     let forced_taskbar_window = extended_style & WS_EX_APPWINDOW.0 != 0;
-    let Some(title) = title else {
-        return;
-    };
     if !visible
         || minimized
         || is_cloaked_window(hwnd)
@@ -4164,6 +4171,12 @@ fn collect_window(hwnd: HWND, collector: &mut WindowCollector) {
     {
         return;
     }
+    // Only already-eligible foreign windows are titled. Across a process boundary GetWindowText
+    // copies the cached title instead of sending WM_GETTEXT, so it cannot wait on that window's
+    // thread; untitled windows stay excluded exactly as before.
+    let Some(title) = window_text(hwnd) else {
+        return;
+    };
     let display_affinity = window_display_affinity(hwnd);
     if !display_affinity_allows_capture(display_affinity) {
         log_window_candidate(
@@ -4259,6 +4272,21 @@ fn native_window_display_id(hwnd: HWND, displays: &[DisplayInfo]) -> Option<Disp
         .iter()
         .find(|display| display.bounds == bounds)
         .map(|display| display.id.clone())
+}
+
+/// Reports whether `hwnd` belongs to this process, so window enumeration can skip it.
+///
+/// A handle that no longer resolves to a thread counts as ours: it is useless as a capture target
+/// and must not be queried further.
+fn is_own_process_window(hwnd: HWND) -> bool {
+    let mut process_id = 0_u32;
+    // SAFETY: process_id is writable storage and hwnd is inspected synchronously.
+    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
+    if thread_id == 0 {
+        return true;
+    }
+    // SAFETY: GetCurrentProcessId has no preconditions and cannot fail.
+    process_id == unsafe { GetCurrentProcessId() }
 }
 
 fn is_cloaked_window(hwnd: HWND) -> bool {
@@ -5634,6 +5662,20 @@ mod tests {
             WS_EX_TOOLWINDOW.0 | WS_EX_APPWINDOW.0
         ));
         assert!(window_styles_allow_task_switcher(0));
+    }
+
+    #[test]
+    fn enumeration_rejects_this_process_before_querying_a_window() {
+        // A handle that resolves to no thread is treated as ours, so nothing queries it further.
+        assert!(is_own_process_window(HWND(0)));
+        // SAFETY: Returns the shell desktop window handle for a process comparison only.
+        let shell = unsafe { GetShellWindow() };
+        if shell.0 != 0 {
+            assert!(
+                !is_own_process_window(shell),
+                "the shell window belongs to another process"
+            );
+        }
     }
 
     #[test]
