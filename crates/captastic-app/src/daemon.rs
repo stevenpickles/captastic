@@ -393,15 +393,18 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                 continue;
                             };
                             let recorder = trigger_recorder(capture_id, &trigger);
-                            let output_status = match dispatch_live_selection(
-                                sender,
+                            let output_status = match output_status_or_fatal(
                                 capture_id,
-                                &trigger,
-                                action_route(trigger.action),
-                                metadata,
-                                &cached_ui,
-                                selection_preview,
-                                recorder,
+                                dispatch_live_selection(
+                                    sender,
+                                    capture_id,
+                                    &trigger,
+                                    action_route(trigger.action),
+                                    metadata,
+                                    &cached_ui,
+                                    selection_preview,
+                                    recorder,
+                                ),
                             ) {
                                 Ok(status) => status,
                                 Err(error) => {
@@ -490,23 +493,26 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                     .as_ref()
                                     .map(captastic_core::CpuFrame::required_bytes);
                                 let native_frame_retained = outcome.native_frame.is_some();
-                                let output_status = match dispatch_output(
-                                    selection_sender.as_ref(),
-                                    clipboard_sender.as_ref(),
+                                let output_status = match output_status_or_fatal(
                                     capture_id,
-                                    trigger.received_at,
-                                    trigger.source,
-                                    trigger.action,
-                                    trigger.chord,
-                                    &outcome.metadata,
-                                    &capture_confirmed_regions,
-                                    &cached_ui,
-                                    selection_preview,
-                                    json_output,
-                                    outcome.metadata.cpu_ready_offset_ns,
-                                    outcome.frame,
-                                    outcome.native_frame,
-                                    recorder,
+                                    dispatch_output(
+                                        selection_sender.as_ref(),
+                                        clipboard_sender.as_ref(),
+                                        capture_id,
+                                        trigger.received_at,
+                                        trigger.source,
+                                        trigger.action,
+                                        trigger.chord,
+                                        &outcome.metadata,
+                                        &capture_confirmed_regions,
+                                        &cached_ui,
+                                        selection_preview,
+                                        json_output,
+                                        outcome.metadata.cpu_ready_offset_ns,
+                                        outcome.frame,
+                                        outcome.native_frame,
+                                        recorder,
+                                    ),
                                 ) {
                                     Ok(status) => status,
                                     Err(error) => {
@@ -549,8 +555,9 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                 recorder.record(capture_id, PerfEventKind::AttemptFinished, 0);
                                 if let Err(metrics_error) = validate_event_order(recorder.events())
                                 {
-                                    let _ = done_sender.send(Err(metrics_error.into()));
-                                    break;
+                                    // Telemetry only: the capture already failed, and losing the
+                                    // daemon on top of it would take every hotkey with it.
+                                    log_metrics_validation_failure(capture_id, &metrics_error);
                                 }
                                 crate::logging::error(format_args!(
                                     "capture {} action={} failed: {error}",
@@ -1377,6 +1384,38 @@ fn capture_budget_exhausted(max_captures: Option<usize>, attempts: usize) -> boo
 #[cfg(windows)]
 fn queued_to_selection_worker(output_status: &str) -> bool {
     matches!(output_status, "selection_queued" | "live_selection_queued")
+}
+
+/// Stands in for a dispatch status the daemon could not learn because closing out the attempt's
+/// perf record failed. It is never a queued status, so in-flight accounting stays correct.
+#[cfg(windows)]
+const METRICS_VALIDATION_FAILED: &str = "metrics_validation_failed";
+
+#[cfg(windows)]
+fn log_metrics_validation_failure(capture_id: CaptureId, error: &captastic_core::MetricsError) {
+    crate::logging::error(format_args!(
+        "capture {} metrics failed validation: {error}",
+        capture_id.0
+    ));
+}
+
+/// Keeps perf-event bookkeeping out of the daemon's fatal path. Event ordering depends on a rank
+/// heuristic spanning several hybrid capture routes, and one mis-ordered telemetry event must not
+/// take a resident daemon - and with it every registered hotkey - down. Real dispatch failures,
+/// such as an action the running configuration cannot serve, still stop the daemon.
+#[cfg(windows)]
+fn output_status_or_fatal(
+    capture_id: CaptureId,
+    dispatch_result: Result<&'static str, AppError>,
+) -> Result<&'static str, AppError> {
+    match dispatch_result {
+        Ok(status) => Ok(status),
+        Err(AppError::Metrics(error)) => {
+            log_metrics_validation_failure(capture_id, &error);
+            Ok(METRICS_VALIDATION_FAILED)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(windows)]
@@ -2254,6 +2293,42 @@ mod tests {
             preview_mode: PreviewMode::Live,
             preview_fallback_reason: None,
         })
+    }
+
+    #[test]
+    fn metrics_validation_failures_never_stop_the_daemon() {
+        let mut recorder = EventRecorder::with_capacity(4);
+        recorder.record(CaptureId(3), PerfEventKind::AttemptFinished, 0);
+        recorder.record(CaptureId(3), PerfEventKind::HotkeyReceived, 0);
+        let metrics_error =
+            validate_event_order(recorder.events()).expect_err("rank regression must be rejected");
+
+        let status = output_status_or_fatal(CaptureId(3), Err(metrics_error.into()))
+            .expect("telemetry bookkeeping must never be fatal");
+
+        assert_eq!(status, METRICS_VALIDATION_FAILED);
+        // A stand-in status must never look like a queued selection, or the in-flight count that
+        // gates --max-captures would never be released.
+        assert!(!queued_to_selection_worker(status));
+    }
+
+    #[test]
+    fn real_dispatch_failures_still_stop_the_daemon() {
+        assert_eq!(
+            output_status_or_fatal(CaptureId(1), Ok("selection_queued"))
+                .expect("a successful dispatch passes its status through"),
+            "selection_queued"
+        );
+
+        let error = output_status_or_fatal(
+            CaptureId(1),
+            Err(AppError::InvalidArgument(
+                "hotkey action window requires selection.enabled = true".to_owned(),
+            )),
+        )
+        .expect_err("configuration failures remain fatal");
+
+        assert!(matches!(error, AppError::InvalidArgument(_)));
     }
 
     #[test]
