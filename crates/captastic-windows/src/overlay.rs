@@ -8,10 +8,17 @@ use std::thread;
 use std::time::Instant;
 
 mod layout;
+mod machine;
 
 use layout::{
     layout_dimension_label, DimensionLabelPlacement, DisplayEnvironment, ToolbarControl,
     ToolbarLayout, UiMetrics, UiRect, UiSize,
+};
+#[cfg(test)]
+use machine::{contains, hit_test_resize_handle, move_region, rect_from_points, resize_region};
+use machine::{
+    latest_interaction_region, local_point, transition, CaptureTool, CloseOutcome, CursorIntent,
+    OverlayEffect, OverlayInput, OverlayModel, ResizeHandle, ToolbarDrag,
 };
 
 use crate::dwm_thumbnail::{fit_source_in_bounds, DwmThumbnail};
@@ -79,11 +86,9 @@ use crate::window_capture::{
 };
 
 const CLASS_NAME: PCWSTR = w!("CaptasticFrozenSelectionOverlay");
-const DRAG_THRESHOLD: i32 = 4;
 const DIM_ALPHA: u8 = 128;
 const LIVE_HIT_TEST_ALPHA: u8 = 1;
 const _: () = assert!(LIVE_HIT_TEST_ALPHA > 0);
-const MIN_REGION_SIZE: i64 = 8;
 const REGION_CURSOR_SIZE: u32 = 64;
 const REGION_CURSOR_CENTER: i32 = REGION_CURSOR_SIZE as i32 / 2;
 const WINDOW_THUMBNAIL_MAX_PIXELS: u64 = 1_200_000;
@@ -401,8 +406,27 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
     };
     let (selection, selection_kind) = initial_selection(tool, last_region, source);
     let mut state = Box::new(OverlayState {
+        model: OverlayModel {
+            source,
+            display_environment,
+            tool,
+            selection,
+            selection_kind,
+            selected_window: None,
+            anchor: None,
+            dragging: false,
+            resizing: None,
+            moving_region: None,
+            hovered_handle: None,
+            last_region,
+            toolbar_position,
+            toolbar_drag: None,
+            options_open: false,
+            dim_background: true,
+            hovered_control: None,
+            pointer_local: None,
+        },
         overlay_hwnd: HWND(0),
-        source,
         live_preview: preview_source.is_live(),
         surface,
         back_buffer,
@@ -412,26 +436,9 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
         window_assets_ready: false,
         windows: None,
         hovered: None,
-        pointer_local: None,
         dimension_label_placement: None,
-        anchor: None,
-        dragging: false,
-        selection,
-        selection_kind,
-        selected_window: None,
         selected_window_frame: None,
-        hovered_handle: None,
-        resizing: None,
-        moving_region: None,
-        last_region,
-        tool,
-        options_open: false,
-        dim_background: true,
-        hovered_control: None,
-        toolbar_position,
-        toolbar_drag: None,
         releasing_pointer_capture: false,
-        display_environment,
         reference_metadata: metadata.clone(),
         window_preview: None,
         window_thumbnails: Vec::new(),
@@ -554,8 +561,9 @@ fn query_display_environment(source: Rect) -> DisplayEnvironment {
 }
 
 struct OverlayState {
+    /// The pure product-state machine; every transition-owned field lives here.
+    model: OverlayModel,
     overlay_hwnd: HWND,
-    source: Rect,
     live_preview: bool,
     surface: FrozenSurface,
     back_buffer: FrozenSurface,
@@ -565,26 +573,11 @@ struct OverlayState {
     window_assets_ready: bool,
     windows: Option<Vec<WindowCandidate>>,
     hovered: Option<WindowCandidate>,
-    pointer_local: Option<POINT>,
     dimension_label_placement: Option<DimensionLabelPlacement>,
-    anchor: Option<POINT>,
-    dragging: bool,
-    selection: Option<Rect>,
-    selection_kind: Option<SelectionKind>,
-    selected_window: Option<NativeWindowHandle>,
     selected_window_frame: Option<CpuFrame>,
-    hovered_handle: Option<ResizeHandle>,
-    resizing: Option<ResizeDrag>,
-    moving_region: Option<MoveDrag>,
-    last_region: Option<Rect>,
-    tool: CaptureTool,
-    options_open: bool,
-    dim_background: bool,
-    hovered_control: Option<ToolbarControl>,
-    toolbar_position: POINT,
-    toolbar_drag: Option<ToolbarDrag>,
+    /// Shell-side protocol flag distinguishing a self-initiated `ReleaseCapture` round trip from
+    /// an externally stolen pointer capture. Never part of the model.
     releasing_pointer_capture: bool,
-    display_environment: DisplayEnvironment,
     reference_metadata: FrameMetadata,
     window_preview: Option<WindowPreviewState>,
     window_thumbnails: Vec<WindowThumbnail>,
@@ -658,48 +651,10 @@ fn cache_overlay_state(state: Box<OverlayState>) -> Option<OverlaySelection> {
     result
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CaptureTool {
-    FullDisplay,
-    Window,
-    Region,
-}
-
-impl CaptureTool {
-    const fn from_selection_kind(kind: SelectionKind) -> Self {
-        match kind {
-            SelectionKind::Display => Self::FullDisplay,
-            SelectionKind::Region => Self::Region,
-            SelectionKind::Window => Self::Window,
-        }
-    }
-
-    const fn from_config(tool: captastic_config::CaptureTool) -> Self {
-        match tool {
-            captastic_config::CaptureTool::FullDisplay => Self::FullDisplay,
-            captastic_config::CaptureTool::Window => Self::Window,
-            captastic_config::CaptureTool::Region => Self::Region,
-        }
-    }
-
-    const fn to_config(self) -> captastic_config::CaptureTool {
-        match self {
-            Self::FullDisplay => captastic_config::CaptureTool::FullDisplay,
-            Self::Window => captastic_config::CaptureTool::Window,
-            Self::Region => captastic_config::CaptureTool::Region,
-        }
-    }
-}
-
 #[derive(Clone, Copy)]
 enum TextAlignment {
     Left,
     Center,
-}
-
-#[derive(Clone, Copy)]
-struct ToolbarDrag {
-    pointer_offset: POINT,
 }
 
 enum WindowPreviewState {
@@ -1033,30 +988,6 @@ struct WindowCandidate {
     handle: NativeWindowHandle,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ResizeHandle {
-    NorthWest,
-    North,
-    NorthEast,
-    East,
-    SouthEast,
-    South,
-    SouthWest,
-    West,
-}
-
-#[derive(Clone, Copy)]
-struct ResizeDrag {
-    handle: ResizeHandle,
-    original: Rect,
-}
-
-#[derive(Clone, Copy)]
-struct MoveDrag {
-    original: Rect,
-    pointer_origin: POINT,
-}
-
 fn remembered_toolbar_position(
     normalized_center: Option<(f64, f64)>,
     position: Option<(i32, i32)>,
@@ -1093,19 +1024,6 @@ fn initial_selection(
                 .unwrap_or_else(|| default_region_for_source(source));
             (Some(region), Some(SelectionKind::Region))
         }
-    }
-}
-
-fn latest_interaction_region(
-    tool: CaptureTool,
-    selection: Option<Rect>,
-    selection_kind: Option<SelectionKind>,
-    last_region: Option<Rect>,
-) -> Option<Rect> {
-    if tool == CaptureTool::Region && selection_kind == Some(SelectionKind::Region) {
-        selection.or(last_region)
-    } else {
-        last_region
     }
 }
 
@@ -1352,7 +1270,7 @@ fn run_overlay(
         return Err(last_error("register_overlay_class"));
     }
     let class_guard = ClassRegistration { instance };
-    let source = state.source;
+    let source = state.model.source;
     let live_preview = state.live_preview;
     let width = i32::try_from(source.width)
         .map_err(|_| invalid_frame("overlay width exceeds Win32 limits"))?;
@@ -1393,7 +1311,7 @@ fn run_overlay(
     // lets tool transitions register compositor previews against this top-level destination.
     unsafe {
         (*state_pointer).overlay_hwnd = hwnd;
-        if (*state_pointer).tool == CaptureTool::Window {
+        if (*state_pointer).model.tool == CaptureTool::Window {
             refresh_live_window_thumbnails(&mut *state_pointer);
             rebuild_window_overview_cache(&mut *state_pointer);
         }
@@ -1540,100 +1458,64 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     }
     match message {
-        WM_DPICHANGED => {
-            display_configuration_changed_and_close(hwnd, "overlay_dpi_changed");
-            LRESULT(0)
-        }
-        WM_DISPLAYCHANGE => {
-            display_configuration_changed_and_close(hwnd, "overlay_display_changed");
-            LRESULT(0)
-        }
+        WM_DPICHANGED => run_machine(
+            hwnd,
+            state_pointer,
+            OverlayInput::DisplayConfigurationInvalidated {
+                reason: "overlay_dpi_changed",
+            },
+        ),
+        WM_DISPLAYCHANGE => run_machine(
+            hwnd,
+            state_pointer,
+            OverlayInput::DisplayConfigurationInvalidated {
+                reason: "overlay_display_changed",
+            },
+        ),
         WM_SETTINGCHANGE
             if wparam.0 == SPI_SETWORKAREA.0 as usize
                 || wparam.0 == SPI_SETLOGICALDPIOVERRIDE.0 as usize =>
         {
-            display_configuration_changed_and_close(hwnd, "overlay_display_setting_changed");
-            LRESULT(0)
+            run_machine(
+                hwnd,
+                state_pointer,
+                OverlayInput::DisplayConfigurationInvalidated {
+                    reason: "overlay_display_setting_changed",
+                },
+            )
         }
         WM_MOUSEMOVE => {
+            // Route through the machine unless the window-chooser hover pass (not yet modeled)
+            // owns this message: Window tool with no active toolbar drag. Region drags exist
+            // only in the region tool, so the machine covers every other combination.
+            let routed = {
+                // SAFETY: The borrow ends with this block, before run_machine derives its own.
+                let state = unsafe { &*state_pointer };
+                let point = screen_point(state.model.source, lparam);
+                (state.model.toolbar_drag.is_some() || state.model.tool != CaptureTool::Window)
+                    .then_some(point)
+            };
+            if let Some(point) = routed {
+                return run_machine(hwnd, state_pointer, OverlayInput::PointerMoved { point });
+            }
+            // Legacy window-chooser hover pass, untouched by stage A of the extraction.
             // SAFETY: The Box remains alive for the message loop. The last state access occurs
             // before UpdateWindow can synchronously dispatch WM_PAINT and reborrow the pointer.
             let state = unsafe { &mut *state_pointer };
-            let point = screen_point(state.source, lparam);
-            let local = local_point(state.source, point);
-            state.pointer_local = Some(local);
+            let point = screen_point(state.model.source, lparam);
+            let local = local_point(state.model.source, point);
+            state.model.pointer_local = Some(local);
             let previous_hovered = state.hovered.map(|candidate| candidate.handle);
-            let previous_control = state.hovered_control;
-            if let Some(drag) = state.toolbar_drag {
-                state.toolbar_position = ToolbarLayout::clamp_origin(
-                    state.display_environment,
-                    POINT {
-                        x: local.x.saturating_sub(drag.pointer_offset.x),
-                        y: local.y.saturating_sub(drag.pointer_offset.y),
-                    },
-                );
-                state.hovered_control = Some(ToolbarControl::Background);
-                state.hovered = None;
-                state.hovered_handle = None;
-                set_arrow_cursor();
-                invalidate(hwnd);
-                return LRESULT(0);
-            }
-            let layout = ToolbarLayout::new(state.display_environment, state.toolbar_position);
-            let region_drag_active =
-                state.resizing.is_some() || state.moving_region.is_some() || state.anchor.is_some();
-            state.hovered_control = (!region_drag_active)
-                .then(|| layout.hit_test(local, state.options_open))
-                .flatten();
-            if state.hovered_control.is_some() {
+            let previous_control = state.model.hovered_control;
+            let layout = ToolbarLayout::new(
+                state.model.display_environment,
+                state.model.toolbar_position,
+            );
+            state.model.hovered_control = layout.hit_test(local, state.model.options_open);
+            if state.model.hovered_control.is_some() {
                 state.hovered = None;
                 set_arrow_cursor();
-            } else if let Some(resize) = state.resizing {
-                state.selection = Some(resize_region(
-                    resize.original,
-                    resize.handle,
-                    point,
-                    state.source,
-                ));
-                state.hovered_handle = Some(resize.handle);
-                update_cursor(state.hovered_handle, &state.region_cursor);
-            } else if let Some(moving) = state.moving_region {
-                state.selection = Some(move_region(
-                    moving.original,
-                    moving.pointer_origin,
-                    point,
-                    state.source,
-                ));
-                state.hovered_handle = None;
-                set_move_cursor();
-            } else if let Some(anchor) = state.anchor {
-                state.dragging |= (point.x - anchor.x).abs() >= DRAG_THRESHOLD
-                    || (point.y - anchor.y).abs() >= DRAG_THRESHOLD;
-                if state.dragging {
-                    state.selection = rect_from_points(state.source, anchor, point);
-                    state.selection_kind = Some(SelectionKind::Region);
-                    state.selected_window = None;
-                    state.hovered = None;
-                }
-                state.hovered_handle = None;
-                update_cursor(None, &state.region_cursor);
-            } else if state.tool == CaptureTool::Region
-                && state.selection_kind == Some(SelectionKind::Region)
-            {
-                state.hovered_handle = state.selection.and_then(|selection| {
-                    hit_test_resize_handle(selection, point, state.display_environment.metrics)
-                });
-                state.hovered = None;
-                if state.hovered_handle.is_none()
-                    && state
-                        .selection
-                        .is_some_and(|selection| contains(selection, point))
-                {
-                    set_move_cursor();
-                } else {
-                    update_cursor(state.hovered_handle, &state.region_cursor);
-                }
-            } else if state.tool == CaptureTool::Window {
+            } else {
                 let hovered_handle = hit_test_window_thumbnail(state, local);
                 state.hovered = hovered_handle.and_then(|handle| {
                     state.windows.as_ref().and_then(|windows| {
@@ -1643,29 +1525,17 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                             .find(|candidate| candidate.handle == handle)
                     })
                 });
-                state.hovered_handle = None;
+                state.model.hovered_handle = None;
                 set_arrow_cursor();
-            } else {
-                state.hovered = None;
-                state.hovered_handle = None;
-                if state.tool == CaptureTool::Region {
-                    update_cursor(None, &state.region_cursor);
-                } else {
-                    set_arrow_cursor();
-                }
             }
-            if state.tool == CaptureTool::Window
-                && previous_hovered == state.hovered.map(|candidate| candidate.handle)
-                && previous_control == state.hovered_control
+            if previous_hovered == state.hovered.map(|candidate| candidate.handle)
+                && previous_control == state.model.hovered_control
             {
                 return LRESULT(0);
             }
-            let update_window = state.tool == CaptureTool::Window;
             invalidate(hwnd);
-            if update_window {
-                // SAFETY: Forces the now-cheap cached hover paint before this mouse message returns.
-                let _ = unsafe { UpdateWindow(hwnd) };
-            }
+            // SAFETY: Forces the now-cheap cached hover paint before this mouse message returns.
+            let _ = unsafe { UpdateWindow(hwnd) };
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
@@ -1673,29 +1543,32 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             // overlay callback while capture is still owned by this window; destruction is only
             // requested after the final state access in the confirming branches.
             let state = unsafe { &mut *state_pointer };
-            let point = screen_point(state.source, lparam);
-            let local = local_point(state.source, point);
-            let layout = ToolbarLayout::new(state.display_environment, state.toolbar_position);
-            if let Some(control) = layout.hit_test(local, state.options_open) {
-                state.anchor = None;
-                state.dragging = false;
-                state.resizing = None;
-                state.moving_region = None;
-                state.hovered_control = Some(control);
+            let point = screen_point(state.model.source, lparam);
+            let local = local_point(state.model.source, point);
+            let layout = ToolbarLayout::new(
+                state.model.display_environment,
+                state.model.toolbar_position,
+            );
+            if let Some(control) = layout.hit_test(local, state.model.options_open) {
+                state.model.anchor = None;
+                state.model.dragging = false;
+                state.model.resizing = None;
+                state.model.moving_region = None;
+                state.model.hovered_control = Some(control);
                 match control {
                     ToolbarControl::Background if layout.bounds.contains(local) => {
-                        state.options_open = false;
-                        if state.tool == CaptureTool::Window {
+                        state.model.options_open = false;
+                        if state.model.tool == CaptureTool::Window {
                             // DWM thumbnails are compositor-managed and can cover overlay pixels.
                             // Use frozen fallbacks while the toolbar is moving, then register only
                             // previews that do not overlap its final position on button-up.
                             state.live_window_thumbnails.clear();
                             rebuild_window_overview_cache(state);
                         }
-                        state.toolbar_drag = Some(ToolbarDrag {
+                        state.model.toolbar_drag = Some(ToolbarDrag {
                             pointer_offset: POINT {
-                                x: local.x.saturating_sub(state.toolbar_position.x),
-                                y: local.y.saturating_sub(state.toolbar_position.y),
+                                x: local.x.saturating_sub(state.model.toolbar_position.x),
+                                y: local.y.saturating_sub(state.model.toolbar_position.y),
                             },
                         });
                         capture_pointer(hwnd);
@@ -1707,8 +1580,8 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                     ToolbarControl::Window => activate_tool(state, CaptureTool::Window),
                     ToolbarControl::Region => activate_tool(state, CaptureTool::Region),
                     ToolbarControl::Options => {
-                        state.options_open = !state.options_open;
-                        if state.tool == CaptureTool::Window {
+                        state.model.options_open = !state.model.options_open;
+                        if state.model.tool == CaptureTool::Window {
                             refresh_live_window_thumbnails(state);
                             rebuild_window_overview_cache(state);
                         }
@@ -1720,7 +1593,7 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                         return LRESULT(0);
                     }
                     ToolbarControl::DimBackground => {
-                        state.dim_background = !state.dim_background;
+                        state.model.dim_background = !state.model.dim_background;
                     }
                     ToolbarControl::ClipboardDestination => {}
                     ToolbarControl::Cancel => {
@@ -1733,26 +1606,27 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                 invalidate(hwnd);
                 return LRESULT(0);
             }
-            state.hovered_control = None;
-            let options_were_open = state.options_open;
-            state.options_open = false;
-            if options_were_open && state.tool == CaptureTool::Window {
+            state.model.hovered_control = None;
+            let options_were_open = state.model.options_open;
+            state.model.options_open = false;
+            if options_were_open && state.model.tool == CaptureTool::Window {
                 refresh_live_window_thumbnails(state);
                 rebuild_window_overview_cache(state);
             }
-            if state.tool != CaptureTool::Region {
-                if state.tool == CaptureTool::Window {
-                    state.selected_window = hit_test_window_thumbnail(state, local);
-                    update_window_preview(state, state.selected_window);
+            if state.model.tool != CaptureTool::Region {
+                if state.model.tool == CaptureTool::Window {
+                    state.model.selected_window = hit_test_window_thumbnail(state, local);
+                    update_window_preview(state, state.model.selected_window);
                     state.selected_window_frame =
-                        ready_window_preview(state, state.selected_window)
+                        ready_window_preview(state, state.model.selected_window)
                             .map(|preview| preview.frame.clone());
-                    state.selection = state
+                    state.model.selection = state
                         .selected_window_frame
                         .as_ref()
                         .map(|frame| frame.metadata.source_rect);
-                    state.selection_kind = state.selection.map(|_| SelectionKind::Window);
-                    if state.selection.is_some() {
+                    state.model.selection_kind =
+                        state.model.selection.map(|_| SelectionKind::Window);
+                    if state.model.selection.is_some() {
                         if confirm_overlay(state) {
                             close_overlay(hwnd);
                         }
@@ -1763,183 +1637,44 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                 invalidate(hwnd);
                 return LRESULT(0);
             }
-            let existing_region = (state.selection_kind == Some(SelectionKind::Region))
-                .then_some(state.selection)
-                .flatten();
-            let resize_handle = existing_region.and_then(|selection| {
-                hit_test_resize_handle(selection, point, state.display_environment.metrics)
-            });
-            if let (Some(original), Some(handle)) = (existing_region, resize_handle) {
-                state.resizing = Some(ResizeDrag { handle, original });
-                state.moving_region = None;
-                state.hovered_handle = Some(handle);
-                state.anchor = None;
-                state.dragging = false;
-                update_cursor(Some(handle), &state.region_cursor);
-                capture_pointer(hwnd);
-            } else if existing_region.is_some_and(|selection| contains(selection, point)) {
-                state.moving_region = existing_region.map(|original| MoveDrag {
-                    original,
-                    pointer_origin: point,
-                });
-                state.anchor = None;
-                state.dragging = false;
-                state.hovered_handle = None;
-                set_move_cursor();
-                capture_pointer(hwnd);
-            } else {
-                state.anchor = Some(point);
-                state.dragging = false;
-                state.resizing = None;
-                state.moving_region = None;
-                state.selection = None;
-                state.selection_kind = None;
-                state.selected_window = None;
-                state.hovered_handle = None;
-                state.hovered = None;
-                state.dimension_label_placement = None;
-                update_cursor(None, &state.region_cursor);
-                capture_pointer(hwnd);
-            }
-            invalidate(hwnd);
-            LRESULT(0)
+            // Region tool, no toolbar hit: the drag dispatch is fully modeled.
+            run_machine(hwnd, state_pointer, OverlayInput::PointerDown { point })
         }
         WM_LBUTTONUP => {
-            // ReleaseCapture synchronously sends WM_CAPTURECHANGED back to this window. Mark the
-            // release before calling Win32 so that reentrant notification does not erase the drag
-            // which this button-up message still needs to commit.
-            // SAFETY: This single-field mutation ends before ReleaseCapture can re-enter.
-            unsafe { (&mut *state_pointer).releasing_pointer_capture = true };
-            release_pointer_capture();
-            // Clear a stale marker if the platform did not deliver WM_CAPTURECHANGED.
-            // SAFETY: ReleaseCapture has returned, so no state borrow spans its callback.
-            unsafe { (&mut *state_pointer).releasing_pointer_capture = false };
-            // SAFETY: The Box remains alive for the message loop and this message does not
-            // synchronously dispatch another window-procedure callback while borrowed.
-            let state = unsafe { &mut *state_pointer };
-            let point = screen_point(state.source, lparam);
-            if state.toolbar_drag.take().is_some() {
-                remember_toolbar_position(
-                    state.ui_updates.as_ref(),
-                    &state.reference_metadata.display_id,
-                    state.toolbar_position,
-                    state.display_environment,
-                );
-                if state.tool == CaptureTool::Window {
-                    refresh_live_window_thumbnails(state);
-                    rebuild_window_overview_cache(state);
-                }
-                state.hovered_control = Some(ToolbarControl::Background);
-                set_arrow_cursor();
-                invalidate(hwnd);
-                return LRESULT(0);
-            }
-            if state.tool != CaptureTool::Region {
-                return LRESULT(0);
-            }
-            if let Some(resize) = state.resizing.take() {
-                state.selection = Some(resize_region(
-                    resize.original,
-                    resize.handle,
-                    point,
-                    state.source,
-                ));
-                state.selection_kind = Some(SelectionKind::Region);
-                state.selected_window = None;
-            } else if let Some(moving) = state.moving_region.take() {
-                state.selection = Some(move_region(
-                    moving.original,
-                    moving.pointer_origin,
-                    point,
-                    state.source,
-                ));
-                state.selection_kind = Some(SelectionKind::Region);
-                state.selected_window = None;
-            } else if let Some(anchor) = state.anchor.take() {
-                if state.dragging {
-                    state.selection = rect_from_points(state.source, anchor, point);
-                    state.selection_kind = Some(SelectionKind::Region);
-                    state.selected_window = None;
-                }
-            }
-            state.dragging = false;
-            state.hovered_handle = if state.selection_kind == Some(SelectionKind::Region) {
-                state.selection.and_then(|selection| {
-                    hit_test_resize_handle(selection, point, state.display_environment.metrics)
-                })
-            } else {
-                None
+            let point = {
+                // SAFETY: This borrow ends before run_machine derives its own.
+                let state = unsafe { &*state_pointer };
+                screen_point(state.model.source, lparam)
             };
-            if state.hovered_handle.is_none()
-                && state
-                    .selection
-                    .is_some_and(|selection| contains(selection, point))
-            {
-                set_move_cursor();
-            } else {
-                update_cursor(state.hovered_handle, &state.region_cursor);
-            }
-            invalidate(hwnd);
-            LRESULT(0)
+            run_machine(hwnd, state_pointer, OverlayInput::PointerUp { point })
         }
         WM_LBUTTONDBLCLK => {
-            let should_close = {
-                // SAFETY: The Box remains alive for the message loop. The borrow ends before
-                // close_overlay synchronously dispatches destruction messages.
-                let state = unsafe { &mut *state_pointer };
-                let point = screen_point(state.source, lparam);
-                let local = local_point(state.source, point);
-                let layout = ToolbarLayout::new(state.display_environment, state.toolbar_position);
-                layout.hit_test(local, state.options_open).is_none() && confirm_overlay(state)
+            let point = {
+                // SAFETY: This borrow ends before run_machine derives its own.
+                let state = unsafe { &*state_pointer };
+                screen_point(state.model.source, lparam)
             };
-            if should_close {
-                close_overlay(hwnd);
-            }
-            LRESULT(0)
+            run_machine(hwnd, state_pointer, OverlayInput::DoubleClicked { point })
         }
         WM_KEYDOWN if wparam.0 == usize::from(VK_RETURN.0) => {
-            // SAFETY: The Box remains alive for the message loop. The borrow is consumed by the
-            // pure state transition and ends before close_overlay dispatches messages.
-            let should_close = confirm_overlay(unsafe { &mut *state_pointer });
-            if should_close {
-                close_overlay(hwnd);
-            }
-            LRESULT(0)
+            run_machine(hwnd, state_pointer, OverlayInput::ConfirmRequested)
         }
         WM_KEYDOWN if wparam.0 == usize::from(VK_ESCAPE.0) => {
-            // SAFETY: The Box remains alive for the message loop. The borrow ends when the pure
-            // cancellation transition returns, before close_overlay dispatches messages.
-            cancel_overlay(unsafe { &mut *state_pointer });
-            close_overlay(hwnd);
-            LRESULT(0)
+            run_machine(hwnd, state_pointer, OverlayInput::CancelRequested)
         }
         WM_CAPTURECHANGED => {
-            // SAFETY: The state allocation remains live. This arm performs only local mutation
-            // and does not call ReleaseCapture recursively.
-            let state = unsafe { &mut *state_pointer };
-            if consume_self_initiated_capture_change(&mut state.releasing_pointer_capture) {
+            // A self-initiated ReleaseCapture round trip is protocol, not product state: consume
+            // the shell's flag and never involve the machine.
+            // SAFETY: This single-field borrow ends before run_machine derives its own.
+            if consume_self_initiated_capture_change(unsafe {
+                &mut (*state_pointer).releasing_pointer_capture
+            }) {
                 return LRESULT(0);
             }
-            let toolbar_dragging = state.toolbar_drag.take().is_some();
-            state.resizing = None;
-            state.moving_region = None;
-            state.anchor = None;
-            state.dragging = false;
-            state.hovered_handle = None;
-            if toolbar_dragging && state.tool == CaptureTool::Window {
-                refresh_live_window_thumbnails(state);
-                rebuild_window_overview_cache(state);
-            }
-            set_arrow_cursor();
-            invalidate(hwnd);
-            LRESULT(0)
+            run_machine(hwnd, state_pointer, OverlayInput::PointerCaptureLost)
         }
         WM_RBUTTONDOWN | WM_CLOSE => {
-            // SAFETY: The Box remains alive for the message loop. The borrow ends when the pure
-            // cancellation transition returns, before close_overlay dispatches messages.
-            cancel_overlay(unsafe { &mut *state_pointer });
-            close_overlay(hwnd);
-            LRESULT(0)
+            run_machine(hwnd, state_pointer, OverlayInput::CancelRequested)
         }
         WM_PAINT => {
             paint(hwnd, state_pointer);
@@ -1960,24 +1695,24 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
 
 fn remember_overlay_state(state: &mut OverlayState) {
     let region = latest_interaction_region(
-        state.tool,
-        state.selection,
-        state.selection_kind,
-        state.last_region,
+        state.model.tool,
+        state.model.selection,
+        state.model.selection_kind,
+        state.model.last_region,
     );
     remember_overlay_interaction(
         state.ui_updates.as_ref(),
         &state.reference_metadata.display_id,
-        state.source,
-        state.tool,
+        state.model.source,
+        state.model.tool,
         region,
         state.reference_metadata.rotation_degrees,
     );
-    state.last_region = region;
+    state.model.last_region = region;
 }
 
 fn confirm_overlay(state: &mut OverlayState) -> bool {
-    if let (Some(rect), Some(kind)) = (state.selection, state.selection_kind) {
+    if let (Some(rect), Some(kind)) = (state.model.selection, state.model.selection_kind) {
         let window_frame = if kind == SelectionKind::Window {
             state.selected_window_frame.clone()
         } else {
@@ -1987,31 +1722,152 @@ fn confirm_overlay(state: &mut OverlayState) -> bool {
             .as_ref()
             .map(|frame| frame.metadata.source_rect)
             .unwrap_or(rect);
-        debug_assert_eq!(state.tool, CaptureTool::from_selection_kind(kind));
+        debug_assert_eq!(state.model.tool, CaptureTool::from_selection_kind(kind));
         remember_overlay_state(state);
-        state.result = Some(OverlaySelection {
-            rect,
-            kind,
-            window: state.selected_window,
-            selection_ns: duration_ns(state.started.elapsed()),
-            preparation_ns: state.preparation_ns,
-            window_overview_ns: state.window_overview_ns,
-            window_preview_count: state.window_thumbnails.len(),
-            window_live_preview_count: state.live_window_thumbnails.len(),
-            window_frozen_preview_count: state
-                .window_thumbnails
-                .len()
-                .saturating_sub(state.live_window_thumbnails.len()),
-            window_preview_bytes: state
-                .window_thumbnails
-                .iter()
-                .map(|thumbnail| thumbnail.surface.byte_length)
-                .sum(),
-            window_frame,
-        });
+        let window = state.model.selected_window;
+        let selection = build_overlay_selection(state, rect, kind, window, window_frame);
+        state.result = Some(selection);
         true
     } else {
         false
+    }
+}
+
+fn build_overlay_selection(
+    state: &OverlayState,
+    rect: Rect,
+    kind: SelectionKind,
+    window: Option<NativeWindowHandle>,
+    window_frame: Option<CpuFrame>,
+) -> OverlaySelection {
+    OverlaySelection {
+        rect,
+        kind,
+        window,
+        selection_ns: duration_ns(state.started.elapsed()),
+        preparation_ns: state.preparation_ns,
+        window_overview_ns: state.window_overview_ns,
+        window_preview_count: state.window_thumbnails.len(),
+        window_live_preview_count: state.live_window_thumbnails.len(),
+        window_frozen_preview_count: state
+            .window_thumbnails
+            .len()
+            .saturating_sub(state.live_window_thumbnails.len()),
+        window_preview_bytes: state
+            .window_thumbnails
+            .iter()
+            .map(|thumbnail| thumbnail.surface.byte_length)
+            .sum(),
+        window_frame,
+    }
+}
+
+/// Runs one machine transition and applies the returned effects. The model borrow taken for the
+/// transition ends before any effect executes, so effects that reenter this window procedure
+/// (`ReleaseCapture`, `DestroyWindow`) can never observe a live `&mut` of the state.
+fn run_machine(hwnd: HWND, state_pointer: *mut OverlayState, input: OverlayInput) -> LRESULT {
+    // SAFETY: The Box remains alive for the message loop; this borrow ends at the semicolon.
+    let effects = transition(unsafe { &mut (*state_pointer).model }, input);
+    apply_overlay_effects(hwnd, state_pointer, effects);
+    LRESULT(0)
+}
+
+fn apply_overlay_effects(
+    hwnd: HWND,
+    state_pointer: *mut OverlayState,
+    effects: Vec<OverlayEffect>,
+) {
+    for effect in effects {
+        match effect {
+            OverlayEffect::SetCursor(intent) => {
+                // SAFETY: Shared borrow for the cursor resources; released at the block's end.
+                let state = unsafe { &*state_pointer };
+                match intent {
+                    CursorIntent::Arrow => set_arrow_cursor(),
+                    CursorIntent::Move => set_move_cursor(),
+                    CursorIntent::Crosshair => update_cursor(None, &state.region_cursor),
+                    CursorIntent::Resize(handle) => {
+                        update_cursor(Some(handle), &state.region_cursor)
+                    }
+                }
+            }
+            OverlayEffect::Invalidate => invalidate(hwnd),
+            OverlayEffect::CapturePointer => capture_pointer(hwnd),
+            OverlayEffect::ReleasePointer => {
+                // ReleaseCapture synchronously sends WM_CAPTURECHANGED back to this window. Arm
+                // the protocol flag first so that reentrant notification is recognized as
+                // self-initiated; the model transition has already committed its work, so the
+                // reentrant callback can never erase state the caller still needs.
+                // SAFETY: This single-field mutation ends before ReleaseCapture can re-enter.
+                unsafe { (*state_pointer).releasing_pointer_capture = true };
+                release_pointer_capture();
+                // Clear a stale marker if the platform did not deliver WM_CAPTURECHANGED.
+                // SAFETY: ReleaseCapture has returned, so no borrow spans its callback.
+                unsafe { (*state_pointer).releasing_pointer_capture = false };
+            }
+            OverlayEffect::ClearWindowHover => {
+                // SAFETY: Local mutation on the owning thread; nothing is dispatched.
+                unsafe { (*state_pointer).hovered = None };
+            }
+            OverlayEffect::ClearDimensionLabel => {
+                // SAFETY: Local mutation on the owning thread; nothing is dispatched.
+                unsafe { (*state_pointer).dimension_label_placement = None };
+            }
+            OverlayEffect::RefreshWindowChrome => {
+                // SAFETY: The borrow ends before the next effect. DWM thumbnail registration
+                // does not dispatch messages into this window procedure.
+                let state = unsafe { &mut *state_pointer };
+                refresh_live_window_thumbnails(state);
+                rebuild_window_overview_cache(state);
+            }
+            OverlayEffect::PersistToolbarCenter { position } => {
+                // SAFETY: Shared borrow released at the block's end.
+                let state = unsafe { &*state_pointer };
+                remember_toolbar_position(
+                    state.ui_updates.as_ref(),
+                    &state.reference_metadata.display_id,
+                    position,
+                    state.model.display_environment,
+                );
+            }
+            OverlayEffect::PersistInteraction { region } => {
+                // SAFETY: Shared borrow released at the block's end.
+                let state = unsafe { &*state_pointer };
+                remember_overlay_interaction(
+                    state.ui_updates.as_ref(),
+                    &state.reference_metadata.display_id,
+                    state.model.source,
+                    state.model.tool,
+                    region,
+                    state.reference_metadata.rotation_degrees,
+                );
+            }
+            OverlayEffect::Close(outcome) => {
+                match outcome {
+                    CloseOutcome::Confirmed { rect, kind, window } => {
+                        // SAFETY: The borrow ends before close_overlay dispatches destruction.
+                        let state = unsafe { &mut *state_pointer };
+                        let window_frame = (kind == SelectionKind::Window)
+                            .then(|| state.selected_window_frame.clone())
+                            .flatten();
+                        let rect = window_frame
+                            .as_ref()
+                            .map(|frame| frame.metadata.source_rect)
+                            .unwrap_or(rect);
+                        let selection =
+                            build_overlay_selection(state, rect, kind, window, window_frame);
+                        state.result = Some(selection);
+                        close_overlay(hwnd);
+                    }
+                    CloseOutcome::Cancelled => close_overlay(hwnd),
+                    CloseOutcome::DisplayConfigurationInvalidated { reason } => {
+                        display_configuration_changed_and_close(hwnd, reason);
+                    }
+                }
+                // Destruction has been dispatched; nothing may run after it.
+                return;
+            }
+        }
     }
 }
 
@@ -2073,11 +1929,11 @@ fn consume_self_initiated_capture_change(releasing_pointer_capture: &mut bool) -
 
 fn compose_overlay_state(state: &mut OverlayState) {
     let width = state.surface.width;
-    if state.tool == CaptureTool::Window {
+    if state.model.tool == CaptureTool::Window {
         let cache_matches = state
             .window_overview_cache
             .as_ref()
-            .is_some_and(|cache| cache.dim_background == state.dim_background);
+            .is_some_and(|cache| cache.dim_background == state.model.dim_background);
         if !cache_matches {
             rebuild_window_overview_cache(state);
         }
@@ -2122,7 +1978,8 @@ fn compose_overlay_state(state: &mut OverlayState) {
     }
     // Window mode's dim wash is already part of its static overview cache. Other tools compose it
     // here so the selected region can subsequently restore its original frozen pixels.
-    if state.tool != CaptureTool::Window && state.dim_background && !state.live_preview {
+    if state.model.tool != CaptureTool::Window && state.model.dim_background && !state.live_preview
+    {
         let _ = apply_dim_wash(
             state.back_buffer.device,
             state.dimmer.device,
@@ -2131,18 +1988,18 @@ fn compose_overlay_state(state: &mut OverlayState) {
             DIM_ALPHA,
         );
     }
-    if state.tool != CaptureTool::Window {
-        if let Some(rect) = state.selection {
+    if state.model.tool != CaptureTool::Window {
+        if let Some(rect) = state.model.selection {
             if !state.live_preview {
                 restore_highlight(state, rect);
             }
-            draw_outline(state.back_buffer.device, state.source, rect);
-            if state.selection_kind == Some(SelectionKind::Region) {
+            draw_outline(state.back_buffer.device, state.model.source, rect);
+            if state.model.selection_kind == Some(SelectionKind::Region) {
                 draw_resize_handles(
                     state.back_buffer.device,
-                    state.source,
+                    state.model.source,
                     rect,
-                    state.display_environment.metrics,
+                    state.model.display_environment.metrics,
                 );
                 draw_region_dimensions(state, rect);
             }
@@ -2178,16 +2035,25 @@ fn paint_live_selection_background(state: &OverlayState) {
     fill_device_rect(state.back_buffer.device, bounds, COLORREF(0));
 
     if let Some(selection) = state
+        .model
         .selection
-        .and_then(|rect| rect.intersection(state.source))
+        .and_then(|rect| rect.intersection(state.model.source))
     {
         let local = RECT {
-            left: selection.x.saturating_sub(state.source.x),
-            top: selection.y.saturating_sub(state.source.y),
-            right: i32::try_from(selection.right().saturating_sub(i64::from(state.source.x)))
-                .unwrap_or(state.back_buffer.width),
-            bottom: i32::try_from(selection.bottom().saturating_sub(i64::from(state.source.y)))
-                .unwrap_or(state.back_buffer.height),
+            left: selection.x.saturating_sub(state.model.source.x),
+            top: selection.y.saturating_sub(state.model.source.y),
+            right: i32::try_from(
+                selection
+                    .right()
+                    .saturating_sub(i64::from(state.model.source.x)),
+            )
+            .unwrap_or(state.back_buffer.width),
+            bottom: i32::try_from(
+                selection
+                    .bottom()
+                    .saturating_sub(i64::from(state.model.source.y)),
+            )
+            .unwrap_or(state.back_buffer.height),
         };
         fill_device_rect(state.back_buffer.device, local, COLORREF(0));
     }
@@ -2196,8 +2062,8 @@ fn paint_live_selection_background(state: &OverlayState) {
 fn present_live_layer(hwnd: HWND, state: &OverlayState) -> Result<(), CaptureError> {
     prepare_live_layer_pixels(state);
     let destination = POINT {
-        x: state.source.x,
-        y: state.source.y,
+        x: state.model.source.x,
+        y: state.model.source.y,
     };
     let source = POINT { x: 0, y: 0 };
     let size = SIZE {
@@ -2241,15 +2107,19 @@ fn prepare_live_layer_pixels(state: &OverlayState) {
     let width = state.back_buffer.width.max(0) as usize;
     let height = state.back_buffer.height.max(0) as usize;
     let selection = state
+        .model
         .selection
-        .and_then(|rect| rect.intersection(state.source))
+        .and_then(|rect| rect.intersection(state.model.source))
         .map(|rect| RECT {
-            left: rect.x.saturating_sub(state.source.x),
-            top: rect.y.saturating_sub(state.source.y),
-            right: i32::try_from(rect.right().saturating_sub(i64::from(state.source.x)))
+            left: rect.x.saturating_sub(state.model.source.x),
+            top: rect.y.saturating_sub(state.model.source.y),
+            right: i32::try_from(rect.right().saturating_sub(i64::from(state.model.source.x)))
                 .unwrap_or(state.back_buffer.width),
-            bottom: i32::try_from(rect.bottom().saturating_sub(i64::from(state.source.y)))
-                .unwrap_or(state.back_buffer.height),
+            bottom: i32::try_from(
+                rect.bottom()
+                    .saturating_sub(i64::from(state.model.source.y)),
+            )
+            .unwrap_or(state.back_buffer.height),
         });
     // SAFETY: The back buffer uniquely owns this writable DIB on the overlay thread.
     let pixels = unsafe {
@@ -2265,8 +2135,12 @@ fn prepare_live_layer_pixels(state: &OverlayState) {
                     && y >= rect.top.max(0) as usize
                     && y < rect.bottom.max(0) as usize
             });
-            pixels[offset + 3] =
-                live_pixel_alpha(state.tool, state.dim_background, in_selection, colored);
+            pixels[offset + 3] = live_pixel_alpha(
+                state.model.tool,
+                state.model.dim_background,
+                in_selection,
+                colored,
+            );
         }
     }
 }
@@ -2443,7 +2317,7 @@ fn ensure_window_mode_assets(state: &mut OverlayState) {
         };
         state.windows = Some(
             match enumerate_visible_windows(
-                state.source,
+                state.model.source,
                 &state.reference_metadata.display_id,
                 displays,
             ) {
@@ -2467,8 +2341,9 @@ fn fallback_display_info(state: &OverlayState) -> DisplayInfo {
     DisplayInfo {
         id: state.reference_metadata.display_id.clone(),
         name: state.reference_metadata.display_id.0.clone(),
-        bounds: state.source,
-        scale_factor: state.display_environment.metrics.dpi as f32 / UiMetrics::BASE_DPI as f32,
+        bounds: state.model.source,
+        scale_factor: state.model.display_environment.metrics.dpi as f32
+            / UiMetrics::BASE_DPI as f32,
         rotation_degrees: state.reference_metadata.rotation_degrees,
         is_primary: false,
     }
@@ -2553,11 +2428,14 @@ fn build_window_overview(state: &mut OverlayState) {
 
 fn refresh_live_window_thumbnails(state: &mut OverlayState) {
     state.live_window_thumbnails.clear();
-    if !state.live_preview || state.tool != CaptureTool::Window || state.overlay_hwnd.0 == 0 {
+    if !state.live_preview || state.model.tool != CaptureTool::Window || state.overlay_hwnd.0 == 0 {
         return;
     }
 
-    let toolbar = ToolbarLayout::new(state.display_environment, state.toolbar_position);
+    let toolbar = ToolbarLayout::new(
+        state.model.display_environment,
+        state.model.toolbar_position,
+    );
     let rects = window_overview_rects(state);
     for (window, bounds) in state.window_thumbnails.iter().zip(rects) {
         let thumbnail = match DwmThumbnail::register(state.overlay_hwnd, HWND(window.handle.raw()))
@@ -2590,7 +2468,7 @@ fn refresh_live_window_thumbnails(state: &mut OverlayState) {
                 bottom: bounds.bottom,
             },
         );
-        if live_thumbnail_overlaps_chrome(destination, toolbar, state.options_open) {
+        if live_thumbnail_overlaps_chrome(destination, toolbar, state.model.options_open) {
             // DWM thumbnails are composed above the destination window's own pixels. Keep this
             // preview in the frozen overview instead so the toolbar and menu remain unobscured.
             continue;
@@ -2661,7 +2539,7 @@ fn rebuild_window_overview_cache(state: &mut OverlayState) {
     draw_window_overview_static(&surface, state);
     state.window_overview_cache = Some(WindowOverviewCache {
         surface,
-        dim_background: state.dim_background,
+        dim_background: state.model.dim_background,
     });
 }
 
@@ -2684,7 +2562,7 @@ fn compose_window_overview_background(destination: &FrozenSurface, state: &Overl
             SRCCOPY,
         );
     }
-    if state.dim_background {
+    if state.model.dim_background {
         let _ = apply_dim_wash(
             destination.device,
             state.dimmer.device,
@@ -2834,11 +2712,11 @@ fn ready_window_preview(
 }
 
 fn restore_highlight(state: &OverlayState, rect: Rect) {
-    let Some(visible) = intersect_rect(rect, state.source) else {
+    let Some(visible) = intersect_rect(rect, state.model.source) else {
         return;
     };
-    let x = visible.x - state.source.x;
-    let y = visible.y - state.source.y;
+    let x = visible.x - state.model.source.x;
+    let y = visible.y - state.model.source.y;
     let width = visible.width as i32;
     let height = visible.height as i32;
     // SAFETY: The intersection is contained in both same-sized memory DIBs. Copying from the
@@ -2937,8 +2815,8 @@ fn draw_resize_handles(device: HDC, source: Rect, rect: Rect, metrics: UiMetrics
 
 fn draw_region_dimensions(state: &mut OverlayState, rect: Rect) {
     let device = state.back_buffer.device;
-    let source = state.source;
-    let metrics = state.display_environment.metrics;
+    let source = state.model.source;
+    let metrics = state.model.display_environment.metrics;
     let tokens = metrics.region_tokens();
     // Region width and height remain the exact physical-pixel values from the selection rectangle.
     let value = format!("{} × {} px", rect.width, rect.height);
@@ -2960,12 +2838,15 @@ fn draw_region_dimensions(state: &mut OverlayState, rect: Rect) {
         right: selection_left.saturating_add(rect.width as i32),
         bottom: selection_top.saturating_add(rect.height as i32),
     };
-    let toolbar = ToolbarLayout::new(state.display_environment, state.toolbar_position);
+    let toolbar = ToolbarLayout::new(
+        state.model.display_environment,
+        state.model.toolbar_position,
+    );
     let mut reserved = vec![toolbar.bounds];
-    if state.options_open {
+    if state.model.options_open {
         reserved.push(toolbar.menu);
     }
-    let pointer_exclusion = state.pointer_local.map(|pointer| UiRect {
+    let pointer_exclusion = state.model.pointer_local.map(|pointer| UiRect {
         left: pointer.x.saturating_sub(REGION_CURSOR_CENTER),
         top: pointer.y.saturating_sub(REGION_CURSOR_CENTER),
         right: pointer
@@ -3036,7 +2917,7 @@ fn draw_window_overview_static(destination: &FrozenSurface, state: &OverlayState
             "No capturable application windows",
             rgb(220, 220, 224),
             TextAlignment::Center,
-            state.display_environment.metrics.px(UI_FONT_HEIGHT),
+            state.model.display_environment.metrics.px(UI_FONT_HEIGHT),
         );
         return;
     }
@@ -3045,7 +2926,7 @@ fn draw_window_overview_static(destination: &FrozenSurface, state: &OverlayState
         if has_live_window_thumbnail(state, thumbnail.handle) {
             continue;
         }
-        let selected = state.selected_window == Some(thumbnail.handle);
+        let selected = state.model.selected_window == Some(thumbnail.handle);
         let preview = selected
             .then(|| ready_window_preview(state, Some(thumbnail.handle)))
             .flatten();
@@ -3057,7 +2938,7 @@ fn draw_window_overview_static(destination: &FrozenSurface, state: &OverlayState
 fn draw_window_overview_interactive(state: &OverlayState) {
     let rects = window_overview_rects(state);
     for (thumbnail, rect) in state.window_thumbnails.iter().zip(rects) {
-        let selected = state.selected_window == Some(thumbnail.handle);
+        let selected = state.model.selected_window == Some(thumbnail.handle);
         let hovered = state.hovered.map(|candidate| candidate.handle) == Some(thumbnail.handle);
         if selected || hovered {
             let color = if selected {
@@ -3437,10 +3318,13 @@ fn draw_surface_to_rect(device: HDC, surface: &FrozenSurface, destination: UiRec
 
 fn draw_toolbar(state: &OverlayState) {
     let device = state.back_buffer.device;
-    let metrics = state.display_environment.metrics;
+    let metrics = state.model.display_environment.metrics;
     let tokens = metrics.toolbar_tokens();
-    let layout = ToolbarLayout::new(state.display_environment, state.toolbar_position);
-    if state.options_open {
+    let layout = ToolbarLayout::new(
+        state.model.display_environment,
+        state.model.toolbar_position,
+    );
+    if state.model.options_open {
         draw_options_menu(device, state, layout);
     }
     draw_round_box(
@@ -3489,8 +3373,8 @@ fn draw_toolbar(state: &OverlayState) {
         1,
     );
 
-    let options_hovered = state.hovered_control == Some(ToolbarControl::Options);
-    if state.options_open || options_hovered {
+    let options_hovered = state.model.hovered_control == Some(ToolbarControl::Options);
+    if state.model.options_open || options_hovered {
         draw_round_box(
             device,
             layout.options,
@@ -3533,9 +3417,9 @@ fn draw_toolbar(state: &OverlayState) {
         tokens.icon_stroke,
     );
 
-    let capture_enabled = state.selection.is_some();
+    let capture_enabled = state.model.selection.is_some();
     let capture_color = if capture_enabled {
-        if state.hovered_control == Some(ToolbarControl::Capture) {
+        if state.model.hovered_control == Some(ToolbarControl::Capture) {
             rgb(68, 145, 255)
         } else {
             rgb(45, 125, 246)
@@ -3591,8 +3475,8 @@ fn draw_tool_button(
         CaptureTool::Window => ToolbarControl::Window,
         CaptureTool::Region => ToolbarControl::Region,
     };
-    if state.tool == tool || state.hovered_control == Some(control) {
-        let color = if state.tool == tool {
+    if state.model.tool == tool || state.model.hovered_control == Some(control) {
+        let color = if state.model.tool == tool {
             rgb(76, 76, 82)
         } else {
             rgb(58, 58, 63)
@@ -3608,10 +3492,10 @@ fn draw_tool_button(
 }
 
 fn draw_hover_tooltip(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
-    if state.options_open {
+    if state.model.options_open {
         return;
     }
-    let (target, value) = match state.hovered_control {
+    let (target, value) = match state.model.hovered_control {
         Some(ToolbarControl::FullDisplay) => {
             (layout.full_display, "Capture full display".to_owned())
         }
@@ -3619,7 +3503,7 @@ fn draw_hover_tooltip(device: HDC, state: &OverlayState, layout: ToolbarLayout) 
         Some(ToolbarControl::Region) => (layout.region, "Select a region".to_owned()),
         Some(ToolbarControl::Options) => (layout.options, "Capture options".to_owned()),
         Some(ToolbarControl::Capture) => {
-            let value = if state.selection.is_some() {
+            let value = if state.model.selection.is_some() {
                 "Copy selection to clipboard"
             } else {
                 "Select something to capture"
@@ -3628,7 +3512,7 @@ fn draw_hover_tooltip(device: HDC, state: &OverlayState, layout: ToolbarLayout) 
         }
         _ => return,
     };
-    let metrics = state.display_environment.metrics;
+    let metrics = state.model.display_environment.metrics;
     let tokens = metrics.toolbar_tokens();
     let font_height = tokens.font_height;
     let measured = measure_ui_text(device, &value, font_height);
@@ -3636,23 +3520,24 @@ fn draw_hover_tooltip(device: HDC, state: &OverlayState, layout: ToolbarLayout) 
         .cx
         .saturating_add(tokens.tooltip_padding_x.saturating_mul(2))
         .max(metrics.px(120))
-        .min((state.display_environment.work_area.width() - metrics.px(16)).max(1));
+        .min((state.model.display_environment.work_area.width() - metrics.px(16)).max(1));
     let height = (measured.cy + tokens.tooltip_padding_y * 2).max(metrics.px(32));
     let left = ((target.left + target.right - width) / 2).clamp(
-        state.display_environment.work_area.left + metrics.px(8),
-        (state.display_environment.work_area.right - width - metrics.px(8))
-            .max(state.display_environment.work_area.left + metrics.px(8)),
+        state.model.display_environment.work_area.left + metrics.px(8),
+        (state.model.display_environment.work_area.right - width - metrics.px(8))
+            .max(state.model.display_environment.work_area.left + metrics.px(8)),
     );
-    let preferred_top =
-        if layout.bounds.top >= state.display_environment.work_area.top + height + metrics.px(16) {
-            layout.bounds.top - height - metrics.px(8)
-        } else {
-            layout.bounds.bottom + metrics.px(8)
-        };
+    let preferred_top = if layout.bounds.top
+        >= state.model.display_environment.work_area.top + height + metrics.px(16)
+    {
+        layout.bounds.top - height - metrics.px(8)
+    } else {
+        layout.bounds.bottom + metrics.px(8)
+    };
     let top = preferred_top.clamp(
-        state.display_environment.work_area.top + metrics.px(8),
-        (state.display_environment.work_area.bottom - height - metrics.px(8))
-            .max(state.display_environment.work_area.top + metrics.px(8)),
+        state.model.display_environment.work_area.top + metrics.px(8),
+        (state.model.display_environment.work_area.bottom - height - metrics.px(8))
+            .max(state.model.display_environment.work_area.top + metrics.px(8)),
     );
     let bounds = UiRect {
         left,
@@ -3683,7 +3568,7 @@ fn draw_hover_tooltip(device: HDC, state: &OverlayState, layout: ToolbarLayout) 
 }
 
 fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
-    let metrics = state.display_environment.metrics;
+    let metrics = state.model.display_environment.metrics;
     let tokens = metrics.toolbar_tokens();
     draw_round_box(
         device,
@@ -3701,7 +3586,7 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
         (ToolbarControl::Cancel, layout.cancel),
     ];
     for (control, row) in rows {
-        if state.hovered_control == Some(control) {
+        if state.model.hovered_control == Some(control) {
             draw_round_box(
                 device,
                 row,
@@ -3711,7 +3596,7 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
             );
         }
     }
-    if state.dim_background {
+    if state.model.dim_background {
         draw_checkmark(
             device,
             layout.dim_background.left + tokens.menu_check_offset,
@@ -4498,173 +4383,48 @@ fn screen_point(source: Rect, lparam: LPARAM) -> POINT {
     }
 }
 
-fn local_point(source: Rect, point: POINT) -> POINT {
-    POINT {
-        x: point.x.saturating_sub(source.x),
-        y: point.y.saturating_sub(source.y),
-    }
-}
-
 fn activate_tool(state: &mut OverlayState, tool: CaptureTool) {
-    state.anchor = None;
-    state.dragging = false;
-    state.resizing = None;
-    state.moving_region = None;
-    let tool_changed = state.tool != tool;
+    state.model.anchor = None;
+    state.model.dragging = false;
+    state.model.resizing = None;
+    state.model.moving_region = None;
+    let tool_changed = state.model.tool != tool;
     if tool_changed {
-        state.last_region = latest_interaction_region(
-            state.tool,
-            state.selection,
-            state.selection_kind,
-            state.last_region,
+        state.model.last_region = latest_interaction_region(
+            state.model.tool,
+            state.model.selection,
+            state.model.selection_kind,
+            state.model.last_region,
         );
         state.dimension_label_placement = None;
-        state.selection = None;
-        state.selection_kind = None;
-        state.selected_window = None;
+        state.model.selection = None;
+        state.model.selection_kind = None;
+        state.model.selected_window = None;
         state.selected_window_frame = None;
         state.hovered = None;
-        state.hovered_handle = None;
+        state.model.hovered_handle = None;
     }
-    state.tool = tool;
-    state.options_open = false;
+    state.model.tool = tool;
+    state.model.options_open = false;
     match tool {
         CaptureTool::FullDisplay => {
-            state.selection = Some(state.source);
-            state.selection_kind = Some(SelectionKind::Display);
-            state.selected_window = None;
+            state.model.selection = Some(state.model.source);
+            state.model.selection_kind = Some(SelectionKind::Display);
+            state.model.selected_window = None;
             state.selected_window_frame = None;
         }
         CaptureTool::Window => build_window_overview(state),
         CaptureTool::Region if tool_changed => {
-            (state.selection, state.selection_kind) =
-                initial_selection(CaptureTool::Region, state.last_region, state.source);
+            (state.model.selection, state.model.selection_kind) = initial_selection(
+                CaptureTool::Region,
+                state.model.last_region,
+                state.model.source,
+            );
         }
         CaptureTool::Region => {}
     }
     if tool != CaptureTool::Window {
         hide_live_window_thumbnails(state);
-    }
-}
-
-fn rect_from_points(source: Rect, first: POINT, second: POINT) -> Option<Rect> {
-    let source_right = i64::from(source.x) + i64::from(source.width);
-    let source_bottom = i64::from(source.y) + i64::from(source.height);
-    let left = i64::from(first.x.min(second.x)).clamp(i64::from(source.x), source_right);
-    let top = i64::from(first.y.min(second.y)).clamp(i64::from(source.y), source_bottom);
-    let right = i64::from(first.x.max(second.x)).clamp(i64::from(source.x), source_right);
-    let bottom = i64::from(first.y.max(second.y)).clamp(i64::from(source.y), source_bottom);
-    (right > left && bottom > top).then_some(Rect {
-        x: left as i32,
-        y: top as i32,
-        width: (right - left) as u32,
-        height: (bottom - top) as u32,
-    })
-}
-
-fn contains(rect: Rect, point: POINT) -> bool {
-    let right = i64::from(rect.x) + i64::from(rect.width);
-    let bottom = i64::from(rect.y) + i64::from(rect.height);
-    i64::from(point.x) >= i64::from(rect.x)
-        && i64::from(point.y) >= i64::from(rect.y)
-        && i64::from(point.x) < right
-        && i64::from(point.y) < bottom
-}
-
-fn hit_test_resize_handle(rect: Rect, point: POINT, metrics: UiMetrics) -> Option<ResizeHandle> {
-    let left = i64::from(rect.x);
-    let top = i64::from(rect.y);
-    let right = left + i64::from(rect.width);
-    let bottom = top + i64::from(rect.height);
-    let x = i64::from(point.x);
-    let y = i64::from(point.y);
-    let radius = i64::from(metrics.region_tokens().handle_hit_radius);
-    let near_left = (x - left).abs() <= radius;
-    let near_right = (x - right).abs() <= radius;
-    let near_top = (y - top).abs() <= radius;
-    let near_bottom = (y - bottom).abs() <= radius;
-    if near_left && near_top {
-        Some(ResizeHandle::NorthWest)
-    } else if near_right && near_top {
-        Some(ResizeHandle::NorthEast)
-    } else if near_right && near_bottom {
-        Some(ResizeHandle::SouthEast)
-    } else if near_left && near_bottom {
-        Some(ResizeHandle::SouthWest)
-    } else if near_top && x >= left && x <= right {
-        Some(ResizeHandle::North)
-    } else if near_right && y >= top && y <= bottom {
-        Some(ResizeHandle::East)
-    } else if near_bottom && x >= left && x <= right {
-        Some(ResizeHandle::South)
-    } else if near_left && y >= top && y <= bottom {
-        Some(ResizeHandle::West)
-    } else {
-        None
-    }
-}
-
-fn resize_region(original: Rect, handle: ResizeHandle, point: POINT, source: Rect) -> Rect {
-    let source_left = i64::from(source.x);
-    let source_top = i64::from(source.y);
-    let source_right = source_left + i64::from(source.width);
-    let source_bottom = source_top + i64::from(source.height);
-    let mut left = i64::from(original.x);
-    let mut top = i64::from(original.y);
-    let mut right = left + i64::from(original.width);
-    let mut bottom = top + i64::from(original.height);
-    let point_x = i64::from(point.x);
-    let point_y = i64::from(point.y);
-
-    if matches!(
-        handle,
-        ResizeHandle::NorthWest | ResizeHandle::West | ResizeHandle::SouthWest
-    ) {
-        let maximum_left = (right - MIN_REGION_SIZE).max(source_left);
-        left = point_x.clamp(source_left, maximum_left);
-    }
-    if matches!(
-        handle,
-        ResizeHandle::NorthEast | ResizeHandle::East | ResizeHandle::SouthEast
-    ) {
-        let minimum_right = (left + MIN_REGION_SIZE).min(source_right);
-        right = point_x.clamp(minimum_right, source_right);
-    }
-    if matches!(
-        handle,
-        ResizeHandle::NorthWest | ResizeHandle::North | ResizeHandle::NorthEast
-    ) {
-        let maximum_top = (bottom - MIN_REGION_SIZE).max(source_top);
-        top = point_y.clamp(source_top, maximum_top);
-    }
-    if matches!(
-        handle,
-        ResizeHandle::SouthWest | ResizeHandle::South | ResizeHandle::SouthEast
-    ) {
-        let minimum_bottom = (top + MIN_REGION_SIZE).min(source_bottom);
-        bottom = point_y.clamp(minimum_bottom, source_bottom);
-    }
-
-    Rect {
-        x: left as i32,
-        y: top as i32,
-        width: (right - left) as u32,
-        height: (bottom - top) as u32,
-    }
-}
-
-fn move_region(original: Rect, pointer_origin: POINT, point: POINT, source: Rect) -> Rect {
-    let delta_x = i64::from(point.x) - i64::from(pointer_origin.x);
-    let delta_y = i64::from(point.y) - i64::from(pointer_origin.y);
-    let source_left = i64::from(source.x);
-    let source_top = i64::from(source.y);
-    let maximum_x = source_left + i64::from(source.width.saturating_sub(original.width));
-    let maximum_y = source_top + i64::from(source.height.saturating_sub(original.height));
-    Rect {
-        x: (i64::from(original.x) + delta_x).clamp(source_left, maximum_x) as i32,
-        y: (i64::from(original.y) + delta_y).clamp(source_top, maximum_y) as i32,
-        width: original.width,
-        height: original.height,
     }
 }
 
