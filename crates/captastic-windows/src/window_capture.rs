@@ -1221,6 +1221,7 @@ fn capture_error(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Instant;
 
     use super::*;
     use captastic_core::{
@@ -1296,11 +1297,12 @@ mod tests {
         release_sender.send(()).expect("release detached worker");
         drop(replacement);
         assert_eq!(active.load(Ordering::Acquire), 0);
-        for _ in 0..100 {
-            if workers.load(Ordering::Acquire) == 0 {
-                break;
-            }
-            thread::yield_now();
+        // The released worker still has to be scheduled before it drops its budget lease. Wait on
+        // wall-clock time, not a fixed yield count, so a preempted worker on a loaded CI runner
+        // cannot outlive the wait; the deadline only bounds a genuinely stuck release.
+        let release_deadline = Instant::now() + Duration::from_secs(10);
+        while workers.load(Ordering::Acquire) != 0 && Instant::now() < release_deadline {
+            thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(workers.load(Ordering::Acquire), 0);
     }
@@ -1312,10 +1314,14 @@ mod tests {
         let permit = WindowRenderPermit::acquire_from(active, 1).expect("render permit");
         let budget = WindowRenderBudget::acquire_from(workers, 1).expect("worker budget");
 
-        let error = run_bounded_window_render::<u8>(permit, budget, Duration::from_secs(1), || {
-            panic!("scripted render panic")
-        })
-        .expect_err("panic disconnects the bounded worker");
+        // The worker terminates promptly by panicking, so this timeout only bounds a broken
+        // harness. Keep it generous: a 1-second budget lost the race to thread spawn plus unwind
+        // on coverage-instrumented CI runners and misreported the panic as a Timeout.
+        let error =
+            run_bounded_window_render::<u8>(permit, budget, Duration::from_secs(60), || {
+                panic!("scripted render panic")
+            })
+            .expect_err("panic disconnects the bounded worker");
 
         assert_eq!(error.kind, CaptureErrorKind::NativeFailure);
         assert!(!error.retryable);
