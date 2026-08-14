@@ -3,7 +3,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -445,7 +445,7 @@ fn tray_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPAR
                 (state.paused, state.event_sender.clone())
             };
             if notification == WM_LBUTTONDBLCLK && !paused {
-                let _ = sender.try_send(TrayEvent::Capture);
+                dispatch_tray_event(&sender, TrayEvent::Capture);
             } else if notification == WM_RBUTTONUP || notification == WM_CONTEXTMENU {
                 let startup_enabled = {
                     // SAFETY: Short immutable read from the live state allocation.
@@ -466,7 +466,7 @@ fn tray_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPAR
                         (state.paused, state.event_sender.clone())
                     };
                     if !paused {
-                        let _ = sender.try_send(TrayEvent::Capture);
+                        dispatch_tray_event(&sender, TrayEvent::Capture);
                     }
                 }
                 COMMAND_PAUSE => {
@@ -479,7 +479,7 @@ fn tray_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPAR
                     if let Err(error) = modify_tray_tooltip(hwnd, paused) {
                         log::warn!("failed to update tray state: {error}");
                     }
-                    let _ = sender.try_send(TrayEvent::PausedChanged(paused));
+                    dispatch_tray_event(&sender, TrayEvent::PausedChanged(paused));
                 }
                 COMMAND_CONFIG => {
                     send_tray_event(state_pointer, TrayEvent::OpenConfig);
@@ -600,7 +600,34 @@ fn send_tray_event(state_pointer: *mut TrayState, event: TrayEvent) {
     // SAFETY: Callers invoke this only while processing a message for the live tray window. The
     // cloned sender outlives the short borrow and sending cannot alias TrayState on reentry.
     let sender = unsafe { (&*state_pointer).event_sender.clone() };
-    let _ = sender.try_send(event);
+    dispatch_tray_event(&sender, event);
+}
+
+/// Sends a tray event without ever blocking the window procedure, logging when the bounded
+/// channel drops it instead of silently discarding it.
+///
+/// `std::sync::mpsc::SyncSender` offers no way to pop or replace a queued item from the sender
+/// side, so a full channel always drops the newest event (the one being sent here) rather than
+/// an older one already queued; there is no drop-oldest option available with std mpsc. `Exit` is
+/// the one command that must never vanish without a trace, so a dropped `Exit` is logged at
+/// `error`; other dropped events only warn. A disconnected channel means the main thread has
+/// already stopped reading, which is expected noise during shutdown, so it is logged at `debug`.
+fn dispatch_tray_event(sender: &SyncSender<TrayEvent>, event: TrayEvent) {
+    match sender.try_send(event) {
+        Ok(()) => {}
+        Err(TrySendError::Full(dropped)) => {
+            if matches!(dropped, TrayEvent::Exit) {
+                log::error!("tray event channel is full; dropped {dropped:?}");
+            } else {
+                log::warn!("tray event channel is full; dropped {dropped:?}");
+            }
+        }
+        Err(TrySendError::Disconnected(dropped)) => {
+            log::debug!(
+                "tray event channel is disconnected; dropped {dropped:?} (expected during shutdown)"
+            );
+        }
+    }
 }
 
 fn add_tray_icon(
@@ -866,6 +893,21 @@ mod tests {
         release_sender
             .send(())
             .expect("release detached tray test worker");
+    }
+
+    #[test]
+    fn dispatch_tray_event_drops_without_blocking_when_full_or_disconnected() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        dispatch_tray_event(&sender, TrayEvent::Capture);
+        // The channel is now full; the drop-newest send below must return immediately rather
+        // than block the caller, and must leave the already-queued event untouched.
+        dispatch_tray_event(&sender, TrayEvent::Exit);
+        assert!(matches!(receiver.try_recv(), Ok(TrayEvent::Capture)));
+        assert!(receiver.try_recv().is_err());
+
+        drop(receiver);
+        // A disconnected receiver must not panic or block either.
+        dispatch_tray_event(&sender, TrayEvent::Exit);
     }
 
     #[test]
