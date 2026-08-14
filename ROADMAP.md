@@ -33,6 +33,9 @@ important for a future public release, but it does not gate the capture mileston
   workflows, including validated per-display confirmed-region state.
 - Programmatic Windows Graphics Capture fallback for windows rejected by `PrintWindow`, with bounded
   worker isolation and GPU readback.
+- Live selection previews (`selection.preview = auto|live|frozen`) with confirmation-anchored
+  capture, per-pixel-alpha live overlays, and a DWM-thumbnail window chooser with static fallback
+  surfaces (ADR 0004, PR #14).
 
 ## Milestone 1 — Multi-monitor and topology support
 
@@ -134,7 +137,9 @@ capture path and explicit failure behavior.
 **Status:** Functional baseline complete. Captastic already falls back from `PrintWindow` to
 programmatic WGC with bounded frame wait, D3D11 staging readback, and no occluded-desktop fallback.
 Retained-session optimization and richer backend/fallback metrics remain quality follow-ups rather
-than blockers for the next display milestone.
+than blockers for the next display milestone. The narrow window-capture backend trait described
+below has not been introduced yet — window capture currently ships as free functions — so that
+bullet remains open alongside the retention and metrics follow-ups.
 
 **Outcome:** Window mode captures GPU-rendered and modern applications that do not render reliably
 through `PrintWindow`.
@@ -166,6 +171,14 @@ through `PrintWindow`.
 
 ## Milestone 4 — Asynchronous file output and capture history
 
+**Status:** Not started. Prerequisites identified during the 2026-08 architecture review: adopt a
+real PNG compressor for file output (the clipboard encoder emits stored, uncompressed DEFLATE —
+acceptable as a clipboard latency trade, unacceptable on disk); move app-owned state (UI state,
+history) out of the user's `captastic.toml` into separate app-owned storage before per-capture
+history writes exist; introduce a shared output-sink seam so clipboard and file destinations fail
+independently; and extract a worker-registry/shutdown coordinator from the daemon loop before
+wiring in a third worker.
+
 **Outcome:** Captastic can save and revisit captures without adding disk or compression work to the
 capture critical path.
 
@@ -195,6 +208,10 @@ capture critical path.
 
 ## Milestone 5 — Capture quality and resilience
 
+**Status:** Not started. Precede the soak-test exit criteria with a documented detach budget for
+timed-out capture and window-render threads (counted in metrics, recorded in an ADR) so handle and
+memory accounting is honest, and extend the core pixel-format contract before HDR work begins.
+
 **Outcome:** Captastic handles the remaining pixel formats and Windows lifecycle transitions with
 explicit, tested behavior.
 
@@ -221,6 +238,11 @@ explicit, tested behavior.
 
 ## Milestone 6 — Annotation and pinning
 
+**Status:** Not started. Gated on the overlay/tray message-state-machine extraction in the
+architecture hardening backlog: annotation needs a compose/render layer and window-shell utilities
+that the current single-file overlay cannot expose, and building on it as-is would compound the
+existing defect pattern.
+
 **Outcome:** Optional post-capture tools add communication value without changing Captastic's
 capture-engine identity.
 
@@ -238,6 +260,11 @@ capture-engine identity.
 - Pinned windows cannot be mistaken for capture candidates unless explicitly requested.
 
 ## Milestone 7 — Native macOS and Linux implementations
+
+**Status:** Not started. Before the first non-Windows backend, extract session-oriented platform
+seams (overlay session, hotkey source, tray port) from the by-then-stable Windows call sites and
+move the selection/clipboard worker logic out from under `cfg(windows)` so the pipeline compiles
+and tests on every CI leg; port the contracts, not the Windows behaviors.
 
 **Outcome:** Extend Captastic's contracts through independent native backends rather than presenting
 platforms as equivalent when they are not.
@@ -304,6 +331,9 @@ without diagnostic value.
   it with a migration note.
 - Implement `[output]` only through Milestone 4's bounded asynchronous output worker; until then,
   reject unsupported non-default values rather than silently accepting them.
+- Apply the same reject-or-implement treatment to `capture.cursor` (a free-form string that is
+  never validated or consumed — `CursorMode::Exclude` is hardcoded at every request site) and
+  `capture.buffer_slots` (validated 2–16 but never read; the DXGI pool hardcodes three slots).
 - Inventory and remove legacy UI-state save/load entry points superseded by `UiStateStore`.
 - Either expose `backend_duration` in structured results/diagnostics with a precise timing contract
   or remove it from the public capture outcome.
@@ -349,23 +379,36 @@ Authenticode is deliberately not on the near-term critical path. Until signing i
 
 ## Recommended implementation order
 
-1. Finish rotated-output normalization and virtual-desktop composition.
-2. Complete WGC retention/provenance follow-ups.
-3. Add asynchronous file output and capture history.
-4. Build capture-quality completeness and performance evidence.
-5. Add annotation/pinning or cross-platform work, based on audience demand.
+Rotated-output normalization and same-adapter virtual-desktop composition shipped in PRs #8–#9;
+the order below reflects the 2026-08 code, architecture, and roadmap review.
+
+1. Remediate the verified review findings: the confirmed High-severity defects (one-shot
+   persistence failures discarding confirmed captures, the stale-`WM_QUIT` overlay fallback defeat,
+   the cross-thread window-text aliasing path) plus the small user-visible fixes around silent
+   drops and sticky failure states.
+2. Resolve the dormant configuration and telemetry surfaces (the backlog above) so every documented
+   setting changes observable behavior before Milestone 4 activates `[output]`.
+3. Extract the overlay and tray message state machines (the backlog above) — the prerequisite for
+   Milestone 6 and the highest-leverage reduction of the current defect stream.
+4. Add asynchronous file output and capture history (Milestone 4), starting with its listed
+   prerequisites.
+5. Complete Milestone 1 (multi-adapter composition and the hardware validation matrix) — this can
+   proceed in parallel with items 2–3.
+6. Build capture-quality completeness and performance evidence (Milestone 5).
+7. Add annotation/pinning or cross-platform work, based on audience demand (existing decision gate).
 
 ## Recommended next branch
 
-Use `feature/8/normalize-rotated-displays` and normalize rotated single-display outputs before
-starting virtual-desktop composition:
+Use a review-remediation branch to land the verified findings from the 2026-08 review before any
+milestone work:
 
-1. Define and test raw-texture to top-left BGRA transforms for 0, 90, 180, and 270 degrees.
-2. Apply the transform directly into pooled CPU readback buffers without adding an intermediate
-   full-frame allocation.
-3. Map normalized region coordinates back into raw DXGI texture coordinates, then normalize the
-   copied GPU region before publication.
-4. Verify negative desktop origins, per-display saved regions, direct hotkeys, and dimension
-   metadata remain in normalized physical pixels.
-5. Follow with same-adapter virtual-desktop bounds and composition, then explicitly support or reject
-   multi-adapter and mixed-mode layouts.
+1. Fix the three confirmed High findings (one-shot UI-state persistence aborting confirmed
+   captures; stale `WM_QUIT` poisoning the frozen-preview fallback; pre-filter cross-thread window
+   text retrieval inside the overlay window procedure).
+2. Close the silent-drop paths: dropped confirmed selections during backend recovery, discarded
+   tray events including Exit, silent hotkey-thread death, and blank-frame `PrintWindow` results
+   that skip the WGC fallback.
+3. Guard the config write paths that can persist state the strict loader rejects, and the
+   `toml_edit` indexing panics on hand-edited files.
+4. Follow with the dormant-configuration-surfaces branch, then the overlay state-machine
+   extraction.
