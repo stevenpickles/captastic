@@ -1845,9 +1845,62 @@ fn consume_self_initiated_capture_change(releasing_pointer_capture: &mut bool) -
     std::mem::take(releasing_pointer_capture)
 }
 
+/// Removes every chooser entry whose source window no longer exists and returns the dead
+/// handles. The tiles, live DWM registrations, candidates, and any preview pixels disappear
+/// together, so the layout closes the gap and a destroyed window is no longer clickable.
+/// Windows that are still alive keep their entries even when their live thumbnail or preview
+/// has failed - failure stays retryable, only destruction prunes.
+fn prune_dead_window_sources(state: &mut OverlayState) -> Vec<NativeWindowHandle> {
+    let dead: Vec<NativeWindowHandle> = state
+        .window_thumbnails
+        .iter()
+        .map(|thumbnail| thumbnail.handle)
+        // SAFETY: IsWindow validates a handle without retaining or dereferencing it.
+        .filter(|handle| !unsafe { IsWindow(HWND(handle.raw())) }.as_bool())
+        .collect();
+    if dead.is_empty() {
+        return dead;
+    }
+    for handle in &dead {
+        log::debug!(
+            "pruning chooser slot for destroyed window handle=0x{:X}",
+            handle.raw()
+        );
+    }
+    state
+        .window_thumbnails
+        .retain(|thumbnail| !dead.contains(&thumbnail.handle));
+    // Dropping a live registration unregisters its DWM thumbnail.
+    state
+        .live_window_thumbnails
+        .retain(|preview| !dead.contains(&preview.handle));
+    if let Some(windows) = state.windows.as_mut() {
+        windows.retain(|candidate| !dead.contains(&candidate.handle));
+    }
+    let preview_died = match &state.window_preview {
+        Some(WindowPreviewState::Ready(preview)) => dead.contains(&preview.handle),
+        Some(WindowPreviewState::Unavailable(handle)) => dead.contains(handle),
+        None => false,
+    };
+    if preview_died {
+        state.window_preview = None;
+    }
+    dead
+}
+
 fn compose_overlay_state(state: &mut OverlayState) {
     let width = state.surface.width;
     if state.model.tool == CaptureTool::Window {
+        // Destroyed sources are pruned once per paint (the overlay runs no timers), and any
+        // model state pointing at them is cleared before the chooser surface is rebuilt.
+        let dead = prune_dead_window_sources(state);
+        if !dead.is_empty() {
+            for effect in machine::window_sources_pruned(&mut state.model, &dead) {
+                debug_assert!(matches!(effect, OverlayEffect::ClearSelectedWindowFrame));
+                state.selected_window_frame = None;
+            }
+            rebuild_window_overview_cache(state);
+        }
         let cache_matches = state
             .window_overview_cache
             .as_ref()

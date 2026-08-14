@@ -471,6 +471,31 @@ fn toolbar_control_pressed(
     effects
 }
 
+/// Reacts to the shell pruning destroyed source windows from the chooser inventory: product
+/// state pointing at a dead handle is dropped, so a vanished window can neither stay hovered
+/// nor remain the selection target. Alive windows are untouched, whatever the state of their
+/// live thumbnails.
+pub(super) fn window_sources_pruned(
+    model: &mut OverlayModel,
+    dead: &[NativeWindowHandle],
+) -> Vec<OverlayEffect> {
+    if model
+        .hovered
+        .is_some_and(|candidate| dead.contains(&candidate.handle))
+    {
+        model.hovered = None;
+    }
+    let mut effects = Vec::new();
+    if model
+        .selected_window
+        .is_some_and(|handle| dead.contains(&handle))
+    {
+        model.selected_window = None;
+        effects.push(OverlayEffect::ClearSelectedWindowFrame);
+    }
+    effects
+}
+
 /// Switches the active tool, restoring or resetting the selection to match, and returns the
 /// window-chooser side work the shell must run for the transition.
 pub(super) fn activate_tool(model: &mut OverlayModel, tool: CaptureTool) -> Vec<OverlayEffect> {
@@ -1972,6 +1997,36 @@ mod tests {
         // The chrome refresh from closing the menu runs before the preview request, as the
         // legacy handler ordered it.
         assert_eq!(kinds, ["refresh", "preview"]);
+    }
+
+    #[test]
+    fn pruned_sources_clear_only_matching_selection_and_hover() {
+        let dead = NativeWindowHandle::from_raw(0xDEAD);
+        let alive = NativeWindowHandle::from_raw(0xA11E);
+
+        // Selection and hover pointing at the pruned window are dropped together.
+        let mut model = region_model();
+        model.tool = CaptureTool::Window;
+        model.selected_window = Some(dead);
+        model.hovered = Some(candidate(0xDEAD));
+        let effects = window_sources_pruned(&mut model, &[dead]);
+        assert_eq!(model.selected_window, None);
+        assert!(model.hovered.is_none());
+        assert!(has_effect(&effects, |e| matches!(
+            e,
+            OverlayEffect::ClearSelectedWindowFrame
+        )));
+
+        // State pointing at windows that are still alive is untouched, and no frame-clearing
+        // effect is emitted for a prune that missed everything.
+        let mut model = region_model();
+        model.tool = CaptureTool::Window;
+        model.selected_window = Some(alive);
+        model.hovered = Some(candidate(0xA11E));
+        let effects = window_sources_pruned(&mut model, &[dead]);
+        assert_eq!(model.selected_window, Some(alive));
+        assert_eq!(model.hovered.map(|c| c.handle), Some(alive));
+        assert!(effects.is_empty());
     }
 
     #[test]
