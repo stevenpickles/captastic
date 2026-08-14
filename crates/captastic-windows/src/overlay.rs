@@ -461,10 +461,11 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
         window_preview: None,
         window_thumbnails: Vec::new(),
         live_window_thumbnails: Vec::new(),
-        window_overview_cache: cached_overview_surface.map(|surface| WindowOverviewCache {
-            surface,
-            dim_background: false,
-        }),
+        // A previous run's chooser surface is only ever an allocation to draw into, never
+        // presentable content: the cache starts empty so the first Window-mode compose is
+        // forced to rebuild, and the rebuild reclaims the spare buffer below.
+        window_overview_cache: None,
+        spare_overview_surface: cached_overview_surface,
         region_cursor,
         _font_resource: font_resource,
         previous_foreground,
@@ -600,6 +601,10 @@ struct OverlayState {
     window_thumbnails: Vec<WindowThumbnail>,
     live_window_thumbnails: Vec<LiveWindowThumbnail>,
     window_overview_cache: Option<WindowOverviewCache>,
+    /// A previous run's chooser surface, held purely as a reusable allocation for
+    /// [`rebuild_window_overview_cache`]. Its pixels are stale by definition and are always
+    /// overdrawn before the surface can reach the screen.
+    spare_overview_surface: Option<FrozenSurface>,
     region_cursor: RegionCursor,
     _font_resource: PrivateFontResource,
     previous_foreground: HWND,
@@ -668,12 +673,16 @@ fn cache_overlay_state(
         blurred_background,
         cached_blurred_background,
         window_overview_cache,
+        spare_overview_surface,
         region_cursor,
         _font_resource,
         ..
     } = *state;
     let blurred_background = blurred_background.or(cached_blurred_background);
-    let overview_surface = window_overview_cache.map(|cache| cache.surface);
+    // A run that never entered Window mode passes the unused spare allocation along.
+    let overview_surface = window_overview_cache
+        .map(|cache| cache.surface)
+        .or(spare_overview_surface);
     resources.cache = Some(OverlayResourceCache {
         surface,
         back_buffer,
@@ -2428,18 +2437,19 @@ fn has_live_window_thumbnail(state: &OverlayState, handle: NativeWindowHandle) -
 }
 
 fn rebuild_window_overview_cache(state: &mut OverlayState) {
-    let reusable = state
-        .window_overview_cache
-        .take()
-        .map(|cache| cache.surface);
-    let surface = reusable
-        .filter(|surface| {
-            surface.width == state.surface.width && surface.height == state.surface.height
-        })
-        .map_or_else(
-            || FrozenSurface::empty(state.surface.width as u32, state.surface.height as u32),
-            Ok,
-        );
+    let reusable = reusable_overview_surface(
+        state
+            .window_overview_cache
+            .take()
+            .map(|cache| cache.surface),
+        &mut state.spare_overview_surface,
+        state.surface.width,
+        state.surface.height,
+    );
+    let surface = reusable.map_or_else(
+        || FrozenSurface::empty(state.surface.width as u32, state.surface.height as u32),
+        Ok,
+    );
     let Ok(surface) = surface else {
         state.window_overview_cache = None;
         return;
@@ -2450,6 +2460,21 @@ fn rebuild_window_overview_cache(state: &mut OverlayState) {
         surface,
         dim_background: state.model.dim_background,
     });
+}
+
+/// Picks the allocation the chooser rebuild will draw into: the current cache's own surface
+/// first, else the spare carried over from a previous run. Either is only a buffer - the caller
+/// overdraws it completely - and a dimension mismatch consumes the candidate instead of handing
+/// out a wrong-sized surface.
+fn reusable_overview_surface(
+    current: Option<FrozenSurface>,
+    spare: &mut Option<FrozenSurface>,
+    width: i32,
+    height: i32,
+) -> Option<FrozenSurface> {
+    current
+        .or_else(|| spare.take())
+        .filter(|surface| surface.width == width && surface.height == height)
 }
 
 fn compose_window_overview_background(destination: &FrozenSurface, state: &OverlayState) {
@@ -5601,6 +5626,36 @@ mod tests {
         });
         resources.clear();
         assert!(resources.take_matching(8, 8).is_none());
+    }
+
+    #[test]
+    fn a_previous_runs_overview_surface_is_an_allocation_never_content() {
+        // The constructor no longer manufactures a WindowOverviewCache from a previous run's
+        // surface, so its stale pixels cannot be blitted as current content; the only way the
+        // spare reaches the screen is through this reuse seam, whose caller overdraws it.
+        let spare_surface = FrozenSurface::empty(8, 8).expect("surface");
+        let spare_device = spare_surface.device.0;
+        let mut spare = Some(spare_surface);
+        let reused = reusable_overview_surface(None, &mut spare, 8, 8).expect("matching spare");
+        assert_eq!(
+            reused.device.0, spare_device,
+            "the allocation itself is reused"
+        );
+        assert!(spare.is_none(), "the spare was consumed");
+
+        // The current cache's own surface wins; the spare stays put for later.
+        let current = FrozenSurface::empty(8, 8).expect("surface");
+        let current_device = current.device.0;
+        let mut spare = Some(FrozenSurface::empty(8, 8).expect("surface"));
+        let reused =
+            reusable_overview_surface(Some(current), &mut spare, 8, 8).expect("current allocation");
+        assert_eq!(reused.device.0, current_device);
+        assert!(spare.is_some());
+
+        // A resolution change consumes the mismatched candidate rather than handing it out.
+        let mut spare = Some(FrozenSurface::empty(8, 8).expect("surface"));
+        assert!(reusable_overview_surface(None, &mut spare, 16, 16).is_none());
+        assert!(spare.is_none());
     }
 
     fn ready_preview_state(handle: NativeWindowHandle) -> WindowPreviewState {
