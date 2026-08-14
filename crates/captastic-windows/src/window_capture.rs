@@ -75,6 +75,17 @@ pub fn materialize_selection(
     }
 }
 
+/// Returns the native frame captured while a window selection was confirmed.
+///
+/// Live display and region selections intentionally defer pixel acquisition until after the
+/// overlay closes. A window selection is different: confirming it already renders that native
+/// window independently of the desktop, so callers should not acquire an unrelated display frame.
+pub fn captured_window_frame(selection: &OverlaySelection) -> Option<CpuFrame> {
+    (selection.kind == SelectionKind::Window)
+        .then(|| selection.window_frame.clone())
+        .flatten()
+}
+
 pub(crate) fn capture_window(
     handle: NativeWindowHandle,
     reference_metadata: &FrameMetadata,
@@ -1436,6 +1447,8 @@ mod tests {
                 preparation_ns: 0,
                 window_overview_ns: None,
                 window_preview_count: 0,
+                window_live_preview_count: 0,
+                window_frozen_preview_count: 0,
                 window_preview_bytes: 0,
                 window_frame: None,
             },
@@ -1458,6 +1471,8 @@ mod tests {
                 preparation_ns: 0,
                 window_overview_ns: None,
                 window_preview_count: 0,
+                window_live_preview_count: 0,
+                window_frozen_preview_count: 0,
                 window_preview_bytes: 0,
                 window_frame: None,
             },
@@ -1481,12 +1496,32 @@ mod tests {
                 preparation_ns: 0,
                 window_overview_ns: None,
                 window_preview_count: 0,
+                window_live_preview_count: 0,
+                window_frozen_preview_count: 0,
                 window_preview_bytes: 0,
                 window_frame: Some(preview.clone()),
             },
         )
         .expect("previewed window frame should be materialized without another native render");
         assert!(Arc::ptr_eq(&preview.pixels, &selected.pixels));
+        assert!(Arc::ptr_eq(
+            &preview.pixels,
+            &captured_window_frame(&OverlaySelection {
+                rect: preview.metadata.source_rect,
+                kind: SelectionKind::Window,
+                window: None,
+                selection_ns: 0,
+                preparation_ns: 0,
+                window_overview_ns: None,
+                window_preview_count: 0,
+                window_live_preview_count: 0,
+                window_frozen_preview_count: 0,
+                window_preview_bytes: 0,
+                window_frame: Some(preview.clone()),
+            })
+            .expect("window confirmation should expose its native frame")
+            .pixels
+        ));
     }
 
     #[test]

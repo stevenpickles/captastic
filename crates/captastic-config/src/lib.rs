@@ -452,7 +452,7 @@ pub struct AppConfig {
     pub daemon: DaemonConfig,
     pub hotkey: HotkeyConfig,
     pub capture: CaptureConfig,
-    pub selection: QueueFeatureConfig,
+    pub selection: SelectionConfig,
     pub clipboard: QueueFeatureConfig,
     pub output: OutputConfig,
     pub metrics: MetricsConfig,
@@ -467,7 +467,7 @@ impl Default for AppConfig {
             daemon: DaemonConfig::default(),
             hotkey: HotkeyConfig::default(),
             capture: CaptureConfig::default(),
-            selection: QueueFeatureConfig::default(),
+            selection: SelectionConfig::default(),
             clipboard: QueueFeatureConfig::default(),
             output: OutputConfig::default(),
             metrics: MetricsConfig::default(),
@@ -1554,6 +1554,33 @@ pub struct QueueFeatureConfig {
     pub queue_capacity: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewMode {
+    #[default]
+    Auto,
+    Live,
+    Frozen,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SelectionConfig {
+    pub enabled: bool,
+    pub queue_capacity: usize,
+    pub preview: PreviewMode,
+}
+
+impl Default for SelectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            queue_capacity: 1,
+            preview: PreviewMode::Auto,
+        }
+    }
+}
+
 impl Default for QueueFeatureConfig {
     fn default() -> Self {
         Self {
@@ -1743,7 +1770,34 @@ mod tests {
 
     #[test]
     fn defaults_are_valid() {
-        AppConfig::default().validate().expect("valid defaults");
+        let config = AppConfig::default();
+        config.validate().expect("valid defaults");
+        assert_eq!(config.selection.preview, PreviewMode::Auto);
+    }
+
+    #[test]
+    fn existing_selection_tables_default_to_automatic_preview() {
+        let config: AppConfig =
+            toml::from_str("schema_version = 1\n[selection]\nenabled = true\nqueue_capacity = 1\n")
+                .expect("legacy selection table remains compatible");
+
+        assert_eq!(config.selection.preview, PreviewMode::Auto);
+    }
+
+    #[test]
+    fn selection_preview_policy_is_strictly_typed() {
+        for (value, expected) in [
+            ("auto", PreviewMode::Auto),
+            ("live", PreviewMode::Live),
+            ("frozen", PreviewMode::Frozen),
+        ] {
+            let source = format!("schema_version = 1\n[selection]\npreview = \"{value}\"\n");
+            let config: AppConfig = toml::from_str(&source).expect("supported preview policy");
+            assert_eq!(config.selection.preview, expected);
+        }
+
+        toml::from_str::<AppConfig>("schema_version = 1\n[selection]\npreview = \"continuous\"\n")
+            .expect_err("unknown preview policies must be rejected");
     }
 
     #[test]

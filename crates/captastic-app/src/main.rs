@@ -20,6 +20,8 @@ use captastic_core::{
     EventRecorder, PerfEventKind,
 };
 use clap::Parser;
+#[cfg(windows)]
+use cli::PreviewArg;
 use cli::{BenchmarkArgs, Cli, Command, ConfigCommand, ModeArg, StartupCommand};
 use error::AppError;
 use serde_json::json;
@@ -229,10 +231,23 @@ fn stop() -> Result<(), AppError> {
 }
 
 fn capture(args: cli::CaptureArgs) -> Result<(), AppError> {
+    capture_with_preview_fallback(args, None)
+}
+
+fn capture_with_preview_fallback(
+    args: cli::CaptureArgs,
+    preview_fallback_reason: Option<String>,
+) -> Result<(), AppError> {
+    #[cfg(not(windows))]
+    let _ = preview_fallback_reason;
     if (args.selection || args.clipboard) && !args.cpu_frame {
         return Err(AppError::InvalidArgument(
             "selection and clipboard output require --cpu-frame true".to_owned(),
         ));
+    }
+    #[cfg(windows)]
+    if args.selection && args.selection_preview != PreviewArg::Frozen {
+        return capture_with_live_selection(args);
     }
     let display_policy = resolve_display_policy(&args.display)?;
     let mut backend = create_backend(&args.backend, &display_policy)?;
@@ -351,9 +366,23 @@ fn capture(args: cli::CaptureArgs) -> Result<(), AppError> {
                 },
                 "rect": selection.rect,
                 "selection_ns": selection.selection_ns,
+                "requested_preview_mode": if preview_fallback_reason.is_some() {
+                    "auto"
+                } else {
+                    match args.selection_preview {
+                        PreviewArg::Auto => "auto",
+                        PreviewArg::Live => "live",
+                        PreviewArg::Frozen => "frozen",
+                    }
+                },
+                "preview_mode": "frozen",
+                "preview_fallback_reason": preview_fallback_reason.as_deref(),
+                "capture_anchor": if preview_fallback_reason.is_some() { "fallback" } else { "trigger" },
                 "overlay_preparation_ns": selection.preparation_ns,
                 "window_overview_ns": selection.window_overview_ns,
                 "window_preview_count": selection.window_preview_count,
+                "window_live_preview_count": selection.window_live_preview_count,
+                "window_frozen_preview_count": selection.window_frozen_preview_count,
                 "window_preview_bytes": selection.window_preview_bytes,
                 "materialization": materialization,
                 "materialization_ns": materialization_ns,
@@ -424,6 +453,206 @@ fn capture(args: cli::CaptureArgs) -> Result<(), AppError> {
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         log::info!("capture {} complete: {}", request.id.0, value);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn capture_with_live_selection(mut args: cli::CaptureArgs) -> Result<(), AppError> {
+    let display_policy = resolve_display_policy(&args.display)?;
+    let mut backend = create_backend(&args.backend, &display_policy)?;
+    let source = resolve_capture_source(&display_policy, backend.displays())?;
+    let capture_id = CaptureId(1);
+    let triggered_at = Instant::now();
+    let mode = capture_mode(args.mode);
+    let metadata = daemon::preview_metadata(capture_id, &source, backend.displays(), mode.clone())?;
+    let mut recorder = EventRecorder::with_capacity(16);
+    recorder.record(capture_id, PerfEventKind::HotkeyReceived, 0);
+    recorder.record(capture_id, PerfEventKind::TriggerEnqueued, 0);
+    recorder.record(capture_id, PerfEventKind::TriggerDequeued, 0);
+
+    let ui_store = captastic_config::UiStateStore::for_default_config();
+    let remembered_ui = load_optional_one_shot_ui_state(&ui_store, &metadata.display_id.0);
+    let ui_worker = selection::OneShotUiStateWorker::start(ui_store)?;
+    let selection_result = captastic_windows::select_from_preview_source_with_initial_tool_and_ui(
+        captastic_windows::SelectionPreviewSource::live(&metadata),
+        ui_worker.controller(),
+        captastic_windows::InitialSelectionTool::Remembered,
+        Some(remembered_ui),
+    );
+    ui_worker.finish()?;
+    let selection = match selection_result {
+        Ok(selection) => selection,
+        Err(error) if args.selection_preview == PreviewArg::Auto => {
+            crate::logging::warn(format_args!(
+                "one-shot live presenter failed; retrying with a frozen preview: {error}"
+            ));
+            let reason = error.to_string();
+            args.selection_preview = PreviewArg::Frozen;
+            return capture_with_preview_fallback(args, Some(reason));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    recorder.record(capture_id, PerfEventKind::SelectionStarted, 0);
+    let Some(selection) = selection else {
+        recorder.record(capture_id, PerfEventKind::AttemptFinished, 0);
+        captastic_core::validate_event_order(recorder.events())?;
+        let value = json!({
+            "schema_version": 1,
+            "event": "selection_cancelled",
+            "capture_id": capture_id,
+        });
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        } else {
+            log::info!("selection {} cancelled", capture_id.0);
+        }
+        return Ok(());
+    };
+    recorder.record(
+        capture_id,
+        PerfEventKind::SelectionConfirmed,
+        selection.selection_ns,
+    );
+
+    let (full_frame, native_frame) = if selection.kind == captastic_windows::SelectionKind::Window {
+        let frame = captastic_windows::captured_window_frame(&selection).ok_or_else(|| {
+            AppError::BackendUnavailable(
+                "confirmed window selection did not retain its native frame".to_owned(),
+            )
+        })?;
+        let ready_offset_ns = duration_ns(triggered_at.elapsed());
+        recorder.record(capture_id, PerfEventKind::CaptureRequested, ready_offset_ns);
+        recorder.record(capture_id, PerfEventKind::NativeFrameReady, ready_offset_ns);
+        recorder.record(capture_id, PerfEventKind::CpuFrameReady, ready_offset_ns);
+        (frame, None)
+    } else {
+        if let Err(error) = captastic_windows::flush_desktop_composition() {
+            log::warn!(
+                "one-shot selection could not synchronize overlay removal before capture: {error}"
+            );
+        }
+        let request = CaptureRequest {
+            id: capture_id,
+            triggered_at: Instant::now(),
+            source,
+            mode,
+            cpu_frame: true,
+            retain_native_frame: selection.kind == captastic_windows::SelectionKind::Region,
+            cursor: CursorMode::Exclude,
+        };
+        let outcome = backend.capture(&request, &mut recorder)?;
+        let frame = outcome.frame.ok_or_else(|| {
+            AppError::BackendUnavailable("confirmation capture returned no CPU frame".to_owned())
+        })?;
+        (frame, outcome.native_frame)
+    };
+
+    let materialize_started = Instant::now();
+    let mut materialization = match selection.kind {
+        captastic_windows::SelectionKind::Display => "confirmation_display",
+        captastic_windows::SelectionKind::Region => "confirmation_desktop_crop",
+        captastic_windows::SelectionKind::Window => "native_window_render",
+    };
+    let mut gpu_materialization = None;
+    let mut gpu_fallback_error = None;
+    let gpu_result = if selection.kind == captastic_windows::SelectionKind::Region {
+        native_frame.as_deref().map(|native_frame| {
+            captastic_windows::materialize_native_region(native_frame, selection.rect)
+        })
+    } else {
+        None
+    };
+    let selected_frame = match gpu_result.transpose() {
+        Ok(Some(Some(result))) => {
+            materialization = "dxgi_gpu_region";
+            gpu_materialization = Some(json!({
+                "gpu_copy_submit_ns": result.gpu_copy_submit_ns,
+                "map_wait_ns": result.map_wait_ns,
+                "cpu_copy_ns": result.cpu_copy_ns,
+                "total_ns": result.total_ns,
+                "bytes_read": result.bytes_read,
+                "full_frame_bytes": result.full_frame_bytes,
+                "bytes_avoided": result.bytes_avoided,
+                "contiguous_rows": result.contiguous_rows,
+            }));
+            result.frame
+        }
+        Ok(Some(None)) | Ok(None) => {
+            captastic_windows::materialize_selection(&full_frame, &selection)?
+        }
+        Err(error) => {
+            crate::logging::warn(format_args!(
+                "capture {} GPU region materialization failed; using CPU crop: {error}",
+                capture_id.0
+            ));
+            gpu_fallback_error = Some(error.to_string());
+            captastic_windows::materialize_selection(&full_frame, &selection)?
+        }
+    };
+    let materialization_ns = duration_ns(materialize_started.elapsed());
+    recorder.record(capture_id, PerfEventKind::CropFinished, materialization_ns);
+    let selection_value = json!({
+        "kind": match selection.kind {
+            captastic_windows::SelectionKind::Display => "display",
+            captastic_windows::SelectionKind::Region => "region",
+            captastic_windows::SelectionKind::Window => "window",
+        },
+        "rect": selection.rect,
+        "selection_ns": selection.selection_ns,
+        "requested_preview_mode": match args.selection_preview {
+            PreviewArg::Auto => "auto",
+            PreviewArg::Live => "live",
+            PreviewArg::Frozen => "frozen",
+        },
+        "preview_mode": "live",
+        "capture_anchor": "confirmation",
+        "overlay_preparation_ns": selection.preparation_ns,
+        "window_overview_ns": selection.window_overview_ns,
+        "window_preview_count": selection.window_preview_count,
+        "window_live_preview_count": selection.window_live_preview_count,
+        "window_frozen_preview_count": selection.window_frozen_preview_count,
+        "window_preview_bytes": selection.window_preview_bytes,
+        "materialization": materialization,
+        "materialization_ns": materialization_ns,
+        "gpu_materialization": gpu_materialization,
+        "gpu_fallback_error": gpu_fallback_error,
+    });
+
+    let mut clipboard_value = None;
+    if args.clipboard {
+        recorder.record(capture_id, PerfEventKind::ClipboardStarted, 0);
+        let report = captastic_windows::ClipboardPublisher::new()?.publish(&selected_frame)?;
+        recorder.record(
+            capture_id,
+            PerfEventKind::ClipboardCommitted,
+            report.publish_ns,
+        );
+        clipboard_value = Some(json!({
+            "payload_bytes": report.payload_bytes,
+            "png_payload_bytes": report.png_payload_bytes,
+            "png_encode_ns": report.png_encode_ns,
+            "allocation_copy_ns": report.allocation_copy_ns,
+            "open_wait_ns": report.open_wait_ns,
+            "open_retries": report.open_retries,
+            "publish_ns": report.publish_ns,
+        }));
+    }
+    recorder.record(capture_id, PerfEventKind::AttemptFinished, 0);
+    captastic_core::validate_event_order(recorder.events())?;
+    let value = json!({
+        "schema_version": 1,
+        "synthetic": backend.name() == "fake",
+        "metadata": selected_frame.metadata,
+        "cpu_frame_bytes": selected_frame.required_bytes(),
+        "native_frame_retained": native_frame.is_some(),
+        "selection": selection_value,
+        "clipboard": clipboard_value,
+    });
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        log::info!("capture {} complete: {}", capture_id.0, value);
     }
     Ok(())
 }

@@ -37,15 +37,13 @@ fn join_capture_worker(join: thread::JoinHandle<()>) {
 
 #[cfg(windows)]
 use captastic_config::{
-    AppConfig, ConfirmedRegion, HotkeyAction, HotkeyBinding, HotkeyChord, UiConfig,
+    AppConfig, ConfirmedRegion, HotkeyAction, HotkeyBinding, HotkeyChord, PreviewMode, UiConfig,
 };
-#[cfg(all(windows, test))]
-use captastic_core::DisplayId;
 #[cfg(windows)]
 use captastic_core::{
     validate_event_order, CaptureBackend, CaptureError, CaptureErrorKind, CaptureId, CaptureMode,
-    CaptureRequest, CpuFrame, CursorMode, EventRecorder, FrameMetadata, NativeFrame, PerfEventKind,
-    Rect,
+    CaptureRequest, CaptureSource, CpuFrame, CursorMode, DisplayId, DisplayInfo, EventRecorder,
+    FrameMetadata, NativeFrame, PerfEventKind, Rect, TimingProvenance,
 };
 #[cfg(windows)]
 use serde_json::json;
@@ -68,6 +66,7 @@ struct ResolvedDaemonArgs {
     cpu_frame: bool,
     clipboard: bool,
     selection: bool,
+    selection_preview: PreviewMode,
     trigger_queue_capacity: usize,
     hotkey_bindings: Vec<HotkeyBinding>,
     confirmed_regions: BTreeMap<String, ConfirmedRegion>,
@@ -148,6 +147,7 @@ fn resolve_daemon_args_with_default(
         cpu_frame: args.cpu_frame.unwrap_or(config.capture.cpu_frame),
         clipboard: args.clipboard.unwrap_or(config.clipboard.enabled),
         selection: args.selection.unwrap_or(config.selection.enabled),
+        selection_preview: config.selection.preview,
         trigger_queue_capacity: config.daemon.trigger_queue_capacity,
         clipboard_queue_capacity: config.clipboard.queue_capacity,
         hotkey_bindings,
@@ -207,6 +207,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         .clipboard
         .then(|| crate::clipboard::ClipboardWorker::start(args.json, args.clipboard_queue_capacity))
         .transpose()?;
+    let (command_sender, command_receiver) = mpsc::sync_channel(args.trigger_queue_capacity);
     let confirmed_regions = Arc::new(Mutex::new(args.confirmed_regions.clone()));
     let mut selection_worker = args
         .selection
@@ -216,6 +217,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                     .as_ref()
                     .expect("selection requires clipboard")
                     .submitter(),
+                command_sender.clone(),
                 args.json,
                 args.selection_queue_capacity,
                 confirmed_regions.clone(),
@@ -229,7 +231,6 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let clipboard_sender = clipboard_worker
         .as_ref()
         .map(crate::clipboard::ClipboardWorker::submitter);
-    let (command_sender, command_receiver) = mpsc::sync_channel(args.trigger_queue_capacity);
     let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
     let (done_sender, done_receiver) = mpsc::sync_channel::<Result<(), AppError>>(1);
     let capture_stop_requested = Arc::new(AtomicBool::new(false));
@@ -239,6 +240,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let mode = args.mode.clone();
     let cpu_frame = args.cpu_frame;
     let selection_enabled = args.selection;
+    let selection_preview = args.selection_preview;
     let max_captures = args.max_captures;
     let json_output = args.json;
     let capture_confirmed_regions = confirmed_regions.clone();
@@ -323,6 +325,69 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                             ));
                             continue;
                         }
+                        if selection_enabled
+                            && selection_preview != PreviewMode::Frozen
+                            && matches!(action_route(trigger.action), ActionRoute::Overlay(_))
+                        {
+                            let active_backend = backend
+                                .as_ref()
+                                .expect("backend availability was checked above");
+                            let source = match super::resolve_capture_source(
+                                &display_policy,
+                                active_backend.displays(),
+                            ) {
+                                Ok(source) => source,
+                                Err(error) => {
+                                    crate::logging::error(format_args!(
+                                        "live selection {} could not resolve its display: {error}",
+                                        capture_id.0
+                                    ));
+                                    continue;
+                                }
+                            };
+                            let metadata = match preview_metadata(
+                                capture_id,
+                                &source,
+                                active_backend.displays(),
+                                mode.clone(),
+                            ) {
+                                Ok(metadata) => metadata,
+                                Err(error) => {
+                                    crate::logging::error(format_args!(
+                                        "live selection {} could not describe its display: {error}",
+                                        capture_id.0
+                                    ));
+                                    continue;
+                                }
+                            };
+                            let Some(sender) = selection_sender.as_ref() else {
+                                crate::logging::error(format_args!(
+                                    "live selection {} has no selection worker",
+                                    capture_id.0
+                                ));
+                                continue;
+                            };
+                            let recorder = trigger_recorder(capture_id, &trigger);
+                            if let Err(error) = dispatch_live_selection(
+                                sender,
+                                capture_id,
+                                &trigger,
+                                action_route(trigger.action),
+                                metadata,
+                                &cached_ui,
+                                selection_preview,
+                                recorder,
+                            ) {
+                                let _ = done_sender.send(Err(error));
+                                break;
+                            }
+                            log::info!(
+                                "capture {} action={} output=live_selection_queued",
+                                capture_id.0,
+                                trigger.action
+                            );
+                            continue;
+                        }
                         let (
                             capture_result,
                             mut recorder,
@@ -404,6 +469,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                     &outcome.metadata,
                                     &capture_confirmed_regions,
                                     &cached_ui,
+                                    selection_preview,
                                     json_output,
                                     outcome.metadata.cpu_ready_offset_ns,
                                     outcome.frame,
@@ -460,6 +526,207 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                     backend.take();
                                     recovery = Some(BackendRecovery::immediate());
                                 }
+                            }
+                        }
+                        if max_captures.is_some_and(|maximum| attempts >= maximum) {
+                            let _ = done_sender.send(Ok(()));
+                            break;
+                        }
+                    }
+                    CaptureCommand::LiveSelection(mut request) => {
+                        let capture_id = request.job.capture_id;
+                        let capture_source = if request.job.metadata.display_id
+                            == DisplayId::virtual_desktop()
+                        {
+                            CaptureSource::VirtualDesktop
+                        } else {
+                            CaptureSource::Display(request.job.metadata.display_id.clone())
+                        };
+                        if backend.is_none() {
+                            request.job.terminal_error = Some(
+                                "capture engine is recovering after live selection confirmation"
+                                    .to_owned(),
+                            );
+                            request.job.confirmed_selection = Some(request.selection);
+                            let _ = crate::selection::try_submit(
+                                selection_sender
+                                    .as_ref()
+                                    .expect("live selection requires its worker"),
+                                request.job,
+                            );
+                            continue;
+                        }
+                        let capture_request = CaptureRequest {
+                            id: capture_id,
+                            triggered_at: request.confirmed_at,
+                            source: capture_source,
+                            mode: mode.clone(),
+                            cpu_frame: true,
+                            retain_native_frame: request.selection.kind
+                                == captastic_windows::SelectionKind::Region,
+                            cursor: CursorMode::Exclude,
+                        };
+                        let (capture_result, (), recovery_attempts, reinitialize_error) =
+                            capture_with_backend_recovery(
+                                &mut backend,
+                                |active_backend| {
+                                    let result = active_backend
+                                        .capture(&capture_request, &mut request.job.recorder);
+                                    (result, ())
+                                },
+                                || super::create_backend(&backend_name, &display_policy),
+                                thread::sleep,
+                                |attempt, delay, error| {
+                                    crate::logging::warn(format_args!(
+                                        "confirmation capture {} lost the engine; retrying {}/{} in {:.0} ms: {error}",
+                                        capture_id.0,
+                                        attempt,
+                                        CAPTURE_RECOVERY_RETRIES,
+                                        delay.as_secs_f64() * 1_000.0
+                                    ));
+                                },
+                            );
+                        if let Some(reinitialize_error) = reinitialize_error {
+                            recovery = Some(BackendRecovery {
+                                failed_attempts: recovery_attempts,
+                                next_attempt: Instant::now() + recovery_delay(recovery_attempts),
+                            });
+                            crate::logging::warn(format_args!(
+                                "capture engine reinitialization failed during confirmation capture {}: {reinitialize_error}",
+                                capture_id.0
+                            ));
+                        }
+                        match capture_result {
+                            Ok(outcome) => {
+                                request.job.cpu_ready_offset_ns = Some(duration_ns(
+                                    request.job.triggered_at,
+                                    Instant::now(),
+                                ));
+                                request.job.metadata = outcome.metadata;
+                                request.job.frame = outcome.frame;
+                                request.job.native_frame = outcome.native_frame;
+                                request.job.confirmed_selection = Some(request.selection);
+                            }
+                            Err(error) => {
+                                if requires_backend_recovery(&error) && recovery.is_none() {
+                                    backend.take();
+                                    recovery = Some(BackendRecovery::immediate());
+                                }
+                                request.job.terminal_error = Some(error.to_string());
+                                request.job.confirmed_selection = Some(request.selection);
+                            }
+                        }
+                        let sender = selection_sender
+                            .as_ref()
+                            .expect("live selection requires its worker");
+                        match crate::selection::try_submit(sender, request.job) {
+                            Ok(()) => {}
+                            Err(crate::selection::SubmitError::Full(job))
+                            | Err(crate::selection::SubmitError::Disconnected(job)) => {
+                                let _ = crate::selection::finish_rejected(*job);
+                                crate::logging::warn(format_args!(
+                                    "selection {} could not resume after confirmation capture",
+                                    capture_id.0
+                                ));
+                            }
+                        }
+                        if max_captures.is_some_and(|maximum| attempts >= maximum) {
+                            let _ = done_sender.send(Ok(()));
+                            break;
+                        }
+                    }
+                    CaptureCommand::FrozenSelectionFallback(mut request) => {
+                        let capture_id = request.job.capture_id;
+                        let capture_source = if request.job.metadata.display_id
+                            == DisplayId::virtual_desktop()
+                        {
+                            CaptureSource::VirtualDesktop
+                        } else {
+                            CaptureSource::Display(request.job.metadata.display_id.clone())
+                        };
+                        if backend.is_none() {
+                            request.job.terminal_error = Some(
+                                "capture engine is recovering during automatic preview fallback"
+                                    .to_owned(),
+                            );
+                            let _ = crate::selection::try_submit(
+                                selection_sender
+                                    .as_ref()
+                                    .expect("preview fallback requires its selection worker"),
+                                request.job,
+                            );
+                            continue;
+                        }
+                        let capture_request = CaptureRequest {
+                            id: capture_id,
+                            triggered_at: request.requested_at,
+                            source: capture_source,
+                            mode: mode.clone(),
+                            cpu_frame: true,
+                            retain_native_frame: true,
+                            cursor: CursorMode::Exclude,
+                        };
+                        let (capture_result, (), recovery_attempts, reinitialize_error) =
+                            capture_with_backend_recovery(
+                                &mut backend,
+                                |active_backend| {
+                                    let result = active_backend
+                                        .capture(&capture_request, &mut request.job.recorder);
+                                    (result, ())
+                                },
+                                || super::create_backend(&backend_name, &display_policy),
+                                thread::sleep,
+                                |attempt, delay, error| {
+                                    crate::logging::warn(format_args!(
+                                        "preview fallback capture {} lost the engine; retrying {}/{} in {:.0} ms: {error}",
+                                        capture_id.0,
+                                        attempt,
+                                        CAPTURE_RECOVERY_RETRIES,
+                                        delay.as_secs_f64() * 1_000.0
+                                    ));
+                                },
+                            );
+                        if let Some(reinitialize_error) = reinitialize_error {
+                            recovery = Some(BackendRecovery {
+                                failed_attempts: recovery_attempts,
+                                next_attempt: Instant::now() + recovery_delay(recovery_attempts),
+                            });
+                            crate::logging::warn(format_args!(
+                                "capture engine reinitialization failed during preview fallback {}: {reinitialize_error}",
+                                capture_id.0
+                            ));
+                        }
+                        match capture_result {
+                            Ok(outcome) => {
+                                request.job.cpu_ready_offset_ns = Some(duration_ns(
+                                    request.job.triggered_at,
+                                    Instant::now(),
+                                ));
+                                request.job.metadata = outcome.metadata;
+                                request.job.frame = outcome.frame;
+                                request.job.native_frame = outcome.native_frame;
+                                request.job.confirmation_anchored = false;
+                            }
+                            Err(error) => {
+                                if requires_backend_recovery(&error) && recovery.is_none() {
+                                    backend.take();
+                                    recovery = Some(BackendRecovery::immediate());
+                                }
+                                request.job.terminal_error = Some(error.to_string());
+                            }
+                        }
+                        let sender = selection_sender
+                            .as_ref()
+                            .expect("preview fallback requires its selection worker");
+                        match crate::selection::try_submit(sender, request.job) {
+                            Ok(()) => {}
+                            Err(crate::selection::SubmitError::Full(job))
+                            | Err(crate::selection::SubmitError::Disconnected(job)) => {
+                                let _ = crate::selection::finish_rejected(*job);
+                                crate::logging::warn(format_args!(
+                                    "selection {} could not resume with its frozen preview fallback",
+                                    capture_id.0
+                                ));
                             }
                         }
                         if max_captures.is_some_and(|maximum| attempts >= maximum) {
@@ -1007,6 +1274,145 @@ fn action_route(action: HotkeyAction) -> ActionRoute {
 }
 
 #[cfg(windows)]
+pub(crate) fn preview_metadata(
+    capture_id: CaptureId,
+    source: &CaptureSource,
+    displays: &[DisplayInfo],
+    mode: CaptureMode,
+) -> Result<FrameMetadata, AppError> {
+    let (display_id, source_rect, rotation_degrees) = match source {
+        CaptureSource::Display(requested) => {
+            let display = if requested.is_primary_alias() {
+                displays
+                    .iter()
+                    .find(|display| display.is_primary)
+                    .or_else(|| displays.first())
+            } else {
+                displays.iter().find(|display| display.id == *requested)
+            }
+            .ok_or_else(|| {
+                AppError::BackendUnavailable(format!(
+                    "display {} disappeared before live selection",
+                    requested.0
+                ))
+            })?;
+            (display.id.clone(), display.bounds, display.rotation_degrees)
+        }
+        CaptureSource::VirtualDesktop => {
+            let first = displays.first().ok_or_else(|| {
+                AppError::BackendUnavailable(
+                    "no attached displays are available for live selection".to_owned(),
+                )
+            })?;
+            let mut left = i64::from(first.bounds.x);
+            let mut top = i64::from(first.bounds.y);
+            let mut right = first.bounds.right();
+            let mut bottom = first.bounds.bottom();
+            for display in &displays[1..] {
+                left = left.min(i64::from(display.bounds.x));
+                top = top.min(i64::from(display.bounds.y));
+                right = right.max(display.bounds.right());
+                bottom = bottom.max(display.bounds.bottom());
+            }
+            let source_rect = Rect {
+                x: i32::try_from(left).map_err(|_| {
+                    AppError::BackendUnavailable("virtual desktop x origin overflowed".to_owned())
+                })?,
+                y: i32::try_from(top).map_err(|_| {
+                    AppError::BackendUnavailable("virtual desktop y origin overflowed".to_owned())
+                })?,
+                width: u32::try_from(right.saturating_sub(left)).map_err(|_| {
+                    AppError::BackendUnavailable("virtual desktop width overflowed".to_owned())
+                })?,
+                height: u32::try_from(bottom.saturating_sub(top)).map_err(|_| {
+                    AppError::BackendUnavailable("virtual desktop height overflowed".to_owned())
+                })?,
+            };
+            (DisplayId::virtual_desktop(), source_rect, 0)
+        }
+    };
+
+    Ok(FrameMetadata {
+        capture_id,
+        backend: "selection-preview".to_owned(),
+        display_id,
+        source_rect,
+        rotation_degrees,
+        capture_mode: mode,
+        presentation_offset_ns: None,
+        timing_provenance: TimingProvenance::Unavailable,
+        native_ready_offset_ns: 0,
+        cpu_ready_offset_ns: None,
+        frame_age_ns: None,
+        frame_generation: None,
+        copy_count: 0,
+        pool_slot: None,
+    })
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn dispatch_live_selection(
+    sender: &mpsc::SyncSender<crate::selection::SelectionJob>,
+    capture_id: CaptureId,
+    trigger: &TriggerEvent,
+    route: ActionRoute,
+    metadata: FrameMetadata,
+    cached_ui: &UiConfig,
+    preview_mode: PreviewMode,
+    recorder: EventRecorder,
+) -> Result<&'static str, AppError> {
+    let ActionRoute::Overlay(initial_tool) = route else {
+        return Err(AppError::InvalidArgument(
+            "live selection requires an overlay action".to_owned(),
+        ));
+    };
+    let remembered_ui = Some(captastic_config::resolve_display_ui_state(
+        cached_ui,
+        &metadata.display_id.0,
+    ));
+    let job = crate::selection::SelectionJob {
+        capture_id,
+        triggered_at: trigger.received_at,
+        action: trigger.action,
+        chord: trigger.chord,
+        initial_tool,
+        cpu_ready_offset_ns: None,
+        remembered_ui,
+        source: trigger.source,
+        metadata,
+        frame: None,
+        native_frame: None,
+        recorder,
+        confirmed_selection: None,
+        terminal_error: None,
+        selection_offset_ns: None,
+        confirmation_anchored: true,
+        preview_mode,
+        preview_fallback_reason: None,
+    };
+    match crate::selection::try_submit(sender, job) {
+        Ok(()) => Ok("live_selection_queued"),
+        Err(crate::selection::SubmitError::Full(job)) => {
+            let capture_id = crate::selection::finish_rejected(*job)?;
+            crate::logging::warn(format_args!(
+                "live selection {} skipped because the selection queue is full",
+                capture_id.0
+            ));
+            Ok("selection_queue_full")
+        }
+        Err(crate::selection::SubmitError::Disconnected(job)) => {
+            let capture_id = crate::selection::finish_rejected(*job)?;
+            crate::logging::warn(format_args!(
+                "live selection {} skipped because the selection worker stopped",
+                capture_id.0
+            ));
+            Ok("selection_worker_disconnected")
+        }
+    }
+}
+
+#[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 fn dispatch_output(
     selection_sender: Option<&mpsc::SyncSender<crate::selection::SelectionJob>>,
@@ -1019,6 +1425,7 @@ fn dispatch_output(
     metadata: &FrameMetadata,
     confirmed_regions: &crate::selection::ConfirmedRegionCache,
     cached_ui: &UiConfig,
+    preview_mode: PreviewMode,
     json_output: bool,
     cpu_ready_offset_ns: Option<u64>,
     frame: Option<CpuFrame>,
@@ -1044,6 +1451,7 @@ fn dispatch_output(
                 frame,
                 native_frame,
                 recorder,
+                preview_mode,
             );
         }
         if action != HotkeyAction::LastWorkflow {
@@ -1119,6 +1527,7 @@ fn dispatch_output(
                     frame,
                     native_frame,
                     recorder,
+                    PreviewMode::Frozen,
                 );
             }
         }
@@ -1152,6 +1561,7 @@ fn dispatch_selection(
     frame: Option<CpuFrame>,
     native_frame: Option<Arc<dyn NativeFrame>>,
     recorder: EventRecorder,
+    preview_mode: PreviewMode,
 ) -> Result<&'static str, AppError> {
     let frame = frame.ok_or_else(|| {
         AppError::BackendUnavailable(
@@ -1170,11 +1580,18 @@ fn dispatch_selection(
         chord,
         initial_tool,
         remembered_ui,
-        cpu_ready_offset_ns,
+        cpu_ready_offset_ns: Some(cpu_ready_offset_ns),
         source,
-        frame,
+        metadata: frame.metadata.clone(),
+        frame: Some(frame),
         native_frame,
         recorder,
+        confirmed_selection: None,
+        terminal_error: None,
+        selection_offset_ns: None,
+        confirmation_anchored: false,
+        preview_mode,
+        preview_fallback_reason: None,
     };
     match crate::selection::try_submit(sender, job) {
         Ok(()) => Ok("selection_queued"),
@@ -1395,15 +1812,16 @@ pub fn run(_args: DaemonArgs) -> Result<(), AppError> {
 }
 
 #[cfg(windows)]
-#[derive(Debug)]
-enum CaptureCommand {
+pub(crate) enum CaptureCommand {
     Trigger(TriggerEvent),
+    LiveSelection(Box<crate::selection::LiveSelectionRequest>),
+    FrozenSelectionFallback(Box<crate::selection::FrozenSelectionFallbackRequest>),
     Shutdown,
 }
 
 #[cfg(windows)]
 #[derive(Debug)]
-struct TriggerEvent {
+pub(crate) struct TriggerEvent {
     received_at: Instant,
     enqueued_at: Instant,
     source: &'static str,
@@ -1457,6 +1875,72 @@ mod tests {
     }
 
     static NEXT_TEMP_CONFIG: AtomicU64 = AtomicU64::new(0);
+
+    fn preview_display(id: &str, bounds: Rect, primary: bool) -> DisplayInfo {
+        DisplayInfo {
+            id: DisplayId(id.to_owned()),
+            name: id.to_owned(),
+            bounds,
+            scale_factor: 1.0,
+            rotation_degrees: 0,
+            is_primary: primary,
+        }
+    }
+
+    #[test]
+    fn live_preview_metadata_preserves_display_identity_and_virtual_bounds() {
+        let displays = [
+            preview_display(
+                "left",
+                Rect {
+                    x: -1280,
+                    y: 0,
+                    width: 1280,
+                    height: 1024,
+                },
+                false,
+            ),
+            preview_display(
+                "primary-id",
+                Rect {
+                    x: 0,
+                    y: -200,
+                    width: 1920,
+                    height: 1080,
+                },
+                true,
+            ),
+        ];
+        let mode = CaptureMode::Latest { max_age_ms: None };
+
+        let primary = preview_metadata(
+            CaptureId(1),
+            &CaptureSource::Display(DisplayId::primary()),
+            &displays,
+            mode.clone(),
+        )
+        .expect("primary preview metadata");
+        assert_eq!(primary.display_id.0, "primary-id");
+        assert_eq!(primary.source_rect, displays[1].bounds);
+
+        let desktop = preview_metadata(
+            CaptureId(2),
+            &CaptureSource::VirtualDesktop,
+            &displays,
+            mode,
+        )
+        .expect("virtual preview metadata");
+        assert_eq!(desktop.display_id, DisplayId::virtual_desktop());
+        assert_eq!(
+            desktop.source_rect,
+            Rect {
+                x: -1280,
+                y: -200,
+                width: 3200,
+                height: 1224,
+            }
+        );
+    }
 
     impl TempConfig {
         fn with_contents(contents: &str) -> Self {

@@ -28,25 +28,50 @@ pub enum PerfEventKind {
 }
 
 impl PerfEventKind {
-    fn rank(self) -> u8 {
+    fn rank(self, order: CaptureOrder) -> u8 {
+        match (order, self) {
+            (CaptureOrder::SelectionFirst, Self::HotkeyReceived) => 0,
+            (CaptureOrder::SelectionFirst, Self::TriggerEnqueued) => 1,
+            (CaptureOrder::SelectionFirst, Self::TriggerDequeued) => 2,
+            (CaptureOrder::SelectionFirst, Self::SelectionStarted) => 3,
+            (CaptureOrder::SelectionFirst, Self::SelectionConfirmed) => 4,
+            (CaptureOrder::SelectionFirst, Self::CaptureRequested) => 5,
+            (CaptureOrder::SelectionFirst, Self::NativeFrameReady) => 6,
+            (CaptureOrder::SelectionFirst, Self::ReadbackStarted) => 7,
+            (CaptureOrder::SelectionFirst, Self::CpuFrameReady) => 8,
+            (CaptureOrder::SelectionFirst, Self::CropFinished) => 9,
+            (CaptureOrder::SelectionFirst, Self::ClipboardStarted) => 10,
+            (CaptureOrder::SelectionFirst, Self::ClipboardCommitted) => 11,
+            (CaptureOrder::SelectionFirst, Self::EncodeStarted) => 12,
+            (CaptureOrder::SelectionFirst, Self::EncodeFinished) => 13,
+            (CaptureOrder::SelectionFirst, Self::FileWriteStarted) => 14,
+            (CaptureOrder::SelectionFirst, Self::FileWriteFinished) => 15,
+            (CaptureOrder::SelectionFirst, Self::AttemptFinished) => 16,
+            (CaptureOrder::CaptureFirst, Self::HotkeyReceived) => 0,
+            (CaptureOrder::CaptureFirst, Self::TriggerEnqueued) => 1,
+            (CaptureOrder::CaptureFirst, Self::TriggerDequeued) => 2,
+            (CaptureOrder::CaptureFirst, Self::CaptureRequested) => 3,
+            (CaptureOrder::CaptureFirst, Self::NativeFrameReady) => 4,
+            (CaptureOrder::CaptureFirst, Self::ReadbackStarted) => 5,
+            (CaptureOrder::CaptureFirst, Self::CpuFrameReady) => 6,
+            (CaptureOrder::CaptureFirst, Self::SelectionStarted) => 7,
+            (CaptureOrder::CaptureFirst, Self::SelectionConfirmed) => 8,
+            (CaptureOrder::CaptureFirst, Self::CropFinished) => 9,
+            (CaptureOrder::CaptureFirst, Self::ClipboardStarted) => 10,
+            (CaptureOrder::CaptureFirst, Self::ClipboardCommitted) => 11,
+            (CaptureOrder::CaptureFirst, Self::EncodeStarted) => 12,
+            (CaptureOrder::CaptureFirst, Self::EncodeFinished) => 13,
+            (CaptureOrder::CaptureFirst, Self::FileWriteStarted) => 14,
+            (CaptureOrder::CaptureFirst, Self::FileWriteFinished) => 15,
+            (CaptureOrder::CaptureFirst, Self::AttemptFinished) => 16,
+        }
+    }
+
+    fn establishes_order(self) -> Option<CaptureOrder> {
         match self {
-            Self::HotkeyReceived => 0,
-            Self::TriggerEnqueued => 1,
-            Self::TriggerDequeued => 2,
-            Self::CaptureRequested => 3,
-            Self::NativeFrameReady => 4,
-            Self::ReadbackStarted => 5,
-            Self::CpuFrameReady => 6,
-            Self::SelectionStarted => 7,
-            Self::SelectionConfirmed => 8,
-            Self::CropFinished => 9,
-            Self::ClipboardStarted => 10,
-            Self::ClipboardCommitted => 11,
-            Self::EncodeStarted => 12,
-            Self::EncodeFinished => 13,
-            Self::FileWriteStarted => 14,
-            Self::FileWriteFinished => 15,
-            Self::AttemptFinished => 16,
+            Self::CaptureRequested => Some(CaptureOrder::CaptureFirst),
+            Self::SelectionStarted => Some(CaptureOrder::SelectionFirst),
+            _ => None,
         }
     }
 
@@ -83,6 +108,12 @@ impl PerfEventKind {
             Self::AttemptFinished => "attempt_finished",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaptureOrder {
+    CaptureFirst,
+    SelectionFirst,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -174,16 +205,21 @@ impl LatencySummary {
 }
 
 pub fn validate_event_order(events: &[PerfEvent]) -> Result<(), MetricsError> {
-    let mut state: HashMap<CaptureId, (u8, bool)> = HashMap::new();
+    let mut state: HashMap<CaptureId, (u8, bool, Option<CaptureOrder>)> = HashMap::new();
     for event in events {
-        let entry = state.entry(event.capture_id).or_insert((0, false));
+        let entry = state.entry(event.capture_id).or_insert((0, false, None));
         if event.kind.is_output() && !entry.1 {
             return Err(MetricsError::OutputBeforeCpuFrame {
                 capture_id: event.capture_id.0,
                 current: event.kind.label(),
             });
         }
-        let rank = event.kind.rank();
+        if entry.2.is_none() {
+            entry.2 = event.kind.establishes_order();
+        }
+        let rank = event
+            .kind
+            .rank(entry.2.unwrap_or(CaptureOrder::CaptureFirst));
         if rank < entry.0 {
             return Err(MetricsError::EventOrderRegression {
                 capture_id: event.capture_id.0,
@@ -258,5 +294,41 @@ mod tests {
             event(7, PerfEventKind::AttemptFinished, 6),
         ];
         assert_eq!(validate_event_order(&events), Ok(()));
+    }
+
+    #[test]
+    fn accepts_confirmation_anchored_capture_after_live_selection() {
+        let events = [
+            event(7, PerfEventKind::HotkeyReceived, 0),
+            event(7, PerfEventKind::TriggerEnqueued, 1),
+            event(7, PerfEventKind::TriggerDequeued, 2),
+            event(7, PerfEventKind::SelectionStarted, 3),
+            event(7, PerfEventKind::SelectionConfirmed, 4),
+            event(7, PerfEventKind::CaptureRequested, 5),
+            event(7, PerfEventKind::NativeFrameReady, 6),
+            event(7, PerfEventKind::ReadbackStarted, 7),
+            event(7, PerfEventKind::CpuFrameReady, 8),
+            event(7, PerfEventKind::CropFinished, 9),
+            event(7, PerfEventKind::ClipboardStarted, 10),
+            event(7, PerfEventKind::ClipboardCommitted, 11),
+            event(7, PerfEventKind::AttemptFinished, 12),
+        ];
+
+        assert_eq!(validate_event_order(&events), Ok(()));
+    }
+
+    #[test]
+    fn rejects_returning_to_selection_after_live_capture_starts() {
+        let events = [
+            event(7, PerfEventKind::SelectionStarted, 0),
+            event(7, PerfEventKind::SelectionConfirmed, 1),
+            event(7, PerfEventKind::CaptureRequested, 2),
+            event(7, PerfEventKind::SelectionConfirmed, 3),
+        ];
+
+        assert!(matches!(
+            validate_event_order(&events),
+            Err(MetricsError::EventOrderRegression { .. })
+        ));
     }
 }
