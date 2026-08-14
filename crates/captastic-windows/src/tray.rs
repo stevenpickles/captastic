@@ -621,7 +621,8 @@ mod machine {
                     vec![TrayEffect::CreateShutdownBlockReason]
                 } else {
                     // Windows may query more than once per session end; the block reason is
-                    // created exactly once and stays owed until WM_ENDSESSION settles it.
+                    // created exactly once and stays owed until WM_ENDSESSION or window
+                    // destruction settles it.
                     Vec::new()
                 };
                 (effects, MessageDisposition::AllowSessionEnd)
@@ -640,7 +641,20 @@ mod machine {
                 model.session = SessionPhase::Idle;
                 (effects, Handled)
             }
-            TrayInput::Destroyed => (vec![TrayEffect::PostQuit], Handled),
+            TrayInput::Destroyed => {
+                let mut effects = Vec::new();
+                if model.session == SessionPhase::QueryReceived {
+                    // The window is dying outside the WM_ENDSESSION handshake (daemon stop, menu
+                    // Exit mid-handshake, panic recovery). Every destruction path dispatches
+                    // WM_DESTROY through this transition while the handle is still valid, so the
+                    // block reason that WM_ENDSESSION never got to release is settled here
+                    // instead of leaking with the window.
+                    effects.push(TrayEffect::DestroyShutdownBlockReason);
+                    model.session = SessionPhase::Idle;
+                }
+                effects.push(TrayEffect::PostQuit);
+                (effects, Handled)
+            }
         }
     }
 }
@@ -1668,6 +1682,36 @@ mod tests {
         // Only actual destruction ends the message loop; the daemon owns the WM_QUIT decision.
         let (effects, _) = transition(&mut model, TrayInput::Destroyed);
         assert_eq!(effects, vec![TrayEffect::PostQuit]);
+    }
+
+    #[test]
+    fn a_dying_window_settles_the_block_reason_it_still_owes() {
+        // Destroyed outside the handshake owes nothing.
+        let mut model = TrayModel::new(false);
+        let (effects, _) = transition(&mut model, TrayInput::Destroyed);
+        assert_eq!(effects, vec![TrayEffect::PostQuit]);
+
+        // Destroyed mid-handshake (daemon stop, menu Exit, panic recovery): the destroy that
+        // WM_ENDSESSION never got to perform runs before the quit, while the handle is valid.
+        let mut model = TrayModel::new(false);
+        let _ = transition(&mut model, TrayInput::QueryEndSession);
+        let (effects, _) = transition(&mut model, TrayInput::Destroyed);
+        assert_eq!(
+            effects,
+            vec![TrayEffect::DestroyShutdownBlockReason, TrayEffect::PostQuit]
+        );
+        assert_eq!(model.session, SessionPhase::Idle);
+    }
+
+    #[test]
+    fn a_settled_session_handshake_is_not_double_destroyed_at_teardown() {
+        for committed in [false, true] {
+            let mut model = TrayModel::new(false);
+            let _ = transition(&mut model, TrayInput::QueryEndSession);
+            let _ = transition(&mut model, TrayInput::EndSession { committed });
+            let (effects, _) = transition(&mut model, TrayInput::Destroyed);
+            assert_eq!(effects, vec![TrayEffect::PostQuit], "committed={committed}");
+        }
     }
 
     #[test]
