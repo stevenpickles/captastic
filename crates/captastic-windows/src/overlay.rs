@@ -236,11 +236,36 @@ impl OverlayController {
         // the other's publication in the store-then-load rendezvous.
         self.inner.cancelled.store(true, Ordering::SeqCst);
         let hwnd = self.inner.hwnd.load(Ordering::SeqCst);
-        if hwnd != 0 {
+        // The overlay thread clears the published handle inside WM_NCDESTROY - before the value
+        // can be recycled - so a non-zero load is almost always a live overlay. The load-to-post
+        // gap that remains is narrowed by verifying the handle still names this process's
+        // overlay class. The sub-microsecond TOCTOU that survives both layers would require the
+        // exact handle value to be recycled in that instant, and could misdeliver only a
+        // WM_CLOSE - a soft close request - which is an accepted residual risk.
+        if hwnd != 0 && overlay_window_is_current(HWND(hwnd)) {
             // SAFETY: hwnd was published by the live overlay thread. Posting does not retain it.
             let _ = unsafe { PostMessageW(HWND(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
         }
     }
+}
+
+/// True when the handle still names this process's overlay window. The publisher may have been
+/// destroyed - and the value recycled by any process - between publication and this call, so
+/// the check pins both the owning process and the window class before a message is posted.
+fn overlay_window_is_current(handle: HWND) -> bool {
+    let mut process_id = 0_u32;
+    // SAFETY: Queries the owning thread and process without retaining the handle.
+    let thread_id = unsafe { GetWindowThreadProcessId(handle, Some(&mut process_id)) };
+    // SAFETY: Reads this process's own identity.
+    if thread_id == 0 || process_id != unsafe { GetCurrentProcessId() } {
+        return false;
+    }
+    let mut class_name = [0_u16; 64];
+    // SAFETY: class_name is writable storage for the null-terminated class query.
+    let length = unsafe { GetClassNameW(handle, &mut class_name) }.max(0) as usize;
+    // SAFETY: CLASS_NAME is a static null-terminated wide string.
+    let expected = unsafe { CLASS_NAME.as_wide() };
+    class_name.get(..length) == Some(expected)
 }
 
 pub fn select_from_frozen_frame(
@@ -469,6 +494,7 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
         dimension_label_placement: None,
         selected_window_frame: None,
         releasing_pointer_capture: false,
+        controller: controller.clone(),
         reference_metadata: metadata.clone(),
         window_preview: None,
         window_thumbnails: Vec::new(),
@@ -610,6 +636,9 @@ struct OverlayState {
     /// Shell-side protocol flag distinguishing a self-initiated `ReleaseCapture` round trip from
     /// an externally stolen pointer capture. Never part of the model.
     releasing_pointer_capture: bool,
+    /// The cross-thread controller this run published its HWND to; WM_NCDESTROY clears that
+    /// publication before the handle value can be recycled.
+    controller: OverlayController,
     reference_metadata: FrameMetadata,
     window_preview: Option<WindowPreviewState>,
     window_thumbnails: Vec<WindowThumbnail>,
@@ -1477,6 +1506,10 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             let state = unsafe { &mut *state_pointer };
             state.live_window_thumbnails.clear();
             state.overlay_hwnd = HWND(0);
+            // Retract the published handle while the window still exists: after WM_NCDESTROY
+            // returns the value can be recycled, and cancel() must not be able to load it.
+            // run_overlay's later store(0) remains as belt and braces for non-window paths.
+            state.controller.inner.hwnd.store(0, Ordering::SeqCst);
         }
         // SAFETY: Prevents any later callback from observing the state pointer.
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
