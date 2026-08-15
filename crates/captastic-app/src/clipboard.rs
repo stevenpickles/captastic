@@ -66,11 +66,17 @@ impl ClipboardWorker {
                         PerfEventKind::ClipboardStarted,
                         offset_after_cpu(&job),
                     );
-                    let (publish_result, publish_retries) = publish_with_retry(
-                        || publisher.publish(&job.frame),
-                        thread::sleep,
-                        || worker_stop_requested.load(Ordering::Acquire),
-                    );
+                    // Encode once, outside the retry loop: the bytes are identical on every
+                    // attempt, and re-encoding a 4K frame per retry was the expensive half of a
+                    // failing publish.
+                    let (publish_result, publish_retries) = match captastic_windows::ClipboardPayload::prepare(&job.frame) {
+                        Ok(payload) => publish_with_retry(
+                            || publisher.publish(&payload),
+                            thread::sleep,
+                            || worker_stop_requested.load(Ordering::Acquire),
+                        ),
+                        Err(error) => (Err(error), 0),
+                    };
                     match publish_result {
                         Ok(report) => {
                             let total_offset_ns = duration_ns(job.triggered_at.elapsed());

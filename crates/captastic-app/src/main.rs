@@ -419,7 +419,9 @@ fn capture_with_preview_fallback(
                 )
             })?;
             recorder.record(request.id, PerfEventKind::ClipboardStarted, 0);
-            let report = captastic_windows::ClipboardPublisher::new()?.publish(clipboard_frame)?;
+            let payload = captastic_windows::ClipboardPayload::prepare(clipboard_frame)?;
+            let mut publisher = captastic_windows::ClipboardPublisher::new()?;
+            let report = publisher.publish(&payload)?;
             recorder.record(
                 request.id,
                 PerfEventKind::ClipboardCommitted,
@@ -643,7 +645,9 @@ fn capture_with_live_selection(mut args: cli::CaptureArgs) -> Result<(), AppErro
     let mut clipboard_value = None;
     if args.clipboard {
         recorder.record(capture_id, PerfEventKind::ClipboardStarted, 0);
-        let report = captastic_windows::ClipboardPublisher::new()?.publish(&selected_frame)?;
+        let payload = captastic_windows::ClipboardPayload::prepare(&selected_frame)?;
+        let mut publisher = captastic_windows::ClipboardPublisher::new()?;
+        let report = publisher.publish(&payload)?;
         recorder.record(
             capture_id,
             PerfEventKind::ClipboardCommitted,

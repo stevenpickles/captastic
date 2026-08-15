@@ -6,6 +6,7 @@ mod error;
 mod fake;
 mod frame;
 mod metrics;
+mod png;
 
 pub use capture::{
     BackendCapabilities, CaptureBackend, CaptureId, CaptureMode, CaptureOutcome, CaptureRequest,
@@ -18,3 +19,4 @@ pub use frame::{
     ColorSpace, CpuFrame, FrameAlpha, FrameMetadata, FrameOrigin, PixelFormat, TimingProvenance,
 };
 pub use metrics::{validate_event_order, EventRecorder, LatencySummary, PerfEvent, PerfEventKind};
+pub use png::{encode_frame, PngEffort, PngError};
