@@ -649,8 +649,11 @@ impl SelectionWorker {
         // winding down in parallel and only needs a moment to write once the selection thread
         // releases its own sender. Joining the selection thread against the full deadline could
         // spend all of it, so hold the last slice back for the write that must reach disk.
-        let selection_deadline =
-            crate::daemon::reserved_deadline(Instant::now(), deadline, UI_STATE_STOP_RESERVE);
+        let selection_deadline = crate::worker_registry::reserved_deadline(
+            Instant::now(),
+            deadline,
+            UI_STATE_STOP_RESERVE,
+        );
         let mut selection_stopped = true;
         if let Some(join) = self.join.take() {
             if !join_worker_until(join, "selection", selection_deadline) {
@@ -663,7 +666,7 @@ impl SelectionWorker {
                 // overrun the shared deadline. This is the only shutdown step that writes user
                 // state to disk, so it is guaranteed its slice, overrunning by at most the reserve
                 // and staying well inside the tray's session-shutdown drain window.
-                let ui_deadline = crate::daemon::guaranteed_deadline(
+                let ui_deadline = crate::worker_registry::guaranteed_deadline(
                     Instant::now(),
                     deadline,
                     UI_STATE_STOP_RESERVE,
@@ -999,7 +1002,7 @@ mod tests {
         let deadline = now + WORKER_STOP_TIMEOUT;
 
         let selection_deadline =
-            crate::daemon::reserved_deadline(now, deadline, UI_STATE_STOP_RESERVE);
+            crate::worker_registry::reserved_deadline(now, deadline, UI_STATE_STOP_RESERVE);
 
         // Both stages must get a real slice: a reserve as large as the budget would starve the
         // selection join instead, and no reserve would starve the flush that outlives the process.
@@ -1017,7 +1020,8 @@ mod tests {
         // Everything before the flush overran the shared deadline by ten seconds.
         let now = base + Duration::from_secs(10);
 
-        let ui_deadline = crate::daemon::guaranteed_deadline(now, base, UI_STATE_STOP_RESERVE);
+        let ui_deadline =
+            crate::worker_registry::guaranteed_deadline(now, base, UI_STATE_STOP_RESERVE);
 
         assert_eq!(
             ui_deadline.saturating_duration_since(now),
@@ -1026,7 +1030,7 @@ mod tests {
         // A budget that is still healthy is left alone rather than shortened to the minimum.
         let healthy = now + WORKER_STOP_TIMEOUT;
         assert_eq!(
-            crate::daemon::guaranteed_deadline(now, healthy, UI_STATE_STOP_RESERVE),
+            crate::worker_registry::guaranteed_deadline(now, healthy, UI_STATE_STOP_RESERVE),
             healthy
         );
     }

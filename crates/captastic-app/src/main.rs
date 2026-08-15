@@ -10,6 +10,8 @@ mod error;
 mod logging;
 #[cfg(windows)]
 mod selection;
+#[cfg(windows)]
+mod worker_registry;
 
 use std::process;
 use std::time::Instant;
