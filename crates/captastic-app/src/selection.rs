@@ -189,6 +189,9 @@ impl SelectionWorker {
             .name("captastic-selection".to_owned())
             .spawn(move || {
                 let mut cache_idle_started = Instant::now();
+                // Worker-owned overlay resources (M24): reused across runs on this thread,
+                // released after RESOURCE_CACHE_IDLE below, dropped with the worker.
+                let mut overlay_resources = captastic_windows::OverlayResources::new();
                 loop {
                     if worker_stop_requested.load(Ordering::Acquire) {
                         break;
@@ -200,7 +203,7 @@ impl SelectionWorker {
                             break;
                         }
                         if cache_idle_started.elapsed() >= RESOURCE_CACHE_IDLE {
-                            captastic_windows::clear_overlay_resource_cache();
+                            overlay_resources.clear();
                             cache_idle_started = Instant::now();
                         }
                         continue;
@@ -235,6 +238,7 @@ impl SelectionWorker {
                         &worker_controller,
                         job.initial_tool,
                         Some(remembered_ui),
+                        &mut overlay_resources,
                     )
                 };
                 match selection {

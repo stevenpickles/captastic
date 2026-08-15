@@ -147,6 +147,38 @@ impl ToolbarLayoutTokens {
     }
 }
 
+/// DPI-scaled measurements for the window-chooser overview grid. The bottom reserve keeps the
+/// last thumbnail row clear of the toolbar, which scales with the same metrics - mixing the two
+/// coordinate systems is exactly the collision this struct exists to prevent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct OverviewLayoutTokens {
+    pub(super) margin_x: i32,
+    pub(super) top: i32,
+    pub(super) bottom_reserve: i32,
+    pub(super) gap: i32,
+    pub(super) min_available_width: i32,
+    pub(super) min_available_height: i32,
+    pub(super) min_row_height: i32,
+    pub(super) min_window_size: i32,
+    pub(super) empty_state_bottom: i32,
+}
+
+impl OverviewLayoutTokens {
+    fn new(metrics: UiMetrics) -> Self {
+        Self {
+            margin_x: metrics.px(70),
+            top: metrics.px(64),
+            bottom_reserve: metrics.px(160),
+            gap: metrics.px(28),
+            min_available_width: metrics.px(200),
+            min_available_height: metrics.px(160),
+            min_row_height: metrics.px(60),
+            min_window_size: metrics.px(40),
+            empty_state_bottom: metrics.px(118),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct UiMetrics {
     pub(super) dpi: u32,
@@ -168,6 +200,10 @@ impl UiMetrics {
 
     pub(super) fn region_tokens(self) -> RegionLayoutTokens {
         RegionLayoutTokens::new(self)
+    }
+
+    pub(super) fn overview_tokens(self) -> OverviewLayoutTokens {
+        OverviewLayoutTokens::new(self)
     }
 
     pub(super) fn toolbar_tokens(self) -> ToolbarLayoutTokens {

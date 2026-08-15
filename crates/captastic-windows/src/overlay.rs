@@ -1,6 +1,7 @@
-use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::marker::PhantomData;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -8,10 +9,41 @@ use std::thread;
 use std::time::Instant;
 
 mod layout;
+mod machine;
+mod raster;
+mod shell;
+mod window_enumeration;
 
 use layout::{
-    layout_dimension_label, DimensionLabelPlacement, DisplayEnvironment, ToolbarControl,
-    ToolbarLayout, UiMetrics, UiRect, UiSize,
+    layout_dimension_label, DimensionLabelPlacement, DisplayEnvironment, OverviewLayoutTokens,
+    ToolbarControl, ToolbarLayout, UiMetrics, UiRect, UiSize,
+};
+use raster::{
+    apply_dim_wash, build_blurred_background, draw_antialiased_rounded_outline, draw_camera_icon,
+    draw_checkmark, draw_display_icon, draw_filled_ellipse, draw_lines, draw_outline,
+    draw_region_icon, draw_resize_handles, draw_round_box, draw_text, draw_window_icon,
+    draw_window_surface, fill_device_rect, fill_live_background, fitted_surface_rect,
+    measure_ui_text, rgb, scaled_corner_radius, TextAlignment,
+};
+pub use shell::flush_desktop_composition;
+use shell::{
+    capture_pointer, consume_self_initiated_capture_change, drain_pending_quit, duration_ns,
+    invalid_frame, invalidate, last_error, overlay_error, query_display_environment,
+    release_pointer_capture, restore_input_context, screen_point, set_arrow_cursor,
+    set_move_cursor, ClassRegistration, FrozenSurface, PrivateFontResource, RegionCursor,
+    ThreadDpiContext, REGION_CURSOR_CENTER,
+};
+use window_enumeration::{enumerate_visible_windows, WindowCandidate};
+
+#[cfg(test)]
+use machine::{
+    contains, hit_test_resize_handle, latest_interaction_region, move_region, rect_from_points,
+    resize_region,
+};
+use machine::{
+    default_region_for_source, fit_region_to_source, initial_selection, local_point, transition,
+    CaptureTool, CloseOutcome, CursorIntent, OverlayEffect, OverlayInput, OverlayModel,
+    ResizeHandle,
 };
 
 use crate::dwm_thumbnail::{fit_source_in_bounds, DwmThumbnail};
@@ -21,56 +53,31 @@ use captastic_core::{
 };
 #[cfg(test)]
 use captastic_core::{CaptureId, CaptureMode, ColorSpace, TimingProvenance};
-use windows::core::{w, Error as WindowsError, PCWSTR, PWSTR};
+use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, BOOL, COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE,
-    WPARAM,
+    COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
-use windows::Win32::Graphics::Dwm::{DwmFlush, DwmGetWindowAttribute, DWMWA_CLOAKED};
-#[cfg(test)]
-use windows::Win32::Graphics::Gdi::GetTextFaceW;
 use windows::Win32::Graphics::Gdi::{
-    AddFontMemResourceEx, AlphaBlend, BeginPaint, BitBlt, CreateBitmap, CreateCompatibleDC,
-    CreateDIBSection, CreateFontW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW,
-    Ellipse, EndPaint, FillRect, GdiFlush, GetDC, GetMonitorInfoW, GetStockObject,
-    GetTextExtentPoint32W, InvalidateRect, LineTo, MonitorFromRect, MonitorFromWindow, MoveToEx,
-    Rectangle, ReleaseDC, RemoveFontMemResourceEx, RoundRect, SelectObject, SetBkMode,
-    SetStretchBltMode, SetTextColor, StretchBlt, UpdateWindow, AC_SRC_ALPHA, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, CAPTUREBLT, CLEARTYPE_QUALITY, DEFAULT_CHARSET,
-    DEFAULT_PITCH, DIB_RGB_COLORS, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
-    FW_MEDIUM, HALFTONE, HBITMAP, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-    MONITOR_DEFAULTTONULL, NULL_BRUSH, PAINTSTRUCT, PS_SOLID, RGBQUAD, SRCCOPY, TRANSPARENT,
+    BeginPaint, BitBlt, EndPaint, GdiFlush, GetDC, ReleaseDC, SetStretchBltMode, StretchBlt,
+    UpdateWindow, AC_SRC_ALPHA, BLENDFUNCTION, CAPTUREBLT, HALFTONE, HDC, PAINTSTRUCT, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{
-    GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION,
-};
-use windows::Win32::UI::HiDpi::{
-    GetDpiForMonitor, SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT,
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, MDT_EFFECTIVE_DPI,
-};
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE, VK_RETURN,
-};
+use windows::Win32::System::Threading::GetCurrentProcessId;
+use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyCursor, DestroyWindow,
-    DispatchMessageW, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow,
-    GetLastActivePopup, GetMessageW, GetShellWindow, GetWindowDisplayAffinity, GetWindowLongPtrW,
-    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-    IsWindow, IsWindowVisible, LoadCursorW, PeekMessageW, PostMessageW, PostQuitMessage,
-    RegisterClassW, SetCursor, SetForegroundWindow, SetWindowDisplayAffinity, SetWindowLongPtrW,
-    ShowWindow, TranslateMessage, UnregisterClassW, UpdateLayeredWindow, CREATESTRUCTW, CS_DBLCLKS,
-    CS_HREDRAW, CS_VREDRAW, GA_ROOTOWNER, GWLP_USERDATA, GWL_EXSTYLE, HCURSOR, ICONINFO, IDC_ARROW,
-    IDC_CROSS, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, MSG, PM_REMOVE,
-    SPI_SETLOGICALDPIOVERRIDE, SPI_SETWORKAREA, SW_SHOW, ULW_ALPHA, WDA_EXCLUDEFROMCAPTURE,
-    WDA_NONE, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
-    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_QUIT, WM_RBUTTONDOWN, WM_SETTINGCHANGE, WNDCLASSW,
-    WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClassNameW,
+    GetForegroundWindow, GetMessageW, GetWindowLongPtrW, GetWindowThreadProcessId, IsWindow,
+    LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW, SetCursor, SetForegroundWindow,
+    SetWindowDisplayAffinity, SetWindowLongPtrW, ShowWindow, TranslateMessage, UpdateLayeredWindow,
+    CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_CROSS, IDC_SIZENESW,
+    IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, MSG, SPI_SETLOGICALDPIOVERRIDE, SPI_SETWORKAREA, SW_SHOW,
+    ULW_ALPHA, WDA_EXCLUDEFROMCAPTURE, WM_APP, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY,
+    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN,
+    WM_SETTINGCHANGE, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 #[cfg(test)]
-use windows::Win32::UI::WindowsAndMessaging::{PM_NOREMOVE, WDA_MONITOR};
+use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, PM_NOREMOVE, WM_QUIT};
 
 #[cfg(test)]
 use crate::window_capture::scaled_dimensions;
@@ -79,20 +86,23 @@ use crate::window_capture::{
 };
 
 const CLASS_NAME: PCWSTR = w!("CaptasticFrozenSelectionOverlay");
-const DRAG_THRESHOLD: i32 = 4;
+/// Posted by the incremental window-overview build: each delivery renders one batch of
+/// thumbnails and posts the next, so the message pump stays live for paint, Escape, and
+/// cancellation between batches. `wparam` carries the build generation.
+const WM_OVERVIEW_RENDER_BATCH: u32 = WM_APP + 1;
 const DIM_ALPHA: u8 = 128;
 const LIVE_HIT_TEST_ALPHA: u8 = 1;
 const _: () = assert!(LIVE_HIT_TEST_ALPHA > 0);
-const MIN_REGION_SIZE: i64 = 8;
-const REGION_CURSOR_SIZE: u32 = 64;
-const REGION_CURSOR_CENTER: i32 = REGION_CURSOR_SIZE as i32 / 2;
+/// Alpha byte the live background fill stamps on every pixel before the chrome pass. GDI
+/// drawing writes 0 into a 32bpp DIB's reserved byte, so after the chrome is drawn the alpha
+/// byte is an exact per-pixel coverage signal: 0 means some GDI operation painted the pixel,
+/// this sentinel means untouched background. Color cannot carry that signal - the fill is pure
+/// black and so is the outline's contrast halo (M19). The present pass rewrites every alpha
+/// byte, so the sentinel itself never reaches the screen.
+const LIVE_UNDRAWN_ALPHA: u8 = u8::MAX;
+const _: () = assert!(LIVE_UNDRAWN_ALPHA != 0);
 const WINDOW_THUMBNAIL_MAX_PIXELS: u64 = 1_200_000;
 const UI_FONT_HEIGHT: i32 = 21;
-const IOSKELEY_MONO_MEDIUM: &[u8] = include_bytes!("../assets/fonts/IoskeleyMono-Medium.ttf");
-
-thread_local! {
-    static OVERLAY_RESOURCE_CACHE: RefCell<Option<OverlayResourceCache>> = const { RefCell::new(None) };
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SelectionKind {
@@ -218,32 +228,71 @@ impl OverlayController {
         // the other's publication in the store-then-load rendezvous.
         self.inner.cancelled.store(true, Ordering::SeqCst);
         let hwnd = self.inner.hwnd.load(Ordering::SeqCst);
-        if hwnd != 0 {
+        // The overlay thread clears the published handle inside WM_NCDESTROY - before the value
+        // can be recycled - so a non-zero load is almost always a live overlay. The load-to-post
+        // gap that remains is narrowed by verifying the handle still names this process's
+        // overlay class. The sub-microsecond TOCTOU that survives both layers would require the
+        // exact handle value to be recycled in that instant, and could misdeliver only a
+        // WM_CLOSE - a soft close request - which is an accepted residual risk.
+        if hwnd != 0 && overlay_window_is_current(HWND(hwnd)) {
             // SAFETY: hwnd was published by the live overlay thread. Posting does not retain it.
             let _ = unsafe { PostMessageW(HWND(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
         }
     }
 }
 
+/// True when the handle still names this process's overlay window. The publisher may have been
+/// destroyed - and the value recycled by any process - between publication and this call, so
+/// the check pins both the owning process and the window class before a message is posted.
+fn overlay_window_is_current(handle: HWND) -> bool {
+    let mut process_id = 0_u32;
+    // SAFETY: Queries the owning thread and process without retaining the handle.
+    let thread_id = unsafe { GetWindowThreadProcessId(handle, Some(&mut process_id)) };
+    // SAFETY: Reads this process's own identity.
+    if thread_id == 0 || process_id != unsafe { GetCurrentProcessId() } {
+        return false;
+    }
+    let mut class_name = [0_u16; 64];
+    // SAFETY: class_name is writable storage for the null-terminated class query.
+    let length = unsafe { GetClassNameW(handle, &mut class_name) }.max(0) as usize;
+    // SAFETY: CLASS_NAME is a static null-terminated wide string.
+    let expected = unsafe { CLASS_NAME.as_wide() };
+    class_name.get(..length) == Some(expected)
+}
+
 pub fn select_from_frozen_frame(
     frame: &CpuFrame,
+    resources: &mut OverlayResources,
 ) -> Result<Option<OverlaySelection>, CaptureError> {
-    select_from_frozen_frame_with_controller(frame, &OverlayController::new())
+    select_from_frozen_frame_with_controller(frame, &OverlayController::new(), resources)
 }
 
 pub fn select_from_frozen_frame_with_controller(
     frame: &CpuFrame,
     controller: &OverlayController,
+    resources: &mut OverlayResources,
 ) -> Result<Option<OverlaySelection>, CaptureError> {
-    select_from_frozen_frame_with_initial_tool(frame, controller, InitialSelectionTool::Remembered)
+    select_from_frozen_frame_with_initial_tool(
+        frame,
+        controller,
+        InitialSelectionTool::Remembered,
+        resources,
+    )
 }
 
 pub fn select_from_frozen_frame_with_initial_tool(
     frame: &CpuFrame,
     controller: &OverlayController,
     initial_tool: InitialSelectionTool,
+    resources: &mut OverlayResources,
 ) -> Result<Option<OverlaySelection>, CaptureError> {
-    select_from_frozen_frame_with_initial_tool_and_ui(frame, controller, initial_tool, None)
+    select_from_frozen_frame_with_initial_tool_and_ui(
+        frame,
+        controller,
+        initial_tool,
+        None,
+        resources,
+    )
 }
 
 pub fn select_from_frozen_frame_with_initial_tool_and_ui(
@@ -251,12 +300,14 @@ pub fn select_from_frozen_frame_with_initial_tool_and_ui(
     controller: &OverlayController,
     initial_tool: InitialSelectionTool,
     remembered_ui: Option<captastic_config::DisplayUiState>,
+    resources: &mut OverlayResources,
 ) -> Result<Option<OverlaySelection>, CaptureError> {
     select_from_preview_source_with_initial_tool_and_ui(
         SelectionPreviewSource::frozen(frame),
         controller,
         initial_tool,
         remembered_ui,
+        resources,
     )
 }
 
@@ -295,6 +346,7 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
     controller: &OverlayController,
     initial_tool: InitialSelectionTool,
     remembered_ui: Option<captastic_config::DisplayUiState>,
+    resources: &mut OverlayResources,
 ) -> Result<Option<OverlaySelection>, CaptureError> {
     let preparation_started = Instant::now();
     if controller.inner.cancelled.load(Ordering::SeqCst) {
@@ -314,7 +366,7 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
     // SAFETY: Reads the current foreground window without retaining or mutating it.
     let previous_foreground = unsafe { GetForegroundWindow() };
     let pixels = preview_source.frozen_frame.map(tight_pixels).transpose()?;
-    let cached = take_overlay_resource_cache(source.width, source.height);
+    let cached = resources.take_matching(source.width, source.height);
     let (
         surface,
         back_buffer,
@@ -400,9 +452,29 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
         InitialSelectionTool::Window => CaptureTool::Window,
     };
     let (selection, selection_kind) = initial_selection(tool, last_region, source);
-    let mut state = Box::new(OverlayState {
+    let state = Box::new(OverlayState {
+        model: OverlayModel {
+            source,
+            display_environment,
+            tool,
+            selection,
+            selection_kind,
+            selected_window: None,
+            anchor: None,
+            dragging: false,
+            resizing: None,
+            moving_region: None,
+            hovered_handle: None,
+            last_region,
+            toolbar_position,
+            toolbar_drag: None,
+            options_open: false,
+            dim_background: true,
+            hovered_control: None,
+            pointer_local: None,
+            hovered: None,
+        },
         overlay_hwnd: HWND(0),
-        source,
         live_preview: preview_source.is_live(),
         surface,
         back_buffer,
@@ -411,35 +483,21 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
         cached_blurred_background: blurred_background,
         window_assets_ready: false,
         windows: None,
-        hovered: None,
-        pointer_local: None,
         dimension_label_placement: None,
-        anchor: None,
-        dragging: false,
-        selection,
-        selection_kind,
-        selected_window: None,
         selected_window_frame: None,
-        hovered_handle: None,
-        resizing: None,
-        moving_region: None,
-        last_region,
-        tool,
-        options_open: false,
-        dim_background: true,
-        hovered_control: None,
-        toolbar_position,
-        toolbar_drag: None,
         releasing_pointer_capture: false,
-        display_environment,
+        controller: controller.clone(),
         reference_metadata: metadata.clone(),
         window_preview: None,
         window_thumbnails: Vec::new(),
         live_window_thumbnails: Vec::new(),
-        window_overview_cache: cached_overview_surface.map(|surface| WindowOverviewCache {
-            surface,
-            dim_background: false,
-        }),
+        // A previous run's chooser surface is only ever an allocation to draw into, never
+        // presentable content: the cache starts empty so the first Window-mode compose is
+        // forced to rebuild, and the rebuild reclaims the spare buffer below.
+        window_overview_cache: None,
+        window_overview_build: None,
+        overview_build_generation: 0,
+        spare_overview_surface: cached_overview_surface,
         region_cursor,
         _font_resource: font_resource,
         previous_foreground,
@@ -449,113 +507,16 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
         window_overview_ns: None,
         ui_updates: controller.inner.ui_updates.clone(),
     });
-    if tool == CaptureTool::Window {
-        build_window_overview(&mut state);
-    }
-    run_overlay(state, controller)
-}
-
-struct ThreadDpiContext {
-    previous: DPI_AWARENESS_CONTEXT,
-}
-
-impl ThreadDpiContext {
-    fn enter_per_monitor_v2() -> Result<Self, CaptureError> {
-        // SAFETY: Changes DPI virtualization only for the current overlay worker thread.
-        let previous =
-            unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
-        if previous.0 == 0 {
-            return Err(last_error("set_overlay_dpi_awareness"));
-        }
-        Ok(Self { previous })
-    }
-}
-
-impl Drop for ThreadDpiContext {
-    fn drop(&mut self) {
-        // SAFETY: Restores the exact thread context returned by the successful enter call.
-        let _ = unsafe { SetThreadDpiAwarenessContext(self.previous) };
-    }
-}
-
-fn query_display_environment(source: Rect) -> DisplayEnvironment {
-    let full_area = UiRect {
-        left: 0,
-        top: 0,
-        right: i32::try_from(source.width).unwrap_or(i32::MAX),
-        bottom: i32::try_from(source.height).unwrap_or(i32::MAX),
-    };
-    let native_source = RECT {
-        left: source.x,
-        top: source.y,
-        right: source
-            .right()
-            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-        bottom: source
-            .bottom()
-            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-    };
-    // SAFETY: native_source is a valid physical desktop rectangle and the returned monitor handle
-    // is used only for synchronous information queries.
-    let monitor = unsafe { MonitorFromRect(&native_source, MONITOR_DEFAULTTONEAREST) };
-    if monitor.0 == 0 {
-        log::warn!(
-            "monitor work area unavailable for display bounds={}x{}{:+}{:+}; using full display at 96 DPI",
-            source.width,
-            source.height,
-            source.x,
-            source.y
-        );
-        return DisplayEnvironment {
-            work_area: full_area,
-            metrics: UiMetrics::new(UiMetrics::BASE_DPI),
-        };
-    }
-
-    let mut info = MONITORINFO {
-        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-        ..MONITORINFO::default()
-    };
-    // SAFETY: info is initialized with the required size and remains writable for the call.
-    let work_area = if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
-        UiRect {
-            left: info.rcWork.left.saturating_sub(source.x),
-            top: info.rcWork.top.saturating_sub(source.y),
-            right: info.rcWork.right.saturating_sub(source.x),
-            bottom: info.rcWork.bottom.saturating_sub(source.y),
-        }
-    } else {
-        log::warn!(
-            "monitor work area query failed for display bounds={}x{}{:+}{:+}; using full display",
-            source.width,
-            source.height,
-            source.x,
-            source.y
-        );
-        full_area
-    };
-
-    let mut dpi_x = UiMetrics::BASE_DPI;
-    let mut dpi_y = UiMetrics::BASE_DPI;
-    // SAFETY: dpi_x and dpi_y are writable values and monitor is a live handle from the query.
-    let dpi_result =
-        unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) };
-    if let Err(error) = dpi_result {
-        log::warn!("effective monitor DPI query failed: {error}; using 96 DPI");
-        dpi_x = UiMetrics::BASE_DPI;
-    } else if dpi_x != dpi_y {
-        log::debug!("monitor reports asymmetric DPI x={dpi_x} y={dpi_y}; using x-axis DPI");
-    }
-
-    DisplayEnvironment {
-        work_area,
-        metrics: UiMetrics::new(dpi_x),
-    }
+    // A remembered Window tool no longer builds the chooser synchronously before the window
+    // exists: run_overlay starts the incremental build right after creation, so the overlay
+    // appears at once and the thumbnails stream in - strictly better than a frozen launch.
+    run_overlay(state, controller, resources)
 }
 
 struct OverlayState {
+    /// The pure product-state machine; every transition-owned field lives here.
+    model: OverlayModel,
     overlay_hwnd: HWND,
-    source: Rect,
     live_preview: bool,
     surface: FrozenSurface,
     back_buffer: FrozenSurface,
@@ -564,32 +525,30 @@ struct OverlayState {
     cached_blurred_background: Option<FrozenSurface>,
     window_assets_ready: bool,
     windows: Option<Vec<WindowCandidate>>,
-    hovered: Option<WindowCandidate>,
-    pointer_local: Option<POINT>,
     dimension_label_placement: Option<DimensionLabelPlacement>,
-    anchor: Option<POINT>,
-    dragging: bool,
-    selection: Option<Rect>,
-    selection_kind: Option<SelectionKind>,
-    selected_window: Option<NativeWindowHandle>,
     selected_window_frame: Option<CpuFrame>,
-    hovered_handle: Option<ResizeHandle>,
-    resizing: Option<ResizeDrag>,
-    moving_region: Option<MoveDrag>,
-    last_region: Option<Rect>,
-    tool: CaptureTool,
-    options_open: bool,
-    dim_background: bool,
-    hovered_control: Option<ToolbarControl>,
-    toolbar_position: POINT,
-    toolbar_drag: Option<ToolbarDrag>,
+    /// Shell-side protocol flag distinguishing a self-initiated `ReleaseCapture` round trip from
+    /// an externally stolen pointer capture. Never part of the model.
     releasing_pointer_capture: bool,
-    display_environment: DisplayEnvironment,
+    /// The cross-thread controller this run published its HWND to; WM_NCDESTROY clears that
+    /// publication before the handle value can be recycled.
+    controller: OverlayController,
     reference_metadata: FrameMetadata,
     window_preview: Option<WindowPreviewState>,
     window_thumbnails: Vec<WindowThumbnail>,
     live_window_thumbnails: Vec<LiveWindowThumbnail>,
     window_overview_cache: Option<WindowOverviewCache>,
+    /// The in-flight incremental thumbnail build, if any. Shell inventory work, not product
+    /// state: it survives a tool switch away (frozen; its posted messages are ignored) and
+    /// resumes when the Window tool is re-activated.
+    window_overview_build: Option<WindowOverviewBuild>,
+    /// Monotonic stamp for overview builds; a posted batch message whose generation does not
+    /// match the current build is stale and ignored.
+    overview_build_generation: usize,
+    /// A previous run's chooser surface, held purely as a reusable allocation for
+    /// [`rebuild_window_overview_cache`]. Its pixels are stale by definition and are always
+    /// overdrawn before the surface can reach the screen.
+    spare_overview_surface: Option<FrozenSurface>,
     region_cursor: RegionCursor,
     _font_resource: PrivateFontResource,
     previous_foreground: HWND,
@@ -610,26 +569,41 @@ struct OverlayResourceCache {
     font_resource: PrivateFontResource,
 }
 
-fn take_overlay_resource_cache(width: u32, height: u32) -> Option<OverlayResourceCache> {
-    OVERLAY_RESOURCE_CACHE.with(|cache| {
-        cache.borrow_mut().take().filter(|resources| {
+/// Reusable GDI-backed overlay resources: the frozen and composition surfaces, the blur and
+/// chooser caches, the region cursor, and the process-private font registration - roughly three
+/// full-display DIB allocations when warm. The caller that runs overlays owns one instance and
+/// passes it into every run; dropping or [`clear`](Self::clear)ing it releases everything at
+/// once. Thread-affine: every handle inside was created on the owning thread and the `Drop`
+/// impls must run there, which the `!Send` marker enforces.
+#[derive(Default)]
+pub struct OverlayResources {
+    cache: Option<OverlayResourceCache>,
+    _thread_affine: PhantomData<Rc<()>>,
+}
+
+impl OverlayResources {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Releases every cached surface and resource immediately.
+    pub fn clear(&mut self) {
+        self.cache = None;
+    }
+
+    /// Hands out the cached resources only when they match the requested dimensions exactly;
+    /// a resolution change drops the stale allocation instead of resizing it.
+    fn take_matching(&mut self, width: u32, height: u32) -> Option<OverlayResourceCache> {
+        self.cache.take().filter(|resources| {
             resources.surface.width == width as i32 && resources.surface.height == height as i32
         })
-    })
+    }
 }
 
-pub fn clear_overlay_resource_cache() {
-    OVERLAY_RESOURCE_CACHE.with(|cache| {
-        cache.borrow_mut().take();
-    });
-}
-
-pub fn flush_desktop_composition() -> Result<(), CaptureError> {
-    // SAFETY: DwmFlush has no pointer arguments and synchronizes this process's queued changes.
-    unsafe { DwmFlush() }.map_err(|error| overlay_error("flush_overlay_composition", error))
-}
-
-fn cache_overlay_state(state: Box<OverlayState>) -> Option<OverlaySelection> {
+fn cache_overlay_state(
+    state: Box<OverlayState>,
+    resources: &mut OverlayResources,
+) -> Option<OverlaySelection> {
     let OverlayState {
         result,
         surface,
@@ -638,68 +612,26 @@ fn cache_overlay_state(state: Box<OverlayState>) -> Option<OverlaySelection> {
         blurred_background,
         cached_blurred_background,
         window_overview_cache,
+        spare_overview_surface,
         region_cursor,
         _font_resource,
         ..
     } = *state;
     let blurred_background = blurred_background.or(cached_blurred_background);
-    let overview_surface = window_overview_cache.map(|cache| cache.surface);
-    OVERLAY_RESOURCE_CACHE.with(|cache| {
-        *cache.borrow_mut() = Some(OverlayResourceCache {
-            surface,
-            back_buffer,
-            dimmer,
-            blurred_background,
-            overview_surface,
-            region_cursor,
-            font_resource: _font_resource,
-        });
+    // A run that never entered Window mode passes the unused spare allocation along.
+    let overview_surface = window_overview_cache
+        .map(|cache| cache.surface)
+        .or(spare_overview_surface);
+    resources.cache = Some(OverlayResourceCache {
+        surface,
+        back_buffer,
+        dimmer,
+        blurred_background,
+        overview_surface,
+        region_cursor,
+        font_resource: _font_resource,
     });
     result
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CaptureTool {
-    FullDisplay,
-    Window,
-    Region,
-}
-
-impl CaptureTool {
-    const fn from_selection_kind(kind: SelectionKind) -> Self {
-        match kind {
-            SelectionKind::Display => Self::FullDisplay,
-            SelectionKind::Region => Self::Region,
-            SelectionKind::Window => Self::Window,
-        }
-    }
-
-    const fn from_config(tool: captastic_config::CaptureTool) -> Self {
-        match tool {
-            captastic_config::CaptureTool::FullDisplay => Self::FullDisplay,
-            captastic_config::CaptureTool::Window => Self::Window,
-            captastic_config::CaptureTool::Region => Self::Region,
-        }
-    }
-
-    const fn to_config(self) -> captastic_config::CaptureTool {
-        match self {
-            Self::FullDisplay => captastic_config::CaptureTool::FullDisplay,
-            Self::Window => captastic_config::CaptureTool::Window,
-            Self::Region => captastic_config::CaptureTool::Region,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum TextAlignment {
-    Left,
-    Center,
-}
-
-#[derive(Clone, Copy)]
-struct ToolbarDrag {
-    pointer_offset: POINT,
 }
 
 enum WindowPreviewState {
@@ -730,138 +662,6 @@ struct WindowOverviewCache {
     dim_background: bool,
 }
 
-struct RegionCursor {
-    handle: HCURSOR,
-    owned: bool,
-}
-
-impl RegionCursor {
-    fn create() -> Self {
-        match Self::create_high_contrast() {
-            Ok(handle) => Self {
-                handle,
-                owned: true,
-            },
-            Err(_) => {
-                // SAFETY: IDC_CROSS is a shared system cursor and remains valid process-wide.
-                let handle = unsafe { LoadCursorW(None, IDC_CROSS) }.unwrap_or_default();
-                Self {
-                    handle,
-                    owned: false,
-                }
-            }
-        }
-    }
-
-    fn create_high_contrast() -> Result<HCURSOR, CaptureError> {
-        let (pixels, mask_bits) = high_contrast_cursor_pixels();
-        let color = FrozenSurface::new(REGION_CURSOR_SIZE, REGION_CURSOR_SIZE, &pixels)?;
-        // SAFETY: mask_bits contains exactly one 1-bit scanline per cursor row.
-        let mask = unsafe {
-            CreateBitmap(
-                REGION_CURSOR_SIZE as i32,
-                REGION_CURSOR_SIZE as i32,
-                1,
-                1,
-                Some(mask_bits.as_ptr().cast()),
-            )
-        };
-        if mask.0 == 0 {
-            return Err(last_error("create_region_cursor_mask"));
-        }
-        let info = ICONINFO {
-            fIcon: BOOL(0),
-            xHotspot: REGION_CURSOR_CENTER as u32,
-            yHotspot: REGION_CURSOR_CENTER as u32,
-            hbmMask: mask,
-            hbmColor: color.bitmap,
-        };
-        // SAFETY: info references two live, correctly sized bitmaps for the duration of the call.
-        let result = unsafe { CreateIconIndirect(&info) };
-        // SAFETY: CreateIconIndirect copies both bitmaps; this temporary mask is no longer needed.
-        unsafe { DeleteObject(mask) };
-        result
-            .map(|icon| HCURSOR(icon.0))
-            .map_err(|error| overlay_error("create_region_cursor", error))
-    }
-
-    fn activate(&self) {
-        if self.handle.0 != 0 {
-            // SAFETY: handle is either this object's live cursor or a shared system cursor.
-            unsafe { SetCursor(self.handle) };
-        }
-    }
-}
-
-impl Drop for RegionCursor {
-    fn drop(&mut self) {
-        if self.owned && self.handle.0 != 0 {
-            // SAFETY: Only the cursor created and uniquely owned by this object is destroyed.
-            let _ = unsafe { DestroyCursor(self.handle) };
-        }
-    }
-}
-
-fn high_contrast_cursor_pixels() -> (Vec<u8>, Vec<u8>) {
-    let size = REGION_CURSOR_SIZE as usize;
-    let mask_stride = size.div_ceil(16) * 2;
-    let mut pixels = vec![0_u8; size * size * 4];
-    let mut mask = vec![0xff_u8; mask_stride * size];
-    for y in 0..size {
-        for x in 0..size {
-            let delta_x = (x as i32 - REGION_CURSOR_CENTER).abs();
-            let delta_y = (y as i32 - REGION_CURSOR_CENTER).abs();
-            let horizontal = delta_y <= 3 && (6..=29).contains(&delta_x);
-            let vertical = delta_x <= 3 && (6..=29).contains(&delta_y);
-            let center_mark = delta_x <= 1 && delta_y <= 1;
-            if !horizontal && !vertical && !center_mark {
-                continue;
-            }
-            let inner = (delta_y <= 1 && horizontal)
-                || (delta_x <= 1 && vertical)
-                || (delta_x == 0 && delta_y == 0);
-            let offset = (y * size + x) * 4;
-            let channel = if inner { 255 } else { 0 };
-            pixels[offset..offset + 3].fill(channel);
-            pixels[offset + 3] = 255;
-            let mask_byte = y * mask_stride + x / 8;
-            mask[mask_byte] &= !(0x80 >> (x % 8));
-        }
-    }
-    (pixels, mask)
-}
-
-struct PrivateFontResource(HANDLE);
-
-impl PrivateFontResource {
-    fn register() -> Result<Self, CaptureError> {
-        let byte_length = u32::try_from(IOSKELEY_MONO_MEDIUM.len())
-            .map_err(|_| invalid_frame("embedded UI font exceeds Win32 resource limits"))?;
-        let mut font_count = 0_u32;
-        let font_count_pointer = std::ptr::addr_of_mut!(font_count).cast_const();
-        // SAFETY: The embedded font bytes have static lifetime; font_count is writable storage.
-        let handle = unsafe {
-            AddFontMemResourceEx(
-                IOSKELEY_MONO_MEDIUM.as_ptr().cast(),
-                byte_length,
-                None,
-                font_count_pointer,
-            )
-        };
-        if handle.0 == 0 || font_count == 0 {
-            return Err(last_error("register_embedded_ui_font"));
-        }
-        Ok(Self(handle))
-    }
-}
-
-impl Drop for PrivateFontResource {
-    fn drop(&mut self) {
-        // SAFETY: This exact handle was returned by AddFontMemResourceEx and is removed once.
-        let _ = unsafe { RemoveFontMemResourceEx(self.0) };
-    }
-}
-
 impl WindowPreviewState {
     /// Whether this cached entry lets a click on `handle` skip another capture attempt.
     ///
@@ -876,185 +676,6 @@ impl WindowPreviewState {
             Self::Unavailable(_) => false,
         }
     }
-}
-
-struct FrozenSurface {
-    device: HDC,
-    bitmap: HBITMAP,
-    previous_bitmap: HGDIOBJ,
-    bits: *mut u8,
-    byte_length: usize,
-    width: i32,
-    height: i32,
-}
-
-impl FrozenSurface {
-    fn new(width: u32, height: u32, pixels: &[u8]) -> Result<Self, CaptureError> {
-        Self::allocate(width, height, Some(pixels))
-    }
-
-    fn empty(width: u32, height: u32) -> Result<Self, CaptureError> {
-        Self::allocate(width, height, None)
-    }
-
-    fn from_straight_alpha(width: u32, height: u32, pixels: &[u8]) -> Result<Self, CaptureError> {
-        let surface = Self::empty(width, height)?;
-        if pixels.len() < surface.byte_length {
-            return Err(invalid_frame("overlay alpha buffer is too short"));
-        }
-        // GDI AlphaBlend requires premultiplied BGRA. Window frames stay straight-alpha for PNG
-        // clipboard publication; only this private paint surface is converted.
-        for (source, offset) in pixels[..surface.byte_length]
-            .chunks_exact(4)
-            .zip((0..surface.byte_length).step_by(4))
-        {
-            let alpha = u32::from(source[3]);
-            // SAFETY: `offset` advances by complete pixels inside this surface's DIB allocation.
-            unsafe {
-                *surface.bits.add(offset) = ((u32::from(source[0]) * alpha + 127) / 255) as u8;
-                *surface.bits.add(offset + 1) = ((u32::from(source[1]) * alpha + 127) / 255) as u8;
-                *surface.bits.add(offset + 2) = ((u32::from(source[2]) * alpha + 127) / 255) as u8;
-                *surface.bits.add(offset + 3) = source[3];
-            }
-        }
-        Ok(surface)
-    }
-
-    fn write_pixels(&self, pixels: &[u8]) -> Result<(), CaptureError> {
-        if pixels.len() < self.byte_length {
-            return Err(invalid_frame("overlay pixel buffer is too short"));
-        }
-        // SAFETY: bits addresses byte_length writable bytes owned by this surface's live DIB.
-        unsafe { std::ptr::copy_nonoverlapping(pixels.as_ptr(), self.bits, self.byte_length) };
-        Ok(())
-    }
-
-    fn clear(&self) {
-        // SAFETY: bits addresses byte_length writable bytes owned by this surface's live DIB.
-        unsafe { std::ptr::write_bytes(self.bits, 0, self.byte_length) };
-    }
-
-    fn allocate(width: u32, height: u32, pixels: Option<&[u8]>) -> Result<Self, CaptureError> {
-        let width_i32 = i32::try_from(width)
-            .map_err(|_| invalid_frame("overlay width exceeds Win32 limits"))?;
-        let height_i32 = i32::try_from(height)
-            .map_err(|_| invalid_frame("overlay height exceeds Win32 limits"))?;
-        let byte_length = usize::try_from(width)
-            .ok()
-            .and_then(|value| value.checked_mul(height as usize))
-            .and_then(|value| value.checked_mul(4))
-            .ok_or_else(|| invalid_frame("overlay bitmap size overflowed"))?;
-        if pixels.is_some_and(|pixels| pixels.len() < byte_length) {
-            return Err(invalid_frame("overlay pixel buffer is too short"));
-        }
-        // SAFETY: A null compatible DC creates a memory DC compatible with the current screen.
-        let device = unsafe { CreateCompatibleDC(None) };
-        if device.0 == 0 {
-            return Err(last_error("create_overlay_memory_dc"));
-        }
-        let bitmap_info = top_down_bitmap_info(width_i32, height_i32);
-        let mut bitmap_bits = std::ptr::null_mut();
-        // SAFETY: bitmap_info and bitmap_bits are valid for the duration of the call. A null
-        // section handle requests process-owned storage for the DIB.
-        let bitmap = match unsafe {
-            CreateDIBSection(
-                device,
-                &bitmap_info,
-                DIB_RGB_COLORS,
-                &mut bitmap_bits,
-                None,
-                0,
-            )
-        } {
-            Ok(bitmap) => bitmap,
-            Err(error) => {
-                // SAFETY: device was created by CreateCompatibleDC and owns no selected bitmap.
-                unsafe { DeleteDC(device) };
-                return Err(overlay_error("create_overlay_dib", error));
-            }
-        };
-        if bitmap_bits.is_null() {
-            // SAFETY: bitmap and device were created above and have not been selected/retained.
-            unsafe {
-                DeleteObject(bitmap);
-                DeleteDC(device);
-            }
-            return Err(invalid_frame("overlay DIB returned no writable pixels"));
-        }
-        if let Some(pixels) = pixels {
-            // SAFETY: CreateDIBSection allocated byte_length writable bytes for this 32-bit bitmap.
-            unsafe {
-                std::ptr::copy_nonoverlapping(pixels.as_ptr(), bitmap_bits.cast(), byte_length)
-            };
-        }
-        // SAFETY: Selects the newly created bitmap into its owning memory DC.
-        let previous_bitmap = unsafe { SelectObject(device, bitmap) };
-        if previous_bitmap.0 == 0 || previous_bitmap.0 == -1 {
-            // SAFETY: selection failed, so both newly created handles can be released directly.
-            unsafe {
-                DeleteObject(bitmap);
-                DeleteDC(device);
-            }
-            return Err(last_error("select_overlay_dib"));
-        }
-        Ok(Self {
-            device,
-            bitmap,
-            previous_bitmap,
-            bits: bitmap_bits.cast(),
-            byte_length,
-            width: width_i32,
-            height: height_i32,
-        })
-    }
-
-    #[cfg(test)]
-    fn pixel_bytes(&self) -> &[u8] {
-        // SAFETY: bits points to byte_length bytes owned by bitmap for this surface's lifetime.
-        unsafe { std::slice::from_raw_parts(self.bits, self.byte_length) }
-    }
-}
-
-impl Drop for FrozenSurface {
-    fn drop(&mut self) {
-        debug_assert!(!self.bits.is_null());
-        debug_assert!(self.byte_length > 0);
-        // SAFETY: Restores the original object before releasing the process-owned bitmap and DC.
-        unsafe {
-            SelectObject(self.device, self.previous_bitmap);
-            DeleteObject(self.bitmap);
-            DeleteDC(self.device);
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct WindowCandidate {
-    handle: NativeWindowHandle,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ResizeHandle {
-    NorthWest,
-    North,
-    NorthEast,
-    East,
-    SouthEast,
-    South,
-    SouthWest,
-    West,
-}
-
-#[derive(Clone, Copy)]
-struct ResizeDrag {
-    handle: ResizeHandle,
-    original: Rect,
-}
-
-#[derive(Clone, Copy)]
-struct MoveDrag {
-    original: Rect,
-    pointer_origin: POINT,
 }
 
 fn remembered_toolbar_position(
@@ -1077,36 +698,6 @@ fn remembered_toolbar_position(
         })
         .or_else(|| position.map(|(x, y)| POINT { x, y }))
         .map(|origin| ToolbarLayout::clamp_origin(environment, origin))
-}
-
-fn initial_selection(
-    tool: CaptureTool,
-    last_region: Option<Rect>,
-    source: Rect,
-) -> (Option<Rect>, Option<SelectionKind>) {
-    match tool {
-        CaptureTool::FullDisplay => (Some(source), Some(SelectionKind::Display)),
-        CaptureTool::Window => (None, None),
-        CaptureTool::Region => {
-            let region = last_region
-                .map(|region| fit_region_to_source(region, source))
-                .unwrap_or_else(|| default_region_for_source(source));
-            (Some(region), Some(SelectionKind::Region))
-        }
-    }
-}
-
-fn latest_interaction_region(
-    tool: CaptureTool,
-    selection: Option<Rect>,
-    selection_kind: Option<SelectionKind>,
-    last_region: Option<Rect>,
-) -> Option<Rect> {
-    if tool == CaptureTool::Region && selection_kind == Some(SelectionKind::Region) {
-        selection.or(last_region)
-    } else {
-        last_region
-    }
 }
 
 fn remembered_last_region(
@@ -1214,36 +805,6 @@ fn remember_overlay_interaction(
     }
 }
 
-fn default_region_for_source(source: Rect) -> Rect {
-    let width = (source.width / 2).max(1);
-    let height = (source.height / 2).max(1);
-    Rect {
-        x: source
-            .x
-            .saturating_add(((source.width - width) / 2).min(i32::MAX as u32) as i32),
-        y: source
-            .y
-            .saturating_add(((source.height - height) / 2).min(i32::MAX as u32) as i32),
-        width,
-        height,
-    }
-}
-
-fn fit_region_to_source(region: Rect, source: Rect) -> Rect {
-    let width = region.width.min(source.width);
-    let height = region.height.min(source.height);
-    let source_right = i64::from(source.x) + i64::from(source.width);
-    let source_bottom = i64::from(source.y) + i64::from(source.height);
-    let maximum_x = source_right - i64::from(width);
-    let maximum_y = source_bottom - i64::from(height);
-    Rect {
-        x: i64::from(region.x).clamp(i64::from(source.x), maximum_x) as i32,
-        y: i64::from(region.y).clamp(i64::from(source.y), maximum_y) as i32,
-        width,
-        height,
-    }
-}
-
 fn remember_toolbar_position(
     ui_updates: Option<&OverlayUiSink>,
     display_id: &DisplayId,
@@ -1327,6 +888,7 @@ fn apply_overlay_ui_update(
 fn run_overlay(
     state: Box<OverlayState>,
     controller: &OverlayController,
+    resources: &mut OverlayResources,
 ) -> Result<Option<OverlaySelection>, CaptureError> {
     // Overlays run back to back on one long-lived selection thread. Start from a queue that cannot
     // already be quitting, so an earlier run's teardown can never end this loop before it pumps.
@@ -1351,8 +913,11 @@ fn run_overlay(
     if atom == 0 {
         return Err(last_error("register_overlay_class"));
     }
-    let class_guard = ClassRegistration { instance };
-    let source = state.source;
+    let class_guard = ClassRegistration {
+        class_name: CLASS_NAME,
+        instance,
+    };
+    let source = state.model.source;
     let live_preview = state.live_preview;
     let width = i32::try_from(source.width)
         .map_err(|_| invalid_frame("overlay width exceeds Win32 limits"))?;
@@ -1386,16 +951,15 @@ fn run_overlay(
     if hwnd.0 == 0 {
         // SAFETY: Window creation failed, so Win32 did not retain the state allocation.
         let state = unsafe { Box::from_raw(state_pointer) };
-        let _ = cache_overlay_state(state);
+        let _ = cache_overlay_state(state, resources);
         return Err(last_error("create_overlay_window"));
     }
     // SAFETY: state_pointer remains exclusively owned by this overlay thread. Recording the HWND
     // lets tool transitions register compositor previews against this top-level destination.
     unsafe {
         (*state_pointer).overlay_hwnd = hwnd;
-        if (*state_pointer).tool == CaptureTool::Window {
-            refresh_live_window_thumbnails(&mut *state_pointer);
-            rebuild_window_overview_cache(&mut *state_pointer);
+        if (*state_pointer).model.tool == CaptureTool::Window {
+            start_window_overview_build(hwnd, &mut *state_pointer);
         }
     }
     if live_preview {
@@ -1412,7 +976,7 @@ fn run_overlay(
             drain_pending_quit();
             // SAFETY: no callback can access the state after DestroyWindow returns.
             let state = unsafe { Box::from_raw(state_pointer) };
-            let _ = cache_overlay_state(state);
+            let _ = cache_overlay_state(state, resources);
             return Err(error);
         }
         // Capture exclusion is defense in depth. Confirmation still destroys this window before
@@ -1424,15 +988,20 @@ fn run_overlay(
     }
     controller.inner.hwnd.store(hwnd.0, Ordering::SeqCst);
     if controller.inner.cancelled.load(Ordering::SeqCst) {
+        // A cancel raced construction: destroy immediately and fall through to the message
+        // loop, which consumes the WM_QUIT that WM_DESTROY just latched and exits through
+        // the normal teardown (state reclaim, resource cache, controller clear). The handle
+        // is dead past this point and must not be shown or focused.
         // SAFETY: hwnd was just created on this thread and cancellation was requested.
         let _ = unsafe { DestroyWindow(hwnd) };
-    }
-    // SAFETY: hwnd is the live overlay window on this thread.
-    unsafe {
-        ShowWindow(hwnd, SW_SHOW);
-        UpdateWindow(hwnd);
-        SetForegroundWindow(hwnd);
-        SetFocus(hwnd);
+    } else {
+        // SAFETY: hwnd is the live overlay window on this thread.
+        unsafe {
+            ShowWindow(hwnd, SW_SHOW);
+            UpdateWindow(hwnd);
+            SetForegroundWindow(hwnd);
+            SetFocus(hwnd);
+        }
     }
     let mut message = MSG::default();
     loop {
@@ -1447,7 +1016,7 @@ fn run_overlay(
             let state = unsafe { Box::from_raw(state_pointer) };
             controller.inner.hwnd.store(0, Ordering::SeqCst);
             let previous_foreground = state.previous_foreground;
-            let _ = cache_overlay_state(state);
+            let _ = cache_overlay_state(state, resources);
             restore_input_context(previous_foreground);
             return Err(last_error("overlay_message_loop"));
         }
@@ -1464,34 +1033,10 @@ fn run_overlay(
     let state = unsafe { Box::from_raw(state_pointer) };
     controller.inner.hwnd.store(0, Ordering::SeqCst);
     let previous_foreground = state.previous_foreground;
-    let result = cache_overlay_state(state);
+    let result = cache_overlay_state(state, resources);
     restore_input_context(previous_foreground);
     drop(class_guard);
     Ok(result)
-}
-
-/// Removes a pending `WM_QUIT` from this thread's queue, if one is waiting.
-///
-/// `DestroyWindow` dispatches `WM_DESTROY` synchronously, and the overlay window procedure answers
-/// it with `PostQuitMessage`. When an overlay tears down without running its message loop to the
-/// end, that quit stays latched on the thread as per-thread state and would end the very next
-/// overlay run before it pumped a single message. The filter matches only `WM_QUIT`, so no
-/// window message can be discarded by mistake.
-fn drain_pending_quit() {
-    let mut message = MSG::default();
-    // SAFETY: message is writable storage and this thread owns the queue being peeked.
-    let _ = unsafe { PeekMessageW(&mut message, None, WM_QUIT, WM_QUIT, PM_REMOVE) };
-}
-
-struct ClassRegistration {
-    instance: HINSTANCE,
-}
-
-impl Drop for ClassRegistration {
-    fn drop(&mut self) {
-        // SAFETY: Balances this thread's successful RegisterClassW after all windows are gone.
-        let _ = unsafe { UnregisterClassW(CLASS_NAME, self.instance) };
-    }
 }
 
 unsafe extern "system" fn overlay_window_proc(
@@ -1516,9 +1061,16 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
     if message == WM_NCCREATE {
         // SAFETY: WM_NCCREATE lparam points to a valid CREATESTRUCTW for this call.
         let create = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
-        // SAFETY: Stores the Box pointer passed to CreateWindowExW for later callbacks.
+        // SAFETY: Stores the Box pointer passed to CreateWindowExW for later callbacks. This
+        // must run first and unconditionally so every later message can reach the state.
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize) };
-        return LRESULT(1);
+        // Delegate to DefWindowProcW instead of answering TRUE directly: its WM_NCCREATE
+        // handling stores the window text passed to CreateWindowExW (without it,
+        // GetWindowTextW on the overlay returns nothing) and returns TRUE on success, so
+        // creation proceeds exactly as before - and honestly aborts if default non-client
+        // setup ever fails.
+        // SAFETY: Default non-client creation for this live window.
+        return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     }
     // SAFETY: Retrieves only the pointer installed during WM_NCCREATE.
     let state_pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut OverlayState;
@@ -1529,6 +1081,10 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             let state = unsafe { &mut *state_pointer };
             state.live_window_thumbnails.clear();
             state.overlay_hwnd = HWND(0);
+            // Retract the published handle while the window still exists: after WM_NCDESTROY
+            // returns the value can be recycled, and cancel() must not be able to load it.
+            // run_overlay's later store(0) remains as belt and braces for non-window paths.
+            state.controller.inner.hwnd.store(0, Ordering::SeqCst);
         }
         // SAFETY: Prevents any later callback from observing the state pointer.
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
@@ -1540,102 +1096,59 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     }
     match message {
-        WM_DPICHANGED => {
-            display_configuration_changed_and_close(hwnd, "overlay_dpi_changed");
-            LRESULT(0)
-        }
-        WM_DISPLAYCHANGE => {
-            display_configuration_changed_and_close(hwnd, "overlay_display_changed");
-            LRESULT(0)
-        }
+        WM_DPICHANGED => run_machine(
+            hwnd,
+            state_pointer,
+            OverlayInput::DisplayConfigurationInvalidated {
+                reason: "overlay_dpi_changed",
+            },
+        ),
+        WM_DISPLAYCHANGE => run_machine(
+            hwnd,
+            state_pointer,
+            OverlayInput::DisplayConfigurationInvalidated {
+                reason: "overlay_display_changed",
+            },
+        ),
         WM_SETTINGCHANGE
             if wparam.0 == SPI_SETWORKAREA.0 as usize
                 || wparam.0 == SPI_SETLOGICALDPIOVERRIDE.0 as usize =>
         {
-            display_configuration_changed_and_close(hwnd, "overlay_display_setting_changed");
-            LRESULT(0)
+            run_machine(
+                hwnd,
+                state_pointer,
+                OverlayInput::DisplayConfigurationInvalidated {
+                    reason: "overlay_display_setting_changed",
+                },
+            )
         }
         WM_MOUSEMOVE => {
-            // SAFETY: The Box remains alive for the message loop. The last state access occurs
-            // before UpdateWindow can synchronously dispatch WM_PAINT and reborrow the pointer.
-            let state = unsafe { &mut *state_pointer };
-            let point = screen_point(state.source, lparam);
-            let local = local_point(state.source, point);
-            state.pointer_local = Some(local);
-            let previous_hovered = state.hovered.map(|candidate| candidate.handle);
-            let previous_control = state.hovered_control;
-            if let Some(drag) = state.toolbar_drag {
-                state.toolbar_position = ToolbarLayout::clamp_origin(
-                    state.display_environment,
-                    POINT {
-                        x: local.x.saturating_sub(drag.pointer_offset.x),
-                        y: local.y.saturating_sub(drag.pointer_offset.y),
+            let (point, window_pass) = {
+                // SAFETY: The borrow ends with this block, before run_machine derives its own.
+                let state = unsafe { &*state_pointer };
+                (
+                    screen_point(state.model.source, lparam),
+                    state.model.tool == CaptureTool::Window && state.model.toolbar_drag.is_none(),
+                )
+            };
+            if !window_pass {
+                return run_machine(
+                    hwnd,
+                    state_pointer,
+                    OverlayInput::PointerMoved {
+                        point,
+                        window_hover: None,
                     },
                 );
-                state.hovered_control = Some(ToolbarControl::Background);
-                state.hovered = None;
-                state.hovered_handle = None;
-                set_arrow_cursor();
-                invalidate(hwnd);
-                return LRESULT(0);
             }
-            let layout = ToolbarLayout::new(state.display_environment, state.toolbar_position);
-            let region_drag_active =
-                state.resizing.is_some() || state.moving_region.is_some() || state.anchor.is_some();
-            state.hovered_control = (!region_drag_active)
-                .then(|| layout.hit_test(local, state.options_open))
-                .flatten();
-            if state.hovered_control.is_some() {
-                state.hovered = None;
-                set_arrow_cursor();
-            } else if let Some(resize) = state.resizing {
-                state.selection = Some(resize_region(
-                    resize.original,
-                    resize.handle,
-                    point,
-                    state.source,
-                ));
-                state.hovered_handle = Some(resize.handle);
-                update_cursor(state.hovered_handle, &state.region_cursor);
-            } else if let Some(moving) = state.moving_region {
-                state.selection = Some(move_region(
-                    moving.original,
-                    moving.pointer_origin,
-                    point,
-                    state.source,
-                ));
-                state.hovered_handle = None;
-                set_move_cursor();
-            } else if let Some(anchor) = state.anchor {
-                state.dragging |= (point.x - anchor.x).abs() >= DRAG_THRESHOLD
-                    || (point.y - anchor.y).abs() >= DRAG_THRESHOLD;
-                if state.dragging {
-                    state.selection = rect_from_points(state.source, anchor, point);
-                    state.selection_kind = Some(SelectionKind::Region);
-                    state.selected_window = None;
-                    state.hovered = None;
-                }
-                state.hovered_handle = None;
-                update_cursor(None, &state.region_cursor);
-            } else if state.tool == CaptureTool::Region
-                && state.selection_kind == Some(SelectionKind::Region)
-            {
-                state.hovered_handle = state.selection.and_then(|selection| {
-                    hit_test_resize_handle(selection, point, state.display_environment.metrics)
-                });
-                state.hovered = None;
-                if state.hovered_handle.is_none()
-                    && state
-                        .selection
-                        .is_some_and(|selection| contains(selection, point))
-                {
-                    set_move_cursor();
-                } else {
-                    update_cursor(state.hovered_handle, &state.region_cursor);
-                }
-            } else if state.tool == CaptureTool::Window {
-                let hovered_handle = hit_test_window_thumbnail(state, local);
-                state.hovered = hovered_handle.and_then(|handle| {
+            // Window-tool hover pass: the shell resolves the thumbnail under the pointer (it
+            // owns the inventory) and owns the paint policy - skip the repaint entirely when
+            // nothing changed, otherwise force the now-cheap cached hover paint synchronously.
+            let (input, previous) = {
+                // SAFETY: The borrow ends with this block, before run_machine derives its own.
+                let state = unsafe { &*state_pointer };
+                let local = local_point(state.model.source, point);
+                let window_hover = hit_test_window_thumbnail(state, local).and_then(|handle| {
                     state.windows.as_ref().and_then(|windows| {
                         windows
                             .iter()
@@ -1643,302 +1156,88 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                             .find(|candidate| candidate.handle == handle)
                     })
                 });
-                state.hovered_handle = None;
-                set_arrow_cursor();
-            } else {
-                state.hovered = None;
-                state.hovered_handle = None;
-                if state.tool == CaptureTool::Region {
-                    update_cursor(None, &state.region_cursor);
-                } else {
-                    set_arrow_cursor();
-                }
-            }
-            if state.tool == CaptureTool::Window
-                && previous_hovered == state.hovered.map(|candidate| candidate.handle)
-                && previous_control == state.hovered_control
-            {
+                (
+                    OverlayInput::PointerMoved {
+                        point,
+                        window_hover,
+                    },
+                    (
+                        state.model.hovered.map(|candidate| candidate.handle),
+                        state.model.hovered_control,
+                    ),
+                )
+            };
+            run_machine(hwnd, state_pointer, input);
+            let unchanged = {
+                // SAFETY: run_machine has returned; the borrow ends with this block.
+                let state = unsafe { &*state_pointer };
+                previous
+                    == (
+                        state.model.hovered.map(|candidate| candidate.handle),
+                        state.model.hovered_control,
+                    )
+            };
+            if unchanged {
                 return LRESULT(0);
             }
-            let update_window = state.tool == CaptureTool::Window;
             invalidate(hwnd);
-            if update_window {
-                // SAFETY: Forces the now-cheap cached hover paint before this mouse message returns.
-                let _ = unsafe { UpdateWindow(hwnd) };
-            }
+            // SAFETY: Forces the now-cheap cached hover paint before this mouse message returns.
+            let _ = unsafe { UpdateWindow(hwnd) };
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
-            // SAFETY: The Box remains alive for the message loop. SetCapture does not dispatch an
-            // overlay callback while capture is still owned by this window; destruction is only
-            // requested after the final state access in the confirming branches.
-            let state = unsafe { &mut *state_pointer };
-            let point = screen_point(state.source, lparam);
-            let local = local_point(state.source, point);
-            let layout = ToolbarLayout::new(state.display_environment, state.toolbar_position);
-            if let Some(control) = layout.hit_test(local, state.options_open) {
-                state.anchor = None;
-                state.dragging = false;
-                state.resizing = None;
-                state.moving_region = None;
-                state.hovered_control = Some(control);
-                match control {
-                    ToolbarControl::Background if layout.bounds.contains(local) => {
-                        state.options_open = false;
-                        if state.tool == CaptureTool::Window {
-                            // DWM thumbnails are compositor-managed and can cover overlay pixels.
-                            // Use frozen fallbacks while the toolbar is moving, then register only
-                            // previews that do not overlap its final position on button-up.
-                            state.live_window_thumbnails.clear();
-                            rebuild_window_overview_cache(state);
-                        }
-                        state.toolbar_drag = Some(ToolbarDrag {
-                            pointer_offset: POINT {
-                                x: local.x.saturating_sub(state.toolbar_position.x),
-                                y: local.y.saturating_sub(state.toolbar_position.y),
-                            },
-                        });
-                        capture_pointer(hwnd);
-                    }
-                    ToolbarControl::Background => {}
-                    ToolbarControl::FullDisplay => {
-                        activate_tool(state, CaptureTool::FullDisplay);
-                    }
-                    ToolbarControl::Window => activate_tool(state, CaptureTool::Window),
-                    ToolbarControl::Region => activate_tool(state, CaptureTool::Region),
-                    ToolbarControl::Options => {
-                        state.options_open = !state.options_open;
-                        if state.tool == CaptureTool::Window {
-                            refresh_live_window_thumbnails(state);
-                            rebuild_window_overview_cache(state);
-                        }
-                    }
-                    ToolbarControl::Capture => {
-                        if confirm_overlay(state) {
-                            close_overlay(hwnd);
-                        }
-                        return LRESULT(0);
-                    }
-                    ToolbarControl::DimBackground => {
-                        state.dim_background = !state.dim_background;
-                    }
-                    ToolbarControl::ClipboardDestination => {}
-                    ToolbarControl::Cancel => {
-                        cancel_overlay(state);
-                        close_overlay(hwnd);
-                        return LRESULT(0);
-                    }
-                }
-                set_arrow_cursor();
-                invalidate(hwnd);
-                return LRESULT(0);
-            }
-            state.hovered_control = None;
-            let options_were_open = state.options_open;
-            state.options_open = false;
-            if options_were_open && state.tool == CaptureTool::Window {
-                refresh_live_window_thumbnails(state);
-                rebuild_window_overview_cache(state);
-            }
-            if state.tool != CaptureTool::Region {
-                if state.tool == CaptureTool::Window {
-                    state.selected_window = hit_test_window_thumbnail(state, local);
-                    update_window_preview(state, state.selected_window);
-                    state.selected_window_frame =
-                        ready_window_preview(state, state.selected_window)
-                            .map(|preview| preview.frame.clone());
-                    state.selection = state
-                        .selected_window_frame
-                        .as_ref()
-                        .map(|frame| frame.metadata.source_rect);
-                    state.selection_kind = state.selection.map(|_| SelectionKind::Window);
-                    if state.selection.is_some() {
-                        if confirm_overlay(state) {
-                            close_overlay(hwnd);
-                        }
-                        return LRESULT(0);
-                    }
-                    rebuild_window_overview_cache(state);
-                }
-                invalidate(hwnd);
-                return LRESULT(0);
-            }
-            let existing_region = (state.selection_kind == Some(SelectionKind::Region))
-                .then_some(state.selection)
-                .flatten();
-            let resize_handle = existing_region.and_then(|selection| {
-                hit_test_resize_handle(selection, point, state.display_environment.metrics)
-            });
-            if let (Some(original), Some(handle)) = (existing_region, resize_handle) {
-                state.resizing = Some(ResizeDrag { handle, original });
-                state.moving_region = None;
-                state.hovered_handle = Some(handle);
-                state.anchor = None;
-                state.dragging = false;
-                update_cursor(Some(handle), &state.region_cursor);
-                capture_pointer(hwnd);
-            } else if existing_region.is_some_and(|selection| contains(selection, point)) {
-                state.moving_region = existing_region.map(|original| MoveDrag {
-                    original,
-                    pointer_origin: point,
-                });
-                state.anchor = None;
-                state.dragging = false;
-                state.hovered_handle = None;
-                set_move_cursor();
-                capture_pointer(hwnd);
-            } else {
-                state.anchor = Some(point);
-                state.dragging = false;
-                state.resizing = None;
-                state.moving_region = None;
-                state.selection = None;
-                state.selection_kind = None;
-                state.selected_window = None;
-                state.hovered_handle = None;
-                state.hovered = None;
-                state.dimension_label_placement = None;
-                update_cursor(None, &state.region_cursor);
-                capture_pointer(hwnd);
-            }
-            invalidate(hwnd);
-            LRESULT(0)
+            let input = {
+                // SAFETY: The borrow ends with this block, before run_machine derives its own.
+                let state = unsafe { &*state_pointer };
+                let point = screen_point(state.model.source, lparam);
+                let local = local_point(state.model.source, point);
+                let window_slot = (state.model.tool == CaptureTool::Window)
+                    .then(|| hit_test_window_thumbnail(state, local))
+                    .flatten();
+                OverlayInput::PointerDown { point, window_slot }
+            };
+            run_machine(hwnd, state_pointer, input)
         }
         WM_LBUTTONUP => {
-            // ReleaseCapture synchronously sends WM_CAPTURECHANGED back to this window. Mark the
-            // release before calling Win32 so that reentrant notification does not erase the drag
-            // which this button-up message still needs to commit.
-            // SAFETY: This single-field mutation ends before ReleaseCapture can re-enter.
-            unsafe { (&mut *state_pointer).releasing_pointer_capture = true };
-            release_pointer_capture();
-            // Clear a stale marker if the platform did not deliver WM_CAPTURECHANGED.
-            // SAFETY: ReleaseCapture has returned, so no state borrow spans its callback.
-            unsafe { (&mut *state_pointer).releasing_pointer_capture = false };
-            // SAFETY: The Box remains alive for the message loop and this message does not
-            // synchronously dispatch another window-procedure callback while borrowed.
-            let state = unsafe { &mut *state_pointer };
-            let point = screen_point(state.source, lparam);
-            if state.toolbar_drag.take().is_some() {
-                remember_toolbar_position(
-                    state.ui_updates.as_ref(),
-                    &state.reference_metadata.display_id,
-                    state.toolbar_position,
-                    state.display_environment,
-                );
-                if state.tool == CaptureTool::Window {
-                    refresh_live_window_thumbnails(state);
-                    rebuild_window_overview_cache(state);
-                }
-                state.hovered_control = Some(ToolbarControl::Background);
-                set_arrow_cursor();
-                invalidate(hwnd);
-                return LRESULT(0);
-            }
-            if state.tool != CaptureTool::Region {
-                return LRESULT(0);
-            }
-            if let Some(resize) = state.resizing.take() {
-                state.selection = Some(resize_region(
-                    resize.original,
-                    resize.handle,
-                    point,
-                    state.source,
-                ));
-                state.selection_kind = Some(SelectionKind::Region);
-                state.selected_window = None;
-            } else if let Some(moving) = state.moving_region.take() {
-                state.selection = Some(move_region(
-                    moving.original,
-                    moving.pointer_origin,
-                    point,
-                    state.source,
-                ));
-                state.selection_kind = Some(SelectionKind::Region);
-                state.selected_window = None;
-            } else if let Some(anchor) = state.anchor.take() {
-                if state.dragging {
-                    state.selection = rect_from_points(state.source, anchor, point);
-                    state.selection_kind = Some(SelectionKind::Region);
-                    state.selected_window = None;
-                }
-            }
-            state.dragging = false;
-            state.hovered_handle = if state.selection_kind == Some(SelectionKind::Region) {
-                state.selection.and_then(|selection| {
-                    hit_test_resize_handle(selection, point, state.display_environment.metrics)
-                })
-            } else {
-                None
+            let point = {
+                // SAFETY: This borrow ends before run_machine derives its own.
+                let state = unsafe { &*state_pointer };
+                screen_point(state.model.source, lparam)
             };
-            if state.hovered_handle.is_none()
-                && state
-                    .selection
-                    .is_some_and(|selection| contains(selection, point))
-            {
-                set_move_cursor();
-            } else {
-                update_cursor(state.hovered_handle, &state.region_cursor);
-            }
-            invalidate(hwnd);
-            LRESULT(0)
+            run_machine(hwnd, state_pointer, OverlayInput::PointerUp { point })
         }
         WM_LBUTTONDBLCLK => {
-            let should_close = {
-                // SAFETY: The Box remains alive for the message loop. The borrow ends before
-                // close_overlay synchronously dispatches destruction messages.
-                let state = unsafe { &mut *state_pointer };
-                let point = screen_point(state.source, lparam);
-                let local = local_point(state.source, point);
-                let layout = ToolbarLayout::new(state.display_environment, state.toolbar_position);
-                layout.hit_test(local, state.options_open).is_none() && confirm_overlay(state)
+            let point = {
+                // SAFETY: This borrow ends before run_machine derives its own.
+                let state = unsafe { &*state_pointer };
+                screen_point(state.model.source, lparam)
             };
-            if should_close {
-                close_overlay(hwnd);
-            }
-            LRESULT(0)
+            run_machine(hwnd, state_pointer, OverlayInput::DoubleClicked { point })
         }
         WM_KEYDOWN if wparam.0 == usize::from(VK_RETURN.0) => {
-            // SAFETY: The Box remains alive for the message loop. The borrow is consumed by the
-            // pure state transition and ends before close_overlay dispatches messages.
-            let should_close = confirm_overlay(unsafe { &mut *state_pointer });
-            if should_close {
-                close_overlay(hwnd);
-            }
-            LRESULT(0)
+            run_machine(hwnd, state_pointer, OverlayInput::ConfirmRequested)
         }
         WM_KEYDOWN if wparam.0 == usize::from(VK_ESCAPE.0) => {
-            // SAFETY: The Box remains alive for the message loop. The borrow ends when the pure
-            // cancellation transition returns, before close_overlay dispatches messages.
-            cancel_overlay(unsafe { &mut *state_pointer });
-            close_overlay(hwnd);
-            LRESULT(0)
+            run_machine(hwnd, state_pointer, OverlayInput::CancelRequested)
         }
         WM_CAPTURECHANGED => {
-            // SAFETY: The state allocation remains live. This arm performs only local mutation
-            // and does not call ReleaseCapture recursively.
-            let state = unsafe { &mut *state_pointer };
-            if consume_self_initiated_capture_change(&mut state.releasing_pointer_capture) {
+            // A self-initiated ReleaseCapture round trip is protocol, not product state: consume
+            // the shell's flag and never involve the machine.
+            // SAFETY: This single-field borrow ends before run_machine derives its own.
+            if consume_self_initiated_capture_change(unsafe {
+                &mut (*state_pointer).releasing_pointer_capture
+            }) {
                 return LRESULT(0);
             }
-            let toolbar_dragging = state.toolbar_drag.take().is_some();
-            state.resizing = None;
-            state.moving_region = None;
-            state.anchor = None;
-            state.dragging = false;
-            state.hovered_handle = None;
-            if toolbar_dragging && state.tool == CaptureTool::Window {
-                refresh_live_window_thumbnails(state);
-                rebuild_window_overview_cache(state);
-            }
-            set_arrow_cursor();
-            invalidate(hwnd);
-            LRESULT(0)
+            run_machine(hwnd, state_pointer, OverlayInput::PointerCaptureLost)
         }
         WM_RBUTTONDOWN | WM_CLOSE => {
-            // SAFETY: The Box remains alive for the message loop. The borrow ends when the pure
-            // cancellation transition returns, before close_overlay dispatches messages.
-            cancel_overlay(unsafe { &mut *state_pointer });
-            close_overlay(hwnd);
+            run_machine(hwnd, state_pointer, OverlayInput::CancelRequested)
+        }
+        WM_OVERVIEW_RENDER_BATCH => {
+            // SAFETY: The Box remains alive for the message loop; the borrow ends before this
+            // arm returns, and rendering spawns only scoped workers that never message us.
+            render_overview_batch(hwnd, unsafe { &mut *state_pointer }, wparam.0);
             LRESULT(0)
         }
         WM_PAINT => {
@@ -1958,65 +1257,205 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
     }
 }
 
-fn remember_overlay_state(state: &mut OverlayState) {
-    let region = latest_interaction_region(
-        state.tool,
-        state.selection,
-        state.selection_kind,
-        state.last_region,
+fn build_overlay_selection(
+    state: &OverlayState,
+    rect: Rect,
+    kind: SelectionKind,
+    window: Option<NativeWindowHandle>,
+    window_frame: Option<CpuFrame>,
+) -> OverlaySelection {
+    // Preview counts and bytes are run-scoped cost telemetry, like window_overview_ns: they
+    // describe the chooser inventory this run built and held, whatever kind was confirmed.
+    // The live/frozen split, however, describes presentation at confirm time - leaving the
+    // Window tool hides every live registration, so a non-Window confirm has zero live
+    // previews and the whole inventory counts as frozen.
+    let (live_previews, frozen_previews) = confirm_preview_split(
+        kind,
+        state.live_window_thumbnails.len(),
+        state.window_thumbnails.len(),
     );
-    remember_overlay_interaction(
-        state.ui_updates.as_ref(),
-        &state.reference_metadata.display_id,
-        state.source,
-        state.tool,
-        region,
-        state.reference_metadata.rotation_degrees,
-    );
-    state.last_region = region;
-}
-
-fn confirm_overlay(state: &mut OverlayState) -> bool {
-    if let (Some(rect), Some(kind)) = (state.selection, state.selection_kind) {
-        let window_frame = if kind == SelectionKind::Window {
-            state.selected_window_frame.clone()
-        } else {
-            None
-        };
-        let rect = window_frame
-            .as_ref()
-            .map(|frame| frame.metadata.source_rect)
-            .unwrap_or(rect);
-        debug_assert_eq!(state.tool, CaptureTool::from_selection_kind(kind));
-        remember_overlay_state(state);
-        state.result = Some(OverlaySelection {
-            rect,
-            kind,
-            window: state.selected_window,
-            selection_ns: duration_ns(state.started.elapsed()),
-            preparation_ns: state.preparation_ns,
-            window_overview_ns: state.window_overview_ns,
-            window_preview_count: state.window_thumbnails.len(),
-            window_live_preview_count: state.live_window_thumbnails.len(),
-            window_frozen_preview_count: state
-                .window_thumbnails
-                .len()
-                .saturating_sub(state.live_window_thumbnails.len()),
-            window_preview_bytes: state
-                .window_thumbnails
-                .iter()
-                .map(|thumbnail| thumbnail.surface.byte_length)
-                .sum(),
-            window_frame,
-        });
-        true
-    } else {
-        false
+    OverlaySelection {
+        rect,
+        kind,
+        window,
+        selection_ns: duration_ns(state.started.elapsed()),
+        preparation_ns: state.preparation_ns,
+        window_overview_ns: state.window_overview_ns,
+        window_preview_count: state.window_thumbnails.len(),
+        window_live_preview_count: live_previews,
+        window_frozen_preview_count: frozen_previews,
+        window_preview_bytes: state
+            .window_thumbnails
+            .iter()
+            .map(|thumbnail| thumbnail.surface.byte_length)
+            .sum(),
+        window_frame,
     }
 }
 
-fn cancel_overlay(state: &mut OverlayState) {
-    remember_overlay_state(state);
+/// Splits the chooser inventory into (live, frozen) counts for a confirm of the given kind.
+/// Only a Window confirm can have live DWM previews on screen; every other kind hid them on
+/// the way out of the Window tool.
+const fn confirm_preview_split(kind: SelectionKind, live: usize, total: usize) -> (usize, usize) {
+    let live = if matches!(kind, SelectionKind::Window) {
+        live
+    } else {
+        0
+    };
+    (live, total.saturating_sub(live))
+}
+
+/// Runs one machine transition and applies the returned effects. The model borrow taken for the
+/// transition ends before any effect executes, so effects that reenter this window procedure
+/// (`ReleaseCapture`, `DestroyWindow`) can never observe a live `&mut` of the state.
+fn run_machine(hwnd: HWND, state_pointer: *mut OverlayState, input: OverlayInput) -> LRESULT {
+    // SAFETY: The Box remains alive for the message loop; this borrow ends at the semicolon.
+    let effects = transition(unsafe { &mut (*state_pointer).model }, input);
+    apply_overlay_effects(hwnd, state_pointer, effects);
+    LRESULT(0)
+}
+
+fn apply_overlay_effects(
+    hwnd: HWND,
+    state_pointer: *mut OverlayState,
+    effects: Vec<OverlayEffect>,
+) {
+    for effect in effects {
+        match effect {
+            OverlayEffect::SetCursor(intent) => {
+                // SAFETY: Shared borrow for the cursor resources; released at the block's end.
+                let state = unsafe { &*state_pointer };
+                match intent {
+                    CursorIntent::Arrow => set_arrow_cursor(),
+                    CursorIntent::Move => set_move_cursor(),
+                    CursorIntent::Crosshair => update_cursor(None, &state.region_cursor),
+                    CursorIntent::Resize(handle) => {
+                        update_cursor(Some(handle), &state.region_cursor)
+                    }
+                }
+            }
+            OverlayEffect::Invalidate => invalidate(hwnd),
+            OverlayEffect::CapturePointer => capture_pointer(hwnd),
+            OverlayEffect::ReleasePointer => {
+                // ReleaseCapture synchronously sends WM_CAPTURECHANGED back to this window. Arm
+                // the protocol flag first so that reentrant notification is recognized as
+                // self-initiated; the model transition has already committed its work, so the
+                // reentrant callback can never erase state the caller still needs.
+                // SAFETY: This single-field mutation ends before ReleaseCapture can re-enter.
+                unsafe { (*state_pointer).releasing_pointer_capture = true };
+                release_pointer_capture();
+                // Clear a stale marker if the platform did not deliver WM_CAPTURECHANGED.
+                // SAFETY: ReleaseCapture has returned, so no borrow spans its callback.
+                unsafe { (*state_pointer).releasing_pointer_capture = false };
+            }
+            OverlayEffect::ClearDimensionLabel => {
+                // SAFETY: Local mutation on the owning thread; nothing is dispatched.
+                unsafe { (*state_pointer).dimension_label_placement = None };
+            }
+            OverlayEffect::ClearSelectedWindowFrame => {
+                // SAFETY: Local mutation on the owning thread; nothing is dispatched.
+                unsafe { (*state_pointer).selected_window_frame = None };
+            }
+            OverlayEffect::ClearLiveThumbnails => {
+                // SAFETY: The borrow ends before the next effect; unregistering DWM thumbnails
+                // does not dispatch messages into this window procedure.
+                unsafe { (*state_pointer).live_window_thumbnails.clear() };
+            }
+            OverlayEffect::HideLiveThumbnails => {
+                // SAFETY: Shared borrow released at the block's end.
+                let state = unsafe { &*state_pointer };
+                hide_live_window_thumbnails(state);
+            }
+            OverlayEffect::RebuildOverviewCache => {
+                // SAFETY: The borrow ends before the next effect.
+                let state = unsafe { &mut *state_pointer };
+                rebuild_window_overview_cache(state);
+            }
+            OverlayEffect::BuildWindowOverview => {
+                // Deliberately synchronous: the chooser blocks the pump while thumbnails render
+                // (M21), and this stage preserves that timing exactly.
+                // SAFETY: The borrow ends before the next effect.
+                let state = unsafe { &mut *state_pointer };
+                start_window_overview_build(hwnd, state);
+            }
+            OverlayEffect::UpdateWindowPreview { window } => {
+                let rect = {
+                    // The 700 ms blocking capture attempt stays synchronous here (M21); the
+                    // non-sticky Unavailable retry lives in update_window_preview's cache.
+                    // SAFETY: The borrow ends before the feedback transition derives its own.
+                    let state = unsafe { &mut *state_pointer };
+                    update_window_preview(state, window);
+                    state.selected_window_frame =
+                        ready_window_preview(state, window).map(|preview| preview.frame.clone());
+                    state
+                        .selected_window_frame
+                        .as_ref()
+                        .map(|frame| frame.metadata.source_rect)
+                };
+                // Feed the outcome back so the machine decides confirm versus stay-in-chooser.
+                // SAFETY: The Box remains alive; this borrow ends at the semicolon.
+                let effects = transition(
+                    unsafe { &mut (*state_pointer).model },
+                    OverlayInput::WindowPreviewResolved { rect },
+                );
+                apply_overlay_effects(hwnd, state_pointer, effects);
+            }
+            OverlayEffect::RefreshWindowChrome => {
+                // SAFETY: The borrow ends before the next effect. DWM thumbnail registration
+                // does not dispatch messages into this window procedure.
+                let state = unsafe { &mut *state_pointer };
+                refresh_live_window_thumbnails(state);
+                rebuild_window_overview_cache(state);
+            }
+            OverlayEffect::PersistToolbarCenter { position } => {
+                // SAFETY: Shared borrow released at the block's end.
+                let state = unsafe { &*state_pointer };
+                remember_toolbar_position(
+                    state.ui_updates.as_ref(),
+                    &state.reference_metadata.display_id,
+                    position,
+                    state.model.display_environment,
+                );
+            }
+            OverlayEffect::PersistInteraction { region } => {
+                // SAFETY: Shared borrow released at the block's end.
+                let state = unsafe { &*state_pointer };
+                remember_overlay_interaction(
+                    state.ui_updates.as_ref(),
+                    &state.reference_metadata.display_id,
+                    state.model.source,
+                    state.model.tool,
+                    region,
+                    state.reference_metadata.rotation_degrees,
+                );
+            }
+            OverlayEffect::Close(outcome) => {
+                match outcome {
+                    CloseOutcome::Confirmed { rect, kind, window } => {
+                        // SAFETY: The borrow ends before close_overlay dispatches destruction.
+                        let state = unsafe { &mut *state_pointer };
+                        let window_frame = (kind == SelectionKind::Window)
+                            .then(|| state.selected_window_frame.clone())
+                            .flatten();
+                        let rect = window_frame
+                            .as_ref()
+                            .map(|frame| frame.metadata.source_rect)
+                            .unwrap_or(rect);
+                        let selection =
+                            build_overlay_selection(state, rect, kind, window, window_frame);
+                        state.result = Some(selection);
+                        close_overlay(hwnd);
+                    }
+                    CloseOutcome::Cancelled => close_overlay(hwnd),
+                    CloseOutcome::DisplayConfigurationInvalidated { reason } => {
+                        display_configuration_changed_and_close(hwnd, reason);
+                    }
+                }
+                // Destruction has been dispatched; nothing may run after it.
+                return;
+            }
+        }
+    }
 }
 
 fn close_overlay(hwnd: HWND) {
@@ -2029,11 +1468,6 @@ fn display_configuration_changed_and_close(hwnd: HWND, reason: &'static str) {
     // Do not persist geometry from a display configuration that is no longer current.
     // SAFETY: hwnd is the live overlay window and this function runs on its owner thread.
     let _ = unsafe { DestroyWindow(hwnd) };
-}
-
-fn invalidate(hwnd: HWND) {
-    // SAFETY: Invalidates the complete client area of the live overlay without erasing it first.
-    let _ = unsafe { InvalidateRect(hwnd, None, false) };
 }
 
 fn paint(hwnd: HWND, state_pointer: *mut OverlayState) {
@@ -2057,27 +1491,66 @@ fn paint(hwnd: HWND, state_pointer: *mut OverlayState) {
     unsafe { EndPaint(hwnd, &paint) };
 }
 
-fn capture_pointer(hwnd: HWND) {
-    // SAFETY: Captures mouse input to the live overlay for the duration of an active drag.
-    let _ = unsafe { SetCapture(hwnd) };
-}
-
-fn release_pointer_capture() {
-    // SAFETY: Best-effort release on the overlay thread after the matching button-up message.
-    let _ = unsafe { ReleaseCapture() };
-}
-
-fn consume_self_initiated_capture_change(releasing_pointer_capture: &mut bool) -> bool {
-    std::mem::take(releasing_pointer_capture)
+/// Removes every chooser entry whose source window no longer exists and returns the dead
+/// handles. The tiles, live DWM registrations, candidates, and any preview pixels disappear
+/// together, so the layout closes the gap and a destroyed window is no longer clickable.
+/// Windows that are still alive keep their entries even when their live thumbnail or preview
+/// has failed - failure stays retryable, only destruction prunes.
+fn prune_dead_window_sources(state: &mut OverlayState) -> Vec<NativeWindowHandle> {
+    let dead: Vec<NativeWindowHandle> = state
+        .window_thumbnails
+        .iter()
+        .map(|thumbnail| thumbnail.handle)
+        // SAFETY: IsWindow validates a handle without retaining or dereferencing it.
+        .filter(|handle| !unsafe { IsWindow(HWND(handle.raw())) }.as_bool())
+        .collect();
+    if dead.is_empty() {
+        return dead;
+    }
+    for handle in &dead {
+        log::debug!(
+            "pruning chooser slot for destroyed window handle=0x{:X}",
+            handle.raw()
+        );
+    }
+    state
+        .window_thumbnails
+        .retain(|thumbnail| !dead.contains(&thumbnail.handle));
+    // Dropping a live registration unregisters its DWM thumbnail.
+    state
+        .live_window_thumbnails
+        .retain(|preview| !dead.contains(&preview.handle));
+    if let Some(windows) = state.windows.as_mut() {
+        windows.retain(|candidate| !dead.contains(&candidate.handle));
+    }
+    let preview_died = match &state.window_preview {
+        Some(WindowPreviewState::Ready(preview)) => dead.contains(&preview.handle),
+        Some(WindowPreviewState::Unavailable(handle)) => dead.contains(handle),
+        None => false,
+    };
+    if preview_died {
+        state.window_preview = None;
+    }
+    dead
 }
 
 fn compose_overlay_state(state: &mut OverlayState) {
     let width = state.surface.width;
-    if state.tool == CaptureTool::Window {
+    if state.model.tool == CaptureTool::Window {
+        // Destroyed sources are pruned once per paint (the overlay runs no timers), and any
+        // model state pointing at them is cleared before the chooser surface is rebuilt.
+        let dead = prune_dead_window_sources(state);
+        if !dead.is_empty() {
+            for effect in machine::window_sources_pruned(&mut state.model, &dead) {
+                debug_assert!(matches!(effect, OverlayEffect::ClearSelectedWindowFrame));
+                state.selected_window_frame = None;
+            }
+            rebuild_window_overview_cache(state);
+        }
         let cache_matches = state
             .window_overview_cache
             .as_ref()
-            .is_some_and(|cache| cache.dim_background == state.dim_background);
+            .is_some_and(|cache| cache.dim_background == state.model.dim_background);
         if !cache_matches {
             rebuild_window_overview_cache(state);
         }
@@ -2122,7 +1595,8 @@ fn compose_overlay_state(state: &mut OverlayState) {
     }
     // Window mode's dim wash is already part of its static overview cache. Other tools compose it
     // here so the selected region can subsequently restore its original frozen pixels.
-    if state.tool != CaptureTool::Window && state.dim_background && !state.live_preview {
+    if state.model.tool != CaptureTool::Window && state.model.dim_background && !state.live_preview
+    {
         let _ = apply_dim_wash(
             state.back_buffer.device,
             state.dimmer.device,
@@ -2131,18 +1605,18 @@ fn compose_overlay_state(state: &mut OverlayState) {
             DIM_ALPHA,
         );
     }
-    if state.tool != CaptureTool::Window {
-        if let Some(rect) = state.selection {
+    if state.model.tool != CaptureTool::Window {
+        if let Some(rect) = state.model.selection {
             if !state.live_preview {
                 restore_highlight(state, rect);
             }
-            draw_outline(state.back_buffer.device, state.source, rect);
-            if state.selection_kind == Some(SelectionKind::Region) {
+            draw_outline(state.back_buffer.device, state.model.source, rect);
+            if state.model.selection_kind == Some(SelectionKind::Region) {
                 draw_resize_handles(
                     state.back_buffer.device,
-                    state.source,
+                    state.model.source,
                     rect,
-                    state.display_environment.metrics,
+                    state.model.display_environment.metrics,
                 );
                 draw_region_dimensions(state, rect);
             }
@@ -2169,35 +1643,16 @@ fn copy_overlay_to_paint_device(device: HDC, state: &OverlayState) {
 }
 
 fn paint_live_selection_background(state: &OverlayState) {
-    let bounds = RECT {
-        left: 0,
-        top: 0,
-        right: state.back_buffer.width,
-        bottom: state.back_buffer.height,
-    };
-    fill_device_rect(state.back_buffer.device, bounds, COLORREF(0));
-
-    if let Some(selection) = state
-        .selection
-        .and_then(|rect| rect.intersection(state.source))
-    {
-        let local = RECT {
-            left: selection.x.saturating_sub(state.source.x),
-            top: selection.y.saturating_sub(state.source.y),
-            right: i32::try_from(selection.right().saturating_sub(i64::from(state.source.x)))
-                .unwrap_or(state.back_buffer.width),
-            bottom: i32::try_from(selection.bottom().saturating_sub(i64::from(state.source.y)))
-                .unwrap_or(state.back_buffer.height),
-        };
-        fill_device_rect(state.back_buffer.device, local, COLORREF(0));
-    }
+    // SAFETY: Flushes queued GDI work so none of it can land on top of the CPU fill below.
+    let _ = unsafe { GdiFlush() };
+    fill_live_background(&state.back_buffer);
 }
 
 fn present_live_layer(hwnd: HWND, state: &OverlayState) -> Result<(), CaptureError> {
     prepare_live_layer_pixels(state);
     let destination = POINT {
-        x: state.source.x,
-        y: state.source.y,
+        x: state.model.source.x,
+        y: state.model.source.y,
     };
     let source = POINT { x: 0, y: 0 };
     let size = SIZE {
@@ -2241,15 +1696,19 @@ fn prepare_live_layer_pixels(state: &OverlayState) {
     let width = state.back_buffer.width.max(0) as usize;
     let height = state.back_buffer.height.max(0) as usize;
     let selection = state
+        .model
         .selection
-        .and_then(|rect| rect.intersection(state.source))
+        .and_then(|rect| rect.intersection(state.model.source))
         .map(|rect| RECT {
-            left: rect.x.saturating_sub(state.source.x),
-            top: rect.y.saturating_sub(state.source.y),
-            right: i32::try_from(rect.right().saturating_sub(i64::from(state.source.x)))
+            left: rect.x.saturating_sub(state.model.source.x),
+            top: rect.y.saturating_sub(state.model.source.y),
+            right: i32::try_from(rect.right().saturating_sub(i64::from(state.model.source.x)))
                 .unwrap_or(state.back_buffer.width),
-            bottom: i32::try_from(rect.bottom().saturating_sub(i64::from(state.source.y)))
-                .unwrap_or(state.back_buffer.height),
+            bottom: i32::try_from(
+                rect.bottom()
+                    .saturating_sub(i64::from(state.model.source.y)),
+            )
+            .unwrap_or(state.back_buffer.height),
         });
     // SAFETY: The back buffer uniquely owns this writable DIB on the overlay thread.
     let pixels = unsafe {
@@ -2258,15 +1717,22 @@ fn prepare_live_layer_pixels(state: &OverlayState) {
     for y in 0..height {
         for x in 0..width {
             let offset = (y * width + x) * 4;
-            let colored = pixels[offset] != 0 || pixels[offset + 1] != 0 || pixels[offset + 2] != 0;
+            // GDI zeroed the alpha byte of every pixel the chrome pass painted; the background
+            // fill's sentinel survives everywhere else. This is coverage, not color, so the
+            // pure-black contrast halo and handle rings classify as chrome (M19).
+            let drawn = pixels[offset + 3] == 0;
             let in_selection = selection.is_some_and(|rect| {
                 x >= rect.left.max(0) as usize
                     && x < rect.right.max(0) as usize
                     && y >= rect.top.max(0) as usize
                     && y < rect.bottom.max(0) as usize
             });
-            pixels[offset + 3] =
-                live_pixel_alpha(state.tool, state.dim_background, in_selection, colored);
+            pixels[offset + 3] = live_pixel_alpha(
+                state.model.tool,
+                state.model.dim_background,
+                in_selection,
+                drawn,
+            );
         }
     }
 }
@@ -2275,53 +1741,15 @@ const fn live_pixel_alpha(
     tool: CaptureTool,
     dim_background: bool,
     in_selection: bool,
-    colored: bool,
+    drawn: bool,
 ) -> u8 {
-    if matches!(tool, CaptureTool::Window) || colored {
+    if matches!(tool, CaptureTool::Window) || drawn {
         u8::MAX
     } else if in_selection || !dim_background {
         LIVE_HIT_TEST_ALPHA
     } else {
         DIM_ALPHA
     }
-}
-
-fn fill_device_rect(device: HDC, rect: RECT, color: COLORREF) {
-    // SAFETY: The brush is selected only by FillRect for this call and is deleted exactly once.
-    let brush = unsafe { CreateSolidBrush(color) };
-    if brush.0 == 0 {
-        return;
-    }
-    // SAFETY: device is a live memory DC and rect is bounded by the caller's paint surface.
-    let _ = unsafe { FillRect(device, &rect, brush) };
-    // SAFETY: brush is process-owned and no longer selected after FillRect returns.
-    unsafe { DeleteObject(brush) };
-}
-
-fn apply_dim_wash(destination: HDC, dimmer: HDC, width: i32, height: i32, alpha: u8) -> bool {
-    // SAFETY: Callers provide live memory DCs; dimmer has a selected one-pixel black DIB and the
-    // destination has a writable DIB at least width by height.
-    unsafe {
-        AlphaBlend(
-            destination,
-            0,
-            0,
-            width,
-            height,
-            dimmer,
-            0,
-            0,
-            1,
-            1,
-            BLENDFUNCTION {
-                BlendOp: 0,
-                BlendFlags: 0,
-                SourceConstantAlpha: alpha,
-                AlphaFormat: 0,
-            },
-        )
-    }
-    .as_bool()
 }
 
 fn update_window_preview(state: &mut OverlayState, target: Option<NativeWindowHandle>) {
@@ -2390,30 +1818,6 @@ fn capture_live_window_backdrop(
     copied.map_err(|error| overlay_error("capture_live_window_backdrop", error))
 }
 
-fn build_blurred_background(
-    source: &FrozenSurface,
-    block_size: u32,
-    reusable: Option<FrozenSurface>,
-) -> Result<FrozenSurface, CaptureError> {
-    let block_size = block_size.max(1);
-    let width = (source.width as u32).div_ceil(block_size);
-    let height = (source.height as u32).div_ceil(block_size);
-    let destination = reusable
-        .filter(|surface| surface.width == width as i32 && surface.height == height as i32)
-        .map_or_else(|| FrozenSurface::empty(width, height), Ok)?;
-    draw_surface_to_rect(
-        destination.device,
-        source,
-        UiRect {
-            left: 0,
-            top: 0,
-            right: destination.width,
-            bottom: destination.height,
-        },
-    );
-    Ok(destination)
-}
-
 fn ensure_window_mode_assets(state: &mut OverlayState) {
     if state.window_assets_ready {
         return;
@@ -2443,7 +1847,7 @@ fn ensure_window_mode_assets(state: &mut OverlayState) {
         };
         state.windows = Some(
             match enumerate_visible_windows(
-                state.source,
+                state.model.source,
                 &state.reference_metadata.display_id,
                 displays,
             ) {
@@ -2467,97 +1871,201 @@ fn fallback_display_info(state: &OverlayState) -> DisplayInfo {
     DisplayInfo {
         id: state.reference_metadata.display_id.clone(),
         name: state.reference_metadata.display_id.0.clone(),
-        bounds: state.source,
-        scale_factor: state.display_environment.metrics.dpi as f32 / UiMetrics::BASE_DPI as f32,
+        bounds: state.model.source,
+        scale_factor: state.model.display_environment.metrics.dpi as f32
+            / UiMetrics::BASE_DPI as f32,
         rotation_degrees: state.reference_metadata.rotation_degrees,
         is_primary: false,
     }
 }
 
-fn build_window_overview(state: &mut OverlayState) {
+/// The pure scheduling core of the incremental overview build: an ordered render queue of
+/// (handle, attempt) pairs stamped with a generation. Retryable failures re-queue exactly once,
+/// at the back - the same ordering the old synchronous two-pass loop produced (first-pass
+/// successes in enumeration order, retry successes after them).
+struct OverviewBuildQueue {
+    generation: usize,
+    pending: VecDeque<(NativeWindowHandle, u32)>,
+}
+
+impl OverviewBuildQueue {
+    fn new(generation: usize, handles: impl IntoIterator<Item = NativeWindowHandle>) -> Self {
+        Self {
+            generation,
+            pending: handles.into_iter().map(|handle| (handle, 0)).collect(),
+        }
+    }
+
+    /// True when a posted batch message belongs to this build.
+    fn accepts(&self, generation: usize) -> bool {
+        self.generation == generation
+    }
+
+    fn take_batch(&mut self, size: usize) -> Vec<(NativeWindowHandle, u32)> {
+        let size = size.max(1).min(self.pending.len());
+        self.pending.drain(..size).collect()
+    }
+
+    /// Re-queues a retryable failure once; a second failure (or a non-retryable one, which the
+    /// caller never passes here) drops the window from the overview.
+    fn requeue(&mut self, handle: NativeWindowHandle, attempt: u32) -> bool {
+        if attempt == 0 {
+            self.pending.push_back((handle, 1));
+            return true;
+        }
+        false
+    }
+
+    fn is_done(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
+struct WindowOverviewBuild {
+    queue: OverviewBuildQueue,
+    started: Instant,
+}
+
+fn post_overview_batch(hwnd: HWND, generation: usize) {
+    // SAFETY: hwnd is the live overlay window; the message is consumed by this thread's pump.
+    let _ = unsafe {
+        PostMessageW(
+            hwnd,
+            WM_OVERVIEW_RENDER_BATCH,
+            WPARAM(generation),
+            LPARAM(0),
+        )
+    };
+}
+
+/// Starts (or resumes) the incremental chooser build. The chooser chrome appears immediately -
+/// thumbnails stream in batch by batch via [`WM_OVERVIEW_RENDER_BATCH`], keeping the message
+/// pump live for paint, Escape, and cancellation between batches (M21). Re-activating the
+/// Window tool mid-build resumes the existing queue rather than restarting it.
+fn start_window_overview_build(hwnd: HWND, state: &mut OverlayState) {
     let started = Instant::now();
     ensure_window_mode_assets(state);
-    if state.window_thumbnails.is_empty() {
-        let candidates = state.windows.clone().unwrap_or_default();
-        let mut pending = candidates
+    if state.window_overview_build.is_none() && state.window_thumbnails.is_empty() {
+        let handles: Vec<NativeWindowHandle> = state
+            .windows
+            .as_deref()
+            .unwrap_or_default()
             .iter()
             .map(|candidate| candidate.handle)
-            .collect::<Vec<_>>();
-        for attempt in 0..=1 {
-            let mut retry = Vec::new();
-            for batch in pending.chunks(WINDOW_THUMBNAIL_RENDER_BATCH) {
-                let rendered = thread::scope(|scope| {
-                    let workers: Vec<_> = batch
-                        .iter()
-                        .copied()
-                        .map(|handle| {
-                            let metadata = &state.reference_metadata;
-                            scope.spawn(move || {
-                                (
-                                    handle,
-                                    capture_window_thumbnail(
-                                        handle,
-                                        metadata,
-                                        WINDOW_THUMBNAIL_MAX_PIXELS,
-                                    ),
-                                )
-                            })
-                        })
-                        .collect();
-                    workers
-                        .into_iter()
-                        .filter_map(|worker| worker.join().ok())
-                        .collect::<Vec<_>>()
-                });
-                for (handle, capture) in rendered {
-                    let capture = match capture {
-                        Ok(capture) => capture,
-                        Err(error) if attempt == 0 && error.retryable => {
-                            retry.push(handle);
-                            continue;
-                        }
-                        Err(error) => {
-                            log::debug!(
-                                "window handle=0x{:X} omitted from overview after render failure: {error}",
-                                handle.raw()
-                            );
-                            continue;
-                        }
-                    };
-                    let Ok(surface) = FrozenSurface::from_straight_alpha(
-                        capture.frame.width,
-                        capture.frame.height,
-                        &capture.frame.pixels,
-                    ) else {
-                        continue;
-                    };
-                    state.window_thumbnails.push(WindowThumbnail {
-                        handle,
-                        surface,
-                        corner_radius_px: capture.corner_radius_px,
-                    });
-                }
-            }
-            if retry.is_empty() {
-                break;
-            }
-            pending = retry;
+            .collect();
+        if !handles.is_empty() {
+            state.overview_build_generation = state.overview_build_generation.wrapping_add(1);
+            state.window_overview_build = Some(WindowOverviewBuild {
+                queue: OverviewBuildQueue::new(state.overview_build_generation, handles),
+                started,
+            });
         }
     }
     refresh_live_window_thumbnails(state);
     rebuild_window_overview_cache(state);
-    if state.window_overview_ns.is_none() {
-        state.window_overview_ns = Some(duration_ns(started.elapsed()));
+    invalidate(hwnd);
+    match &state.window_overview_build {
+        Some(build) => post_overview_batch(hwnd, build.queue.generation),
+        // Nothing to render (no candidates, or thumbnails already built): the build is complete
+        // as of this call, matching the old synchronous telemetry for the trivial cases.
+        None => {
+            if state.window_overview_ns.is_none() {
+                state.window_overview_ns = Some(duration_ns(started.elapsed()));
+            }
+        }
     }
+}
+
+/// Renders one batch of the in-flight build. Stale deliveries - after a tool switch away, after
+/// completion, or from a superseded build - are ignored via the tool and generation guards.
+fn render_overview_batch(hwnd: HWND, state: &mut OverlayState, generation: usize) {
+    if state.model.tool != CaptureTool::Window {
+        return;
+    }
+    let Some(build) = state.window_overview_build.as_mut() else {
+        return;
+    };
+    if !build.queue.accepts(generation) {
+        return;
+    }
+    let batch = build.queue.take_batch(WINDOW_THUMBNAIL_RENDER_BATCH);
+    let rendered = thread::scope(|scope| {
+        let workers: Vec<_> = batch
+            .iter()
+            .copied()
+            .map(|(handle, attempt)| {
+                let metadata = &state.reference_metadata;
+                scope.spawn(move || {
+                    (
+                        handle,
+                        attempt,
+                        capture_window_thumbnail(handle, metadata, WINDOW_THUMBNAIL_MAX_PIXELS),
+                    )
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .filter_map(|worker| worker.join().ok())
+            .collect::<Vec<_>>()
+    });
+    let build = state
+        .window_overview_build
+        .as_mut()
+        .expect("the build is untouched while its batch renders");
+    let mut new_thumbnails = Vec::new();
+    for (handle, attempt, capture) in rendered {
+        let capture = match capture {
+            Ok(capture) => capture,
+            Err(error) if error.retryable && build.queue.requeue(handle, attempt) => continue,
+            Err(error) => {
+                log::debug!(
+                    "window handle=0x{:X} omitted from overview after render failure: {error}",
+                    handle.raw()
+                );
+                continue;
+            }
+        };
+        let Ok(surface) = FrozenSurface::from_straight_alpha(
+            capture.frame.width,
+            capture.frame.height,
+            &capture.frame.pixels,
+        ) else {
+            continue;
+        };
+        new_thumbnails.push(WindowThumbnail {
+            handle,
+            surface,
+            corner_radius_px: capture.corner_radius_px,
+        });
+    }
+    let finished = build.queue.is_done();
+    let started = build.started;
+    state.window_thumbnails.extend(new_thumbnails);
+    if finished {
+        state.window_overview_build = None;
+        refresh_live_window_thumbnails(state);
+        rebuild_window_overview_cache(state);
+        if state.window_overview_ns.is_none() {
+            state.window_overview_ns = Some(duration_ns(started.elapsed()));
+        }
+    } else {
+        rebuild_window_overview_cache(state);
+        post_overview_batch(hwnd, generation);
+    }
+    invalidate(hwnd);
 }
 
 fn refresh_live_window_thumbnails(state: &mut OverlayState) {
     state.live_window_thumbnails.clear();
-    if !state.live_preview || state.tool != CaptureTool::Window || state.overlay_hwnd.0 == 0 {
+    if !state.live_preview || state.model.tool != CaptureTool::Window || state.overlay_hwnd.0 == 0 {
         return;
     }
 
-    let toolbar = ToolbarLayout::new(state.display_environment, state.toolbar_position);
+    let toolbar = ToolbarLayout::new(
+        state.model.display_environment,
+        state.model.toolbar_position,
+    );
     let rects = window_overview_rects(state);
     for (window, bounds) in state.window_thumbnails.iter().zip(rects) {
         let thumbnail = match DwmThumbnail::register(state.overlay_hwnd, HWND(window.handle.raw()))
@@ -2590,7 +2098,12 @@ fn refresh_live_window_thumbnails(state: &mut OverlayState) {
                 bottom: bounds.bottom,
             },
         );
-        if live_thumbnail_overlaps_chrome(destination, toolbar, state.options_open) {
+        if live_thumbnail_overlaps_chrome(
+            destination,
+            toolbar,
+            state.model.options_open,
+            state.model.display_environment,
+        ) {
             // DWM thumbnails are composed above the destination window's own pixels. Keep this
             // preview in the frozen overview instead so the toolbar and menu remain unobscured.
             continue;
@@ -2613,9 +2126,36 @@ fn live_thumbnail_overlaps_chrome(
     destination: RECT,
     toolbar: ToolbarLayout,
     options_open: bool,
+    environment: DisplayEnvironment,
 ) -> bool {
     rect_overlaps_ui(destination, toolbar.bounds)
+        || rect_overlaps_ui(destination, tooltip_band(environment, toolbar))
         || (options_open && rect_overlaps_ui(destination, toolbar.menu))
+}
+
+/// The strip a hover tooltip can occupy: directly above the toolbar when there is room
+/// (mirroring draw_hover_tooltip's placement rule), otherwise directly below, spanning the
+/// work area horizontally. The band is reserved whenever the toolbar is present - not only
+/// while a tooltip is showing - so live thumbnails and the dimension label never flicker
+/// between states as the hover comes and goes. DWM thumbnails composite above our pixels, so
+/// anything in this band must yield or the tooltip would be occluded.
+fn tooltip_band(environment: DisplayEnvironment, toolbar: ToolbarLayout) -> UiRect {
+    let metrics = environment.metrics;
+    let work_area = environment.work_area;
+    // draw_hover_tooltip's single-line height: text plus padding, floored at px(32).
+    let height = metrics.px(32);
+    let gap = metrics.px(8);
+    let (top, bottom) = if toolbar.bounds.top >= work_area.top + height + metrics.px(16) {
+        (toolbar.bounds.top - height - gap, toolbar.bounds.top)
+    } else {
+        (toolbar.bounds.bottom, toolbar.bounds.bottom + gap + height)
+    };
+    UiRect {
+        left: work_area.left,
+        top,
+        right: work_area.right,
+        bottom,
+    }
 }
 
 fn rect_overlaps_ui(rect: RECT, ui: UiRect) -> bool {
@@ -2641,18 +2181,19 @@ fn has_live_window_thumbnail(state: &OverlayState, handle: NativeWindowHandle) -
 }
 
 fn rebuild_window_overview_cache(state: &mut OverlayState) {
-    let reusable = state
-        .window_overview_cache
-        .take()
-        .map(|cache| cache.surface);
-    let surface = reusable
-        .filter(|surface| {
-            surface.width == state.surface.width && surface.height == state.surface.height
-        })
-        .map_or_else(
-            || FrozenSurface::empty(state.surface.width as u32, state.surface.height as u32),
-            Ok,
-        );
+    let reusable = reusable_overview_surface(
+        state
+            .window_overview_cache
+            .take()
+            .map(|cache| cache.surface),
+        &mut state.spare_overview_surface,
+        state.surface.width,
+        state.surface.height,
+    );
+    let surface = reusable.map_or_else(
+        || FrozenSurface::empty(state.surface.width as u32, state.surface.height as u32),
+        Ok,
+    );
     let Ok(surface) = surface else {
         state.window_overview_cache = None;
         return;
@@ -2661,8 +2202,23 @@ fn rebuild_window_overview_cache(state: &mut OverlayState) {
     draw_window_overview_static(&surface, state);
     state.window_overview_cache = Some(WindowOverviewCache {
         surface,
-        dim_background: state.dim_background,
+        dim_background: state.model.dim_background,
     });
+}
+
+/// Picks the allocation the chooser rebuild will draw into: the current cache's own surface
+/// first, else the spare carried over from a previous run. Either is only a buffer - the caller
+/// overdraws it completely - and a dimension mismatch consumes the candidate instead of handing
+/// out a wrong-sized surface.
+fn reusable_overview_surface(
+    current: Option<FrozenSurface>,
+    spare: &mut Option<FrozenSurface>,
+    width: i32,
+    height: i32,
+) -> Option<FrozenSurface> {
+    current
+        .or_else(|| spare.take())
+        .filter(|surface| surface.width == width && surface.height == height)
 }
 
 fn compose_window_overview_background(destination: &FrozenSurface, state: &OverlayState) {
@@ -2684,7 +2240,7 @@ fn compose_window_overview_background(destination: &FrozenSurface, state: &Overl
             SRCCOPY,
         );
     }
-    if state.dim_background {
+    if state.model.dim_background {
         let _ = apply_dim_wash(
             destination.device,
             state.dimmer.device,
@@ -2701,39 +2257,42 @@ fn window_overview_rects(state: &OverlayState) -> Vec<UiRect> {
         .iter()
         .map(|thumbnail| (thumbnail.surface.width, thumbnail.surface.height))
         .collect();
-    layout_floating_windows(state.surface.width, state.surface.height, &dimensions)
+    layout_floating_windows(
+        state.surface.width,
+        state.surface.height,
+        state.model.display_environment.metrics,
+        &dimensions,
+    )
 }
 
 fn layout_floating_windows(
     client_width: i32,
     client_height: i32,
+    metrics: UiMetrics,
     dimensions: &[(i32, i32)],
 ) -> Vec<UiRect> {
     if dimensions.is_empty() {
         return Vec::new();
     }
-    let left = 70;
-    let top = 64;
-    let available_width = (client_width - left * 2).max(200);
-    let available_height = (client_height - top - 160).max(160);
-    let gap = 28;
+    let tokens = metrics.overview_tokens();
+    let available_width = (client_width - tokens.margin_x * 2).max(tokens.min_available_width);
+    let available_height =
+        (client_height - tokens.top - tokens.bottom_reserve).max(tokens.min_available_height);
     let columns = (1..=dimensions.len())
         .max_by_key(|&candidate| {
             minimum_row_height(
                 available_width,
                 available_height,
-                gap,
+                tokens,
                 candidate,
                 dimensions,
             )
         })
         .unwrap_or(1);
     layout_floating_windows_with_columns(
-        left,
-        top,
+        tokens,
         available_width,
         available_height,
-        gap,
         columns,
         dimensions,
     )
@@ -2742,12 +2301,13 @@ fn layout_floating_windows(
 fn minimum_row_height(
     available_width: i32,
     available_height: i32,
-    gap: i32,
+    tokens: OverviewLayoutTokens,
     columns: usize,
     dimensions: &[(i32, i32)],
 ) -> i32 {
     let rows = dimensions.len().div_ceil(columns);
-    let row_slot_height = ((available_height - gap * (rows as i32 - 1)) / rows as i32).max(60);
+    let row_slot_height = ((available_height - tokens.gap * (rows as i32 - 1)) / rows as i32)
+        .max(tokens.min_row_height);
     dimensions
         .chunks(columns)
         .map(|row_dimensions| {
@@ -2755,7 +2315,8 @@ fn minimum_row_height(
                 .iter()
                 .map(|&(width, height)| f64::from(width) / f64::from(height.max(1)))
                 .sum();
-            let width_without_gaps = available_width - gap * (row_dimensions.len() as i32 - 1);
+            let width_without_gaps =
+                available_width - tokens.gap * (row_dimensions.len() as i32 - 1);
             f64::from(row_slot_height)
                 .min(f64::from(width_without_gaps.max(1)) / aspect_sum.max(0.01))
                 .round() as i32
@@ -2765,16 +2326,16 @@ fn minimum_row_height(
 }
 
 fn layout_floating_windows_with_columns(
-    left: i32,
-    top: i32,
+    tokens: OverviewLayoutTokens,
     available_width: i32,
     available_height: i32,
-    gap: i32,
     columns: usize,
     dimensions: &[(i32, i32)],
 ) -> Vec<UiRect> {
     let rows = dimensions.len().div_ceil(columns);
-    let row_slot_height = ((available_height - gap * (rows as i32 - 1)) / rows as i32).max(60);
+    let row_slot_height = ((available_height - tokens.gap * (rows as i32 - 1)) / rows as i32)
+        .max(tokens.min_row_height);
+    let minimum_window = f64::from(tokens.min_window_size);
     let mut result = Vec::with_capacity(dimensions.len());
     for row in 0..rows {
         let start = row * columns;
@@ -2784,21 +2345,23 @@ fn layout_floating_windows_with_columns(
             .iter()
             .map(|&(width, height)| f64::from(width) / f64::from(height.max(1)))
             .sum();
-        let width_without_gaps = available_width - gap * (row_dimensions.len() as i32 - 1);
+        let width_without_gaps = available_width - tokens.gap * (row_dimensions.len() as i32 - 1);
         let height_from_width = f64::from(width_without_gaps.max(1)) / aspect_sum.max(0.01);
-        let window_height = f64::from(row_slot_height).min(height_from_width).max(40.0);
+        let window_height = f64::from(row_slot_height)
+            .min(height_from_width)
+            .max(minimum_window);
         let widths: Vec<i32> = row_dimensions
             .iter()
             .map(|&(width, height)| {
                 (window_height * f64::from(width) / f64::from(height.max(1)))
                     .round()
-                    .max(40.0) as i32
+                    .max(minimum_window) as i32
             })
             .collect();
-        let row_width = widths.iter().sum::<i32>() + gap * (widths.len() as i32 - 1);
-        let mut x = left + (available_width - row_width) / 2;
-        let y = top
-            + row as i32 * (row_slot_height + gap)
+        let row_width = widths.iter().sum::<i32>() + tokens.gap * (widths.len() as i32 - 1);
+        let mut x = tokens.margin_x + (available_width - row_width) / 2;
+        let y = tokens.top
+            + row as i32 * (row_slot_height + tokens.gap)
             + (row_slot_height - window_height.round() as i32) / 2;
         for width in widths {
             result.push(UiRect {
@@ -2807,7 +2370,7 @@ fn layout_floating_windows_with_columns(
                 right: x + width,
                 bottom: y + window_height.round() as i32,
             });
-            x += width + gap;
+            x += width + tokens.gap;
         }
     }
     result
@@ -2834,11 +2397,11 @@ fn ready_window_preview(
 }
 
 fn restore_highlight(state: &OverlayState, rect: Rect) {
-    let Some(visible) = intersect_rect(rect, state.source) else {
+    let Some(visible) = intersect_rect(rect, state.model.source) else {
         return;
     };
-    let x = visible.x - state.source.x;
-    let y = visible.y - state.source.y;
+    let x = visible.x - state.model.source.x;
+    let y = visible.y - state.model.source.y;
     let width = visible.width as i32;
     let height = visible.height as i32;
     // SAFETY: The intersection is contained in both same-sized memory DIBs. Copying from the
@@ -2858,87 +2421,10 @@ fn restore_highlight(state: &OverlayState, rect: Rect) {
     };
 }
 
-fn draw_outline(device: windows::Win32::Graphics::Gdi::HDC, source: Rect, rect: Rect) {
-    // SAFETY: NULL_BRUSH is a valid stock object that must not be deleted.
-    let brush = unsafe { GetStockObject(NULL_BRUSH) };
-    // SAFETY: Selects the stock hollow brush for an outline-only rectangle.
-    let old_brush = unsafe { SelectObject(device, brush) };
-    let left = rect.x - source.x;
-    let top = rect.y - source.y;
-    let right = left.saturating_add(rect.width as i32);
-    let bottom = top.saturating_add(rect.height as i32);
-    draw_outline_layer(device, left, top, right, bottom, 7, COLORREF(0x0000_0000));
-    draw_outline_layer(device, left, top, right, bottom, 3, COLORREF(0x00ff_ff00));
-    // SAFETY: Restores the brush that was selected before the outline layers.
-    unsafe { SelectObject(device, old_brush) };
-}
-
-fn draw_outline_layer(
-    device: HDC,
-    left: i32,
-    top: i32,
-    right: i32,
-    bottom: i32,
-    width: i32,
-    color: COLORREF,
-) {
-    // SAFETY: Creates one process-owned pen used only for this off-screen paint operation.
-    let pen = unsafe { CreatePen(PS_SOLID, width, color) };
-    // SAFETY: device and pen are live GDI handles and the prior object is restored before delete.
-    let old_pen = unsafe { SelectObject(device, pen) };
-    // SAFETY: Coordinates may be clipped by GDI but do not address memory directly.
-    unsafe {
-        Rectangle(device, left, top, right, bottom);
-        SelectObject(device, old_pen);
-        DeleteObject(pen);
-    }
-}
-
-fn draw_resize_handles(device: HDC, source: Rect, rect: Rect, metrics: UiMetrics) {
-    let tokens = metrics.region_tokens();
-    let left = rect.x - source.x;
-    let top = rect.y - source.y;
-    let right = left.saturating_add(rect.width as i32);
-    let bottom = top.saturating_add(rect.height as i32);
-    let middle_x = left.saturating_add((right - left) / 2);
-    let middle_y = top.saturating_add((bottom - top) / 2);
-    let points = [
-        (left, top),
-        (middle_x, top),
-        (right, top),
-        (right, middle_y),
-        (right, bottom),
-        (middle_x, bottom),
-        (left, bottom),
-        (left, middle_y),
-    ];
-    // SAFETY: Creates two process-owned brushes used only on the off-screen composition.
-    let (outer, inner) = unsafe {
-        (
-            CreateSolidBrush(COLORREF(0x0000_0000)),
-            CreateSolidBrush(COLORREF(0x00ff_ff00)),
-        )
-    };
-    for (x, y) in points {
-        let outer_rect = centered_rect(x, y, tokens.handle_outer_radius);
-        let inner_rect = centered_rect(x, y, tokens.handle_inner_radius);
-        // SAFETY: The brushes and memory DC are live; GDI clips handles at display edges.
-        unsafe {
-            FillRect(device, &outer_rect, outer);
-            FillRect(device, &inner_rect, inner);
-        }
-    }
-    // SAFETY: The brushes are no longer selected or used after these calls.
-    unsafe {
-        DeleteObject(outer);
-        DeleteObject(inner);
-    }
-}
-
 fn draw_region_dimensions(state: &mut OverlayState, rect: Rect) {
     let device = state.back_buffer.device;
-    let source = state.source;
-    let metrics = state.display_environment.metrics;
+    let source = state.model.source;
+    let metrics = state.model.display_environment.metrics;
     let tokens = metrics.region_tokens();
     // Region width and height remain the exact physical-pixel values from the selection rectangle.
     let value = format!("{} × {} px", rect.width, rect.height);
@@ -2960,12 +2446,18 @@ fn draw_region_dimensions(state: &mut OverlayState, rect: Rect) {
         right: selection_left.saturating_add(rect.width as i32),
         bottom: selection_top.saturating_add(rect.height as i32),
     };
-    let toolbar = ToolbarLayout::new(state.display_environment, state.toolbar_position);
+    let toolbar = ToolbarLayout::new(
+        state.model.display_environment,
+        state.model.toolbar_position,
+    );
     let mut reserved = vec![toolbar.bounds];
-    if state.options_open {
+    // The tooltip paints after the label and would occlude it; reserve its whole potential
+    // band so the label's placement stays stable across hover changes.
+    reserved.push(tooltip_band(state.model.display_environment, toolbar));
+    if state.model.options_open {
         reserved.push(toolbar.menu);
     }
-    let pointer_exclusion = state.pointer_local.map(|pointer| UiRect {
+    let pointer_exclusion = state.model.pointer_local.map(|pointer| UiRect {
         left: pointer.x.saturating_sub(REGION_CURSOR_CENTER),
         top: pointer.y.saturating_sub(REGION_CURSOR_CENTER),
         right: pointer
@@ -3014,29 +2506,26 @@ fn draw_region_dimensions(state: &mut OverlayState, rect: Rect) {
     );
 }
 
-fn centered_rect(x: i32, y: i32, radius: i32) -> RECT {
-    RECT {
-        left: x.saturating_sub(radius),
-        top: y.saturating_sub(radius),
-        right: x.saturating_add(radius).saturating_add(1),
-        bottom: y.saturating_add(radius).saturating_add(1),
-    }
-}
-
 fn draw_window_overview_static(destination: &FrozenSurface, state: &OverlayState) {
     if state.window_thumbnails.is_empty() {
+        // While a build is in flight the empty inventory is a transient, not a verdict: show
+        // only the chooser background until the first tile lands.
+        if state.window_overview_build.is_some() {
+            return;
+        }
+        let tokens = state.model.display_environment.metrics.overview_tokens();
         draw_text(
             destination.device,
             UiRect {
-                left: 70,
-                top: 64,
-                right: state.surface.width - 70,
-                bottom: 118,
+                left: tokens.margin_x,
+                top: tokens.top,
+                right: state.surface.width - tokens.margin_x,
+                bottom: tokens.empty_state_bottom,
             },
             "No capturable application windows",
             rgb(220, 220, 224),
             TextAlignment::Center,
-            state.display_environment.metrics.px(UI_FONT_HEIGHT),
+            state.model.display_environment.metrics.px(UI_FONT_HEIGHT),
         );
         return;
     }
@@ -3045,7 +2534,7 @@ fn draw_window_overview_static(destination: &FrozenSurface, state: &OverlayState
         if has_live_window_thumbnail(state, thumbnail.handle) {
             continue;
         }
-        let selected = state.selected_window == Some(thumbnail.handle);
+        let selected = state.model.selected_window == Some(thumbnail.handle);
         let preview = selected
             .then(|| ready_window_preview(state, Some(thumbnail.handle)))
             .flatten();
@@ -3057,8 +2546,9 @@ fn draw_window_overview_static(destination: &FrozenSurface, state: &OverlayState
 fn draw_window_overview_interactive(state: &OverlayState) {
     let rects = window_overview_rects(state);
     for (thumbnail, rect) in state.window_thumbnails.iter().zip(rects) {
-        let selected = state.selected_window == Some(thumbnail.handle);
-        let hovered = state.hovered.map(|candidate| candidate.handle) == Some(thumbnail.handle);
+        let selected = state.model.selected_window == Some(thumbnail.handle);
+        let hovered =
+            state.model.hovered.map(|candidate| candidate.handle) == Some(thumbnail.handle);
         if selected || hovered {
             let color = if selected {
                 rgb(45, 125, 246)
@@ -3091,356 +2581,15 @@ fn draw_window_overview_interactive(state: &OverlayState) {
     }
 }
 
-fn draw_window_surface(device: &FrozenSurface, surface: &FrozenSurface, bounds: UiRect) {
-    let destination = fitted_surface_rect(surface, bounds, true);
-    let width = (destination.right - destination.left).max(1);
-    let height = (destination.bottom - destination.top).max(1);
-    if width != surface.width || height != surface.height {
-        if let Ok(scaled) = scale_premultiplied_surface(surface, width as u32, height as u32) {
-            alpha_blend_surface(device, &scaled, destination);
-            return;
-        }
-    }
-    alpha_blend_surface(device, surface, destination);
-}
-
-fn scale_premultiplied_surface(
-    source: &FrozenSurface,
-    width: u32,
-    height: u32,
-) -> Result<FrozenSurface, CaptureError> {
-    let scaled = FrozenSurface::empty(width, height)?;
-    // AlphaBlend's built-in stretch is low quality, while GDI HALFTONE discards the alpha byte.
-    // Resample all four premultiplied channels together: area filtering for reduction and bilinear
-    // filtering for enlargement. The exact-size result can then be composited 1:1.
-    // SAFETY: Flushes this thread's queued GDI drawing before CPU reads the DIB section.
-    let _ = unsafe { GdiFlush() };
-    // SAFETY: Both slices cover their live DIB allocations for the duration of this call.
-    let source_pixels = unsafe { std::slice::from_raw_parts(source.bits, source.byte_length) };
-    // SAFETY: `scaled` uniquely owns this writable DIB and no GDI operation runs concurrently.
-    let destination_pixels =
-        unsafe { std::slice::from_raw_parts_mut(scaled.bits, scaled.byte_length) };
-    if width as i32 <= source.width && height as i32 <= source.height {
-        area_scale_bgra(
-            source_pixels,
-            source.width as usize,
-            source.height as usize,
-            destination_pixels,
-            width as usize,
-            height as usize,
-        );
-    } else {
-        bilinear_scale_bgra(
-            source_pixels,
-            source.width as usize,
-            source.height as usize,
-            destination_pixels,
-            width as usize,
-            height as usize,
-        );
-    }
-    Ok(scaled)
-}
-
-fn area_scale_bgra(
-    source: &[u8],
-    source_width: usize,
-    source_height: usize,
-    destination: &mut [u8],
-    destination_width: usize,
-    destination_height: usize,
-) {
-    let horizontal = area_contributors(source_width, destination_width);
-    let vertical = area_contributors(source_height, destination_height);
-    let mut intermediate = vec![0_f32; destination_width * source_height * 4];
-    for source_y in 0..source_height {
-        for (destination_x, contributors) in horizontal.iter().enumerate() {
-            let output = (source_y * destination_width + destination_x) * 4;
-            for &(source_x, weight) in contributors {
-                let input = (source_y * source_width + source_x) * 4;
-                for channel in 0..4 {
-                    intermediate[output + channel] += f32::from(source[input + channel]) * weight;
-                }
-            }
-        }
-    }
-    for (destination_y, contributors) in vertical.iter().enumerate() {
-        for destination_x in 0..destination_width {
-            let output = (destination_y * destination_width + destination_x) * 4;
-            for channel in 0..4 {
-                let mut value = 0_f32;
-                for &(source_y, weight) in contributors {
-                    value += intermediate
-                        [(source_y * destination_width + destination_x) * 4 + channel]
-                        * weight;
-                }
-                destination[output + channel] = value.round().clamp(0.0, 255.0) as u8;
-            }
-        }
-    }
-}
-
-fn area_contributors(source_length: usize, destination_length: usize) -> Vec<Vec<(usize, f32)>> {
-    let scale = source_length as f32 / destination_length as f32;
-    (0..destination_length)
-        .map(|destination| {
-            let start = destination as f32 * scale;
-            let end = (destination + 1) as f32 * scale;
-            let first = start.floor() as usize;
-            let last = end.ceil().min(source_length as f32) as usize;
-            (first..last)
-                .filter_map(|source| {
-                    let overlap = end.min((source + 1) as f32) - start.max(source as f32);
-                    (overlap > 0.0).then_some((source, overlap / scale))
-                })
-                .collect()
-        })
-        .collect()
-}
-
-fn bilinear_scale_bgra(
-    source: &[u8],
-    source_width: usize,
-    source_height: usize,
-    destination: &mut [u8],
-    destination_width: usize,
-    destination_height: usize,
-) {
-    let scale_x = source_width as f32 / destination_width as f32;
-    let scale_y = source_height as f32 / destination_height as f32;
-    for destination_y in 0..destination_height {
-        let source_y =
-            ((destination_y as f32 + 0.5) * scale_y - 0.5).clamp(0.0, (source_height - 1) as f32);
-        let y0 = source_y.floor() as usize;
-        let y1 = (y0 + 1).min(source_height - 1);
-        let fy = source_y - y0 as f32;
-        for destination_x in 0..destination_width {
-            let source_x = ((destination_x as f32 + 0.5) * scale_x - 0.5)
-                .clamp(0.0, (source_width - 1) as f32);
-            let x0 = source_x.floor() as usize;
-            let x1 = (x0 + 1).min(source_width - 1);
-            let fx = source_x - x0 as f32;
-            let output = (destination_y * destination_width + destination_x) * 4;
-            for channel in 0..4 {
-                let top = f32::from(source[(y0 * source_width + x0) * 4 + channel]) * (1.0 - fx)
-                    + f32::from(source[(y0 * source_width + x1) * 4 + channel]) * fx;
-                let bottom = f32::from(source[(y1 * source_width + x0) * 4 + channel]) * (1.0 - fx)
-                    + f32::from(source[(y1 * source_width + x1) * 4 + channel]) * fx;
-                destination[output + channel] =
-                    (top * (1.0 - fy) + bottom * fy).round().clamp(0.0, 255.0) as u8;
-            }
-        }
-    }
-}
-
-fn alpha_blend_surface(device: &FrozenSurface, surface: &FrozenSurface, destination: UiRect) {
-    let width = (destination.right - destination.left).max(1);
-    let height = (destination.bottom - destination.top).max(1);
-    // SAFETY: Both DCs contain live 32-bit DIBs. The source surface stores premultiplied BGRA,
-    // which is the format required by AC_SRC_ALPHA. Normal operation uses a same-size source and
-    // destination; the stretch fallback is retained only for allocation/scale failures.
-    let _ = unsafe {
-        AlphaBlend(
-            device.device,
-            destination.left,
-            destination.top,
-            width,
-            height,
-            surface.device,
-            0,
-            0,
-            surface.width,
-            surface.height,
-            BLENDFUNCTION {
-                BlendOp: 0,
-                BlendFlags: 0,
-                SourceConstantAlpha: 255,
-                AlphaFormat: AC_SRC_ALPHA as u8,
-            },
-        )
-    };
-}
-
-fn blend_channel(foreground: u8, background: u8, coverage: u8) -> u8 {
-    let coverage = u32::from(coverage);
-    ((u32::from(foreground) * coverage + u32::from(background) * (255 - coverage) + 127) / 255)
-        as u8
-}
-
-fn rounded_rect_coverage(width: i32, height: i32, radius: f32, x: i32, y: i32) -> u8 {
-    if x < 0 || y < 0 || x >= width || y >= height {
-        return 0;
-    }
-    let radius = radius.clamp(0.0, width.min(height) as f32 / 2.0);
-    if radius <= 0.0 {
-        return 255;
-    }
-    let left = x as f32 + 1.0 <= radius;
-    let right = x as f32 >= width as f32 - radius;
-    let top = y as f32 + 1.0 <= radius;
-    let bottom = y as f32 >= height as f32 - radius;
-    if !(left || right) || !(top || bottom) {
-        return 255;
-    }
-    let center_x = if left { radius } else { width as f32 - radius };
-    let center_y = if top { radius } else { height as f32 - radius };
-    let radius_squared = radius * radius;
-    let mut inside = 0_u32;
-    const SAMPLES: i32 = 8;
-    for sample_y in 0..SAMPLES {
-        for sample_x in 0..SAMPLES {
-            let sample_x = x as f32 + (sample_x as f32 + 0.5) / SAMPLES as f32;
-            let sample_y = y as f32 + (sample_y as f32 + 0.5) / SAMPLES as f32;
-            let delta_x = sample_x - center_x;
-            let delta_y = sample_y - center_y;
-            if delta_x * delta_x + delta_y * delta_y <= radius_squared {
-                inside += 1;
-            }
-        }
-    }
-    ((inside * 255 + 32) / 64) as u8
-}
-
-fn draw_antialiased_rounded_outline(
-    surface: &FrozenSurface,
-    rect: UiRect,
-    color: COLORREF,
-    stroke_width: i32,
-    corner_radius: f32,
-) {
-    // SAFETY: Flushes preceding GDI composition before blend_surface_pixel reads and writes the
-    // same DIB section through its CPU pointer.
-    let _ = unsafe { GdiFlush() };
-    let width = (rect.right - rect.left).max(1);
-    let height = (rect.bottom - rect.top).max(1);
-    let radius = corner_radius.clamp(0.0, width.min(height) as f32 / 2.0);
-    let stroke_width = stroke_width.clamp(1, width.min(height).max(1) / 2);
-    let color = [
-        ((color.0 >> 16) & 0xff) as u8,
-        ((color.0 >> 8) & 0xff) as u8,
-        (color.0 & 0xff) as u8,
-        255,
-    ];
-    let corner_band = radius.ceil() as i32 + stroke_width + 1;
-    for y in 0..height {
-        for x in 0..width {
-            let near_edge = x < stroke_width
-                || y < stroke_width
-                || x >= width - stroke_width
-                || y >= height - stroke_width;
-            let near_corner = (x < corner_band || x >= width - corner_band)
-                && (y < corner_band || y >= height - corner_band);
-            if !near_edge && !near_corner {
-                continue;
-            }
-            let outer = rounded_rect_coverage(width, height, radius, x, y);
-            let inner = if x >= stroke_width
-                && y >= stroke_width
-                && x < width - stroke_width
-                && y < height - stroke_width
-            {
-                rounded_rect_coverage(
-                    width - stroke_width * 2,
-                    height - stroke_width * 2,
-                    (radius - stroke_width as f32).max(0.0),
-                    x - stroke_width,
-                    y - stroke_width,
-                )
-            } else {
-                0
-            };
-            let coverage = ((u32::from(outer) * u32::from(255 - inner) + 127) / 255) as u8;
-            if coverage == 0 {
-                continue;
-            }
-            blend_surface_pixel(surface, rect.left + x, rect.top + y, color, coverage);
-        }
-    }
-}
-
-fn blend_surface_pixel(surface: &FrozenSurface, x: i32, y: i32, foreground: [u8; 4], coverage: u8) {
-    if x < 0 || y < 0 || x >= surface.width || y >= surface.height {
-        return;
-    }
-    let offset = ((y * surface.width + x) * 4) as usize;
-    // SAFETY: The checked coordinates address four writable bytes in the live off-screen DIB.
-    unsafe {
-        for (channel, foreground) in foreground.into_iter().enumerate() {
-            let destination = surface.bits.add(offset + channel);
-            *destination = blend_channel(foreground, *destination, coverage);
-        }
-    }
-}
-
-fn fitted_surface_rect(surface: &FrozenSurface, bounds: UiRect, allow_upscale: bool) -> UiRect {
-    let available_width = (bounds.right - bounds.left).max(1);
-    let available_height = (bounds.bottom - bounds.top).max(1);
-    let (mut width, mut height) = if i64::from(surface.width) * i64::from(available_height)
-        > i64::from(surface.height) * i64::from(available_width)
-    {
-        (
-            available_width,
-            (i64::from(surface.height) * i64::from(available_width) / i64::from(surface.width))
-                as i32,
-        )
-    } else {
-        (
-            (i64::from(surface.width) * i64::from(available_height) / i64::from(surface.height))
-                as i32,
-            available_height,
-        )
-    };
-    if !allow_upscale && surface.width <= available_width && surface.height <= available_height {
-        width = surface.width;
-        height = surface.height;
-    }
-    let x = bounds.left + (available_width - width) / 2;
-    let y = bounds.top + (available_height - height) / 2;
-    UiRect {
-        left: x,
-        top: y,
-        right: x + width.max(1),
-        bottom: y + height.max(1),
-    }
-}
-
-fn scaled_corner_radius(surface: &FrozenSurface, destination: UiRect, source_radius: f32) -> f32 {
-    if source_radius <= 0.0 || surface.width <= 0 || surface.height <= 0 {
-        return 0.0;
-    }
-    let width_scale = (destination.right - destination.left).max(1) as f32 / surface.width as f32;
-    let height_scale = (destination.bottom - destination.top).max(1) as f32 / surface.height as f32;
-    source_radius * width_scale.min(height_scale)
-}
-
-fn draw_surface_to_rect(device: HDC, surface: &FrozenSurface, destination: UiRect) {
-    let width = (destination.right - destination.left).max(1);
-    let height = (destination.bottom - destination.top).max(1);
-    // SAFETY: Both DCs own live DIBs. Destination bounds are positive and GDI performs scaling.
-    unsafe {
-        SetStretchBltMode(device, HALFTONE);
-        StretchBlt(
-            device,
-            destination.left,
-            destination.top,
-            width,
-            height,
-            surface.device,
-            0,
-            0,
-            surface.width,
-            surface.height,
-            SRCCOPY,
-        );
-    }
-}
-
 fn draw_toolbar(state: &OverlayState) {
     let device = state.back_buffer.device;
-    let metrics = state.display_environment.metrics;
+    let metrics = state.model.display_environment.metrics;
     let tokens = metrics.toolbar_tokens();
-    let layout = ToolbarLayout::new(state.display_environment, state.toolbar_position);
-    if state.options_open {
+    let layout = ToolbarLayout::new(
+        state.model.display_environment,
+        state.model.toolbar_position,
+    );
+    if state.model.options_open {
         draw_options_menu(device, state, layout);
     }
     draw_round_box(
@@ -3489,8 +2638,8 @@ fn draw_toolbar(state: &OverlayState) {
         1,
     );
 
-    let options_hovered = state.hovered_control == Some(ToolbarControl::Options);
-    if state.options_open || options_hovered {
+    let options_hovered = state.model.hovered_control == Some(ToolbarControl::Options);
+    if state.model.options_open || options_hovered {
         draw_round_box(
             device,
             layout.options,
@@ -3533,9 +2682,9 @@ fn draw_toolbar(state: &OverlayState) {
         tokens.icon_stroke,
     );
 
-    let capture_enabled = state.selection.is_some();
+    let capture_enabled = state.model.selection.is_some();
     let capture_color = if capture_enabled {
-        if state.hovered_control == Some(ToolbarControl::Capture) {
+        if state.model.hovered_control == Some(ToolbarControl::Capture) {
             rgb(68, 145, 255)
         } else {
             rgb(45, 125, 246)
@@ -3591,8 +2740,8 @@ fn draw_tool_button(
         CaptureTool::Window => ToolbarControl::Window,
         CaptureTool::Region => ToolbarControl::Region,
     };
-    if state.tool == tool || state.hovered_control == Some(control) {
-        let color = if state.tool == tool {
+    if state.model.tool == tool || state.model.hovered_control == Some(control) {
+        let color = if state.model.tool == tool {
             rgb(76, 76, 82)
         } else {
             rgb(58, 58, 63)
@@ -3608,10 +2757,10 @@ fn draw_tool_button(
 }
 
 fn draw_hover_tooltip(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
-    if state.options_open {
+    if state.model.options_open {
         return;
     }
-    let (target, value) = match state.hovered_control {
+    let (target, value) = match state.model.hovered_control {
         Some(ToolbarControl::FullDisplay) => {
             (layout.full_display, "Capture full display".to_owned())
         }
@@ -3619,7 +2768,7 @@ fn draw_hover_tooltip(device: HDC, state: &OverlayState, layout: ToolbarLayout) 
         Some(ToolbarControl::Region) => (layout.region, "Select a region".to_owned()),
         Some(ToolbarControl::Options) => (layout.options, "Capture options".to_owned()),
         Some(ToolbarControl::Capture) => {
-            let value = if state.selection.is_some() {
+            let value = if state.model.selection.is_some() {
                 "Copy selection to clipboard"
             } else {
                 "Select something to capture"
@@ -3628,7 +2777,7 @@ fn draw_hover_tooltip(device: HDC, state: &OverlayState, layout: ToolbarLayout) 
         }
         _ => return,
     };
-    let metrics = state.display_environment.metrics;
+    let metrics = state.model.display_environment.metrics;
     let tokens = metrics.toolbar_tokens();
     let font_height = tokens.font_height;
     let measured = measure_ui_text(device, &value, font_height);
@@ -3636,23 +2785,24 @@ fn draw_hover_tooltip(device: HDC, state: &OverlayState, layout: ToolbarLayout) 
         .cx
         .saturating_add(tokens.tooltip_padding_x.saturating_mul(2))
         .max(metrics.px(120))
-        .min((state.display_environment.work_area.width() - metrics.px(16)).max(1));
+        .min((state.model.display_environment.work_area.width() - metrics.px(16)).max(1));
     let height = (measured.cy + tokens.tooltip_padding_y * 2).max(metrics.px(32));
     let left = ((target.left + target.right - width) / 2).clamp(
-        state.display_environment.work_area.left + metrics.px(8),
-        (state.display_environment.work_area.right - width - metrics.px(8))
-            .max(state.display_environment.work_area.left + metrics.px(8)),
+        state.model.display_environment.work_area.left + metrics.px(8),
+        (state.model.display_environment.work_area.right - width - metrics.px(8))
+            .max(state.model.display_environment.work_area.left + metrics.px(8)),
     );
-    let preferred_top =
-        if layout.bounds.top >= state.display_environment.work_area.top + height + metrics.px(16) {
-            layout.bounds.top - height - metrics.px(8)
-        } else {
-            layout.bounds.bottom + metrics.px(8)
-        };
+    let preferred_top = if layout.bounds.top
+        >= state.model.display_environment.work_area.top + height + metrics.px(16)
+    {
+        layout.bounds.top - height - metrics.px(8)
+    } else {
+        layout.bounds.bottom + metrics.px(8)
+    };
     let top = preferred_top.clamp(
-        state.display_environment.work_area.top + metrics.px(8),
-        (state.display_environment.work_area.bottom - height - metrics.px(8))
-            .max(state.display_environment.work_area.top + metrics.px(8)),
+        state.model.display_environment.work_area.top + metrics.px(8),
+        (state.model.display_environment.work_area.bottom - height - metrics.px(8))
+            .max(state.model.display_environment.work_area.top + metrics.px(8)),
     );
     let bounds = UiRect {
         left,
@@ -3683,7 +2833,7 @@ fn draw_hover_tooltip(device: HDC, state: &OverlayState, layout: ToolbarLayout) 
 }
 
 fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
-    let metrics = state.display_environment.metrics;
+    let metrics = state.model.display_environment.metrics;
     let tokens = metrics.toolbar_tokens();
     draw_round_box(
         device,
@@ -3701,7 +2851,7 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
         (ToolbarControl::Cancel, layout.cancel),
     ];
     for (control, row) in rows {
-        if state.hovered_control == Some(control) {
+        if state.model.hovered_control == Some(control) {
             draw_round_box(
                 device,
                 row,
@@ -3711,7 +2861,7 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
             );
         }
     }
-    if state.dim_background {
+    if state.model.dim_background {
         draw_checkmark(
             device,
             layout.dim_background.left + tokens.menu_check_offset,
@@ -3777,685 +2927,6 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
     );
 }
 
-fn draw_display_icon(device: HDC, bounds: UiRect, color: COLORREF, metrics: UiMetrics) {
-    let tokens = metrics.toolbar_tokens();
-    let left = (bounds.left + bounds.right - tokens.icon_size) / 2;
-    let top = (bounds.top + bounds.bottom - tokens.icon_size) / 2;
-    let body_height = tokens.icon_size * 2 / 3;
-    let center_x = left + tokens.icon_size / 2;
-    draw_outline_rect(
-        device,
-        left,
-        top,
-        left + tokens.icon_size,
-        top + body_height,
-        color,
-        tokens.icon_stroke,
-    );
-    draw_lines(
-        device,
-        &[
-            (center_x, top + body_height),
-            (center_x, top + tokens.icon_size),
-        ],
-        color,
-        tokens.icon_stroke,
-    );
-    draw_lines(
-        device,
-        &[
-            (center_x - tokens.icon_size / 4, top + tokens.icon_size),
-            (center_x + tokens.icon_size / 4, top + tokens.icon_size),
-        ],
-        color,
-        tokens.icon_stroke,
-    );
-}
-
-fn draw_window_icon(device: HDC, bounds: UiRect, color: COLORREF, metrics: UiMetrics) {
-    let tokens = metrics.toolbar_tokens();
-    let left = (bounds.left + bounds.right - tokens.icon_size) / 2;
-    let top = (bounds.top + bounds.bottom - tokens.icon_size) / 2;
-    let offset = tokens.icon_size / 4;
-    draw_outline_rect(
-        device,
-        left + offset,
-        top,
-        left + tokens.icon_size,
-        top + tokens.icon_size - offset,
-        color,
-        tokens.icon_stroke,
-    );
-    draw_outline_rect(
-        device,
-        left,
-        top + offset,
-        left + tokens.icon_size - offset,
-        top + tokens.icon_size,
-        color,
-        tokens.icon_stroke,
-    );
-}
-
-fn draw_region_icon(device: HDC, bounds: UiRect, color: COLORREF, metrics: UiMetrics) {
-    let tokens = metrics.toolbar_tokens();
-    let left = (bounds.left + bounds.right - tokens.icon_size) / 2;
-    let top = (bounds.top + bounds.bottom - tokens.icon_size) / 2;
-    let right = left + tokens.icon_size;
-    let bottom = top + tokens.icon_size;
-    let corner = tokens.icon_size / 3;
-    for points in [
-        [(left, top + corner), (left, top), (left + corner, top)],
-        [(right - corner, top), (right, top), (right, top + corner)],
-        [
-            (right, bottom - corner),
-            (right, bottom),
-            (right - corner, bottom),
-        ],
-        [
-            (left + corner, bottom),
-            (left, bottom),
-            (left, bottom - corner),
-        ],
-    ] {
-        draw_lines(device, &points, color, tokens.icon_stroke);
-    }
-}
-
-fn draw_camera_icon(device: HDC, left: i32, top: i32, color: COLORREF, metrics: UiMetrics) {
-    let tokens = metrics.toolbar_tokens();
-    let body_top = top + tokens.icon_size / 4;
-    draw_outline_rect(
-        device,
-        left,
-        body_top,
-        left + tokens.icon_size,
-        top + tokens.icon_size,
-        color,
-        tokens.icon_stroke,
-    );
-    draw_lines(
-        device,
-        &[
-            (left + tokens.icon_size / 4, body_top),
-            (left + tokens.icon_size * 2 / 5, top),
-            (left + tokens.icon_size * 3 / 5, top),
-            (left + tokens.icon_size * 3 / 4, body_top),
-        ],
-        color,
-        tokens.icon_stroke,
-    );
-    draw_ellipse(
-        device,
-        left + tokens.icon_size / 3,
-        top + tokens.icon_size / 3,
-        left + tokens.icon_size * 2 / 3,
-        top + tokens.icon_size * 2 / 3,
-        color,
-        tokens.icon_stroke,
-    );
-}
-
-fn draw_checkmark(device: HDC, x: i32, y: i32, color: COLORREF, metrics: UiMetrics) {
-    draw_lines(
-        device,
-        &[
-            (x - metrics.px(5), y),
-            (x - metrics.px(1), y + metrics.px(4)),
-            (x + metrics.px(6), y - metrics.px(5)),
-        ],
-        color,
-        metrics.px(2).max(1),
-    );
-}
-
-fn draw_round_box(device: HDC, rect: UiRect, fill: COLORREF, border: COLORREF, radius: i32) {
-    // SAFETY: Creates temporary process-owned GDI objects for this off-screen paint operation.
-    let (brush, pen) = unsafe { (CreateSolidBrush(fill), CreatePen(PS_SOLID, 1, border)) };
-    // SAFETY: Objects and DC are live. Prior objects are restored before deletion.
-    unsafe {
-        let old_brush = SelectObject(device, brush);
-        let old_pen = SelectObject(device, pen);
-        RoundRect(
-            device,
-            rect.left,
-            rect.top,
-            rect.right,
-            rect.bottom,
-            radius,
-            radius,
-        );
-        SelectObject(device, old_pen);
-        SelectObject(device, old_brush);
-        DeleteObject(pen);
-        DeleteObject(brush);
-    }
-}
-
-fn draw_outline_rect(
-    device: HDC,
-    left: i32,
-    top: i32,
-    right: i32,
-    bottom: i32,
-    color: COLORREF,
-    width: i32,
-) {
-    // SAFETY: NULL_BRUSH is a shared stock object; the pen is process-owned for this draw call.
-    let (brush, pen) = unsafe {
-        (
-            GetStockObject(NULL_BRUSH),
-            CreatePen(PS_SOLID, width, color),
-        )
-    };
-    // SAFETY: Objects and DC are live. Prior objects are restored before deleting the pen.
-    unsafe {
-        let old_brush = SelectObject(device, brush);
-        let old_pen = SelectObject(device, pen);
-        Rectangle(device, left, top, right, bottom);
-        SelectObject(device, old_pen);
-        SelectObject(device, old_brush);
-        DeleteObject(pen);
-    }
-}
-
-fn draw_ellipse(
-    device: HDC,
-    left: i32,
-    top: i32,
-    right: i32,
-    bottom: i32,
-    color: COLORREF,
-    width: i32,
-) {
-    // SAFETY: NULL_BRUSH is shared; the temporary pen is restored and deleted below.
-    let (brush, pen) = unsafe {
-        (
-            GetStockObject(NULL_BRUSH),
-            CreatePen(PS_SOLID, width, color),
-        )
-    };
-    // SAFETY: Objects and DC are live for the duration of this off-screen draw operation.
-    unsafe {
-        let old_brush = SelectObject(device, brush);
-        let old_pen = SelectObject(device, pen);
-        Ellipse(device, left, top, right, bottom);
-        SelectObject(device, old_pen);
-        SelectObject(device, old_brush);
-        DeleteObject(pen);
-    }
-}
-
-fn draw_filled_ellipse(device: HDC, left: i32, top: i32, right: i32, bottom: i32, color: COLORREF) {
-    // SAFETY: Creates temporary process-owned objects for this off-screen paint operation.
-    let (brush, pen) = unsafe { (CreateSolidBrush(color), CreatePen(PS_SOLID, 1, color)) };
-    // SAFETY: Objects and DC are live. Prior objects are restored before deletion.
-    unsafe {
-        let old_brush = SelectObject(device, brush);
-        let old_pen = SelectObject(device, pen);
-        Ellipse(device, left, top, right, bottom);
-        SelectObject(device, old_pen);
-        SelectObject(device, old_brush);
-        DeleteObject(pen);
-        DeleteObject(brush);
-    }
-}
-
-fn draw_lines(device: HDC, points: &[(i32, i32)], color: COLORREF, width: i32) {
-    let Some(&(first_x, first_y)) = points.first() else {
-        return;
-    };
-    // SAFETY: Creates a temporary process-owned pen for this off-screen paint operation.
-    let pen = unsafe { CreatePen(PS_SOLID, width, color) };
-    // SAFETY: DC and pen are live. GDI clips coordinates and the prior pen is restored.
-    unsafe {
-        let old_pen = SelectObject(device, pen);
-        MoveToEx(device, first_x, first_y, None);
-        for &(x, y) in &points[1..] {
-            LineTo(device, x, y);
-        }
-        SelectObject(device, old_pen);
-        DeleteObject(pen);
-    }
-}
-
-fn draw_text(
-    device: HDC,
-    bounds: UiRect,
-    value: &str,
-    color: COLORREF,
-    alignment: TextAlignment,
-    font_height: i32,
-) {
-    let mut text: Vec<u16> = value.encode_utf16().collect();
-    let mut native_bounds = RECT {
-        left: bounds.left,
-        top: bounds.top,
-        right: bounds.right,
-        bottom: bounds.bottom,
-    };
-    let horizontal = match alignment {
-        TextAlignment::Left => DT_LEFT,
-        TextAlignment::Center => DT_CENTER,
-    };
-    let format = windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT(
-        DT_SINGLELINE.0 | DT_VCENTER.0 | DT_NOPREFIX.0 | horizontal.0,
-    );
-    let font = create_ui_font(font_height);
-    // SAFETY: The DC/font and bounds are live and text is valid writable UTF-16 storage.
-    unsafe {
-        let old_font = SelectObject(device, font);
-        SetBkMode(device, TRANSPARENT);
-        SetTextColor(device, color);
-        DrawTextW(device, &mut text, &mut native_bounds, format);
-        SelectObject(device, old_font);
-        DeleteObject(font);
-    }
-}
-
-fn measure_ui_text(device: HDC, value: &str, font_height: i32) -> SIZE {
-    let text: Vec<u16> = value.encode_utf16().collect();
-    let font = create_ui_font(font_height);
-    let mut measured = SIZE::default();
-    // SAFETY: device/font are live, text is valid UTF-16, and measured is writable storage.
-    let succeeded = unsafe {
-        let old_font = SelectObject(device, font);
-        let succeeded = GetTextExtentPoint32W(device, &text, &mut measured).as_bool();
-        SelectObject(device, old_font);
-        DeleteObject(font);
-        succeeded
-    };
-    if succeeded {
-        measured
-    } else {
-        SIZE {
-            cx: value.chars().count() as i32 * (font_height / 2),
-            cy: font_height,
-        }
-    }
-}
-
-fn create_ui_font(font_height: i32) -> HFONT {
-    // SAFETY: Creates a ClearType font from the registered process-private IoskeleyMono face.
-    unsafe {
-        CreateFontW(
-            -font_height,
-            0,
-            0,
-            0,
-            FW_MEDIUM.0 as i32,
-            0,
-            0,
-            0,
-            u32::from(DEFAULT_CHARSET.0),
-            0,
-            0,
-            u32::from(CLEARTYPE_QUALITY.0),
-            u32::from(DEFAULT_PITCH.0),
-            w!("Ioskeley Mono Medium"),
-        )
-    }
-}
-
-const fn rgb(red: u8, green: u8, blue: u8) -> COLORREF {
-    COLORREF((red as u32) | ((green as u32) << 8) | ((blue as u32) << 16))
-}
-
-fn enumerate_visible_windows(
-    source: Rect,
-    target_display_id: &DisplayId,
-    displays: Vec<DisplayInfo>,
-) -> Result<Vec<WindowCandidate>, CaptureError> {
-    let mut collector = WindowCollector {
-        source,
-        target_display_id: target_display_id.clone(),
-        displays,
-        windows: Vec::with_capacity(32),
-        callback_failed: false,
-    };
-    // SAFETY: collector remains alive and uniquely borrowed for the synchronous enumeration.
-    unsafe {
-        EnumWindows(
-            Some(enum_window),
-            LPARAM((&mut collector as *mut WindowCollector) as isize),
-        )
-    }
-    .map_err(|error| overlay_error("enumerate_windows", error))?;
-    if collector.callback_failed {
-        return Err(CaptureError {
-            kind: CaptureErrorKind::NativeFailure,
-            backend: "windows-overlay",
-            operation: "enumerate_windows",
-            message: "window enumeration callback failed".to_owned(),
-            retryable: true,
-            native_code: None,
-        });
-    }
-    Ok(collector.windows)
-}
-
-struct WindowCollector {
-    source: Rect,
-    target_display_id: DisplayId,
-    displays: Vec<DisplayInfo>,
-    windows: Vec<WindowCandidate>,
-    callback_failed: bool,
-}
-
-unsafe extern "system" fn enum_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    // SAFETY: EnumWindows passes back the live WindowCollector pointer supplied by the caller.
-    let collector = unsafe { &mut *(lparam.0 as *mut WindowCollector) };
-    match catch_unwind(AssertUnwindSafe(|| collect_window(hwnd, collector))) {
-        Ok(()) => BOOL(1),
-        Err(_) => {
-            collector.callback_failed = true;
-            BOOL(0)
-        }
-    }
-}
-
-fn collect_window(hwnd: HWND, collector: &mut WindowCollector) {
-    // SAFETY: Returns the shell desktop window for identity comparison only.
-    if hwnd == unsafe { GetShellWindow() } {
-        return;
-    }
-    // Reject Captastic's own windows before anything queries them. Captastic never offers them as
-    // capture targets, and a title query against a same-process window on another thread is a
-    // blocking WM_GETTEXT send: while it waits, this thread dispatches its incoming sent messages,
-    // which can re-enter the window procedure and re-borrow the overlay state that enumeration
-    // already holds mutably further down the stack.
-    if is_own_process_window(hwnd) {
-        return;
-    }
-    // Everything below this point is a foreign window, and every filter here reads window state
-    // directly instead of sending a message, so none of them can block on another thread.
-    // SAFETY: hwnd is a top-level handle supplied synchronously by EnumWindows.
-    let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
-    // SAFETY: hwnd remains the same live enumerated top-level handle.
-    let minimized = unsafe { IsIconic(hwnd) }.as_bool();
-    let class_name = window_class_name(hwnd);
-    // SAFETY: Reads immutable extended-style bits from the enumerated window.
-    let extended_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
-    let forced_taskbar_window = extended_style & WS_EX_APPWINDOW.0 != 0;
-    if !visible
-        || minimized
-        || is_cloaked_window(hwnd)
-        || class_name.as_deref().is_some_and(is_shell_window_class)
-        || !window_styles_allow_task_switcher(extended_style)
-        || (!forced_taskbar_window && !is_root_owner_task_window(hwnd))
-    {
-        return;
-    }
-    // Only already-eligible foreign windows are titled. Across a process boundary GetWindowText
-    // copies the cached title instead of sending WM_GETTEXT, so it cannot wait on that window's
-    // thread; untitled windows stay excluded exactly as before.
-    let Some(title) = window_text(hwnd) else {
-        return;
-    };
-    let display_affinity = window_display_affinity(hwnd);
-    if !display_affinity_allows_capture(display_affinity) {
-        log_window_candidate(
-            hwnd,
-            "rejected-protected",
-            &title,
-            class_name.as_deref(),
-            extended_style,
-            display_affinity,
-        );
-        return;
-    }
-    let mut native = RECT::default();
-    // SAFETY: native is writable storage and hwnd is the enumerated top-level window.
-    if unsafe { GetWindowRect(hwnd, &mut native) }.is_err() {
-        return;
-    }
-    if let Some(window_bounds) = rect_from_native(native) {
-        let native_display_id = native_window_display_id(hwnd, &collector.displays);
-        if owning_display_id(
-            window_bounds,
-            native_display_id.as_ref(),
-            &collector.displays,
-        ) != Some(&collector.target_display_id)
-        {
-            return;
-        }
-        let Some(visible_bounds) = intersect_with_source(native, collector.source) else {
-            return;
-        };
-        if visible_bounds.width >= 16 && visible_bounds.height >= 16 {
-            log_window_candidate(
-                hwnd,
-                "accepted",
-                &title,
-                class_name.as_deref(),
-                extended_style,
-                display_affinity,
-            );
-            collector.windows.push(WindowCandidate {
-                handle: NativeWindowHandle(hwnd.0),
-            });
-        }
-    }
-}
-
-fn owning_display_id<'a>(
-    window_bounds: Rect,
-    native_display_id: Option<&DisplayId>,
-    displays: &'a [DisplayInfo],
-) -> Option<&'a DisplayId> {
-    let mut candidates: Vec<(&DisplayInfo, u64)> = displays
-        .iter()
-        .filter_map(|display| {
-            display
-                .bounds
-                .intersection(window_bounds)
-                .map(|intersection| (display, intersection.area()))
-        })
-        .collect();
-    let maximum_area = candidates.iter().map(|(_, area)| *area).max()?;
-    candidates.retain(|(_, area)| *area == maximum_area);
-    if let Some(native_display_id) = native_display_id {
-        if let Some((display, _)) = candidates
-            .iter()
-            .find(|(display, _)| display.id == *native_display_id)
-        {
-            return Some(&display.id);
-        }
-    }
-    candidates
-        .into_iter()
-        .min_by(|(left, _), (right, _)| left.id.0.cmp(&right.id.0))
-        .map(|(display, _)| &display.id)
-}
-
-fn native_window_display_id(hwnd: HWND, displays: &[DisplayInfo]) -> Option<DisplayId> {
-    // SAFETY: hwnd is the live top-level window currently supplied by EnumWindows.
-    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL) };
-    if monitor.0 == 0 {
-        return None;
-    }
-    let mut info = MONITORINFO {
-        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-        ..MONITORINFO::default()
-    };
-    // SAFETY: info has the required size and is writable for this synchronous monitor query.
-    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
-        return None;
-    }
-    let bounds = rect_from_native(info.rcMonitor)?;
-    displays
-        .iter()
-        .find(|display| display.bounds == bounds)
-        .map(|display| display.id.clone())
-}
-
-/// Reports whether `hwnd` belongs to this process, so window enumeration can skip it.
-///
-/// A handle that no longer resolves to a thread counts as ours: it is useless as a capture target
-/// and must not be queried further.
-fn is_own_process_window(hwnd: HWND) -> bool {
-    let mut process_id = 0_u32;
-    // SAFETY: process_id is writable storage and hwnd is inspected synchronously.
-    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
-    if thread_id == 0 {
-        return true;
-    }
-    // SAFETY: GetCurrentProcessId has no preconditions and cannot fail.
-    process_id == unsafe { GetCurrentProcessId() }
-}
-
-fn is_cloaked_window(hwnd: HWND) -> bool {
-    let mut cloaked = 0_u32;
-    // SAFETY: cloaked is correctly sized writable storage used only for this synchronous query.
-    unsafe {
-        DwmGetWindowAttribute(
-            hwnd,
-            DWMWA_CLOAKED,
-            (&mut cloaked as *mut u32).cast(),
-            std::mem::size_of::<u32>() as u32,
-        )
-    }
-    .is_ok()
-        && cloaked != 0
-}
-
-fn window_text(hwnd: HWND) -> Option<String> {
-    // SAFETY: Reads the current title length without retaining the enumerated handle.
-    let length = unsafe { GetWindowTextLengthW(hwnd) };
-    if length <= 0 {
-        return None;
-    }
-    let mut title = vec![0_u16; length as usize + 1];
-    // SAFETY: title is writable UTF-16 storage and hwnd is inspected synchronously.
-    let copied = unsafe { GetWindowTextW(hwnd, &mut title) };
-    (copied > 0).then(|| String::from_utf16_lossy(&title[..copied as usize]))
-}
-
-fn window_class_name(hwnd: HWND) -> Option<String> {
-    let mut class_name = [0_u16; 256];
-    // SAFETY: class_name is writable UTF-16 storage and hwnd is used synchronously.
-    let length = unsafe { GetClassNameW(hwnd, &mut class_name) };
-    if length <= 0 {
-        return None;
-    }
-    Some(String::from_utf16_lossy(&class_name[..length as usize]))
-}
-
-fn window_display_affinity(hwnd: HWND) -> Option<u32> {
-    let mut affinity = WDA_NONE.0;
-    // SAFETY: affinity is writable storage and hwnd is a live top-level enumeration candidate.
-    unsafe { GetWindowDisplayAffinity(hwnd, &mut affinity) }
-        .ok()
-        .map(|_| affinity)
-}
-
-const fn display_affinity_allows_capture(affinity: Option<u32>) -> bool {
-    match affinity {
-        Some(value) => value == WDA_NONE.0,
-        None => true,
-    }
-}
-
-fn log_window_candidate(
-    hwnd: HWND,
-    decision: &str,
-    title: &str,
-    class_name: Option<&str>,
-    extended_style: u32,
-    display_affinity: Option<u32>,
-) {
-    if !log::log_enabled!(log::Level::Debug) {
-        return;
-    }
-    let process = window_process_name(hwnd);
-    let affinity = display_affinity
-        .map(|value| format!("0x{value:08X}"))
-        .unwrap_or_else(|| "unknown".to_owned());
-    log::debug!(
-        "window chooser candidate decision={decision} handle=0x{:X} title={title:?} class={:?} process={:?} ex_style=0x{extended_style:08X} display_affinity={affinity}",
-        hwnd.0,
-        class_name.unwrap_or("<unknown>"),
-        process.as_deref().unwrap_or("<unknown>"),
-    );
-}
-
-fn window_process_name(hwnd: HWND) -> Option<String> {
-    let mut process_id = 0_u32;
-    // SAFETY: process_id is writable storage and hwnd is queried synchronously.
-    if unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) } == 0 || process_id == 0 {
-        return None;
-    }
-    // SAFETY: Opens a query-only handle to the owner process without inheriting it.
-    let process =
-        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }.ok()?;
-    let mut path = vec![0_u16; 32_768];
-    let mut length = path.len() as u32;
-    // SAFETY: path and length are writable storage and process remains live through the call.
-    let queried = unsafe {
-        QueryFullProcessImageNameW(
-            process,
-            PROCESS_NAME_WIN32,
-            PWSTR(path.as_mut_ptr()),
-            &mut length,
-        )
-    };
-    // SAFETY: Closes the query-only process handle exactly once after its last use.
-    let _ = unsafe { CloseHandle(process) };
-    queried.ok()?;
-    let path = String::from_utf16_lossy(&path[..length as usize]);
-    std::path::Path::new(&path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(str::to_owned)
-}
-
-fn is_shell_window_class(class_name: &str) -> bool {
-    matches!(
-        class_name,
-        "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
-    )
-}
-
-fn window_styles_allow_task_switcher(extended_style: u32) -> bool {
-    let is_app_window = extended_style & WS_EX_APPWINDOW.0 != 0;
-    let is_tool_window = extended_style & WS_EX_TOOLWINDOW.0 != 0;
-    let is_no_activate = extended_style & WS_EX_NOACTIVATE.0 != 0;
-    !is_no_activate && (is_app_window || !is_tool_window)
-}
-
-fn is_root_owner_task_window(hwnd: HWND) -> bool {
-    // SAFETY: The enumerated HWND is queried synchronously and no handle is retained.
-    let mut candidate = unsafe { GetAncestor(hwnd, GA_ROOTOWNER) };
-    if candidate.0 == 0 {
-        return true;
-    }
-    for _ in 0..32 {
-        // SAFETY: candidate is a live HWND returned by the preceding Win32 query.
-        let popup = unsafe { GetLastActivePopup(candidate) };
-        if popup == candidate {
-            break;
-        }
-        // SAFETY: popup is inspected synchronously and not retained.
-        if unsafe { IsWindowVisible(popup) }.as_bool() {
-            break;
-        }
-        candidate = popup;
-    }
-    candidate == hwnd
-}
-
-fn rect_from_native(native: RECT) -> Option<Rect> {
-    let width = i64::from(native.right) - i64::from(native.left);
-    let height = i64::from(native.bottom) - i64::from(native.top);
-    (width > 0 && height > 0 && width <= i64::from(u32::MAX) && height <= i64::from(u32::MAX))
-        .then_some(Rect {
-            x: native.left,
-            y: native.top,
-            width: width as u32,
-            height: height as u32,
-        })
-}
-
 fn intersect_with_source(native: RECT, source: Rect) -> Option<Rect> {
     let source_right = i64::from(source.x) + i64::from(source.width);
     let source_bottom = i64::from(source.y) + i64::from(source.height);
@@ -4488,186 +2959,6 @@ fn intersect_rect(rect: Rect, source: Rect) -> Option<Rect> {
     })
 }
 
-fn screen_point(source: Rect, lparam: LPARAM) -> POINT {
-    let packed = lparam.0 as u32;
-    let x = (packed as u16) as i16 as i32;
-    let y = ((packed >> 16) as u16) as i16 as i32;
-    POINT {
-        x: source.x.saturating_add(x),
-        y: source.y.saturating_add(y),
-    }
-}
-
-fn local_point(source: Rect, point: POINT) -> POINT {
-    POINT {
-        x: point.x.saturating_sub(source.x),
-        y: point.y.saturating_sub(source.y),
-    }
-}
-
-fn activate_tool(state: &mut OverlayState, tool: CaptureTool) {
-    state.anchor = None;
-    state.dragging = false;
-    state.resizing = None;
-    state.moving_region = None;
-    let tool_changed = state.tool != tool;
-    if tool_changed {
-        state.last_region = latest_interaction_region(
-            state.tool,
-            state.selection,
-            state.selection_kind,
-            state.last_region,
-        );
-        state.dimension_label_placement = None;
-        state.selection = None;
-        state.selection_kind = None;
-        state.selected_window = None;
-        state.selected_window_frame = None;
-        state.hovered = None;
-        state.hovered_handle = None;
-    }
-    state.tool = tool;
-    state.options_open = false;
-    match tool {
-        CaptureTool::FullDisplay => {
-            state.selection = Some(state.source);
-            state.selection_kind = Some(SelectionKind::Display);
-            state.selected_window = None;
-            state.selected_window_frame = None;
-        }
-        CaptureTool::Window => build_window_overview(state),
-        CaptureTool::Region if tool_changed => {
-            (state.selection, state.selection_kind) =
-                initial_selection(CaptureTool::Region, state.last_region, state.source);
-        }
-        CaptureTool::Region => {}
-    }
-    if tool != CaptureTool::Window {
-        hide_live_window_thumbnails(state);
-    }
-}
-
-fn rect_from_points(source: Rect, first: POINT, second: POINT) -> Option<Rect> {
-    let source_right = i64::from(source.x) + i64::from(source.width);
-    let source_bottom = i64::from(source.y) + i64::from(source.height);
-    let left = i64::from(first.x.min(second.x)).clamp(i64::from(source.x), source_right);
-    let top = i64::from(first.y.min(second.y)).clamp(i64::from(source.y), source_bottom);
-    let right = i64::from(first.x.max(second.x)).clamp(i64::from(source.x), source_right);
-    let bottom = i64::from(first.y.max(second.y)).clamp(i64::from(source.y), source_bottom);
-    (right > left && bottom > top).then_some(Rect {
-        x: left as i32,
-        y: top as i32,
-        width: (right - left) as u32,
-        height: (bottom - top) as u32,
-    })
-}
-
-fn contains(rect: Rect, point: POINT) -> bool {
-    let right = i64::from(rect.x) + i64::from(rect.width);
-    let bottom = i64::from(rect.y) + i64::from(rect.height);
-    i64::from(point.x) >= i64::from(rect.x)
-        && i64::from(point.y) >= i64::from(rect.y)
-        && i64::from(point.x) < right
-        && i64::from(point.y) < bottom
-}
-
-fn hit_test_resize_handle(rect: Rect, point: POINT, metrics: UiMetrics) -> Option<ResizeHandle> {
-    let left = i64::from(rect.x);
-    let top = i64::from(rect.y);
-    let right = left + i64::from(rect.width);
-    let bottom = top + i64::from(rect.height);
-    let x = i64::from(point.x);
-    let y = i64::from(point.y);
-    let radius = i64::from(metrics.region_tokens().handle_hit_radius);
-    let near_left = (x - left).abs() <= radius;
-    let near_right = (x - right).abs() <= radius;
-    let near_top = (y - top).abs() <= radius;
-    let near_bottom = (y - bottom).abs() <= radius;
-    if near_left && near_top {
-        Some(ResizeHandle::NorthWest)
-    } else if near_right && near_top {
-        Some(ResizeHandle::NorthEast)
-    } else if near_right && near_bottom {
-        Some(ResizeHandle::SouthEast)
-    } else if near_left && near_bottom {
-        Some(ResizeHandle::SouthWest)
-    } else if near_top && x >= left && x <= right {
-        Some(ResizeHandle::North)
-    } else if near_right && y >= top && y <= bottom {
-        Some(ResizeHandle::East)
-    } else if near_bottom && x >= left && x <= right {
-        Some(ResizeHandle::South)
-    } else if near_left && y >= top && y <= bottom {
-        Some(ResizeHandle::West)
-    } else {
-        None
-    }
-}
-
-fn resize_region(original: Rect, handle: ResizeHandle, point: POINT, source: Rect) -> Rect {
-    let source_left = i64::from(source.x);
-    let source_top = i64::from(source.y);
-    let source_right = source_left + i64::from(source.width);
-    let source_bottom = source_top + i64::from(source.height);
-    let mut left = i64::from(original.x);
-    let mut top = i64::from(original.y);
-    let mut right = left + i64::from(original.width);
-    let mut bottom = top + i64::from(original.height);
-    let point_x = i64::from(point.x);
-    let point_y = i64::from(point.y);
-
-    if matches!(
-        handle,
-        ResizeHandle::NorthWest | ResizeHandle::West | ResizeHandle::SouthWest
-    ) {
-        let maximum_left = (right - MIN_REGION_SIZE).max(source_left);
-        left = point_x.clamp(source_left, maximum_left);
-    }
-    if matches!(
-        handle,
-        ResizeHandle::NorthEast | ResizeHandle::East | ResizeHandle::SouthEast
-    ) {
-        let minimum_right = (left + MIN_REGION_SIZE).min(source_right);
-        right = point_x.clamp(minimum_right, source_right);
-    }
-    if matches!(
-        handle,
-        ResizeHandle::NorthWest | ResizeHandle::North | ResizeHandle::NorthEast
-    ) {
-        let maximum_top = (bottom - MIN_REGION_SIZE).max(source_top);
-        top = point_y.clamp(source_top, maximum_top);
-    }
-    if matches!(
-        handle,
-        ResizeHandle::SouthWest | ResizeHandle::South | ResizeHandle::SouthEast
-    ) {
-        let minimum_bottom = (top + MIN_REGION_SIZE).min(source_bottom);
-        bottom = point_y.clamp(minimum_bottom, source_bottom);
-    }
-
-    Rect {
-        x: left as i32,
-        y: top as i32,
-        width: (right - left) as u32,
-        height: (bottom - top) as u32,
-    }
-}
-
-fn move_region(original: Rect, pointer_origin: POINT, point: POINT, source: Rect) -> Rect {
-    let delta_x = i64::from(point.x) - i64::from(pointer_origin.x);
-    let delta_y = i64::from(point.y) - i64::from(pointer_origin.y);
-    let source_left = i64::from(source.x);
-    let source_top = i64::from(source.y);
-    let maximum_x = source_left + i64::from(source.width.saturating_sub(original.width));
-    let maximum_y = source_top + i64::from(source.height.saturating_sub(original.height));
-    Rect {
-        x: (i64::from(original.x) + delta_x).clamp(source_left, maximum_x) as i32,
-        y: (i64::from(original.y) + delta_y).clamp(source_top, maximum_y) as i32,
-        width: original.width,
-        height: original.height,
-    }
-}
-
 fn update_cursor(handle: Option<ResizeHandle>, region_cursor: &RegionCursor) {
     if handle.is_none() {
         region_cursor.activate();
@@ -4684,38 +2975,6 @@ fn update_cursor(handle: Option<ResizeHandle>, region_cursor: &RegionCursor) {
     if let Ok(cursor) = unsafe { LoadCursorW(None, resource) } {
         // SAFETY: cursor is a live shared system cursor.
         unsafe { SetCursor(cursor) };
-    }
-}
-
-fn set_arrow_cursor() {
-    // SAFETY: IDC_ARROW is a shared system cursor that requires no explicit destruction.
-    if let Ok(cursor) = unsafe { LoadCursorW(None, IDC_ARROW) } {
-        // SAFETY: cursor is a live shared system cursor.
-        unsafe { SetCursor(cursor) };
-    }
-}
-
-fn set_move_cursor() {
-    // SAFETY: IDC_SIZEALL is a shared system cursor that requires no explicit destruction.
-    if let Ok(cursor) = unsafe { LoadCursorW(None, IDC_SIZEALL) } {
-        // SAFETY: cursor is a live shared system cursor.
-        unsafe { SetCursor(cursor) };
-    }
-}
-
-fn restore_input_context(previous_foreground: HWND) {
-    // SAFETY: IDC_ARROW is a shared system cursor that does not require destruction.
-    if let Ok(cursor) = unsafe { LoadCursorW(None, IDC_ARROW) } {
-        // SAFETY: Restores the ordinary pointer after Captastic's directional overlay cursors.
-        unsafe { SetCursor(cursor) };
-    }
-    if previous_foreground.0 != 0 {
-        // SAFETY: The handle was observed immediately before the overlay opened. IsWindow checks
-        // that it still represents a live window before Captastic returns foreground focus.
-        if unsafe { IsWindow(previous_foreground) }.as_bool() {
-            // SAFETY: This is a best-effort restoration from the foreground overlay thread.
-            unsafe { SetForegroundWindow(previous_foreground) };
-        }
     }
 }
 
@@ -4741,24 +3000,6 @@ fn tight_pixels(frame: &CpuFrame) -> Result<Arc<[u8]>, CaptureError> {
     Ok(Arc::from(pixels))
 }
 
-fn top_down_bitmap_info(width: i32, height: i32) -> BITMAPINFO {
-    BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: width,
-            biHeight: -height,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            biSizeImage: (width as u32)
-                .saturating_mul(height as u32)
-                .saturating_mul(4),
-            ..Default::default()
-        },
-        bmiColors: [RGBQUAD::default(); 1],
-    }
-}
-
 fn validate_frame(frame: &CpuFrame) -> Result<(), CaptureError> {
     if frame.format != PixelFormat::Bgra8Unorm || frame.origin != FrameOrigin::TopLeft {
         return Err(CaptureError {
@@ -4778,36 +3019,6 @@ fn validate_frame(frame: &CpuFrame) -> Result<(), CaptureError> {
         ));
     }
     Ok(())
-}
-
-fn overlay_error(operation: &'static str, error: WindowsError) -> CaptureError {
-    CaptureError {
-        kind: CaptureErrorKind::NativeFailure,
-        backend: "windows-overlay",
-        operation,
-        message: error.to_string(),
-        retryable: true,
-        native_code: Some(i64::from(error.code().0)),
-    }
-}
-
-fn last_error(operation: &'static str) -> CaptureError {
-    overlay_error(operation, WindowsError::from_win32())
-}
-
-fn invalid_frame(message: impl Into<String>) -> CaptureError {
-    CaptureError {
-        kind: CaptureErrorKind::InvalidFrame,
-        backend: "windows-overlay",
-        operation: "validate_frame",
-        message: message.into(),
-        retryable: false,
-        native_code: None,
-    }
-}
-
-fn duration_ns(duration: std::time::Duration) -> u64 {
-    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -5064,34 +3275,6 @@ mod tests {
     }
 
     #[test]
-    fn native_crosshair_has_high_contrast_arms_and_a_precise_hotspot() {
-        let (pixels, mask) = high_contrast_cursor_pixels();
-        let pixel = |x: usize, y: usize| {
-            let offset = (y * REGION_CURSOR_SIZE as usize + x) * 4;
-            &pixels[offset..offset + 4]
-        };
-        assert_eq!(pixel(0, 0), &[0, 0, 0, 0]);
-        assert_eq!(
-            pixel(10, REGION_CURSOR_CENTER as usize),
-            &[255, 255, 255, 255]
-        );
-        assert_eq!(
-            pixel(10, REGION_CURSOR_CENTER as usize + 3),
-            &[0, 0, 0, 255]
-        );
-        assert_eq!(
-            pixel(REGION_CURSOR_CENTER as usize, REGION_CURSOR_CENTER as usize),
-            &[255, 255, 255, 255]
-        );
-        assert_ne!(mask[0] & 0x80, 0);
-        let center_mask = REGION_CURSOR_CENTER as usize * 8 + REGION_CURSOR_CENTER as usize / 8;
-        assert_eq!(
-            mask[center_mask] & (0x80 >> (REGION_CURSOR_CENTER as usize % 8)),
-            0
-        );
-    }
-
-    #[test]
     fn corner_resize_moves_two_edges_and_preserves_the_opposite_corner() {
         assert_eq!(
             resize_region(
@@ -5233,6 +3416,67 @@ mod tests {
         );
         assert_eq!(
             live_pixel_alpha(CaptureTool::Region, false, false, false),
+            LIVE_HIT_TEST_ALPHA
+        );
+    }
+
+    #[test]
+    fn confirm_telemetry_reports_live_previews_only_for_window_confirms() {
+        // A Window confirm reports the actual live registrations; the rest of the inventory
+        // is frozen.
+        assert_eq!(confirm_preview_split(SelectionKind::Window, 3, 8), (3, 5));
+        // A confirm that merely passed through Window mode hid every live preview on the way
+        // out: the inventory still counts (run-scoped cost), but nothing is live.
+        assert_eq!(confirm_preview_split(SelectionKind::Region, 3, 8), (0, 8));
+        assert_eq!(confirm_preview_split(SelectionKind::Display, 3, 8), (0, 8));
+        // A run that never entered Window mode has no inventory at all.
+        assert_eq!(confirm_preview_split(SelectionKind::Region, 0, 0), (0, 0));
+    }
+
+    #[test]
+    fn black_chrome_pixels_are_opaque_in_live_region_mode() {
+        // Reproduce the live pipeline on a real DIB: sentinel-alpha fill, then pure-black GDI
+        // chrome the way draw_outline's contrast halo and draw_resize_handles' rings paint it.
+        let surface = FrozenSurface::empty(32, 32).expect("surface");
+        fill_live_background(&surface);
+        fill_device_rect(
+            surface.device,
+            RECT {
+                left: 8,
+                top: 8,
+                right: 24,
+                bottom: 24,
+            },
+            COLORREF(0),
+        );
+        // SAFETY: Flushes the queued fill before the CPU reads the DIB bytes.
+        let _ = unsafe { GdiFlush() };
+        // SAFETY: The surface uniquely owns this readable DIB on the test thread.
+        let pixels = unsafe { std::slice::from_raw_parts(surface.bits, surface.byte_length) };
+        let alpha_at = |x: usize, y: usize| pixels[(y * 32 + x) * 4 + 3];
+
+        // GDI zeroed the alpha byte of the drawn black pixels; untouched background keeps the
+        // sentinel. Coverage therefore separates the two even though both are pure black.
+        assert_eq!(alpha_at(16, 16), 0, "drawn black pixel reads as chrome");
+        assert_eq!(
+            alpha_at(2, 2),
+            LIVE_UNDRAWN_ALPHA,
+            "untouched background keeps the sentinel"
+        );
+
+        // And the present-pass classification: drawn black chrome becomes opaque where the old
+        // color heuristic left it at background alpha; genuinely undrawn areas keep the
+        // reserved dim and hit-test values.
+        assert_eq!(
+            live_pixel_alpha(CaptureTool::Region, true, false, true),
+            u8::MAX
+        );
+        assert_eq!(
+            live_pixel_alpha(CaptureTool::Region, true, false, false),
+            DIM_ALPHA
+        );
+        assert_eq!(
+            live_pixel_alpha(CaptureTool::Region, false, true, false),
             LIVE_HIT_TEST_ALPHA
         );
     }
@@ -5462,12 +3706,25 @@ mod tests {
             bottom: layout.bounds.bottom - 1,
         };
 
-        assert!(live_thumbnail_overlaps_chrome(menu_overlap, layout, true));
-        assert!(!live_thumbnail_overlaps_chrome(menu_overlap, layout, false));
+        assert!(live_thumbnail_overlaps_chrome(
+            menu_overlap,
+            layout,
+            true,
+            environment
+        ));
+        // With the options menu closed the menu rect is no longer chrome, but for a bottom
+        // toolbar it lies inside the always-reserved tooltip band, so it still yields.
+        assert!(live_thumbnail_overlaps_chrome(
+            menu_overlap,
+            layout,
+            false,
+            environment
+        ));
         assert!(live_thumbnail_overlaps_chrome(
             toolbar_overlap,
             layout,
-            false
+            false,
+            environment
         ));
         assert!(!live_thumbnail_overlaps_chrome(
             RECT {
@@ -5477,7 +3734,26 @@ mod tests {
                 bottom: 64,
             },
             layout,
-            true
+            true,
+            environment
+        ));
+
+        // The default-origin toolbar sits near the bottom, so the tooltip band lies directly
+        // above it; a thumbnail there must yield even while no tooltip is showing.
+        let band = tooltip_band(environment, layout);
+        assert_eq!(band.bottom, layout.bounds.top);
+        assert!(band.top < layout.bounds.top);
+        let band_overlap = RECT {
+            left: layout.bounds.left,
+            top: band.top + 1,
+            right: layout.bounds.left + 10,
+            bottom: band.top + 2,
+        };
+        assert!(live_thumbnail_overlaps_chrome(
+            band_overlap,
+            layout,
+            false,
+            environment
         ));
     }
 
@@ -5633,7 +3909,8 @@ mod tests {
     #[test]
     fn window_overview_arranges_independent_surfaces_in_centered_rows() {
         let dimensions = vec![(1600, 900); 5];
-        let rectangles = layout_floating_windows(1920, 1080, &dimensions);
+        let rectangles =
+            layout_floating_windows(1920, 1080, UiMetrics::new(UiMetrics::BASE_DPI), &dimensions);
         assert_eq!(rectangles.len(), dimensions.len());
         assert!(rectangles[0].right < rectangles[1].left);
         assert_eq!(
@@ -5659,163 +3936,45 @@ mod tests {
     }
 
     #[test]
+    fn overview_layout_scales_with_monitor_dpi_and_clears_the_toolbar_band() {
+        let dimensions = vec![(1600, 900); 5];
+        // 200% scaling on a 4K display: the margins must scale with the toolbar's metrics so
+        // the bottom thumbnail row cannot collide with the (equally scaled) toolbar band.
+        let metrics = UiMetrics::new(192);
+        let tokens = metrics.overview_tokens();
+        assert_eq!(tokens.margin_x, 140);
+        assert_eq!(tokens.top, 128);
+        assert_eq!(tokens.bottom_reserve, 320);
+        let rectangles = layout_floating_windows(3840, 2160, metrics, &dimensions);
+        assert_eq!(rectangles.len(), dimensions.len());
+        assert!(rectangles.iter().all(|rectangle| {
+            rectangle.left >= tokens.margin_x
+                && rectangle.top >= tokens.top
+                && rectangle.right <= 3840 - tokens.margin_x
+                && rectangle.bottom <= 2160 - tokens.bottom_reserve
+        }));
+
+        // Base DPI is the identity, so default-DPI layouts do not shift: the scaled geometry
+        // at 200% on a doubled client matches the 100% layout doubled, rounding aside.
+        let base =
+            layout_floating_windows(1920, 1080, UiMetrics::new(UiMetrics::BASE_DPI), &dimensions);
+        // Per-rect rounding (window height, per-column width, centering) can drift a few
+        // pixels as columns accumulate; the bound stays far below one gap width, so any
+        // structural divergence (different column count) would still fail loudly.
+        for (scaled, base) in rectangles.iter().zip(&base) {
+            assert!((scaled.left - base.left * 2).abs() <= 6);
+            assert!((scaled.top - base.top * 2).abs() <= 6);
+            assert!((scaled.right - base.right * 2).abs() <= 6);
+            assert!((scaled.bottom - base.bottom * 2).abs() <= 6);
+        }
+    }
+
+    #[test]
     fn overview_thumbnails_have_a_bounded_pixel_budget() {
         assert_eq!(scaled_dimensions(800, 600, 1_200_000), (800, 600));
         let (width, height) = scaled_dimensions(7_680, 4_320, 1_200_000);
         assert!(u64::from(width) * u64::from(height) <= 1_200_000);
         assert!((width as f64 / height as f64 - 16.0 / 9.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn task_switcher_filters_reject_shell_and_utility_windows() {
-        assert!(is_shell_window_class("Progman"));
-        assert!(is_shell_window_class("WorkerW"));
-        assert!(!is_shell_window_class("Chrome_WidgetWin_1"));
-        assert!(!window_styles_allow_task_switcher(WS_EX_TOOLWINDOW.0));
-        assert!(!window_styles_allow_task_switcher(WS_EX_NOACTIVATE.0));
-        assert!(window_styles_allow_task_switcher(
-            WS_EX_TOOLWINDOW.0 | WS_EX_APPWINDOW.0
-        ));
-        assert!(window_styles_allow_task_switcher(0));
-    }
-
-    #[test]
-    fn enumeration_rejects_this_process_before_querying_a_window() {
-        // A handle that resolves to no thread is treated as ours, so nothing queries it further.
-        assert!(is_own_process_window(HWND(0)));
-        // SAFETY: Returns the shell desktop window handle for a process comparison only.
-        let shell = unsafe { GetShellWindow() };
-        if shell.0 != 0 {
-            assert!(
-                !is_own_process_window(shell),
-                "the shell window belongs to another process"
-            );
-        }
-    }
-
-    #[test]
-    fn protected_windows_are_not_offered_for_capture() {
-        assert!(display_affinity_allows_capture(None));
-        assert!(display_affinity_allows_capture(Some(WDA_NONE.0)));
-        assert!(!display_affinity_allows_capture(Some(WDA_MONITOR.0)));
-        assert!(!display_affinity_allows_capture(Some(
-            WDA_EXCLUDEFROMCAPTURE.0
-        )));
-        assert!(!display_affinity_allows_capture(Some(u32::MAX)));
-    }
-
-    #[test]
-    fn spanning_window_belongs_only_to_the_display_with_most_visible_area() {
-        let displays = ownership_test_displays();
-        let bounds = Rect {
-            x: 1500,
-            y: 100,
-            width: 1800,
-            height: 900,
-        };
-        assert_eq!(
-            owning_display_id(bounds, Some(&displays[0].id), &displays),
-            Some(&displays[1].id)
-        );
-    }
-
-    #[test]
-    fn exact_window_ownership_tie_prefers_native_monitor_then_stable_id() {
-        let displays = ownership_test_displays();
-        let bounds = Rect {
-            x: 1720,
-            y: 100,
-            width: 400,
-            height: 800,
-        };
-        assert_eq!(
-            owning_display_id(bounds, Some(&displays[1].id), &displays),
-            Some(&displays[1].id)
-        );
-        assert_eq!(
-            owning_display_id(bounds, None, &displays),
-            Some(&displays[0].id)
-        );
-    }
-
-    fn ownership_test_displays() -> Vec<DisplayInfo> {
-        vec![
-            DisplayInfo {
-                id: DisplayId("display-a".to_owned()),
-                name: "Laptop".to_owned(),
-                bounds: Rect {
-                    x: 0,
-                    y: 0,
-                    width: 1920,
-                    height: 1080,
-                },
-                scale_factor: 1.0,
-                rotation_degrees: 0,
-                is_primary: true,
-            },
-            DisplayInfo {
-                id: DisplayId("display-b".to_owned()),
-                name: "External".to_owned(),
-                bounds: Rect {
-                    x: 1920,
-                    y: 0,
-                    width: 2560,
-                    height: 1440,
-                },
-                scale_factor: 1.5,
-                rotation_degrees: 0,
-                is_primary: false,
-            },
-        ]
-    }
-
-    #[test]
-    fn rounded_corner_coverage_has_antialiased_edge_pixels() {
-        assert_eq!(rounded_rect_coverage(100, 60, 11.0, 0, 0), 0);
-        assert!((0..11).any(|y| {
-            (0..11).any(|x| {
-                let coverage = rounded_rect_coverage(100, 60, 11.0, x, y);
-                coverage > 0 && coverage < 255
-            })
-        }));
-        assert_eq!(rounded_rect_coverage(100, 60, 11.0, 11, 0), 255);
-        assert_eq!(rounded_rect_coverage(100, 60, 0.0, 0, 0), 255);
-        assert!((149..=151).contains(&blend_channel(200, 100, 128)));
-    }
-
-    #[test]
-    fn window_paint_surface_premultiplies_straight_alpha() {
-        let surface =
-            FrozenSurface::from_straight_alpha(2, 1, &[100, 50, 200, 128, 11, 22, 33, 255])
-                .expect("premultiplied surface");
-        assert_eq!(surface.pixel_bytes(), &[50, 25, 100, 128, 11, 22, 33, 255]);
-    }
-
-    #[test]
-    fn embedded_ioskeley_font_registers_process_privately() {
-        let _font_resource =
-            PrivateFontResource::register().expect("register embedded IoskeleyMono font");
-        let surface = FrozenSurface::empty(8, 8).expect("font test surface");
-        let font = create_ui_font(UI_FONT_HEIGHT);
-        assert_ne!(font.0, 0);
-        let mut face_name = [0_u16; 64];
-        // SAFETY: The font and DC are live; the previous object is restored before deletion.
-        let copied = unsafe {
-            let previous = SelectObject(surface.device, font);
-            let copied = GetTextFaceW(surface.device, Some(&mut face_name));
-            SelectObject(surface.device, previous);
-            DeleteObject(font);
-            copied
-        };
-        assert!(copied > 0);
-        let length = face_name
-            .iter()
-            .position(|character| *character == 0)
-            .unwrap_or(face_name.len());
-        assert_eq!(
-            String::from_utf16_lossy(&face_name[..length]),
-            "Ioskeley Mono Medium"
-        );
     }
 
     #[test]
@@ -5884,74 +4043,9 @@ mod tests {
     }
 
     #[test]
-    fn window_paint_alpha_blends_edges_without_black_fringes() {
-        let background =
-            FrozenSurface::new(2, 1, &[10, 20, 30, 255, 10, 20, 30, 255]).expect("background");
-        let window =
-            FrozenSurface::from_straight_alpha(2, 1, &[200, 100, 50, 0, 100, 50, 200, 128])
-                .expect("window surface");
-        draw_window_surface(
-            &background,
-            &window,
-            UiRect {
-                left: 0,
-                top: 0,
-                right: 2,
-                bottom: 1,
-            },
-        );
-        let pixels = background.pixel_bytes();
-        assert_eq!(&pixels[..4], &[10, 20, 30, 255]);
-        assert!((54..=56).contains(&pixels[4]));
-        assert!((34..=36).contains(&pixels[5]));
-        assert!((114..=116).contains(&pixels[6]));
-    }
-
-    #[test]
-    fn preview_scaling_preserves_premultiplied_alpha() {
-        let source = FrozenSurface::from_straight_alpha(
-            2,
-            2,
-            &[
-                200, 100, 50, 0, 100, 50, 200, 255, 200, 100, 50, 0, 100, 50, 200, 255,
-            ],
-        )
-        .expect("source");
-        let scaled = scale_premultiplied_surface(&source, 12, 12).expect("scaled surface");
-        let pixels = scaled.pixel_bytes();
-        let left_alpha = pixels[3];
-        let right_alpha = pixels[(11 * 4) + 3];
-        assert!(left_alpha < 32, "left alpha was {left_alpha}");
-        assert!(right_alpha > 223, "right alpha was {right_alpha}");
-        assert!(pixels.chunks_exact(4).any(|pixel| {
-            pixel[3] > 0
-                && pixel[3] < 255
-                && u16::from(pixel[0]) <= u16::from(pixel[3])
-                && u16::from(pixel[1]) <= u16::from(pixel[3])
-                && u16::from(pixel[2]) <= u16::from(pixel[3])
-        }));
-    }
-
-    #[test]
-    fn preview_downscaling_area_filters_color_and_alpha_together() {
-        let source = FrozenSurface::from_straight_alpha(
-            4,
-            1,
-            &[0, 0, 0, 0, 0, 0, 0, 0, 200, 100, 50, 255, 200, 100, 50, 255],
-        )
-        .expect("source");
-        let scaled = scale_premultiplied_surface(&source, 1, 1).expect("scaled surface");
-        let pixel = scaled.pixel_bytes();
-        assert!((99..=101).contains(&pixel[0]));
-        assert!((49..=51).contains(&pixel[1]));
-        assert!((24..=26).contains(&pixel[2]));
-        assert!((127..=128).contains(&pixel[3]));
-    }
-
-    #[test]
-    fn overlay_resource_cache_reuses_matching_surfaces_and_rejects_other_sizes() {
-        clear_overlay_resource_cache();
-        let resources = OverlayResourceCache {
+    fn overlay_resources_reuse_matching_surfaces_and_reject_other_sizes() {
+        let mut resources = OverlayResources::new();
+        resources.cache = Some(OverlayResourceCache {
             surface: FrozenSurface::empty(8, 8).expect("surface"),
             back_buffer: FrozenSurface::empty(8, 8).expect("back buffer"),
             dimmer: FrozenSurface::new(1, 1, &[0, 0, 0, 255]).expect("dimmer"),
@@ -5959,12 +4053,82 @@ mod tests {
             overview_surface: None,
             region_cursor: RegionCursor::create(),
             font_resource: PrivateFontResource::register().expect("font"),
-        };
-        OVERLAY_RESOURCE_CACHE.with(|cache| *cache.borrow_mut() = Some(resources));
-        let resources = take_overlay_resource_cache(8, 8).expect("matching cache");
-        OVERLAY_RESOURCE_CACHE.with(|cache| *cache.borrow_mut() = Some(resources));
-        assert!(take_overlay_resource_cache(16, 16).is_none());
-        clear_overlay_resource_cache();
+        });
+        let cached = resources.take_matching(8, 8).expect("matching cache");
+        resources.cache = Some(cached);
+        // A resolution change must drop the stale allocation rather than hand it out.
+        assert!(resources.take_matching(16, 16).is_none());
+        assert!(resources.cache.is_none(), "the mismatch consumed the cache");
+        resources.cache = Some(OverlayResourceCache {
+            surface: FrozenSurface::empty(8, 8).expect("surface"),
+            back_buffer: FrozenSurface::empty(8, 8).expect("back buffer"),
+            dimmer: FrozenSurface::new(1, 1, &[0, 0, 0, 255]).expect("dimmer"),
+            blurred_background: None,
+            overview_surface: None,
+            region_cursor: RegionCursor::create(),
+            font_resource: PrivateFontResource::register().expect("font"),
+        });
+        resources.clear();
+        assert!(resources.take_matching(8, 8).is_none());
+    }
+
+    #[test]
+    fn overview_build_queue_retries_once_in_order_and_rejects_stale_generations() {
+        let first = NativeWindowHandle::from_raw(1);
+        let second = NativeWindowHandle::from_raw(2);
+        let third = NativeWindowHandle::from_raw(3);
+        let mut queue = OverviewBuildQueue::new(7, [first, second, third]);
+
+        // A batch message stamped with another build's generation is stale.
+        assert!(queue.accepts(7));
+        assert!(!queue.accepts(6));
+        assert!(!queue.accepts(8));
+
+        // Batches drain in enumeration order; a retryable first failure re-queues at the back,
+        // so retried windows land after every first-pass window - the old two-pass ordering.
+        assert_eq!(queue.take_batch(1), vec![(first, 0)]);
+        assert!(queue.requeue(first, 0));
+        assert_eq!(queue.take_batch(1), vec![(second, 0)]);
+        assert_eq!(queue.take_batch(2), vec![(third, 0), (first, 1)]);
+
+        // The second failure of the same window is dropped instead of re-queued.
+        assert!(!queue.requeue(first, 1));
+        assert!(queue.is_done());
+
+        // A zero-size batch request still makes progress instead of looping forever.
+        let mut queue = OverviewBuildQueue::new(1, [first]);
+        assert_eq!(queue.take_batch(0), vec![(first, 0)]);
+        assert!(queue.is_done());
+    }
+
+    #[test]
+    fn a_previous_runs_overview_surface_is_an_allocation_never_content() {
+        // The constructor no longer manufactures a WindowOverviewCache from a previous run's
+        // surface, so its stale pixels cannot be blitted as current content; the only way the
+        // spare reaches the screen is through this reuse seam, whose caller overdraws it.
+        let spare_surface = FrozenSurface::empty(8, 8).expect("surface");
+        let spare_device = spare_surface.device.0;
+        let mut spare = Some(spare_surface);
+        let reused = reusable_overview_surface(None, &mut spare, 8, 8).expect("matching spare");
+        assert_eq!(
+            reused.device.0, spare_device,
+            "the allocation itself is reused"
+        );
+        assert!(spare.is_none(), "the spare was consumed");
+
+        // The current cache's own surface wins; the spare stays put for later.
+        let current = FrozenSurface::empty(8, 8).expect("surface");
+        let current_device = current.device.0;
+        let mut spare = Some(FrozenSurface::empty(8, 8).expect("surface"));
+        let reused =
+            reusable_overview_surface(Some(current), &mut spare, 8, 8).expect("current allocation");
+        assert_eq!(reused.device.0, current_device);
+        assert!(spare.is_some());
+
+        // A resolution change consumes the mismatched candidate rather than handing it out.
+        let mut spare = Some(FrozenSurface::empty(8, 8).expect("surface"));
+        assert!(reusable_overview_surface(None, &mut spare, 16, 16).is_none());
+        assert!(spare.is_none());
     }
 
     fn ready_preview_state(handle: NativeWindowHandle) -> WindowPreviewState {
@@ -6026,22 +4190,5 @@ mod tests {
             "a ready preview is reused without recapturing"
         );
         assert!(!ready.satisfies(other));
-    }
-
-    #[test]
-    fn spotlight_preserves_native_size_when_the_window_fits() {
-        let surface = FrozenSurface::empty(800, 600).expect("test preview surface");
-        let destination = fitted_surface_rect(
-            &surface,
-            UiRect {
-                left: 0,
-                top: 0,
-                right: 1920,
-                bottom: 1000,
-            },
-            false,
-        );
-        assert_eq!(destination.right - destination.left, 800);
-        assert_eq!(destination.bottom - destination.top, 600);
     }
 }

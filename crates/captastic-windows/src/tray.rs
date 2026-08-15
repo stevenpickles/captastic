@@ -52,7 +52,7 @@ const TRAY_ADD_RETRY_DELAY: Duration = Duration::from_millis(250);
 /// `HRESULT_FROM_WIN32(ERROR_TIMEOUT)`: the notification area server was too busy to answer.
 const HRESULT_ERROR_TIMEOUT: i32 = 0x8007_05B4_u32 as i32;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TrayEvent {
     Capture,
     PausedChanged(bool),
@@ -276,13 +276,11 @@ fn run_tray(
     let state = Box::new(TrayState {
         event_sender,
         notification_receiver,
-        paused: false,
-        startup_enabled,
         icon,
         taskbar_created,
-        shutdown_block_active: false,
         session_shutdown_requested,
         session_drain_completed,
+        model: machine::TrayModel::new(startup_enabled),
     });
     let state_pointer = Box::into_raw(state);
     // SAFETY: The registered class is live and state_pointer remains allocated through the loop.
@@ -305,31 +303,42 @@ fn run_tray(
         )
     };
     if hwnd.0 == 0 {
-        // SAFETY: Window creation failed, so no callback can retain the state allocation.
-        let _ = unsafe { Box::from_raw(state_pointer) };
-        // SAFETY: Balances the successful class registration; no class window was created.
-        let _ = unsafe { UnregisterClassW(CLASS_NAME, instance) };
-        return Err(last_error("create_tray_window"));
+        let creation_error = last_error("create_tray_window");
+        // SAFETY: Window creation failed, so no callback retains the allocation and there is no
+        // window or icon to destroy.
+        unsafe { tear_down_tray_window(None, state_pointer, instance) };
+        return Err(creation_error);
     }
-    if let Err(error) = add_tray_icon_with_retry(hwnd, icon, false) {
-        // Destroying the window here would also destroy the only listener for the TaskbarCreated
-        // broadcast, so a single failed add would cost the icon for the rest of the session. The
-        // daemon already runs without a tray, so keep the window and its message loop alive in a
-        // degraded state and let the existing TaskbarCreated handler restore the icon later.
-        log::error!(
-            "failed to register the tray icon; running without it until the shell broadcasts TaskbarCreated: {error}"
-        );
-    }
+    let startup_icon_added = match add_tray_icon_with_retry(hwnd, icon, false) {
+        Ok(()) => true,
+        Err(error) => {
+            // Destroying the window here would also destroy the only listener for the
+            // TaskbarCreated broadcast, so a single failed add would cost the icon for the rest
+            // of the session. The daemon already runs without a tray, so keep the window and its
+            // message loop alive in a degraded state and let the existing TaskbarCreated handler
+            // restore the icon later.
+            log::error!(
+                "failed to register the tray icon; running without it until the shell broadcasts TaskbarCreated: {error}"
+            );
+            false
+        }
+    };
+    // Recording the add outcome goes through the same input path as every other transition so
+    // its effects run too (a successful add drains the notification queue - empty at startup,
+    // but the machine should not rely on that here).
+    let _ = run_tray_input(
+        hwnd,
+        state_pointer,
+        machine::TrayInput::IconAddCompleted {
+            restored: startup_icon_added,
+        },
+    );
     // SAFETY: Called on the tray thread after its message queue and hidden window exist.
     let thread_id = unsafe { GetCurrentThreadId() };
     if ready_sender.send(Ok((thread_id, hwnd.0))).is_err() {
-        delete_tray_icon(hwnd);
-        // SAFETY: hwnd is the live hidden window on this thread.
-        let _ = unsafe { DestroyWindow(hwnd) };
-        // SAFETY: DestroyWindow has completed all callbacks and cleared the stored pointer.
-        let _ = unsafe { Box::from_raw(state_pointer) };
-        // SAFETY: No window remains for this registered class.
-        let _ = unsafe { UnregisterClassW(CLASS_NAME, instance) };
+        // SAFETY: hwnd is the live hidden window on this thread and the state Box has no
+        // outstanding borrows once the send has failed.
+        unsafe { tear_down_tray_window(Some(hwnd), state_pointer, instance) };
         return Ok(());
     }
 
@@ -350,26 +359,321 @@ fn run_tray(
         }
     };
 
-    delete_tray_icon(hwnd);
-    // SAFETY: hwnd belongs to this thread and is destroyed before state and class cleanup.
-    let _ = unsafe { DestroyWindow(hwnd) };
-    // SAFETY: Window destruction completed every callback and cleared the stored state pointer.
-    let _ = unsafe { Box::from_raw(state_pointer) };
-    // SAFETY: No window remains for this class.
-    let _ = unsafe { UnregisterClassW(CLASS_NAME, instance) };
+    // SAFETY: The message loop has ended, so no callback is executing and the state Box has no
+    // outstanding borrows; hwnd belongs to this thread.
+    unsafe { tear_down_tray_window(Some(hwnd), state_pointer, instance) };
     loop_result
 }
 
+/// Tears down the tray window's native resources in their one required order: the notification
+/// icon before its owning window, the window before the state allocation its callbacks dereference,
+/// and the class only after no window of the class remains. Every `run_tray` exit path funnels
+/// through here so the ordering cannot drift between them.
+///
+/// # Safety
+///
+/// Must run on the tray thread. `state_pointer` must be the live allocation created by `run_tray`
+/// with no outstanding borrows, and is freed here. `hwnd`, when present, must be the tray window
+/// owning that allocation; when `None`, window creation failed and no icon or window exists.
+unsafe fn tear_down_tray_window(
+    hwnd: Option<HWND>,
+    state_pointer: *mut TrayState,
+    instance: HINSTANCE,
+) {
+    if let Some(hwnd) = hwnd {
+        delete_tray_icon(hwnd);
+        // SAFETY: hwnd is the live hidden window on this thread; destruction runs its callbacks
+        // to completion and clears the stored state pointer.
+        let _ = unsafe { DestroyWindow(hwnd) };
+    }
+    // SAFETY: Either window destruction completed every callback or no window ever existed, so
+    // nothing can dereference the allocation again.
+    let _ = unsafe { Box::from_raw(state_pointer) };
+    // SAFETY: No window remains for this registered class.
+    let _ = unsafe { UnregisterClassW(CLASS_NAME, instance) };
+}
+
+/// Runtime owned by the tray thread: the Win32 handles and channels the effects need, plus the
+/// pure [`machine::TrayModel`] that owns every product decision. The window procedure only ever
+/// borrows this long enough to translate a message and run one transition; all Win32 calls happen
+/// after that borrow ends.
 struct TrayState {
     event_sender: SyncSender<TrayEvent>,
     notification_receiver: Receiver<TrayNotification>,
-    paused: bool,
-    startup_enabled: bool,
     icon: windows::Win32::UI::WindowsAndMessaging::HICON,
     taskbar_created: u32,
-    shutdown_block_active: bool,
     session_shutdown_requested: Arc<AtomicBool>,
     session_drain_completed: Arc<AtomicBool>,
+    model: machine::TrayModel,
+}
+
+/// The tray window's decision core: the window procedure translates each Win32 message into a
+/// [`machine::TrayInput`], runs it through [`machine::transition`], and only then performs the
+/// returned [`machine::TrayEffect`]s. The model borrow always ends before the first effect
+/// executes, so a `Shell_NotifyIconW` or `TrackPopupMenu` call that synchronously re-enters the
+/// window procedure can never alias the state — the structure enforces what scoped-borrow
+/// discipline previously had to guarantee by hand at every call site.
+mod machine {
+    use super::TrayEvent;
+
+    /// Product state of the tray window, free of every Win32 handle and channel so each
+    /// transition is testable without a shell.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(super) struct TrayModel {
+        pub(super) paused: bool,
+        pub(super) startup_enabled: bool,
+        pub(super) icon: IconState,
+        pub(super) session: SessionPhase,
+        /// Latched on the first exit request (menu Exit or `WM_CLOSE`). No transition consults
+        /// it yet: it records the "user already asked to leave" fact explicitly so a later change
+        /// can stop offering captures afterwards, without silently altering today's tolerance for
+        /// duplicate Exit events.
+        pub(super) exit_requested: bool,
+    }
+
+    impl TrayModel {
+        pub(super) fn new(startup_enabled: bool) -> Self {
+            Self {
+                paused: false,
+                startup_enabled,
+                icon: IconState::Absent,
+                session: SessionPhase::Idle,
+                exit_requested: false,
+            }
+        }
+    }
+
+    /// Whether the notification-area icon is currently believed to exist. Previously this was
+    /// only implied by which log lines had been emitted.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum IconState {
+        /// No add attempt has completed yet.
+        Absent,
+        Present,
+        /// The last add exhausted its bounded retries; the hidden window stays alive so a later
+        /// `TaskbarCreated` broadcast can restore the icon.
+        Degraded,
+    }
+
+    /// Where the window sits in the session-shutdown handshake. `QueryReceived` means a shutdown
+    /// block reason was requested (attempted, not necessarily created — the destroy must balance
+    /// the attempt either way, mirroring the previous `shutdown_block_active` flag).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum SessionPhase {
+        Idle,
+        QueryReceived,
+    }
+
+    /// A Win32 message reduced to its product meaning.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(super) enum TrayInput {
+        TaskbarCreated,
+        DisplayChanged,
+        DisplaySettingChanged,
+        IconDoubleClick,
+        IconContextMenu,
+        Menu(TrayMenuCommand),
+        StartupStateChanged(bool),
+        NotificationsPosted,
+        QueryEndSession,
+        EndSession {
+            committed: bool,
+        },
+        CloseRequested,
+        Destroyed,
+        /// Outcome of an [`TrayEffect::AddIcon`] effect, fed back by the effect runner.
+        IconAddCompleted {
+            restored: bool,
+        },
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum TrayMenuCommand {
+        Capture,
+        Pause,
+        OpenConfig,
+        OpenLogs,
+        ToggleStartup,
+        Exit,
+    }
+
+    /// A side effect the transition asks the runtime to perform, in order, after the model
+    /// borrow has ended. Payloads are snapshots taken at transition time: a reentrant message
+    /// that mutates the model mid-effect (a pause toggle while the menu is open, say) does not
+    /// rewrite an effect already handed out.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(super) enum TrayEffect {
+        /// Re-add the notification icon (bounded retry); the runner reports the outcome back
+        /// through [`TrayInput::IconAddCompleted`].
+        AddIcon {
+            paused: bool,
+        },
+        ModifyTooltip {
+            paused: bool,
+        },
+        ShowMenu {
+            paused: bool,
+            startup_enabled: bool,
+        },
+        /// Drain the queued notifications into balloons.
+        DrainNotifications,
+        SendEvent(TrayEvent),
+        CreateShutdownBlockReason,
+        DestroyShutdownBlockReason,
+        /// Block (bounded) until the daemon drains for a committed session shutdown.
+        WaitForSessionDrain,
+        MarkDisplayConfigurationChanged(&'static str),
+        PostQuit,
+    }
+
+    /// What the window procedure should answer Windows once the effects have run.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum MessageDisposition {
+        /// `LRESULT(0)`: the message was fully handled.
+        Handled,
+        /// `LRESULT(1)` for `WM_QUERYENDSESSION`: allow the session to end. Veto is a product
+        /// decision this machine could make, but today it always allows.
+        AllowSessionEnd,
+    }
+
+    pub(super) fn transition(
+        model: &mut TrayModel,
+        input: TrayInput,
+    ) -> (Vec<TrayEffect>, MessageDisposition) {
+        use MessageDisposition::Handled;
+        match input {
+            TrayInput::TaskbarCreated => (
+                vec![TrayEffect::AddIcon {
+                    paused: model.paused,
+                }],
+                Handled,
+            ),
+            TrayInput::IconAddCompleted { restored } => {
+                if restored {
+                    model.icon = IconState::Present;
+                    // Flush anything that queued while the icon was missing, and heal any
+                    // notification whose TRAY_SHOW_ERROR post failed after its queue push
+                    // succeeded. An empty drain is a no-op, so this is safe unconditionally.
+                    (vec![TrayEffect::DrainNotifications], Handled)
+                } else {
+                    model.icon = IconState::Degraded;
+                    (Vec::new(), Handled)
+                }
+            }
+            TrayInput::DisplayChanged => (
+                vec![TrayEffect::MarkDisplayConfigurationChanged(
+                    "tray_display_changed",
+                )],
+                Handled,
+            ),
+            TrayInput::DisplaySettingChanged => (
+                vec![TrayEffect::MarkDisplayConfigurationChanged(
+                    "tray_display_setting_changed",
+                )],
+                Handled,
+            ),
+            TrayInput::IconDoubleClick | TrayInput::Menu(TrayMenuCommand::Capture) => {
+                if model.paused {
+                    (Vec::new(), Handled)
+                } else {
+                    (vec![TrayEffect::SendEvent(TrayEvent::Capture)], Handled)
+                }
+            }
+            TrayInput::IconContextMenu => (
+                vec![TrayEffect::ShowMenu {
+                    paused: model.paused,
+                    startup_enabled: model.startup_enabled,
+                }],
+                Handled,
+            ),
+            TrayInput::Menu(TrayMenuCommand::Pause) => {
+                model.paused = !model.paused;
+                let mut effects = Vec::new();
+                // NIM_MODIFY against a missing icon can only fail; the pause itself still
+                // happens and the daemon still hears it. No refresh is owed on restore: the
+                // tooltip is an input to NIM_ADD, and AddIcon snapshots the live pause flag when
+                // TaskbarCreated arrives, so the re-added icon is born with the right text.
+                if model.icon == IconState::Present {
+                    effects.push(TrayEffect::ModifyTooltip {
+                        paused: model.paused,
+                    });
+                }
+                effects.push(TrayEffect::SendEvent(TrayEvent::PausedChanged(
+                    model.paused,
+                )));
+                (effects, Handled)
+            }
+            TrayInput::Menu(TrayMenuCommand::OpenConfig) => {
+                (vec![TrayEffect::SendEvent(TrayEvent::OpenConfig)], Handled)
+            }
+            TrayInput::Menu(TrayMenuCommand::OpenLogs) => {
+                (vec![TrayEffect::SendEvent(TrayEvent::OpenLogs)], Handled)
+            }
+            TrayInput::Menu(TrayMenuCommand::ToggleStartup) => (
+                vec![TrayEffect::SendEvent(TrayEvent::ToggleStartup)],
+                Handled,
+            ),
+            TrayInput::Menu(TrayMenuCommand::Exit) | TrayInput::CloseRequested => {
+                model.exit_requested = true;
+                (vec![TrayEffect::SendEvent(TrayEvent::Exit)], Handled)
+            }
+            TrayInput::StartupStateChanged(enabled) => {
+                model.startup_enabled = enabled;
+                (Vec::new(), Handled)
+            }
+            TrayInput::NotificationsPosted => {
+                if model.icon == IconState::Present {
+                    (vec![TrayEffect::DrainNotifications], Handled)
+                } else {
+                    // Draining now would burn every queued notification against an icon that
+                    // cannot show balloons. Leave them in the bounded queue; a successful re-add
+                    // drains them (IconAddCompleted), so an outage delays notifications instead
+                    // of destroying them.
+                    (Vec::new(), Handled)
+                }
+            }
+            TrayInput::QueryEndSession => {
+                let effects = if model.session == SessionPhase::Idle {
+                    model.session = SessionPhase::QueryReceived;
+                    vec![TrayEffect::CreateShutdownBlockReason]
+                } else {
+                    // Windows may query more than once per session end; the block reason is
+                    // created exactly once and stays owed until WM_ENDSESSION or window
+                    // destruction settles it.
+                    Vec::new()
+                };
+                (effects, MessageDisposition::AllowSessionEnd)
+            }
+            TrayInput::EndSession { committed } => {
+                let mut effects = Vec::new();
+                if committed {
+                    effects.push(TrayEffect::WaitForSessionDrain);
+                }
+                if model.session == SessionPhase::QueryReceived {
+                    effects.push(TrayEffect::DestroyShutdownBlockReason);
+                }
+                // A canceled shutdown returns to Idle so a later query starts a fresh block; a
+                // committed one is followed by process death, and Idle is equally correct if
+                // Windows ever changes its mind.
+                model.session = SessionPhase::Idle;
+                (effects, Handled)
+            }
+            TrayInput::Destroyed => {
+                let mut effects = Vec::new();
+                if model.session == SessionPhase::QueryReceived {
+                    // The window is dying outside the WM_ENDSESSION handshake (daemon stop, menu
+                    // Exit mid-handshake, panic recovery). Every destruction path dispatches
+                    // WM_DESTROY through this transition while the handle is still valid, so the
+                    // block reason that WM_ENDSESSION never got to release is settled here
+                    // instead of leaking with the window.
+                    effects.push(TrayEffect::DestroyShutdownBlockReason);
+                    model.session = SessionPhase::Idle;
+                }
+                effects.push(TrayEffect::PostQuit);
+                (effects, Handled)
+            }
+        }
+    }
 }
 
 unsafe extern "system" fn tray_window_proc(
@@ -417,158 +721,169 @@ fn tray_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPAR
         // SAFETY: No application state is available, so default handling is required.
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     }
-    let taskbar_state = {
-        // SAFETY: The Box remains live for the message loop. This borrow ends before calling
-        // Shell_NotifyIconW, which may synchronously re-enter this window procedure.
+    let translated = {
+        // SAFETY: The Box remains live for the message loop; this borrow ends before any Win32
+        // call an effect might make.
         let state = unsafe { &*state_pointer };
-        (message == state.taskbar_created).then_some((state.icon, state.paused))
+        translate_tray_message(state.taskbar_created, message, wparam, lparam)
     };
-    if let Some((icon, paused)) = taskbar_state {
-        // A restarting shell is exactly the load that makes NIM_ADD time out, so this retries on
-        // the tray thread. The worst-case stall is bounded and this thread has no other work.
-        if let Err(error) = add_tray_icon_with_retry(hwnd, icon, paused) {
-            log::warn!("failed to restore tray icon after Explorer restart: {error}");
-        }
-        return LRESULT(0);
+    match translated {
+        TranslatedMessage::Input(input) => run_tray_input(hwnd, state_pointer, input),
+        TranslatedMessage::Consumed => LRESULT(0),
+        // SAFETY: Standard handling for messages not consumed by the hidden tray window.
+        TranslatedMessage::Unhandled => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+    }
+}
+
+/// The product meaning of one Win32 message, or how to answer it when it has none.
+#[derive(Debug, PartialEq, Eq)]
+enum TranslatedMessage {
+    Input(machine::TrayInput),
+    /// Handled with `LRESULT(0)` but carrying no product decision (an ignored tray-callback
+    /// notification, an unrecognized menu command id).
+    Consumed,
+    /// Forwarded to `DefWindowProcW`.
+    Unhandled,
+}
+
+fn translate_tray_message(
+    taskbar_created: u32,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> TranslatedMessage {
+    use machine::{TrayInput, TrayMenuCommand};
+    if message == taskbar_created {
+        return TranslatedMessage::Input(TrayInput::TaskbarCreated);
     }
     match message {
-        WM_DISPLAYCHANGE => {
-            crate::dxgi::mark_display_configuration_changed("tray_display_changed");
-            LRESULT(0)
-        }
+        WM_DISPLAYCHANGE => TranslatedMessage::Input(TrayInput::DisplayChanged),
         WM_SETTINGCHANGE
             if wparam.0 == SPI_SETWORKAREA.0 as usize
                 || wparam.0 == SPI_SETLOGICALDPIOVERRIDE.0 as usize =>
         {
-            crate::dxgi::mark_display_configuration_changed("tray_display_setting_changed");
-            LRESULT(0)
+            TranslatedMessage::Input(TrayInput::DisplaySettingChanged)
         }
-        TRAY_CALLBACK => {
-            let notification = lparam.0 as u32;
-            let (paused, sender) = {
-                // SAFETY: The state allocation is live; the borrow is released before menu APIs.
-                let state = unsafe { &*state_pointer };
-                (state.paused, state.event_sender.clone())
+        TRAY_CALLBACK => match lparam.0 as u32 {
+            WM_LBUTTONDBLCLK => TranslatedMessage::Input(TrayInput::IconDoubleClick),
+            WM_RBUTTONUP | WM_CONTEXTMENU => TranslatedMessage::Input(TrayInput::IconContextMenu),
+            _ => TranslatedMessage::Consumed,
+        },
+        WM_COMMAND => match wparam.0 & 0xffff {
+            COMMAND_CAPTURE => TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::Capture)),
+            COMMAND_PAUSE => TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::Pause)),
+            COMMAND_CONFIG => {
+                TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::OpenConfig))
+            }
+            COMMAND_LOGS => TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::OpenLogs)),
+            COMMAND_STARTUP => {
+                TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::ToggleStartup))
+            }
+            COMMAND_EXIT => TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::Exit)),
+            _ => TranslatedMessage::Consumed,
+        },
+        TRAY_SET_STARTUP => TranslatedMessage::Input(TrayInput::StartupStateChanged(wparam.0 != 0)),
+        TRAY_SHOW_ERROR => TranslatedMessage::Input(TrayInput::NotificationsPosted),
+        WM_QUERYENDSESSION => TranslatedMessage::Input(TrayInput::QueryEndSession),
+        WM_ENDSESSION => TranslatedMessage::Input(TrayInput::EndSession {
+            committed: session_end_is_committed(wparam.0),
+        }),
+        WM_CLOSE => {
+            log::warn!("tray window received WM_CLOSE; requesting daemon shutdown");
+            TranslatedMessage::Input(TrayInput::CloseRequested)
+        }
+        WM_DESTROY => TranslatedMessage::Input(TrayInput::Destroyed),
+        _ => TranslatedMessage::Unhandled,
+    }
+}
+
+/// Runs one input through the pure transition, then applies the returned effects. The exclusive
+/// model borrow ends before the first effect executes, so effects that synchronously re-enter the
+/// window procedure (`Shell_NotifyIconW`, `TrackPopupMenu`) recurse through this same path against
+/// a released borrow instead of an aliased one.
+fn run_tray_input(hwnd: HWND, state_pointer: *mut TrayState, input: machine::TrayInput) -> LRESULT {
+    let (effects, disposition) = {
+        // SAFETY: The Box remains live for the message loop; this exclusive borrow ends here,
+        // before any effect runs.
+        let state = unsafe { &mut *state_pointer };
+        machine::transition(&mut state.model, input)
+    };
+    for effect in effects {
+        apply_tray_effect(hwnd, state_pointer, effect);
+    }
+    match disposition {
+        machine::MessageDisposition::Handled => LRESULT(0),
+        machine::MessageDisposition::AllowSessionEnd => LRESULT(1),
+    }
+}
+
+fn apply_tray_effect(hwnd: HWND, state_pointer: *mut TrayState, effect: machine::TrayEffect) {
+    use machine::TrayEffect;
+    match effect {
+        TrayEffect::AddIcon { paused } => {
+            let icon = {
+                // SAFETY: Short copy of the icon handle; the borrow ends before Shell_NotifyIconW.
+                unsafe { (*state_pointer).icon }
             };
-            if notification == WM_LBUTTONDBLCLK && !paused {
-                dispatch_tray_event(&sender, TrayEvent::Capture);
-            } else if notification == WM_RBUTTONUP || notification == WM_CONTEXTMENU {
-                let startup_enabled = {
-                    // SAFETY: Short immutable read from the live state allocation.
-                    unsafe { (&*state_pointer).startup_enabled }
-                };
-                if let Err(error) = show_context_menu(hwnd, paused, startup_enabled) {
-                    log::warn!("failed to show tray menu: {error}");
-                }
-            }
-            LRESULT(0)
-        }
-        WM_COMMAND => {
-            match wparam.0 & 0xffff {
-                COMMAND_CAPTURE => {
-                    let (paused, sender) = {
-                        // SAFETY: Short immutable read from the live state allocation.
-                        let state = unsafe { &*state_pointer };
-                        (state.paused, state.event_sender.clone())
-                    };
-                    if !paused {
-                        dispatch_tray_event(&sender, TrayEvent::Capture);
-                    }
-                }
-                COMMAND_PAUSE => {
-                    let (paused, sender) = {
-                        // SAFETY: This mutation ends before Shell_NotifyIconW can re-enter.
-                        let state = unsafe { &mut *state_pointer };
-                        state.paused = !state.paused;
-                        (state.paused, state.event_sender.clone())
-                    };
-                    if let Err(error) = modify_tray_tooltip(hwnd, paused) {
-                        log::warn!("failed to update tray state: {error}");
-                    }
-                    dispatch_tray_event(&sender, TrayEvent::PausedChanged(paused));
-                }
-                COMMAND_CONFIG => {
-                    send_tray_event(state_pointer, TrayEvent::OpenConfig);
-                }
-                COMMAND_LOGS => {
-                    send_tray_event(state_pointer, TrayEvent::OpenLogs);
-                }
-                COMMAND_STARTUP => {
-                    send_tray_event(state_pointer, TrayEvent::ToggleStartup);
-                }
-                COMMAND_EXIT => {
-                    send_tray_event(state_pointer, TrayEvent::Exit);
-                }
-                _ => {}
-            }
-            LRESULT(0)
-        }
-        TRAY_SET_STARTUP => {
-            // SAFETY: Short mutation of the live state allocation; no reentrant API is called.
-            unsafe { (&mut *state_pointer).startup_enabled = wparam.0 != 0 };
-            LRESULT(0)
-        }
-        TRAY_SHOW_ERROR => {
-            loop {
-                let message = {
-                    // SAFETY: The receive borrow ends before Shell_NotifyIconW can re-enter.
-                    unsafe { (&mut *state_pointer).notification_receiver.try_recv() }
-                };
-                let Ok(message) = message else { break };
-                if let Err(error) = show_error_notification(hwnd, &message) {
-                    log::warn!("failed to show tray error notification: {error}");
-                }
-            }
-            LRESULT(0)
-        }
-        WM_QUERYENDSESSION => {
-            let block_active = {
-                // SAFETY: Short mutation ends before the Win32 call.
-                let state = unsafe { &mut *state_pointer };
-                if state.shutdown_block_active {
-                    true
-                } else {
-                    state.shutdown_block_active = true;
+            // A restarting shell is exactly the load that makes NIM_ADD time out, so this retries
+            // on the tray thread. The worst-case stall is bounded and this thread has no other
+            // work.
+            let restored = match add_tray_icon_with_retry(hwnd, icon, paused) {
+                Ok(()) => true,
+                Err(error) => {
+                    log::warn!("failed to restore tray icon after Explorer restart: {error}");
                     false
                 }
             };
-            if !block_active {
-                // SAFETY: hwnd is this live top-level window and the reason is static UTF-16.
-                if let Err(error) = unsafe {
-                    ShutdownBlockReasonCreate(hwnd, w!("Saving Captastic capture preferences"))
-                } {
-                    log::warn!("failed to register session-shutdown drain reason: {error}");
-                }
-            }
-            LRESULT(1)
+            let _ = run_tray_input(
+                hwnd,
+                state_pointer,
+                machine::TrayInput::IconAddCompleted { restored },
+            );
         }
-        WM_ENDSESSION => {
-            if session_end_is_committed(wparam.0) {
-                wait_for_session_drain(state_pointer);
+        TrayEffect::ModifyTooltip { paused } => {
+            if let Err(error) = modify_tray_tooltip(hwnd, paused) {
+                log::warn!("failed to update tray state: {error}");
             }
-            let block_active = {
-                // SAFETY: Short mutation of the live state allocation.
-                std::mem::take(unsafe { &mut (&mut *state_pointer).shutdown_block_active })
+        }
+        TrayEffect::ShowMenu {
+            paused,
+            startup_enabled,
+        } => {
+            if let Err(error) = show_context_menu(hwnd, paused, startup_enabled) {
+                log::warn!("failed to show tray menu: {error}");
+            }
+        }
+        TrayEffect::DrainNotifications => loop {
+            let message = {
+                // SAFETY: The receive borrow ends before Shell_NotifyIconW can re-enter.
+                unsafe { (*state_pointer).notification_receiver.try_recv() }
             };
-            if block_active {
-                // SAFETY: Balances the successful-or-attempted create for this live window.
-                let _ = unsafe { ShutdownBlockReasonDestroy(hwnd) };
+            let Ok(message) = message else { break };
+            if let Err(error) = show_error_notification(hwnd, &message) {
+                log::warn!("failed to show tray error notification: {error}");
             }
-            LRESULT(0)
+        },
+        TrayEffect::SendEvent(event) => send_tray_event(state_pointer, event),
+        TrayEffect::CreateShutdownBlockReason => {
+            // SAFETY: hwnd is this live top-level window and the reason is static UTF-16.
+            if let Err(error) = unsafe {
+                ShutdownBlockReasonCreate(hwnd, w!("Saving Captastic capture preferences"))
+            } {
+                log::warn!("failed to register session-shutdown drain reason: {error}");
+            }
         }
-        WM_CLOSE => {
-            log::warn!("tray window received WM_CLOSE; requesting daemon shutdown");
-            send_tray_event(state_pointer, TrayEvent::Exit);
-            LRESULT(0)
+        TrayEffect::DestroyShutdownBlockReason => {
+            // SAFETY: Balances the create attempted when the session query arrived.
+            let _ = unsafe { ShutdownBlockReasonDestroy(hwnd) };
         }
-        WM_DESTROY => {
+        TrayEffect::WaitForSessionDrain => wait_for_session_drain(state_pointer),
+        TrayEffect::MarkDisplayConfigurationChanged(reason) => {
+            crate::dxgi::mark_display_configuration_changed(reason);
+        }
+        TrayEffect::PostQuit => {
             // SAFETY: Ends only this tray thread's message loop.
             unsafe { PostQuitMessage(0) };
-            LRESULT(0)
-        }
-        _ => {
-            // SAFETY: Standard handling for messages not consumed by the hidden tray window.
-            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
     }
 }
@@ -1062,5 +1377,445 @@ mod tests {
         let mut output = [99_u16; 5];
         write_wide(&mut output, "abcdef");
         assert_eq!(output, ['a' as u16, 'b' as u16, 'c' as u16, 'd' as u16, 0]);
+    }
+
+    use super::machine::{
+        transition, IconState, MessageDisposition, SessionPhase, TrayEffect, TrayInput,
+        TrayMenuCommand, TrayModel,
+    };
+
+    #[test]
+    fn win32_messages_translate_to_their_product_inputs() {
+        // Registered TaskbarCreated ids live in 0xC000..=0xFFFF, so this cannot collide with any
+        // constant the translator matches on.
+        let taskbar_created = 0xC123_u32;
+        let cases: &[(u32, usize, isize, TranslatedMessage)] = &[
+            (
+                taskbar_created,
+                0,
+                0,
+                TranslatedMessage::Input(TrayInput::TaskbarCreated),
+            ),
+            (
+                WM_DISPLAYCHANGE,
+                0,
+                0,
+                TranslatedMessage::Input(TrayInput::DisplayChanged),
+            ),
+            (
+                WM_SETTINGCHANGE,
+                SPI_SETWORKAREA.0 as usize,
+                0,
+                TranslatedMessage::Input(TrayInput::DisplaySettingChanged),
+            ),
+            (
+                WM_SETTINGCHANGE,
+                SPI_SETLOGICALDPIOVERRIDE.0 as usize,
+                0,
+                TranslatedMessage::Input(TrayInput::DisplaySettingChanged),
+            ),
+            // Any other setting change is none of the tray's business.
+            (WM_SETTINGCHANGE, 0x9999, 0, TranslatedMessage::Unhandled),
+            (
+                TRAY_CALLBACK,
+                0,
+                WM_LBUTTONDBLCLK as isize,
+                TranslatedMessage::Input(TrayInput::IconDoubleClick),
+            ),
+            (
+                TRAY_CALLBACK,
+                0,
+                WM_RBUTTONUP as isize,
+                TranslatedMessage::Input(TrayInput::IconContextMenu),
+            ),
+            (
+                TRAY_CALLBACK,
+                0,
+                WM_CONTEXTMENU as isize,
+                TranslatedMessage::Input(TrayInput::IconContextMenu),
+            ),
+            // Hover and move notifications are acknowledged without a product decision.
+            (TRAY_CALLBACK, 0, 0x0200, TranslatedMessage::Consumed),
+            (
+                WM_COMMAND,
+                COMMAND_CAPTURE,
+                0,
+                TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::Capture)),
+            ),
+            (
+                WM_COMMAND,
+                COMMAND_PAUSE,
+                0,
+                TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::Pause)),
+            ),
+            (
+                WM_COMMAND,
+                COMMAND_CONFIG,
+                0,
+                TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::OpenConfig)),
+            ),
+            (
+                WM_COMMAND,
+                COMMAND_LOGS,
+                0,
+                TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::OpenLogs)),
+            ),
+            (
+                WM_COMMAND,
+                COMMAND_STARTUP,
+                0,
+                TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::ToggleStartup)),
+            ),
+            (
+                WM_COMMAND,
+                COMMAND_EXIT,
+                0,
+                TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::Exit)),
+            ),
+            (WM_COMMAND, 9_999, 0, TranslatedMessage::Consumed),
+            (
+                TRAY_SET_STARTUP,
+                1,
+                0,
+                TranslatedMessage::Input(TrayInput::StartupStateChanged(true)),
+            ),
+            (
+                TRAY_SET_STARTUP,
+                0,
+                0,
+                TranslatedMessage::Input(TrayInput::StartupStateChanged(false)),
+            ),
+            (
+                TRAY_SHOW_ERROR,
+                0,
+                0,
+                TranslatedMessage::Input(TrayInput::NotificationsPosted),
+            ),
+            (
+                WM_QUERYENDSESSION,
+                0,
+                0,
+                TranslatedMessage::Input(TrayInput::QueryEndSession),
+            ),
+            (
+                WM_ENDSESSION,
+                1,
+                0,
+                TranslatedMessage::Input(TrayInput::EndSession { committed: true }),
+            ),
+            (
+                WM_ENDSESSION,
+                0,
+                0,
+                TranslatedMessage::Input(TrayInput::EndSession { committed: false }),
+            ),
+            (
+                WM_CLOSE,
+                0,
+                0,
+                TranslatedMessage::Input(TrayInput::CloseRequested),
+            ),
+            (
+                WM_DESTROY,
+                0,
+                0,
+                TranslatedMessage::Input(TrayInput::Destroyed),
+            ),
+            (WM_APP + 7, 0, 0, TranslatedMessage::Unhandled),
+        ];
+        for (message, wparam, lparam, expected) in cases {
+            assert_eq!(
+                translate_tray_message(taskbar_created, *message, WPARAM(*wparam), LPARAM(*lparam)),
+                *expected,
+                "message {message:#06x} wparam {wparam:#x} lparam {lparam:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn menu_commands_map_to_their_daemon_events() {
+        let cases = [
+            (TrayMenuCommand::OpenConfig, TrayEvent::OpenConfig),
+            (TrayMenuCommand::OpenLogs, TrayEvent::OpenLogs),
+            (TrayMenuCommand::ToggleStartup, TrayEvent::ToggleStartup),
+            (TrayMenuCommand::Exit, TrayEvent::Exit),
+        ];
+        for (command, event) in cases {
+            let mut model = TrayModel::new(false);
+            let (effects, disposition) = transition(&mut model, TrayInput::Menu(command));
+            assert_eq!(effects, vec![TrayEffect::SendEvent(event)], "{command:?}");
+            assert_eq!(disposition, MessageDisposition::Handled);
+        }
+    }
+
+    #[test]
+    fn capture_requests_are_swallowed_while_paused() {
+        for input in [
+            TrayInput::IconDoubleClick,
+            TrayInput::Menu(TrayMenuCommand::Capture),
+        ] {
+            let mut model = TrayModel::new(false);
+            let (effects, _) = transition(&mut model, input.clone());
+            assert_eq!(effects, vec![TrayEffect::SendEvent(TrayEvent::Capture)]);
+
+            model.paused = true;
+            let (effects, _) = transition(&mut model, input.clone());
+            assert!(effects.is_empty(), "{input:?} while paused");
+        }
+    }
+
+    #[test]
+    fn pausing_updates_the_tooltip_before_the_daemon_hears_about_it() {
+        let mut model = TrayModel::new(false);
+        model.icon = IconState::Present;
+        let (effects, _) = transition(&mut model, TrayInput::Menu(TrayMenuCommand::Pause));
+        assert!(model.paused);
+        assert_eq!(
+            effects,
+            vec![
+                TrayEffect::ModifyTooltip { paused: true },
+                TrayEffect::SendEvent(TrayEvent::PausedChanged(true)),
+            ]
+        );
+
+        let (effects, _) = transition(&mut model, TrayInput::Menu(TrayMenuCommand::Pause));
+        assert!(!model.paused);
+        assert_eq!(
+            effects,
+            vec![
+                TrayEffect::ModifyTooltip { paused: false },
+                TrayEffect::SendEvent(TrayEvent::PausedChanged(false)),
+            ]
+        );
+    }
+
+    #[test]
+    fn repeated_session_queries_create_one_block_reason() {
+        let mut model = TrayModel::new(false);
+        let (effects, disposition) = transition(&mut model, TrayInput::QueryEndSession);
+        assert_eq!(effects, vec![TrayEffect::CreateShutdownBlockReason]);
+        assert_eq!(disposition, MessageDisposition::AllowSessionEnd);
+
+        let (effects, disposition) = transition(&mut model, TrayInput::QueryEndSession);
+        assert!(effects.is_empty());
+        assert_eq!(disposition, MessageDisposition::AllowSessionEnd);
+        assert_eq!(model.session, SessionPhase::QueryReceived);
+    }
+
+    #[test]
+    fn a_canceled_session_shutdown_releases_the_block_without_draining() {
+        let mut model = TrayModel::new(false);
+        let _ = transition(&mut model, TrayInput::QueryEndSession);
+        let (effects, _) = transition(&mut model, TrayInput::EndSession { committed: false });
+        // No WaitForSessionDrain: the daemon never hears about a shutdown Windows abandoned.
+        assert_eq!(effects, vec![TrayEffect::DestroyShutdownBlockReason]);
+        assert_eq!(model.session, SessionPhase::Idle);
+
+        // A later query starts a fresh block, exactly as if the canceled attempt never happened.
+        let (effects, _) = transition(&mut model, TrayInput::QueryEndSession);
+        assert_eq!(effects, vec![TrayEffect::CreateShutdownBlockReason]);
+    }
+
+    #[test]
+    fn a_committed_session_shutdown_drains_before_releasing_the_block() {
+        let mut model = TrayModel::new(false);
+        let _ = transition(&mut model, TrayInput::QueryEndSession);
+        let (effects, _) = transition(&mut model, TrayInput::EndSession { committed: true });
+        assert_eq!(
+            effects,
+            vec![
+                TrayEffect::WaitForSessionDrain,
+                TrayEffect::DestroyShutdownBlockReason,
+            ]
+        );
+        assert_eq!(model.session, SessionPhase::Idle);
+    }
+
+    #[test]
+    fn session_end_without_a_query_still_drains_but_owes_no_block_reason() {
+        let mut model = TrayModel::new(false);
+        let (effects, _) = transition(&mut model, TrayInput::EndSession { committed: true });
+        assert_eq!(effects, vec![TrayEffect::WaitForSessionDrain]);
+
+        let (effects, _) = transition(&mut model, TrayInput::EndSession { committed: false });
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn menu_snapshots_track_state_mutated_while_the_menu_was_open() {
+        let mut model = TrayModel::new(true);
+        let (effects, _) = transition(&mut model, TrayInput::IconContextMenu);
+        assert_eq!(
+            effects,
+            vec![TrayEffect::ShowMenu {
+                paused: false,
+                startup_enabled: true,
+            }]
+        );
+
+        // The modal menu loop dispatches messages reentrantly; a pause toggle and a startup
+        // update arriving mid-menu mutate the model without touching the snapshot already handed
+        // out, and the next menu reflects them.
+        let _ = transition(&mut model, TrayInput::Menu(TrayMenuCommand::Pause));
+        let _ = transition(&mut model, TrayInput::StartupStateChanged(false));
+        let (effects, _) = transition(&mut model, TrayInput::IconContextMenu);
+        assert_eq!(
+            effects,
+            vec![TrayEffect::ShowMenu {
+                paused: true,
+                startup_enabled: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn taskbar_rebirth_readds_the_icon_from_both_present_and_degraded_states() {
+        let cases = [
+            (IconState::Present, true, IconState::Present),
+            (IconState::Present, false, IconState::Degraded),
+            (IconState::Degraded, true, IconState::Present),
+            (IconState::Degraded, false, IconState::Degraded),
+        ];
+        for (initial, restored, expected) in cases {
+            let mut model = TrayModel::new(false);
+            model.icon = initial;
+            model.paused = true;
+            let (effects, _) = transition(&mut model, TrayInput::TaskbarCreated);
+            assert_eq!(effects, vec![TrayEffect::AddIcon { paused: true }]);
+
+            let (effects, _) = transition(&mut model, TrayInput::IconAddCompleted { restored });
+            if restored {
+                // A fresh icon immediately drains whatever queued while it was missing.
+                assert_eq!(effects, vec![TrayEffect::DrainNotifications]);
+            } else {
+                assert!(effects.is_empty());
+            }
+            assert_eq!(model.icon, expected, "{initial:?} restored={restored}");
+        }
+    }
+
+    #[test]
+    fn close_requests_exit_without_destroying_the_window() {
+        let mut model = TrayModel::new(false);
+        let (effects, disposition) = transition(&mut model, TrayInput::CloseRequested);
+        assert_eq!(effects, vec![TrayEffect::SendEvent(TrayEvent::Exit)]);
+        assert_eq!(disposition, MessageDisposition::Handled);
+        assert!(model.exit_requested);
+
+        // Only actual destruction ends the message loop; the daemon owns the WM_QUIT decision.
+        let (effects, _) = transition(&mut model, TrayInput::Destroyed);
+        assert_eq!(effects, vec![TrayEffect::PostQuit]);
+    }
+
+    #[test]
+    fn nim_modify_effects_are_suppressed_while_the_icon_is_missing() {
+        for icon in [IconState::Absent, IconState::Degraded] {
+            let mut model = TrayModel::new(false);
+            model.icon = icon;
+            // The pause decision still happens and the daemon still hears it; only the tooltip
+            // write against the nonexistent icon is suppressed.
+            let (effects, _) = transition(&mut model, TrayInput::Menu(TrayMenuCommand::Pause));
+            assert!(model.paused);
+            assert_eq!(
+                effects,
+                vec![TrayEffect::SendEvent(TrayEvent::PausedChanged(true))],
+                "{icon:?}"
+            );
+
+            // Posted notifications stay queued instead of being drained into failing balloons.
+            let (effects, _) = transition(&mut model, TrayInput::NotificationsPosted);
+            assert!(effects.is_empty(), "{icon:?}");
+        }
+
+        // With the icon present both effects flow unchanged.
+        let mut model = TrayModel::new(false);
+        model.icon = IconState::Present;
+        let (effects, _) = transition(&mut model, TrayInput::Menu(TrayMenuCommand::Pause));
+        assert_eq!(
+            effects,
+            vec![
+                TrayEffect::ModifyTooltip { paused: true },
+                TrayEffect::SendEvent(TrayEvent::PausedChanged(true)),
+            ]
+        );
+        let (effects, _) = transition(&mut model, TrayInput::NotificationsPosted);
+        assert_eq!(effects, vec![TrayEffect::DrainNotifications]);
+    }
+
+    #[test]
+    fn a_restored_icon_flushes_notifications_queued_during_the_outage() {
+        let mut model = TrayModel::new(false);
+        model.icon = IconState::Degraded;
+        let (effects, _) = transition(&mut model, TrayInput::IconAddCompleted { restored: true });
+        assert_eq!(effects, vec![TrayEffect::DrainNotifications]);
+        assert_eq!(model.icon, IconState::Present);
+
+        // A failed re-add keeps everything suppressed and the queue intact.
+        model.icon = IconState::Degraded;
+        let (effects, _) = transition(&mut model, TrayInput::IconAddCompleted { restored: false });
+        assert!(effects.is_empty());
+        assert_eq!(model.icon, IconState::Degraded);
+    }
+
+    #[test]
+    fn a_taskbar_restore_carries_pause_state_changed_while_degraded() {
+        // The tooltip is an input to NIM_ADD itself: AddIcon snapshots the live pause flag when
+        // TaskbarCreated arrives, so the re-added icon is born with the right text and no
+        // post-restore ModifyTooltip refresh is owed for the writes suppressed during the outage.
+        let mut model = TrayModel::new(false);
+        model.icon = IconState::Degraded;
+        let _ = transition(&mut model, TrayInput::Menu(TrayMenuCommand::Pause));
+        let (effects, _) = transition(&mut model, TrayInput::TaskbarCreated);
+        assert_eq!(effects, vec![TrayEffect::AddIcon { paused: true }]);
+    }
+
+    #[test]
+    fn a_dying_window_settles_the_block_reason_it_still_owes() {
+        // Destroyed outside the handshake owes nothing.
+        let mut model = TrayModel::new(false);
+        let (effects, _) = transition(&mut model, TrayInput::Destroyed);
+        assert_eq!(effects, vec![TrayEffect::PostQuit]);
+
+        // Destroyed mid-handshake (daemon stop, menu Exit, panic recovery): the destroy that
+        // WM_ENDSESSION never got to perform runs before the quit, while the handle is valid.
+        let mut model = TrayModel::new(false);
+        let _ = transition(&mut model, TrayInput::QueryEndSession);
+        let (effects, _) = transition(&mut model, TrayInput::Destroyed);
+        assert_eq!(
+            effects,
+            vec![TrayEffect::DestroyShutdownBlockReason, TrayEffect::PostQuit]
+        );
+        assert_eq!(model.session, SessionPhase::Idle);
+    }
+
+    #[test]
+    fn a_settled_session_handshake_is_not_double_destroyed_at_teardown() {
+        for committed in [false, true] {
+            let mut model = TrayModel::new(false);
+            let _ = transition(&mut model, TrayInput::QueryEndSession);
+            let _ = transition(&mut model, TrayInput::EndSession { committed });
+            let (effects, _) = transition(&mut model, TrayInput::Destroyed);
+            assert_eq!(effects, vec![TrayEffect::PostQuit], "committed={committed}");
+        }
+    }
+
+    #[test]
+    fn display_reconfiguration_messages_invalidate_the_capture_topology() {
+        let mut model = TrayModel::new(false);
+        let (effects, _) = transition(&mut model, TrayInput::DisplayChanged);
+        assert_eq!(
+            effects,
+            vec![TrayEffect::MarkDisplayConfigurationChanged(
+                "tray_display_changed"
+            )]
+        );
+
+        let (effects, _) = transition(&mut model, TrayInput::DisplaySettingChanged);
+        assert_eq!(
+            effects,
+            vec![TrayEffect::MarkDisplayConfigurationChanged(
+                "tray_display_setting_changed"
+            )]
+        );
     }
 }
