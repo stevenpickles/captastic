@@ -1360,15 +1360,20 @@ fn run_overlay(
     }
     controller.inner.hwnd.store(hwnd.0, Ordering::SeqCst);
     if controller.inner.cancelled.load(Ordering::SeqCst) {
+        // A cancel raced construction: destroy immediately and fall through to the message
+        // loop, which consumes the WM_QUIT that WM_DESTROY just latched and exits through
+        // the normal teardown (state reclaim, resource cache, controller clear). The handle
+        // is dead past this point and must not be shown or focused.
         // SAFETY: hwnd was just created on this thread and cancellation was requested.
         let _ = unsafe { DestroyWindow(hwnd) };
-    }
-    // SAFETY: hwnd is the live overlay window on this thread.
-    unsafe {
-        ShowWindow(hwnd, SW_SHOW);
-        UpdateWindow(hwnd);
-        SetForegroundWindow(hwnd);
-        SetFocus(hwnd);
+    } else {
+        // SAFETY: hwnd is the live overlay window on this thread.
+        unsafe {
+            ShowWindow(hwnd, SW_SHOW);
+            UpdateWindow(hwnd);
+            SetForegroundWindow(hwnd);
+            SetFocus(hwnd);
+        }
     }
     let mut message = MSG::default();
     loop {
