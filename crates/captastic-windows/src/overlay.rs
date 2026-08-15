@@ -3911,6 +3911,11 @@ fn draw_checkmark(device: HDC, x: i32, y: i32, color: COLORREF, metrics: UiMetri
 }
 
 fn draw_round_box(device: HDC, rect: UiRect, fill: COLORREF, border: COLORREF, radius: i32) {
+    // RoundRect's last two parameters are the corner ellipse's WIDTH and HEIGHT - a diameter,
+    // not a radius. Callers pass *_corner_radius tokens, so double them here; the CPU
+    // rasterizer path (draw_antialiased_rounded_outline) already treats the same tokens as
+    // true radii, and the two paths must agree.
+    let diameter = radius.saturating_mul(2);
     // SAFETY: Creates temporary process-owned GDI objects for this off-screen paint operation.
     let (brush, pen) = unsafe { (CreateSolidBrush(fill), CreatePen(PS_SOLID, 1, border)) };
     // SAFETY: Objects and DC are live. Prior objects are restored before deletion.
@@ -3923,8 +3928,8 @@ fn draw_round_box(device: HDC, rect: UiRect, fill: COLORREF, border: COLORREF, r
             rect.top,
             rect.right,
             rect.bottom,
-            radius,
-            radius,
+            diameter,
+            diameter,
         );
         SelectObject(device, old_pen);
         SelectObject(device, old_brush);
