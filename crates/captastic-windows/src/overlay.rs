@@ -3298,6 +3298,14 @@ fn rounded_rect_coverage(width: i32, height: i32, radius: f32, x: i32, y: i32) -
     ((inside * 255 + 32) / 64) as u8
 }
 
+/// Strokes `rect` inward by `stroke_width` with an antialiased rounded outer edge.
+///
+/// The stroke region is the true erosion of the rounded rect: the inner boundary is a
+/// concentric arc of radius `corner_radius - stroke_width`, degenerating to a square corner
+/// when the radius does not exceed the stroke - exactly like a square frame, whose corners
+/// also measure thicker diagonally. Callers wanting a constant-width stroke along the whole
+/// arc therefore pass `corner_radius >= stroke_width` (the window-tile caller derives the
+/// radius as `scaled_radius + stroke_width`, which guarantees it).
 fn draw_antialiased_rounded_outline(
     surface: &FrozenSurface,
     rect: UiRect,
@@ -3359,7 +3367,7 @@ fn blend_surface_pixel(surface: &FrozenSurface, x: i32, y: i32, foreground: [u8;
     if x < 0 || y < 0 || x >= surface.width || y >= surface.height {
         return;
     }
-    let offset = ((y * surface.width + x) * 4) as usize;
+    let offset = (i64::from(y) * i64::from(surface.width) + i64::from(x)) as usize * 4;
     // SAFETY: The checked coordinates address four writable bytes in the live off-screen DIB.
     unsafe {
         for (channel, foreground) in foreground.into_iter().enumerate() {
