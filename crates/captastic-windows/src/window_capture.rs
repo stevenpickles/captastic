@@ -248,14 +248,14 @@ fn capture_window_inner(
             None,
         )
     })?;
-    let visible_frame = visible_frame_bounds(hwnd, capture_bounds);
-    let visible_bounds = visible_frame.bounds;
+    let geometry = window_geometry(hwnd, capture_bounds);
+    let visible_bounds = geometry.content;
     let probe_wgc_error = if !window_is_responsive(hwnd) {
         log::debug!(
             "window handle=0x{:X} did not answer the responsiveness probe; using Windows Graphics Capture",
             handle.raw()
         );
-        match capture_window_with_wgc(hwnd, reference_metadata, max_pixels, &visible_frame) {
+        match capture_window_with_wgc(hwnd, reference_metadata, max_pixels, &geometry) {
             Ok(capture) => return Ok(capture),
             Err(error) => {
                 log::debug!(
@@ -288,7 +288,7 @@ fn capture_window_inner(
             "window handle=0x{:X} rejected PrintWindow; trying Windows Graphics Capture",
             handle.raw()
         );
-        return capture_window_with_wgc(hwnd, reference_metadata, max_pixels, &visible_frame);
+        return capture_window_with_wgc(hwnd, reference_metadata, max_pixels, &geometry);
     }
     if region_is_blank(surface.as_bytes(), capture_bounds, visible_bounds)? {
         if probe_wgc_error.is_none() {
@@ -296,7 +296,7 @@ fn capture_window_inner(
                 "window handle=0x{:X} PrintWindow reported success but rendered a blank frame; trying Windows Graphics Capture",
                 handle.raw()
             );
-            match capture_window_with_wgc(hwnd, reference_metadata, max_pixels, &visible_frame) {
+            match capture_window_with_wgc(hwnd, reference_metadata, max_pixels, &geometry) {
                 Ok(capture) => return Ok(capture),
                 Err(error) => {
                     log::debug!(
@@ -363,10 +363,9 @@ fn capture_window_inner(
             1.0,
         )
     };
-    let inner_corner_radius = (window_corner_radius(hwnd) - visible_frame.border_thickness as f32)
-        .max(0.0)
-        * radius_scale;
-    let border_width = scaled_border_width(visible_frame.border_thickness, radius_scale);
+    let inner_corner_radius =
+        (window_corner_radius(hwnd) - geometry.border_thickness as f32).max(0.0) * radius_scale;
+    let border_width = scaled_border_width(geometry.border_thickness, radius_scale);
     let (pixels, output_width, output_height) = add_clean_window_border(
         pixels,
         content_width,
@@ -377,15 +376,12 @@ fn capture_window_inner(
         AlphaSource::Coverage,
     )?;
     let corner_radius = inner_corner_radius + border_width as f32;
+    let (origin_x, origin_y) = geometry.published_origin(geometry.border_thickness);
     let mut metadata = reference_metadata.clone();
     metadata.backend = "windows-print-window".to_owned();
     metadata.source_rect = Rect {
-        x: visible_bounds
-            .x
-            .saturating_sub(visible_frame.border_thickness as i32),
-        y: visible_bounds
-            .y
-            .saturating_sub(visible_frame.border_thickness as i32),
+        x: origin_x,
+        y: origin_y,
         width: output_width,
         height: output_height,
     };
@@ -452,7 +448,7 @@ fn capture_window_with_wgc(
     hwnd: HWND,
     reference_metadata: &FrameMetadata,
     max_pixels: Option<u64>,
-    visible_frame: &VisibleFrame,
+    geometry: &WindowGeometry,
 ) -> Result<CapturedWindow, CaptureError> {
     let raw = capture_window_wgc_frame(hwnd)?;
     let source_bounds = Rect {
@@ -461,11 +457,23 @@ fn capture_window_with_wgc(
         width: raw.width,
         height: raw.height,
     };
-    let border_thickness = visible_frame
-        .border_thickness
-        .min(raw.width / 4)
-        .min(raw.height / 4);
-    let content_bounds = inset_rect(source_bounds, border_thickness).unwrap_or(source_bounds);
+    let WgcCrop {
+        crop: content_bounds,
+        border_thickness,
+        aligned,
+    } = wgc_content_crop(raw.width, raw.height, geometry);
+    if !aligned {
+        log::debug!(
+            "window handle=0x{:X} Windows Graphics Capture surface is {}x{}, matching neither the window rect {}x{} nor the visible frame {}x{}; cropping a symmetric {border_thickness}px inset instead",
+            hwnd.0,
+            raw.width,
+            raw.height,
+            geometry.window.width,
+            geometry.window.height,
+            geometry.frame.width,
+            geometry.frame.height,
+        );
+    }
     let content = crop_bgra(&raw.pixels, source_bounds, content_bounds)?;
     let (pixels, content_width, content_height, radius_scale) = if let Some(max_pixels) = max_pixels
     {
@@ -506,17 +514,12 @@ fn capture_window_with_wgc(
         AlphaSource::Content,
     )?;
     let corner_radius_px = inner_corner_radius + border_width as f32;
+    let (origin_x, origin_y) = geometry.published_origin(border_thickness);
     let mut metadata = reference_metadata.clone();
     metadata.backend = "windows-graphics-capture".to_owned();
     metadata.source_rect = Rect {
-        x: visible_frame
-            .bounds
-            .x
-            .saturating_sub(visible_frame.border_thickness as i32),
-        y: visible_frame
-            .bounds
-            .y
-            .saturating_sub(visible_frame.border_thickness as i32),
+        x: origin_x,
+        y: origin_y,
         width: output_width,
         height: output_height,
     };
@@ -757,12 +760,37 @@ impl Drop for WindowRenderPermit<'_> {
     }
 }
 
-struct VisibleFrame {
-    bounds: Rect,
+/// The desktop-space rectangles every window capture is derived from.
+///
+/// Both backends must crop the same `content` rectangle and rebuild the same border ring around
+/// it, or the same window comes out with different margins depending on which one ran, and the
+/// overlay preview lands a border width away from the frame that is finally published.
+struct WindowGeometry {
+    /// `GetWindowRect`: the whole window, including the invisible resize frame around it.
+    window: Rect,
+    /// The DWM extended frame bounds clipped to `window`: the window as the user sees it.
+    frame: Rect,
+    /// `frame` inset by `border_thickness`: the pixels copied out of a render.
+    content: Rect,
+    /// The width of the visible DWM border, rebuilt synthetically around `content`.
     border_thickness: u32,
 }
 
-fn visible_frame_bounds(hwnd: HWND, capture_bounds: Rect) -> VisibleFrame {
+impl WindowGeometry {
+    /// The desktop-space origin of a published frame — the outer edge of the rebuilt border ring.
+    ///
+    /// `border_thickness` is a parameter rather than the field because a capture whose surface did
+    /// not line up with either known rectangle rebuilds a clamped ring instead.
+    fn published_origin(&self, border_thickness: u32) -> (i32, i32) {
+        let border = i32::try_from(border_thickness).unwrap_or(i32::MAX);
+        (
+            self.content.x.saturating_sub(border),
+            self.content.y.saturating_sub(border),
+        )
+    }
+}
+
+fn window_geometry(hwnd: HWND, window: Rect) -> WindowGeometry {
     let mut native = RECT::default();
     // SAFETY: hwnd is a live top-level window and native is writable for the exact RECT size.
     let result = unsafe {
@@ -774,20 +802,100 @@ fn visible_frame_bounds(hwnd: HWND, capture_bounds: Rect) -> VisibleFrame {
         )
     };
     let Some(dwm_bounds) = result.ok().and_then(|()| rect_from_native(native)) else {
-        return VisibleFrame {
-            bounds: capture_bounds,
+        return WindowGeometry {
+            window,
+            frame: window,
+            content: window,
             border_thickness: 0,
         };
     };
-    let frame_bounds = intersect_rect(capture_bounds, dwm_bounds).unwrap_or(capture_bounds);
+    let frame = intersect_rect(window, dwm_bounds).unwrap_or(window);
     let border_thickness = visible_frame_border_thickness(hwnd)
-        .min(frame_bounds.width / 4)
-        .min(frame_bounds.height / 4);
-    let bounds = inset_rect(frame_bounds, border_thickness).unwrap_or(frame_bounds);
-    VisibleFrame {
-        bounds,
+        .min(frame.width / 4)
+        .min(frame.height / 4);
+    let content = inset_rect(frame, border_thickness).unwrap_or(frame);
+    WindowGeometry {
+        window,
+        frame,
+        content,
         border_thickness,
     }
+}
+
+/// Where the shared `content` crop lands inside a raw Windows Graphics Capture surface.
+#[derive(Debug, Eq, PartialEq)]
+struct WgcCrop {
+    /// The crop rectangle in the surface's own coordinates.
+    crop: Rect,
+    /// The border ring thickness to rebuild around `crop`.
+    border_thickness: u32,
+    /// Whether the surface lined up with a window rectangle Captastic had already measured.
+    ///
+    /// False means the crop is a best-effort symmetric inset instead of the geometry PrintWindow
+    /// would have produced, which is worth saying out loud in the log.
+    aligned: bool,
+}
+
+/// Maps the visible-frame crop into the coordinate space of a raw WGC surface.
+///
+/// WGC hands back a surface sized like one of the two rectangles already measured for the window:
+/// the full window rect for windows whose surface includes the invisible resize frame, or the DWM
+/// visible frame for those whose surface does not. Matching the size identifies the surface's
+/// desktop-space origin, and therefore where the crop PrintWindow performs lands inside it — which
+/// is the whole point: the invisible resize-frame delta has to come off both backends or it comes
+/// off neither.
+fn wgc_content_crop(surface_width: u32, surface_height: u32, geometry: &WindowGeometry) -> WgcCrop {
+    let surface = Rect {
+        x: 0,
+        y: 0,
+        width: surface_width,
+        height: surface_height,
+    };
+    for origin in [geometry.window, geometry.frame] {
+        if origin.width != surface_width || origin.height != surface_height {
+            continue;
+        }
+        let Some(crop) =
+            translate_rect(geometry.content, -i64::from(origin.x), -i64::from(origin.y))
+        else {
+            continue;
+        };
+        if rect_contains(surface, crop) {
+            return WgcCrop {
+                crop,
+                border_thickness: geometry.border_thickness,
+                aligned: true,
+            };
+        }
+    }
+    // The surface matches neither rectangle: the window resized while the capture was in flight,
+    // or the compositor handed back a size Captastic cannot place. Nothing maps desktop
+    // coordinates onto it, so fall back to a symmetric inset of the surface itself.
+    let border_thickness = geometry
+        .border_thickness
+        .min(surface_width / 4)
+        .min(surface_height / 4);
+    WgcCrop {
+        crop: inset_rect(surface, border_thickness).unwrap_or(surface),
+        border_thickness,
+        aligned: false,
+    }
+}
+
+fn translate_rect(rect: Rect, dx: i64, dy: i64) -> Option<Rect> {
+    Some(Rect {
+        x: i32::try_from(i64::from(rect.x) + dx).ok()?,
+        y: i32::try_from(i64::from(rect.y) + dy).ok()?,
+        width: rect.width,
+        height: rect.height,
+    })
+}
+
+fn rect_contains(outer: Rect, inner: Rect) -> bool {
+    inner.x >= outer.x
+        && inner.y >= outer.y
+        && inner.right() <= outer.right()
+        && inner.bottom() <= outer.bottom()
 }
 
 fn visible_frame_border_thickness(hwnd: HWND) -> u32 {
@@ -1643,6 +1751,185 @@ mod tests {
         assert!(!region_is_blank(&source, source_bounds, region).expect("valid region"));
     }
 
+    /// A resizable window: `GetWindowRect` reports an 8px invisible resize frame around the
+    /// visible DWM frame, which itself carries a 2px visible border.
+    fn resizable_window_geometry() -> WindowGeometry {
+        let window = Rect {
+            x: 100,
+            y: 200,
+            width: 816,
+            height: 616,
+        };
+        let frame = Rect {
+            x: 108,
+            y: 200,
+            width: 800,
+            height: 608,
+        };
+        WindowGeometry {
+            window,
+            frame,
+            content: inset_rect(frame, 2).expect("the visible border fits inside the frame"),
+            border_thickness: 2,
+        }
+    }
+
+    #[test]
+    fn wgc_surface_matching_the_window_rect_crops_the_invisible_resize_frame() {
+        let geometry = resizable_window_geometry();
+        // Same crop PrintWindow performs, expressed in the surface's own coordinates: 8px of
+        // invisible resize frame on the left plus the 2px visible border.
+        assert_eq!(
+            wgc_content_crop(geometry.window.width, geometry.window.height, &geometry),
+            WgcCrop {
+                crop: Rect {
+                    x: 10,
+                    y: 2,
+                    width: 796,
+                    height: 604,
+                },
+                border_thickness: 2,
+                aligned: true,
+            }
+        );
+    }
+
+    #[test]
+    fn wgc_surface_matching_the_visible_frame_crops_only_the_border() {
+        let geometry = resizable_window_geometry();
+        // A surface that already excludes the invisible resize frame must not have it removed
+        // twice; only the visible border comes off.
+        assert_eq!(
+            wgc_content_crop(geometry.frame.width, geometry.frame.height, &geometry),
+            WgcCrop {
+                crop: Rect {
+                    x: 2,
+                    y: 2,
+                    width: 796,
+                    height: 604,
+                },
+                border_thickness: 2,
+                aligned: true,
+            }
+        );
+    }
+
+    #[test]
+    fn both_backends_publish_the_same_origin_and_size_for_one_window() {
+        let geometry = resizable_window_geometry();
+        for (surface_width, surface_height) in [
+            (geometry.window.width, geometry.window.height),
+            (geometry.frame.width, geometry.frame.height),
+        ] {
+            let wgc = wgc_content_crop(surface_width, surface_height, &geometry);
+            // The rebuilt border ring restores exactly what each backend cropped away, so the
+            // published frame is the visible DWM frame either way.
+            assert_eq!(
+                (
+                    wgc.crop.width + wgc.border_thickness * 2,
+                    wgc.crop.height + wgc.border_thickness * 2
+                ),
+                (
+                    geometry.content.width + geometry.border_thickness * 2,
+                    geometry.content.height + geometry.border_thickness * 2
+                ),
+                "surface {surface_width}x{surface_height}"
+            );
+            assert_eq!(
+                geometry.published_origin(wgc.border_thickness),
+                geometry.published_origin(geometry.border_thickness),
+                "surface {surface_width}x{surface_height}"
+            );
+            assert_eq!(
+                geometry.published_origin(wgc.border_thickness),
+                (geometry.frame.x, geometry.frame.y),
+                "surface {surface_width}x{surface_height}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unplaceable_wgc_surface_falls_back_to_a_symmetric_inset() {
+        let geometry = resizable_window_geometry();
+        // The window resized mid-capture, so neither measured rectangle describes the surface.
+        let unaligned = wgc_content_crop(640, 480, &geometry);
+        assert!(!unaligned.aligned);
+        assert_eq!(
+            unaligned.crop,
+            Rect {
+                x: 2,
+                y: 2,
+                width: 636,
+                height: 476,
+            }
+        );
+        assert_eq!(unaligned.border_thickness, 2);
+    }
+
+    #[test]
+    fn a_tiny_wgc_surface_clamps_the_border_it_rebuilds() {
+        let geometry = WindowGeometry {
+            window: Rect {
+                x: 0,
+                y: 0,
+                width: 400,
+                height: 400,
+            },
+            frame: Rect {
+                x: 0,
+                y: 0,
+                width: 400,
+                height: 400,
+            },
+            content: Rect {
+                x: 20,
+                y: 20,
+                width: 360,
+                height: 360,
+            },
+            border_thickness: 20,
+        };
+        let clamped = wgc_content_crop(8, 8, &geometry);
+        assert!(!clamped.aligned);
+        assert_eq!(clamped.border_thickness, 2);
+        assert_eq!(
+            clamped.crop,
+            Rect {
+                x: 2,
+                y: 2,
+                width: 4,
+                height: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn a_borderless_window_publishes_its_own_origin() {
+        let bounds = Rect {
+            x: -40,
+            y: 15,
+            width: 300,
+            height: 200,
+        };
+        let geometry = WindowGeometry {
+            window: bounds,
+            frame: bounds,
+            content: bounds,
+            border_thickness: 0,
+        };
+        let wgc = wgc_content_crop(bounds.width, bounds.height, &geometry);
+        assert!(wgc.aligned);
+        assert_eq!(
+            wgc.crop,
+            Rect {
+                x: 0,
+                y: 0,
+                ..bounds
+            }
+        );
+        assert_eq!(geometry.published_origin(0), (-40, 15));
+    }
+
     #[test]
     fn visible_dwm_border_is_inset_symmetrically() {
         assert_eq!(
@@ -1994,23 +2281,16 @@ mod tests {
         // SAFETY: The test environment supplies a live window handle and writable RECT storage.
         unsafe { GetWindowRect(hwnd, &mut bounds) }.expect("window bounds");
         let outer = rect_from_native(bounds).expect("valid bounds");
-        let visible_frame = visible_frame_bounds(hwnd, outer);
-        let border = visible_frame.border_thickness;
+        let geometry = window_geometry(hwnd, outer);
+        let border = geometry.border_thickness;
+        assert_eq!(captured.frame.width, geometry.content.width + border * 2);
+        assert_eq!(captured.frame.height, geometry.content.height + border * 2);
         assert_eq!(
-            captured.frame.width,
-            visible_frame.bounds.width + border * 2
-        );
-        assert_eq!(
-            captured.frame.height,
-            visible_frame.bounds.height + border * 2
-        );
-        assert_eq!(
-            captured.frame.metadata.source_rect.x,
-            visible_frame.bounds.x - border as i32
-        );
-        assert_eq!(
-            captured.frame.metadata.source_rect.y,
-            visible_frame.bounds.y - border as i32
+            (
+                captured.frame.metadata.source_rect.x,
+                captured.frame.metadata.source_rect.y
+            ),
+            geometry.published_origin(border)
         );
     }
 
