@@ -477,12 +477,43 @@ impl Default for AppConfig {
     }
 }
 
+/// Reads nothing but `schema_version`, tolerating every field around it.
+///
+/// `AppConfig` is `deny_unknown_fields`, which is what makes a typo a startup error rather than a
+/// silently ignored setting. It also means a configuration written by a *newer* Captastic fails
+/// during deserialization, complaining about whichever new key it happened to reach first — so
+/// `UnsupportedSchema`, the error that exists to explain exactly this, could never fire. Reading
+/// the version on its own, leniently, lets it speak before the strict parse gets a chance to
+/// mis-describe the problem.
+#[derive(Deserialize)]
+struct SchemaProbe {
+    #[serde(default = "default_schema_version")]
+    schema_version: u32,
+}
+
+const fn default_schema_version() -> u32 {
+    CONFIG_SCHEMA_VERSION
+}
+
+/// Fails with `UnsupportedSchema` when `text` declares a schema this binary does not implement.
+///
+/// A missing `schema_version` is treated as the current one: that is what a hand-written partial
+/// configuration looks like, and rejecting those would be a regression.
+fn check_schema_version(text: &str) -> Result<(), ConfigError> {
+    let probe: SchemaProbe = toml::from_str(text)?;
+    if probe.schema_version != CONFIG_SCHEMA_VERSION {
+        return Err(ConfigError::UnsupportedSchema(probe.schema_version));
+    }
+    Ok(())
+}
+
 impl AppConfig {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let text = fs::read_to_string(path).map_err(|source| ConfigError::Read {
             path: path.display().to_string(),
             source,
         })?;
+        check_schema_version(&text)?;
         let config: Self = toml::from_str(&text)?;
         config.validate()?;
         Ok(config)
@@ -537,6 +568,11 @@ impl AppConfig {
         if let Err(syntax_error) = text.parse::<toml_edit::Document>() {
             return quarantine_damaged_config(path, syntax_error.to_string());
         }
+        // Before the strict parse, so a configuration from a newer Captastic is reported as a
+        // version this binary cannot read rather than as an unknown key. Deliberately *not*
+        // quarantined: the file is not damaged, this binary is simply too old for it, and moving
+        // it aside would destroy a working configuration for whichever install wrote it.
+        check_schema_version(&text)?;
         let config: Self = toml::from_str(&text)?;
         config.validate()?;
         Ok((config, None))
@@ -1928,6 +1964,85 @@ mod tests {
         let config = AppConfig::default();
         config.validate().expect("valid defaults");
         assert_eq!(config.selection.preview, PreviewMode::Auto);
+    }
+
+    #[test]
+    fn a_newer_schema_reports_its_version_rather_than_an_unknown_key() {
+        // The regression: `deny_unknown_fields` rejected the newer binary's fields first, so the
+        // user was told `unknown field "future_setting"` — a typo's error message — for a
+        // configuration that is not wrong, merely from the future.
+        let directory = TestDirectory::new("newer-schema");
+        let path = directory.join(CONFIG_FILE_NAME);
+        fs::write(
+            &path,
+            format!(
+                "schema_version = {}\n\n[future]\nfuture_setting = true\n",
+                CONFIG_SCHEMA_VERSION + 1
+            ),
+        )
+        .expect("write a newer configuration");
+
+        for error in [
+            AppConfig::load(&path).expect_err("explicit load rejects a newer schema"),
+            AppConfig::load_recovering(&path).expect_err("recovering load rejects a newer schema"),
+        ] {
+            assert!(
+                matches!(error, ConfigError::UnsupportedSchema(version)
+                    if version == CONFIG_SCHEMA_VERSION + 1),
+                "expected a versioned error, got {error}"
+            );
+        }
+        // A newer configuration is not damaged, so nothing may be moved aside: the install that
+        // wrote it still needs it.
+        assert!(path.exists());
+        assert_eq!(
+            fs::read_dir(&directory.0).expect("list directory").count(),
+            1,
+            "a newer configuration must not be quarantined"
+        );
+    }
+
+    #[test]
+    fn an_older_schema_also_reports_its_version() {
+        let directory = TestDirectory::new("older-schema");
+        let path = directory.join(CONFIG_FILE_NAME);
+        fs::write(&path, "schema_version = 0\n").expect("write an older configuration");
+
+        assert!(matches!(
+            AppConfig::load(&path).expect_err("older schema is rejected"),
+            ConfigError::UnsupportedSchema(0)
+        ));
+    }
+
+    #[test]
+    fn an_omitted_schema_version_is_treated_as_current() {
+        // A hand-written partial configuration has no version line; requiring one would turn
+        // every such file into a startup failure.
+        let directory = TestDirectory::new("implicit-schema");
+        let path = directory.join(CONFIG_FILE_NAME);
+        fs::write(&path, "[capture]\ncpu_frame = false\n").expect("write a partial configuration");
+
+        let config = AppConfig::load(&path).expect("partial configuration loads");
+        assert_eq!(config.schema_version, CONFIG_SCHEMA_VERSION);
+        assert!(!config.capture.cpu_frame);
+    }
+
+    #[test]
+    fn an_unknown_key_at_the_current_schema_is_still_an_error() {
+        // The version check must not become a way to smuggle typos past `deny_unknown_fields`.
+        let directory = TestDirectory::new("unknown-key");
+        let path = directory.join(CONFIG_FILE_NAME);
+        fs::write(
+            &path,
+            format!("schema_version = {CONFIG_SCHEMA_VERSION}\n\n[capture]\ncpu_frmae = false\n"),
+        )
+        .expect("write a typo");
+
+        let error = AppConfig::load(&path).expect_err("a typo is still rejected");
+        assert!(
+            !matches!(error, ConfigError::UnsupportedSchema(_)),
+            "a typo at the current schema must not be reported as a version problem"
+        );
     }
 
     #[test]
