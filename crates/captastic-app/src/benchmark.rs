@@ -242,6 +242,7 @@ fn capture_error_kind_label(kind: CaptureErrorKind) -> &'static str {
         CaptureErrorKind::DeviceRemoved => "device_removed",
         CaptureErrorKind::TopologyChanged => "topology_changed",
         CaptureErrorKind::BufferExhausted => "buffer_exhausted",
+        CaptureErrorKind::WorkersExhausted => "workers_exhausted",
         CaptureErrorKind::InvalidFrame => "invalid_frame",
         CaptureErrorKind::NativeFailure => "native_failure",
         CaptureErrorKind::ShuttingDown => "shutting_down",

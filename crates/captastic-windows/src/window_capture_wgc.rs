@@ -2,6 +2,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use captastic_core::{CaptureError, CaptureErrorKind};
+
+use crate::window_capture::RenderDeadline;
 use windows::core::{factory, ComInterface, Error as WindowsError, IInspectable, Interface};
 use windows::Foundation::TypedEventHandler;
 use windows::Graphics::Capture::{
@@ -29,6 +31,13 @@ use windows::Win32::System::WinRT::{RoInitialize, RoUninitialize, RO_INIT_MULTIT
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_millis(300);
 const GPU_MAP_TIMEOUT: Duration = Duration::from_millis(250);
 const GPU_MAP_RETRY_DELAY: Duration = Duration::from_millis(1);
+/// Time held back from the caller's deadline before waiting for the first frame, covering the
+/// readback that has to follow it: staging-texture creation, the GPU copy, the map retry loop and
+/// the row copy out of the mapping.
+const READBACK_RESERVE: Duration = Duration::from_millis(200);
+/// Time held back from the caller's deadline before waiting on the GPU map, covering what remains
+/// after it: copying the rows out, then the caller's own crop, rescale and border reconstruction.
+const PUBLISH_RESERVE: Duration = Duration::from_millis(100);
 
 pub(crate) struct WgcWindowFrame {
     pub pixels: Vec<u8>,
@@ -36,8 +45,20 @@ pub(crate) struct WgcWindowFrame {
     pub height: u32,
 }
 
-pub(crate) fn capture_window(hwnd: HWND) -> Result<WgcWindowFrame, CaptureError> {
+pub(crate) fn capture_window(
+    hwnd: HWND,
+    deadline: RenderDeadline,
+) -> Result<WgcWindowFrame, CaptureError> {
     let _apartment = WinRtApartment::initialize()?;
+    // Building a device and a capture session costs real time. If there is not enough deadline
+    // left to wait for a frame afterwards, say so now instead of spending the rest of it and
+    // handing back a result the caller has already stopped listening for.
+    if deadline
+        .bounded_wait(FIRST_FRAME_TIMEOUT, READBACK_RESERVE)
+        .is_zero()
+    {
+        return Err(deadline_exhausted("start_window_capture", deadline));
+    }
     if !wgc_session_is_supported().map_err(|error| windows_error("check_support", error, false))? {
         return Err(capture_error(
             CaptureErrorKind::Unsupported,
@@ -100,31 +121,33 @@ pub(crate) fn capture_window(hwnd: HWND) -> Result<WgcWindowFrame, CaptureError>
         session
             .StartCapture()
             .map_err(|error| windows_error("start_capture", error, true))?;
-        receiver
-            .recv_timeout(FIRST_FRAME_TIMEOUT)
-            .map_err(|error| {
-                let message = match error {
-                    mpsc::RecvTimeoutError::Timeout => format!(
-                        "no window frame arrived within {} ms",
-                        FIRST_FRAME_TIMEOUT.as_millis()
-                    ),
-                    mpsc::RecvTimeoutError::Disconnected => {
-                        "the window frame notification channel disconnected".to_owned()
-                    }
-                };
-                capture_error(
-                    CaptureErrorKind::Timeout,
-                    "wait_for_first_frame",
-                    message,
-                    true,
-                    None,
-                )
-            })?;
+        let first_frame_wait = deadline.bounded_wait(FIRST_FRAME_TIMEOUT, READBACK_RESERVE);
+        if first_frame_wait.is_zero() {
+            return Err(deadline_exhausted("wait_for_first_frame", deadline));
+        }
+        receiver.recv_timeout(first_frame_wait).map_err(|error| {
+            let message = match error {
+                mpsc::RecvTimeoutError::Timeout => format!(
+                    "no window frame arrived within {} ms",
+                    first_frame_wait.as_millis()
+                ),
+                mpsc::RecvTimeoutError::Disconnected => {
+                    "the window frame notification channel disconnected".to_owned()
+                }
+            };
+            capture_error(
+                CaptureErrorKind::Timeout,
+                "wait_for_first_frame",
+                message,
+                true,
+                None,
+            )
+        })?;
         let frame = resources
             .pool
             .TryGetNextFrame()
             .map_err(|error| windows_error("get_next_frame", error, true))?;
-        readback_frame(&device, &context, &frame)
+        readback_frame(&device, &context, &frame, deadline)
     })();
 
     let _ = resources.pool.RemoveFrameArrived(token);
@@ -244,6 +267,7 @@ fn readback_frame(
     device: &ID3D11Device,
     context: &ID3D11DeviceContext,
     frame: &windows::Graphics::Capture::Direct3D11CaptureFrame,
+    deadline: RenderDeadline,
 ) -> Result<WgcWindowFrame, CaptureError> {
     let content = frame
         .ContentSize()
@@ -343,7 +367,7 @@ fn readback_frame(
         context.CopyResource(&staging, &texture);
         context.Flush();
     }
-    let mapped = MappedTexture::map(context, &staging)?;
+    let mapped = MappedTexture::map(context, &staging, deadline)?;
     let row_bytes = width.checked_mul(4).ok_or_else(|| {
         capture_error(
             CaptureErrorKind::InvalidFrame,
@@ -400,7 +424,10 @@ impl<'a> MappedTexture<'a> {
     fn map(
         context: &'a ID3D11DeviceContext,
         texture: &'a ID3D11Texture2D,
+        deadline: RenderDeadline,
     ) -> Result<Self, CaptureError> {
+        // A zero budget still gets one non-blocking attempt: the copy may already have landed.
+        let map_timeout = deadline.bounded_wait(GPU_MAP_TIMEOUT, PUBLISH_RESERVE);
         let started = Instant::now();
         let data = loop {
             let mut data = D3D11_MAPPED_SUBRESOURCE::default();
@@ -418,7 +445,7 @@ impl<'a> MappedTexture<'a> {
                 Ok(()) => break data,
                 Err(error)
                     if error.code() == DXGI_ERROR_WAS_STILL_DRAWING
-                        && started.elapsed() < GPU_MAP_TIMEOUT =>
+                        && started.elapsed() < map_timeout =>
                 {
                     std::thread::sleep(GPU_MAP_RETRY_DELAY);
                 }
@@ -428,7 +455,7 @@ impl<'a> MappedTexture<'a> {
                         "map_staging_texture",
                         format!(
                             "WGC readback did not complete within {} ms",
-                            GPU_MAP_TIMEOUT.as_millis()
+                            map_timeout.as_millis()
                         ),
                         true,
                         Some(i64::from(error.code().0)),
@@ -481,6 +508,23 @@ impl Drop for WinRtApartment {
         // SAFETY: Balances this worker thread's successful RoInitialize call.
         unsafe { RoUninitialize() };
     }
+}
+
+/// Reports that the caller's render deadline left no room for this wait.
+///
+/// Distinct from an ordinary WGC timeout: nothing here was slow, the attempt simply started too
+/// late to finish inside a window the caller would still be listening at.
+fn deadline_exhausted(operation: &'static str, deadline: RenderDeadline) -> CaptureError {
+    capture_error(
+        CaptureErrorKind::Timeout,
+        operation,
+        format!(
+            "only {} ms of the window-render deadline remained, too little to capture and publish a frame",
+            deadline.remaining().as_millis()
+        ),
+        true,
+        None,
+    )
 }
 
 fn windows_error(operation: &'static str, error: WindowsError, retryable: bool) -> CaptureError {
@@ -579,7 +623,11 @@ mod tests {
             .expect("set CAPTASTIC_TEST_WGC_WINDOW_HANDLE")
             .parse::<isize>()
             .expect("numeric window handle");
-        let frame = capture_window(HWND(raw)).expect("Windows Graphics Capture frame");
+        let frame = capture_window(
+            HWND(raw),
+            RenderDeadline::starting_now(Duration::from_secs(30)),
+        )
+        .expect("Windows Graphics Capture frame");
         assert!(frame.width > 16);
         assert!(frame.height > 16);
         assert_eq!(

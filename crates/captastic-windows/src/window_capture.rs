@@ -1,7 +1,8 @@
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use captastic_core::{CaptureError, CaptureErrorKind, CpuFrame, FrameAlpha, FrameMetadata, Rect};
 use windows::core::Error as WindowsError;
@@ -38,6 +39,7 @@ const WINDOW_BORDER_BGRA: [u8; 3] = [188, 180, 176];
 static IN_FLIGHT_WINDOW_RENDERS: AtomicUsize = AtomicUsize::new(0);
 static WINDOW_RENDER_WORKERS: AtomicUsize = AtomicUsize::new(0);
 static DETACHED_WINDOW_RENDERS: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_WINDOW_RENDER_TARGETS: Mutex<BTreeSet<isize>> = Mutex::new(BTreeSet::new());
 const RENDER_ACTIVE: u8 = 0;
 const RENDER_DETACHED: u8 = 1;
 const RENDER_COMPLETED: u8 = 2;
@@ -118,23 +120,64 @@ fn capture_window_bounded(
     reference_metadata: &FrameMetadata,
     max_pixels: Option<u64>,
 ) -> Result<CapturedWindow, CaptureError> {
-    let budget = WindowRenderBudget::acquire()?;
+    let budget = WindowRenderBudget::acquire(handle.raw())?;
     let permit = WindowRenderPermit::acquire()?;
     let metadata = reference_metadata.clone();
-    run_bounded_window_render(permit, budget, WINDOW_RENDER_TIMEOUT, move || {
+    // One deadline, shared: the caller stops waiting at `deadline`, so every backend the worker
+    // drives has to stop waiting by then too.
+    let deadline = RenderDeadline::starting_now(WINDOW_RENDER_TIMEOUT);
+    run_bounded_window_render(permit, budget, deadline, move || {
         // Capture geometry must use physical pixels. Thread DPI awareness is not inherited
         // reliably by newly spawned workers, and mixing virtualized GetWindowRect values with
         // physical DWM bounds leaves asymmetric one- or two-pixel frame artifacts.
         // SAFETY: Changes DPI virtualization only for this short-lived render worker.
         let _ = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
-        capture_window_inner(handle, &metadata, max_pixels)
+        capture_window_inner(handle, &metadata, max_pixels, deadline)
     })
+}
+
+/// The wall-clock instant a bounded window render stops being useful.
+///
+/// The worker is abandoned once the deadline passes and anything it produces afterwards is thrown
+/// away, so a backend that waits internally has to know when waiting stops paying. Sizing an inner
+/// budget independently of this one is what let a legitimately slow WGC capture spend the caller's
+/// entire deadline and still be discarded — having burned a worker-lifetime slot to produce a
+/// frame nobody read.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RenderDeadline {
+    expires_at: Instant,
+}
+
+impl RenderDeadline {
+    pub(crate) fn starting_now(budget: Duration) -> Self {
+        Self {
+            expires_at: Instant::now() + budget,
+        }
+    }
+
+    pub(crate) fn remaining(&self) -> Duration {
+        self.expires_at.saturating_duration_since(Instant::now())
+    }
+
+    /// Clamps a backend's own timeout to the time the caller can still use.
+    ///
+    /// `reserve` is the work that must still happen *after* the wait for its result to reach the
+    /// caller — without it a backend can wait right up to the deadline and then miss it while
+    /// publishing what it waited for.
+    pub(crate) fn bounded_wait(&self, preferred: Duration, reserve: Duration) -> Duration {
+        bounded_wait(preferred, self.remaining(), reserve)
+    }
+}
+
+/// The arithmetic behind [`RenderDeadline::bounded_wait`], separated so it can be tabulated.
+fn bounded_wait(preferred: Duration, remaining: Duration, reserve: Duration) -> Duration {
+    preferred.min(remaining.saturating_sub(reserve))
 }
 
 fn run_bounded_window_render<T>(
     permit: WindowRenderPermit<'static>,
     budget: WindowRenderBudget<'static>,
-    timeout: Duration,
+    deadline: RenderDeadline,
     render: impl FnOnce() -> Result<T, CaptureError> + Send + 'static,
 ) -> Result<T, CaptureError>
 where
@@ -161,7 +204,9 @@ where
                 None,
             )
         })?;
-    match receiver.recv_timeout(timeout) {
+    // The worker inherits the same deadline, and it started counting a spawn ago — so it gives up
+    // marginally before this wait does, which is the safe direction.
+    match receiver.recv_timeout(deadline.remaining()) {
         Ok(result) => result,
         Err(mpsc::RecvTimeoutError::Timeout) => {
             // The detached worker may remain blocked inside a foreign window procedure. Its
@@ -179,7 +224,7 @@ where
                 "print_selected_window",
                 format!(
                     "the selected window did not render within {} ms",
-                    timeout.as_millis()
+                    WINDOW_RENDER_TIMEOUT.as_millis()
                 ),
                 true,
                 None,
@@ -233,6 +278,7 @@ fn capture_window_inner(
     handle: NativeWindowHandle,
     reference_metadata: &FrameMetadata,
     max_pixels: Option<u64>,
+    deadline: RenderDeadline,
 ) -> Result<CapturedWindow, CaptureError> {
     let hwnd = HWND(handle.raw());
     let mut native_bounds = RECT::default();
@@ -248,14 +294,14 @@ fn capture_window_inner(
             None,
         )
     })?;
-    let visible_frame = visible_frame_bounds(hwnd, capture_bounds);
-    let visible_bounds = visible_frame.bounds;
+    let geometry = window_geometry(hwnd, capture_bounds);
+    let visible_bounds = geometry.content;
     let probe_wgc_error = if !window_is_responsive(hwnd) {
         log::debug!(
             "window handle=0x{:X} did not answer the responsiveness probe; using Windows Graphics Capture",
             handle.raw()
         );
-        match capture_window_with_wgc(hwnd, reference_metadata, max_pixels, &visible_frame) {
+        match capture_window_with_wgc(hwnd, reference_metadata, max_pixels, &geometry, deadline) {
             Ok(capture) => return Ok(capture),
             Err(error) => {
                 log::debug!(
@@ -270,6 +316,25 @@ fn capture_window_inner(
     };
     let mut surface = DibSurface::new(capture_bounds.width, capture_bounds.height)?;
     surface.clear();
+    // Re-probe immediately before the blocking call. Everything since the first probe — the DWM
+    // queries, the DIB allocation, and possibly a full WGC attempt — is time the target had to
+    // stop answering, and `PrintWindow` is a synchronous call into its window procedure with no
+    // timeout of its own. A worker that enters it against a hung window never returns, and the
+    // slot it holds is only reclaimed when it does.
+    if !window_is_responsive(hwnd) {
+        log::debug!(
+            "window handle=0x{:X} stopped answering between the responsiveness probe and PrintWindow; refusing to block a render worker on it",
+            handle.raw()
+        );
+        return match probe_wgc_error {
+            // Windows Graphics Capture already failed for this window during the first probe;
+            // there is nothing left to try that will not wedge the worker.
+            Some(error) => Err(error),
+            None => {
+                capture_window_with_wgc(hwnd, reference_metadata, max_pixels, &geometry, deadline)
+            }
+        };
+    }
     // SAFETY: hwnd is the selected live top-level window and surface.device contains a selected
     // writable DIB sized to the complete window bounds. PrintWindow asks the owning application
     // to render itself, so desktop occlusion is not copied into the result.
@@ -288,7 +353,7 @@ fn capture_window_inner(
             "window handle=0x{:X} rejected PrintWindow; trying Windows Graphics Capture",
             handle.raw()
         );
-        return capture_window_with_wgc(hwnd, reference_metadata, max_pixels, &visible_frame);
+        return capture_window_with_wgc(hwnd, reference_metadata, max_pixels, &geometry, deadline);
     }
     if region_is_blank(surface.as_bytes(), capture_bounds, visible_bounds)? {
         if probe_wgc_error.is_none() {
@@ -296,7 +361,8 @@ fn capture_window_inner(
                 "window handle=0x{:X} PrintWindow reported success but rendered a blank frame; trying Windows Graphics Capture",
                 handle.raw()
             );
-            match capture_window_with_wgc(hwnd, reference_metadata, max_pixels, &visible_frame) {
+            match capture_window_with_wgc(hwnd, reference_metadata, max_pixels, &geometry, deadline)
+            {
                 Ok(capture) => return Ok(capture),
                 Err(error) => {
                     log::debug!(
@@ -363,27 +429,25 @@ fn capture_window_inner(
             1.0,
         )
     };
-    let inner_corner_radius = (window_corner_radius(hwnd) - visible_frame.border_thickness as f32)
-        .max(0.0)
-        * radius_scale;
-    let border_width = scaled_border_width(visible_frame.border_thickness, radius_scale);
+    let inner_corner_radius =
+        (window_corner_radius(hwnd) - geometry.border_thickness as f32).max(0.0) * radius_scale;
+    let border_width = scaled_border_width(geometry.border_thickness, radius_scale);
     let (pixels, output_width, output_height) = add_clean_window_border(
         pixels,
         content_width,
         content_height,
         border_width,
         inner_corner_radius,
+        // GDI never writes the alpha byte, so whatever PrintWindow left behind is meaningless.
+        AlphaSource::Coverage,
     )?;
     let corner_radius = inner_corner_radius + border_width as f32;
+    let (origin_x, origin_y) = geometry.published_origin(geometry.border_thickness);
     let mut metadata = reference_metadata.clone();
     metadata.backend = "windows-print-window".to_owned();
     metadata.source_rect = Rect {
-        x: visible_bounds
-            .x
-            .saturating_sub(visible_frame.border_thickness as i32),
-        y: visible_bounds
-            .y
-            .saturating_sub(visible_frame.border_thickness as i32),
+        x: origin_x,
+        y: origin_y,
         width: output_width,
         height: output_height,
     };
@@ -409,10 +473,35 @@ fn capture_window_inner(
             None,
         )
     })?;
-    Ok(CapturedWindow {
+    let capture = CapturedWindow {
         frame,
         corner_radius_px: corner_radius,
-    })
+    };
+    log_published_window_frame(handle.raw(), &capture, max_pixels.is_some());
+    Ok(capture)
+}
+
+/// Records which backend produced a frame that is about to be published.
+///
+/// The backend name travels with the frame in `FrameMetadata`, but that only helps whoever is
+/// holding the frame. The two paths differ in how they crop, how they treat alpha, and how much
+/// they copy, and either one can run for any given window depending on how it answered a probe
+/// milliseconds earlier — so a capture that comes out misaligned or oddly bright has to be
+/// traceable to the path that produced it from the log alone.
+fn log_published_window_frame(handle: isize, capture: &CapturedWindow, thumbnail: bool) {
+    let metadata = &capture.frame.metadata;
+    log::debug!(
+        "window handle=0x{handle:X} published a {kind} frame from {backend}: {width}x{height} at ({x},{y}), {alpha:?} alpha, corner radius {radius:.1}px, {copies} copies",
+        kind = if thumbnail { "thumbnail" } else { "full-size" },
+        backend = metadata.backend,
+        width = capture.frame.width,
+        height = capture.frame.height,
+        x = metadata.source_rect.x,
+        y = metadata.source_rect.y,
+        alpha = capture.frame.alpha,
+        radius = capture.corner_radius_px,
+        copies = metadata.copy_count,
+    );
 }
 
 fn unpremultiply_bgra(pixels: &mut [u8]) {
@@ -450,21 +539,34 @@ fn capture_window_with_wgc(
     hwnd: HWND,
     reference_metadata: &FrameMetadata,
     max_pixels: Option<u64>,
-    visible_frame: &VisibleFrame,
+    geometry: &WindowGeometry,
+    deadline: RenderDeadline,
 ) -> Result<CapturedWindow, CaptureError> {
-    let raw = capture_window_wgc_frame(hwnd)?;
+    let raw = capture_window_wgc_frame(hwnd, deadline)?;
     let source_bounds = Rect {
         x: 0,
         y: 0,
         width: raw.width,
         height: raw.height,
     };
-    let border_thickness = visible_frame
-        .border_thickness
-        .min(raw.width / 4)
-        .min(raw.height / 4);
-    let content_bounds = inset_rect(source_bounds, border_thickness).unwrap_or(source_bounds);
-    let content = normalize_wgc_content(crop_bgra(&raw.pixels, source_bounds, content_bounds)?);
+    let WgcCrop {
+        crop: content_bounds,
+        border_thickness,
+        aligned,
+    } = wgc_content_crop(raw.width, raw.height, geometry);
+    if !aligned {
+        log::debug!(
+            "window handle=0x{:X} Windows Graphics Capture surface is {}x{}, matching neither the window rect {}x{} nor the visible frame {}x{}; cropping a symmetric {border_thickness}px inset instead",
+            hwnd.0,
+            raw.width,
+            raw.height,
+            geometry.window.width,
+            geometry.window.height,
+            geometry.frame.width,
+            geometry.frame.height,
+        );
+    }
+    let content = crop_bgra(&raw.pixels, source_bounds, content_bounds)?;
     let (pixels, content_width, content_height, radius_scale) = if let Some(max_pixels) = max_pixels
     {
         let (width, height) =
@@ -489,6 +591,7 @@ fn capture_window_with_wgc(
     } else {
         (content, content_bounds.width, content_bounds.height, 1.0)
     };
+    let pixels = normalize_wgc_content(pixels);
     let inner_corner_radius =
         (window_corner_radius(hwnd) - border_thickness as f32).max(0.0) * radius_scale;
     let border_width = scaled_border_width(border_thickness, radius_scale);
@@ -498,19 +601,17 @@ fn capture_window_with_wgc(
         content_height,
         border_width,
         inner_corner_radius,
+        // WGC hands back the composited window surface, so an acrylic or Mica backdrop arrives
+        // genuinely translucent. Overwriting that with corner coverage published it opaque.
+        AlphaSource::Content,
     )?;
     let corner_radius_px = inner_corner_radius + border_width as f32;
+    let (origin_x, origin_y) = geometry.published_origin(border_thickness);
     let mut metadata = reference_metadata.clone();
     metadata.backend = "windows-graphics-capture".to_owned();
     metadata.source_rect = Rect {
-        x: visible_frame
-            .bounds
-            .x
-            .saturating_sub(visible_frame.border_thickness as i32),
-        y: visible_frame
-            .bounds
-            .y
-            .saturating_sub(visible_frame.border_thickness as i32),
+        x: origin_x,
+        y: origin_y,
         width: output_width,
         height: output_height,
     };
@@ -536,21 +637,64 @@ fn capture_window_with_wgc(
             None,
         )
     })?;
-    Ok(CapturedWindow {
+    let capture = CapturedWindow {
         frame,
         corner_radius_px,
-    })
+    };
+    log_published_window_frame(hwnd.0, &capture, max_pixels.is_some());
+    Ok(capture)
 }
 
 fn normalize_wgc_content(mut pixels: Vec<u8>) -> Vec<u8> {
-    // WGC publishes premultiplied BGRA. Convert before any GDI scaling because StretchBlt does
-    // not preserve alpha; waiting until after the blit would interpret every pixel as transparent
-    // and erase its RGB channels.
+    // WGC publishes premultiplied BGRA and Captastic publishes straight alpha. Convert *after* any
+    // scaling: premultiplied is the only representation a resampling filter may average directly,
+    // and unpremultiplying first zeroes the colour of fully transparent pixels, which a downscale
+    // would then bleed as a dark fringe into the rounded corners.
     unpremultiply_bgra(&mut pixels);
     pixels
 }
 
+/// Scales a BGRA buffer through GDI, keeping the alpha channel intact.
+///
+/// `StretchBlt` treats the fourth byte of a 32-bit DIB as padding rather than alpha and is free to
+/// discard it — with `HALFTONE` it does. The alpha channel is therefore resampled separately, as a
+/// grayscale image pushed through the identical filter, and merged back afterwards so the colour
+/// and alpha planes stay aligned.
 fn scale_bgra_with_dib(
+    pixels: &[u8],
+    source_width: u32,
+    source_height: u32,
+    target_width: u32,
+    target_height: u32,
+    operation: &'static str,
+) -> Result<Vec<u8>, CaptureError> {
+    let mut scaled = stretch_bgra_with_dib(
+        pixels,
+        source_width,
+        source_height,
+        target_width,
+        target_height,
+        operation,
+    )?;
+    let alpha_plane: Vec<u8> = pixels
+        .chunks_exact(4)
+        .flat_map(|pixel| [pixel[3], pixel[3], pixel[3], 255])
+        .collect();
+    let scaled_alpha = stretch_bgra_with_dib(
+        &alpha_plane,
+        source_width,
+        source_height,
+        target_width,
+        target_height,
+        operation,
+    )?;
+    for (pixel, alpha) in scaled.chunks_exact_mut(4).zip(scaled_alpha.chunks_exact(4)) {
+        pixel[3] = alpha[0];
+    }
+    Ok(scaled)
+}
+
+fn stretch_bgra_with_dib(
     pixels: &[u8],
     source_width: u32,
     source_height: u32,
@@ -602,29 +746,60 @@ struct WindowRenderPermit<'a> {
     released: Arc<AtomicBool>,
 }
 
+/// A worker-lifetime lease: one of the process's render-worker slots, held for one window.
+///
+/// Unlike the in-flight permit (reclaimed at the caller's timeout deadline), this budget is only
+/// released when the spawned thread itself exits, and a worker blocked inside an unresponsive
+/// foreign window procedure may never exit. Pairing the slot with an exclusive claim on the target
+/// window is what stops that from being fatal: a wedged window pins one slot forever, but it can
+/// never take a second, so eight attempts at one bad window no longer disable window capture for
+/// the life of the process.
 #[derive(Debug)]
 struct WindowRenderBudget<'a> {
     workers: &'a AtomicUsize,
+    // Dropped after the slot is returned; ordering between the two does not matter, only that both
+    // happen when the worker exits.
+    _target: WindowRenderTarget<'a>,
+}
+
+/// An exclusive claim on rendering one specific window.
+#[derive(Debug)]
+struct WindowRenderTarget<'a> {
+    claimed: &'a Mutex<BTreeSet<isize>>,
+    target: isize,
 }
 
 impl WindowRenderBudget<'static> {
-    fn acquire() -> Result<Self, CaptureError> {
-        Self::acquire_from(&WINDOW_RENDER_WORKERS, MAX_WINDOW_RENDER_WORKERS)
+    fn acquire(target: isize) -> Result<Self, CaptureError> {
+        Self::acquire_from(
+            &WINDOW_RENDER_WORKERS,
+            &ACTIVE_WINDOW_RENDER_TARGETS,
+            MAX_WINDOW_RENDER_WORKERS,
+            target,
+        )
     }
 }
 
 impl<'a> WindowRenderBudget<'a> {
-    fn acquire_from(workers: &'a AtomicUsize, limit: usize) -> Result<Self, CaptureError> {
+    fn acquire_from(
+        workers: &'a AtomicUsize,
+        claimed: &'a Mutex<BTreeSet<isize>>,
+        limit: usize,
+        target: isize,
+    ) -> Result<Self, CaptureError> {
+        // Claim the window before the slot. Refusing a duplicate costs nothing, and it must happen
+        // first or a repeatedly retried hung window still burns a slot per attempt on its way to
+        // being rejected. If the slot below is unavailable the claim drops again on the `?`.
+        let target = WindowRenderTarget::claim(claimed, target)?;
         let mut current = workers.load(Ordering::Acquire);
         loop {
             if current >= limit {
-                // Unlike the in-flight permit (reclaimed at the caller's timeout deadline), this
-                // worker-lifetime budget is only released when the spawned thread itself exits
-                // (see `Drop for WindowRenderBudget`, moved into the worker closure). If every
-                // slot is taken, an immediate retry cannot succeed until some worker — possibly
-                // one wedged in a foreign window procedure — finally returns.
+                // Every slot is taken by a worker that has not exited. Some of them may be wedged
+                // in a foreign window procedure and never will, so an immediate retry cannot
+                // succeed — this is a distinct condition from transient buffer pressure, and the
+                // kind says so rather than inviting a retry that is guaranteed to fail.
                 return Err(capture_error(
-                    CaptureErrorKind::BufferExhausted,
+                    CaptureErrorKind::WorkersExhausted,
                     "start_window_render",
                     format!(
                         "{current} native window-render workers are still running; refusing to create an unbounded thread backlog"
@@ -639,7 +814,12 @@ impl<'a> WindowRenderBudget<'a> {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Ok(Self { workers }),
+                Ok(_) => {
+                    return Ok(Self {
+                        workers,
+                        _target: target,
+                    })
+                }
                 Err(observed) => current = observed,
             }
         }
@@ -650,6 +830,38 @@ impl Drop for WindowRenderBudget<'_> {
     fn drop(&mut self) {
         self.workers.fetch_sub(1, Ordering::AcqRel);
     }
+}
+
+impl<'a> WindowRenderTarget<'a> {
+    fn claim(claimed: &'a Mutex<BTreeSet<isize>>, target: isize) -> Result<Self, CaptureError> {
+        if !lock_render_targets(claimed).insert(target) {
+            return Err(capture_error(
+                CaptureErrorKind::BufferExhausted,
+                "start_window_render",
+                format!(
+                    "a native render for window handle=0x{target:X} is already running; one window may occupy only one render worker"
+                ),
+                // Unlike the exhausted worker budget, this really can clear on its own: the
+                // render already in flight is usually a different caller's, moments from done.
+                true,
+                None,
+            ));
+        }
+        Ok(Self { claimed, target })
+    }
+}
+
+impl Drop for WindowRenderTarget<'_> {
+    fn drop(&mut self) {
+        lock_render_targets(self.claimed).remove(&self.target);
+    }
+}
+
+/// A poisoned claim set is still a correct claim set: the guarded `BTreeSet` has no invariant a
+/// panicking holder could have broken, and refusing to render anything ever again is worse than
+/// whatever the panic was.
+fn lock_render_targets(claimed: &Mutex<BTreeSet<isize>>) -> MutexGuard<'_, BTreeSet<isize>> {
+    claimed.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl WindowRenderPermit<'static> {
@@ -710,12 +922,37 @@ impl Drop for WindowRenderPermit<'_> {
     }
 }
 
-struct VisibleFrame {
-    bounds: Rect,
+/// The desktop-space rectangles every window capture is derived from.
+///
+/// Both backends must crop the same `content` rectangle and rebuild the same border ring around
+/// it, or the same window comes out with different margins depending on which one ran, and the
+/// overlay preview lands a border width away from the frame that is finally published.
+struct WindowGeometry {
+    /// `GetWindowRect`: the whole window, including the invisible resize frame around it.
+    window: Rect,
+    /// The DWM extended frame bounds clipped to `window`: the window as the user sees it.
+    frame: Rect,
+    /// `frame` inset by `border_thickness`: the pixels copied out of a render.
+    content: Rect,
+    /// The width of the visible DWM border, rebuilt synthetically around `content`.
     border_thickness: u32,
 }
 
-fn visible_frame_bounds(hwnd: HWND, capture_bounds: Rect) -> VisibleFrame {
+impl WindowGeometry {
+    /// The desktop-space origin of a published frame — the outer edge of the rebuilt border ring.
+    ///
+    /// `border_thickness` is a parameter rather than the field because a capture whose surface did
+    /// not line up with either known rectangle rebuilds a clamped ring instead.
+    fn published_origin(&self, border_thickness: u32) -> (i32, i32) {
+        let border = i32::try_from(border_thickness).unwrap_or(i32::MAX);
+        (
+            self.content.x.saturating_sub(border),
+            self.content.y.saturating_sub(border),
+        )
+    }
+}
+
+fn window_geometry(hwnd: HWND, window: Rect) -> WindowGeometry {
     let mut native = RECT::default();
     // SAFETY: hwnd is a live top-level window and native is writable for the exact RECT size.
     let result = unsafe {
@@ -727,20 +964,100 @@ fn visible_frame_bounds(hwnd: HWND, capture_bounds: Rect) -> VisibleFrame {
         )
     };
     let Some(dwm_bounds) = result.ok().and_then(|()| rect_from_native(native)) else {
-        return VisibleFrame {
-            bounds: capture_bounds,
+        return WindowGeometry {
+            window,
+            frame: window,
+            content: window,
             border_thickness: 0,
         };
     };
-    let frame_bounds = intersect_rect(capture_bounds, dwm_bounds).unwrap_or(capture_bounds);
+    let frame = intersect_rect(window, dwm_bounds).unwrap_or(window);
     let border_thickness = visible_frame_border_thickness(hwnd)
-        .min(frame_bounds.width / 4)
-        .min(frame_bounds.height / 4);
-    let bounds = inset_rect(frame_bounds, border_thickness).unwrap_or(frame_bounds);
-    VisibleFrame {
-        bounds,
+        .min(frame.width / 4)
+        .min(frame.height / 4);
+    let content = inset_rect(frame, border_thickness).unwrap_or(frame);
+    WindowGeometry {
+        window,
+        frame,
+        content,
         border_thickness,
     }
+}
+
+/// Where the shared `content` crop lands inside a raw Windows Graphics Capture surface.
+#[derive(Debug, Eq, PartialEq)]
+struct WgcCrop {
+    /// The crop rectangle in the surface's own coordinates.
+    crop: Rect,
+    /// The border ring thickness to rebuild around `crop`.
+    border_thickness: u32,
+    /// Whether the surface lined up with a window rectangle Captastic had already measured.
+    ///
+    /// False means the crop is a best-effort symmetric inset instead of the geometry PrintWindow
+    /// would have produced, which is worth saying out loud in the log.
+    aligned: bool,
+}
+
+/// Maps the visible-frame crop into the coordinate space of a raw WGC surface.
+///
+/// WGC hands back a surface sized like one of the two rectangles already measured for the window:
+/// the full window rect for windows whose surface includes the invisible resize frame, or the DWM
+/// visible frame for those whose surface does not. Matching the size identifies the surface's
+/// desktop-space origin, and therefore where the crop PrintWindow performs lands inside it — which
+/// is the whole point: the invisible resize-frame delta has to come off both backends or it comes
+/// off neither.
+fn wgc_content_crop(surface_width: u32, surface_height: u32, geometry: &WindowGeometry) -> WgcCrop {
+    let surface = Rect {
+        x: 0,
+        y: 0,
+        width: surface_width,
+        height: surface_height,
+    };
+    for origin in [geometry.window, geometry.frame] {
+        if origin.width != surface_width || origin.height != surface_height {
+            continue;
+        }
+        let Some(crop) =
+            translate_rect(geometry.content, -i64::from(origin.x), -i64::from(origin.y))
+        else {
+            continue;
+        };
+        if rect_contains(surface, crop) {
+            return WgcCrop {
+                crop,
+                border_thickness: geometry.border_thickness,
+                aligned: true,
+            };
+        }
+    }
+    // The surface matches neither rectangle: the window resized while the capture was in flight,
+    // or the compositor handed back a size Captastic cannot place. Nothing maps desktop
+    // coordinates onto it, so fall back to a symmetric inset of the surface itself.
+    let border_thickness = geometry
+        .border_thickness
+        .min(surface_width / 4)
+        .min(surface_height / 4);
+    WgcCrop {
+        crop: inset_rect(surface, border_thickness).unwrap_or(surface),
+        border_thickness,
+        aligned: false,
+    }
+}
+
+fn translate_rect(rect: Rect, dx: i64, dy: i64) -> Option<Rect> {
+    Some(Rect {
+        x: i32::try_from(i64::from(rect.x) + dx).ok()?,
+        y: i32::try_from(i64::from(rect.y) + dy).ok()?,
+        width: rect.width,
+        height: rect.height,
+    })
+}
+
+fn rect_contains(outer: Rect, inner: Rect) -> bool {
+    inner.x >= outer.x
+        && inner.y >= outer.y
+        && inner.right() <= outer.right()
+        && inner.bottom() <= outer.bottom()
 }
 
 fn visible_frame_border_thickness(hwnd: HWND) -> u32 {
@@ -906,12 +1223,53 @@ fn logical_corner_radius(
     }
 }
 
-fn apply_window_alpha(pixels: &mut [u8], width: u32, height: u32, radius: f32) {
+/// Whether the alpha channel of a rendered window buffer carries information worth keeping.
+///
+/// The two capture backends disagree, and publishing both through the same mask is what made
+/// translucent windows opaque: geometric corner coverage is the *whole* answer for one and only
+/// half of it for the other.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AlphaSource {
+    /// The buffer has no meaningful alpha of its own, so the corner mask becomes the alpha.
+    ///
+    /// GDI never writes the alpha byte, so a `PrintWindow` render leaves whatever the DIB was
+    /// cleared to (zero) behind every opaque pixel it painted. The synthetic border ring is
+    /// likewise opaque by construction.
+    Coverage,
+    /// The buffer carries real per-pixel alpha, so the corner mask modulates it.
+    ///
+    /// Windows Graphics Capture publishes the composited window surface, where an acrylic or Mica
+    /// backdrop is genuinely translucent. Replacing that alpha with coverage publishes the
+    /// backdrop as if it were opaque, which reads as over-bright against whatever it is composited
+    /// onto later.
+    Content,
+}
+
+impl AlphaSource {
+    /// Combines the alpha already stored in a pixel with the geometric corner `coverage`.
+    fn combine(self, stored: u8, coverage: u8) -> u8 {
+        match self {
+            Self::Coverage => coverage,
+            // Rounded so a fully opaque source pixel reproduces `coverage` exactly, which keeps
+            // the `Coverage` and `Content` masks identical for opaque content.
+            Self::Content => ((u32::from(stored) * u32::from(coverage) + 127) / 255) as u8,
+        }
+    }
+}
+
+fn apply_window_alpha(
+    pixels: &mut [u8],
+    width: u32,
+    height: u32,
+    radius: f32,
+    alpha_source: AlphaSource,
+) {
     let stride = width as usize * 4;
     for y in 0..height {
         for x in 0..width {
-            let alpha = rounded_rect_coverage(x, y, width, height, radius);
+            let coverage = rounded_rect_coverage(x, y, width, height, radius);
             let offset = y as usize * stride + x as usize * 4;
+            let alpha = alpha_source.combine(pixels[offset + 3], coverage);
             pixels[offset + 3] = alpha;
             if alpha == 0 {
                 pixels[offset..offset + 3].fill(0);
@@ -934,6 +1292,7 @@ fn add_clean_window_border(
     content_height: u32,
     border_width: u32,
     inner_corner_radius: f32,
+    alpha_source: AlphaSource,
 ) -> Result<(Vec<u8>, u32, u32), CaptureError> {
     let content_stride = content_width
         .checked_mul(4)
@@ -951,6 +1310,7 @@ fn add_clean_window_border(
             content_width,
             content_height,
             inner_corner_radius,
+            alpha_source,
         );
         return Ok((content, content_width, content_height));
     }
@@ -977,35 +1337,52 @@ fn add_clean_window_border(
         pixel[..3].copy_from_slice(&WINDOW_BORDER_BGRA);
         pixel[3] = 255;
     }
-    apply_window_alpha(&mut framed, width, height, outer_corner_radius);
+    // The ring is synthetic and opaque, so its own mask never has content alpha to preserve.
+    apply_window_alpha(
+        &mut framed,
+        width,
+        height,
+        outer_corner_radius,
+        AlphaSource::Coverage,
+    );
 
     for content_y in 0..content_height {
         for content_x in 0..content_width {
-            let content_alpha = u32::from(rounded_rect_coverage(
+            // `coverage` is *area*: how much of this output pixel the rounded content rectangle
+            // occupies, with the border ring occupying the rest. It is deliberately kept separate
+            // from the content's own transparency below, because the two combine differently —
+            // area splits the pixel between content and ring, transparency does not.
+            let coverage = rounded_rect_coverage(
                 content_x,
                 content_y,
                 content_width,
                 content_height,
                 inner_corner_radius,
-            ));
-            if content_alpha == 0 {
+            );
+            if coverage == 0 {
                 continue;
             }
             let source_offset = content_y as usize * content_stride + content_x as usize * 4;
             let output_x = content_x + border_width;
             let output_y = content_y + border_width;
             let output_offset = output_y as usize * stride + output_x as usize * 4;
-            if content_alpha == 255 {
+            let source_alpha = alpha_source.combine(content[source_offset + 3], 255);
+            if coverage == 255 {
                 framed[output_offset..output_offset + 3]
                     .copy_from_slice(&content[source_offset..source_offset + 3]);
-                framed[output_offset + 3] = 255;
+                framed[output_offset + 3] = source_alpha;
                 continue;
             }
 
+            let content_alpha = u32::from(alpha_source.combine(source_alpha, coverage));
             let background_alpha = u32::from(framed[output_offset + 3]);
-            let remaining = 255 - content_alpha;
-            let retained_background_alpha = (background_alpha * remaining + 127) / 255;
+            let uncovered = 255 - u32::from(coverage);
+            let retained_background_alpha = (background_alpha * uncovered + 127) / 255;
             let output_alpha = content_alpha + retained_background_alpha;
+            if output_alpha == 0 {
+                framed[output_offset..output_offset + 4].fill(0);
+                continue;
+            }
             for channel in 0..3 {
                 let premultiplied = u32::from(content[source_offset + channel]) * content_alpha
                     + u32::from(framed[output_offset + channel]) * retained_background_alpha;
@@ -1261,6 +1638,75 @@ mod tests {
     }
 
     #[test]
+    fn inner_waits_are_bounded_by_what_the_caller_can_still_use() {
+        let ms = Duration::from_millis;
+        // (preferred, remaining, reserve) -> effective wait
+        let cases = [
+            // Plenty of deadline left: the backend keeps its own preferred bound.
+            ((ms(300), ms(700), ms(200)), ms(300)),
+            ((ms(300), ms(500), ms(200)), ms(300)),
+            // Squeezed: the caller's remaining time wins, minus what publishing still costs.
+            ((ms(300), ms(400), ms(200)), ms(200)),
+            ((ms(250), ms(300), ms(100)), ms(200)),
+            // Exactly enough to publish and no more, and past that point.
+            ((ms(300), ms(200), ms(200)), Duration::ZERO),
+            ((ms(300), ms(50), ms(200)), Duration::ZERO),
+            ((ms(300), Duration::ZERO, ms(200)), Duration::ZERO),
+        ];
+        for ((preferred, remaining, reserve), expected) in cases {
+            assert_eq!(
+                bounded_wait(preferred, remaining, reserve),
+                expected,
+                "preferred={preferred:?} remaining={remaining:?} reserve={reserve:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_whole_wgc_budget_fits_inside_the_outer_render_deadline() {
+        // The failure this guards: 300 ms first-frame wait plus 250 ms map retry, sized without
+        // reference to the 700 ms outer deadline, could outlast a device creation slow enough to
+        // matter — and the frame it finally produced was thrown away, having consumed a
+        // worker-lifetime slot for nothing.
+        let first_frame = Duration::from_millis(300);
+        let map = Duration::from_millis(250);
+        let readback_reserve = Duration::from_millis(200);
+        let publish_reserve = Duration::from_millis(100);
+        for device_creation_ms in [0, 50, 100, 200, 400, 600, 700, 900] {
+            let after_device =
+                WINDOW_RENDER_TIMEOUT.saturating_sub(Duration::from_millis(device_creation_ms));
+            let first_frame_wait = bounded_wait(first_frame, after_device, readback_reserve);
+            let after_first_frame = after_device.saturating_sub(first_frame_wait);
+            let map_wait = bounded_wait(map, after_first_frame, publish_reserve);
+            let waited = first_frame_wait + map_wait;
+            assert!(
+                waited <= after_device,
+                "device creation of {device_creation_ms} ms left {after_device:?} but the inner waits still asked for {waited:?}"
+            );
+            // ...and whenever the path runs at all, the readback and the border rebuild that
+            // follow the last wait still have room before the caller stops listening.
+            assert!(
+                first_frame_wait.is_zero() || after_device - waited >= publish_reserve,
+                "device creation of {device_creation_ms} ms left no room to publish"
+            );
+        }
+    }
+
+    #[test]
+    fn an_expired_deadline_offers_no_wait_at_all() {
+        let expired = RenderDeadline::starting_now(Duration::ZERO);
+        assert_eq!(expired.remaining(), Duration::ZERO);
+        assert_eq!(
+            expired.bounded_wait(Duration::from_millis(300), Duration::from_millis(200)),
+            Duration::ZERO
+        );
+
+        let fresh = RenderDeadline::starting_now(WINDOW_RENDER_TIMEOUT);
+        assert!(fresh.remaining() > Duration::ZERO);
+        assert!(fresh.remaining() <= WINDOW_RENDER_TIMEOUT);
+    }
+
+    #[test]
     fn render_permit_deadline_reclaims_capacity_idempotently() {
         let active = AtomicUsize::new(0);
         let first = WindowRenderPermit::acquire_from(&active, 2).expect("first permit");
@@ -1292,20 +1738,27 @@ mod tests {
     fn bounded_render_timeout_reclaims_capacity_before_late_completion() {
         let active = Box::leak(Box::new(AtomicUsize::new(0)));
         let workers = Box::leak(Box::new(AtomicUsize::new(0)));
+        let claimed = Box::leak(Box::new(Mutex::new(BTreeSet::new())));
         let permit = WindowRenderPermit::acquire_from(active, 1).expect("render permit");
-        let budget = WindowRenderBudget::acquire_from(workers, 1).expect("worker budget");
+        let budget =
+            WindowRenderBudget::acquire_from(workers, claimed, 1, 0x11).expect("worker budget");
         let (release_sender, release_receiver) = mpsc::sync_channel(0);
 
-        let error = run_bounded_window_render(permit, budget, Duration::ZERO, move || {
-            release_receiver.recv().expect("release late worker");
-            Ok(7_u8)
-        })
+        let error = run_bounded_window_render(
+            permit,
+            budget,
+            RenderDeadline::starting_now(Duration::ZERO),
+            move || {
+                release_receiver.recv().expect("release late worker");
+                Ok(7_u8)
+            },
+        )
         .expect_err("worker must exceed the immediate deadline");
 
         assert_eq!(error.kind, CaptureErrorKind::Timeout);
         assert_eq!(active.load(Ordering::Acquire), 0);
         assert_eq!(workers.load(Ordering::Acquire), 1);
-        assert!(WindowRenderBudget::acquire_from(workers, 1).is_err());
+        assert!(WindowRenderBudget::acquire_from(workers, claimed, 1, 0x22).is_err());
         let replacement =
             WindowRenderPermit::acquire_from(active, 1).expect("deadline reclaimed capacity");
         release_sender.send(()).expect("release detached worker");
@@ -1325,17 +1778,21 @@ mod tests {
     fn bounded_render_worker_panic_is_a_non_retryable_native_failure() {
         let active = Box::leak(Box::new(AtomicUsize::new(0)));
         let workers = Box::leak(Box::new(AtomicUsize::new(0)));
+        let claimed = Box::leak(Box::new(Mutex::new(BTreeSet::new())));
         let permit = WindowRenderPermit::acquire_from(active, 1).expect("render permit");
-        let budget = WindowRenderBudget::acquire_from(workers, 1).expect("worker budget");
+        let budget =
+            WindowRenderBudget::acquire_from(workers, claimed, 1, 0x11).expect("worker budget");
 
         // The worker terminates promptly by panicking, so this timeout only bounds a broken
         // harness. Keep it generous: a 1-second budget lost the race to thread spawn plus unwind
         // on coverage-instrumented CI runners and misreported the panic as a Timeout.
-        let error =
-            run_bounded_window_render::<u8>(permit, budget, Duration::from_secs(60), || {
-                panic!("scripted render panic")
-            })
-            .expect_err("panic disconnects the bounded worker");
+        let error = run_bounded_window_render::<u8>(
+            permit,
+            budget,
+            RenderDeadline::starting_now(Duration::from_secs(60)),
+            || panic!("scripted render panic"),
+        )
+        .expect_err("panic disconnects the bounded worker");
 
         assert_eq!(error.kind, CaptureErrorKind::NativeFailure);
         assert!(!error.retryable);
@@ -1346,21 +1803,76 @@ mod tests {
     #[test]
     fn native_render_worker_budget_is_a_strict_hard_cap() {
         let workers = AtomicUsize::new(0);
-        let first = WindowRenderBudget::acquire_from(&workers, 2).expect("first worker");
-        let second = WindowRenderBudget::acquire_from(&workers, 2).expect("second worker");
+        let claimed = Mutex::new(BTreeSet::new());
+        let first =
+            WindowRenderBudget::acquire_from(&workers, &claimed, 2, 0x11).expect("first worker");
+        let second =
+            WindowRenderBudget::acquire_from(&workers, &claimed, 2, 0x22).expect("second worker");
 
-        let error = WindowRenderBudget::acquire_from(&workers, 2).expect_err("worker cap");
-        assert_eq!(error.kind, CaptureErrorKind::BufferExhausted);
+        let error =
+            WindowRenderBudget::acquire_from(&workers, &claimed, 2, 0x33).expect_err("worker cap");
+        assert_eq!(error.kind, CaptureErrorKind::WorkersExhausted);
         assert!(error.message.contains("unbounded thread backlog"));
         // The budget is only reclaimed when a worker thread exits, so an immediate retry cannot
         // succeed while the cap is held; unlike the in-flight permit, this must not be retryable.
         assert!(!error.retryable);
-
+        // The rejected attempt must not leave its window claimed behind, or one exhausted moment
+        // would lock that window out until the process restarts.
+        drop(error);
         drop(first);
-        let replacement = WindowRenderBudget::acquire_from(&workers, 2).expect("released slot");
+        let replacement = WindowRenderBudget::acquire_from(&workers, &claimed, 2, 0x33)
+            .expect("released slot, and 0x33 was never left claimed");
         drop(second);
         drop(replacement);
         assert_eq!(workers.load(Ordering::Acquire), 0);
+        assert!(lock_render_targets(&claimed).is_empty());
+    }
+
+    #[test]
+    fn one_window_can_never_occupy_more_than_one_render_worker() {
+        // A window wedged inside its own window procedure holds its slot until the process exits.
+        // Eight retries against that one window used to consume the entire worker budget and
+        // disable window capture process-wide; now the second attempt is refused for free.
+        let workers = AtomicUsize::new(0);
+        let claimed = Mutex::new(BTreeSet::new());
+        let wedged = WindowRenderBudget::acquire_from(&workers, &claimed, 8, 0xBAD)
+            .expect("first render of the wedged window");
+
+        for attempt in 0..8 {
+            let error = WindowRenderBudget::acquire_from(&workers, &claimed, 8, 0xBAD)
+                .expect_err("a repeat attempt must not take a second slot");
+            assert_eq!(error.kind, CaptureErrorKind::BufferExhausted);
+            // The render already in flight is often another caller's and moments from finishing,
+            // so this one really can clear on its own.
+            assert!(error.retryable, "attempt {attempt}");
+            assert_eq!(
+                workers.load(Ordering::Acquire),
+                1,
+                "attempt {attempt} consumed a worker slot"
+            );
+        }
+
+        // Every other window is unaffected, which is the whole point.
+        let healthy = WindowRenderBudget::acquire_from(&workers, &claimed, 8, 0x600D)
+            .expect("an unrelated window still renders");
+        assert_eq!(workers.load(Ordering::Acquire), 2);
+
+        drop(healthy);
+        drop(wedged);
+        assert_eq!(workers.load(Ordering::Acquire), 0);
+        assert!(lock_render_targets(&claimed).is_empty());
+    }
+
+    #[test]
+    fn a_finished_render_releases_its_window_for_the_next_one() {
+        let workers = AtomicUsize::new(0);
+        let claimed = Mutex::new(BTreeSet::new());
+        let first = WindowRenderBudget::acquire_from(&workers, &claimed, 8, 0x11).expect("first");
+        drop(first);
+        let second = WindowRenderBudget::acquire_from(&workers, &claimed, 8, 0x11)
+            .expect("the same window renders again once its worker has exited");
+        drop(second);
+        assert!(lock_render_targets(&claimed).is_empty());
     }
 
     #[test]
@@ -1536,6 +2048,185 @@ mod tests {
         assert!(!region_is_blank(&source, source_bounds, region).expect("valid region"));
     }
 
+    /// A resizable window: `GetWindowRect` reports an 8px invisible resize frame around the
+    /// visible DWM frame, which itself carries a 2px visible border.
+    fn resizable_window_geometry() -> WindowGeometry {
+        let window = Rect {
+            x: 100,
+            y: 200,
+            width: 816,
+            height: 616,
+        };
+        let frame = Rect {
+            x: 108,
+            y: 200,
+            width: 800,
+            height: 608,
+        };
+        WindowGeometry {
+            window,
+            frame,
+            content: inset_rect(frame, 2).expect("the visible border fits inside the frame"),
+            border_thickness: 2,
+        }
+    }
+
+    #[test]
+    fn wgc_surface_matching_the_window_rect_crops_the_invisible_resize_frame() {
+        let geometry = resizable_window_geometry();
+        // Same crop PrintWindow performs, expressed in the surface's own coordinates: 8px of
+        // invisible resize frame on the left plus the 2px visible border.
+        assert_eq!(
+            wgc_content_crop(geometry.window.width, geometry.window.height, &geometry),
+            WgcCrop {
+                crop: Rect {
+                    x: 10,
+                    y: 2,
+                    width: 796,
+                    height: 604,
+                },
+                border_thickness: 2,
+                aligned: true,
+            }
+        );
+    }
+
+    #[test]
+    fn wgc_surface_matching_the_visible_frame_crops_only_the_border() {
+        let geometry = resizable_window_geometry();
+        // A surface that already excludes the invisible resize frame must not have it removed
+        // twice; only the visible border comes off.
+        assert_eq!(
+            wgc_content_crop(geometry.frame.width, geometry.frame.height, &geometry),
+            WgcCrop {
+                crop: Rect {
+                    x: 2,
+                    y: 2,
+                    width: 796,
+                    height: 604,
+                },
+                border_thickness: 2,
+                aligned: true,
+            }
+        );
+    }
+
+    #[test]
+    fn both_backends_publish_the_same_origin_and_size_for_one_window() {
+        let geometry = resizable_window_geometry();
+        for (surface_width, surface_height) in [
+            (geometry.window.width, geometry.window.height),
+            (geometry.frame.width, geometry.frame.height),
+        ] {
+            let wgc = wgc_content_crop(surface_width, surface_height, &geometry);
+            // The rebuilt border ring restores exactly what each backend cropped away, so the
+            // published frame is the visible DWM frame either way.
+            assert_eq!(
+                (
+                    wgc.crop.width + wgc.border_thickness * 2,
+                    wgc.crop.height + wgc.border_thickness * 2
+                ),
+                (
+                    geometry.content.width + geometry.border_thickness * 2,
+                    geometry.content.height + geometry.border_thickness * 2
+                ),
+                "surface {surface_width}x{surface_height}"
+            );
+            assert_eq!(
+                geometry.published_origin(wgc.border_thickness),
+                geometry.published_origin(geometry.border_thickness),
+                "surface {surface_width}x{surface_height}"
+            );
+            assert_eq!(
+                geometry.published_origin(wgc.border_thickness),
+                (geometry.frame.x, geometry.frame.y),
+                "surface {surface_width}x{surface_height}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unplaceable_wgc_surface_falls_back_to_a_symmetric_inset() {
+        let geometry = resizable_window_geometry();
+        // The window resized mid-capture, so neither measured rectangle describes the surface.
+        let unaligned = wgc_content_crop(640, 480, &geometry);
+        assert!(!unaligned.aligned);
+        assert_eq!(
+            unaligned.crop,
+            Rect {
+                x: 2,
+                y: 2,
+                width: 636,
+                height: 476,
+            }
+        );
+        assert_eq!(unaligned.border_thickness, 2);
+    }
+
+    #[test]
+    fn a_tiny_wgc_surface_clamps_the_border_it_rebuilds() {
+        let geometry = WindowGeometry {
+            window: Rect {
+                x: 0,
+                y: 0,
+                width: 400,
+                height: 400,
+            },
+            frame: Rect {
+                x: 0,
+                y: 0,
+                width: 400,
+                height: 400,
+            },
+            content: Rect {
+                x: 20,
+                y: 20,
+                width: 360,
+                height: 360,
+            },
+            border_thickness: 20,
+        };
+        let clamped = wgc_content_crop(8, 8, &geometry);
+        assert!(!clamped.aligned);
+        assert_eq!(clamped.border_thickness, 2);
+        assert_eq!(
+            clamped.crop,
+            Rect {
+                x: 2,
+                y: 2,
+                width: 4,
+                height: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn a_borderless_window_publishes_its_own_origin() {
+        let bounds = Rect {
+            x: -40,
+            y: 15,
+            width: 300,
+            height: 200,
+        };
+        let geometry = WindowGeometry {
+            window: bounds,
+            frame: bounds,
+            content: bounds,
+            border_thickness: 0,
+        };
+        let wgc = wgc_content_crop(bounds.width, bounds.height, &geometry);
+        assert!(wgc.aligned);
+        assert_eq!(
+            wgc.crop,
+            Rect {
+                x: 0,
+                y: 0,
+                ..bounds
+            }
+        );
+        assert_eq!(geometry.published_origin(0), (-40, 15));
+    }
+
     #[test]
     fn visible_dwm_border_is_inset_symmetrically() {
         assert_eq!(
@@ -1572,7 +2263,7 @@ mod tests {
     #[test]
     fn rounded_window_mask_has_transparent_antialiased_corners() {
         let mut pixels = vec![128_u8; 16 * 16 * 4];
-        apply_window_alpha(&mut pixels, 16, 16, 8.0);
+        apply_window_alpha(&mut pixels, 16, 16, 8.0, AlphaSource::Coverage);
         assert_eq!(pixels[3], 0);
         assert_eq!(pixels[(8 * 16 + 8) * 4 + 3], 255);
         assert!(pixels
@@ -1585,7 +2276,8 @@ mod tests {
     fn clean_window_border_expands_the_frame_without_changing_content() {
         let content = vec![10, 20, 30, 0, 40, 50, 60, 0];
         let (framed, width, height) =
-            add_clean_window_border(content, 2, 1, 1, 0.0).expect("bordered frame");
+            add_clean_window_border(content, 2, 1, 1, 0.0, AlphaSource::Coverage)
+                .expect("bordered frame");
         assert_eq!((width, height), (4, 3));
         let pixel = |x: u32, y: u32| {
             let offset = (y * width + x) as usize * 4;
@@ -1600,7 +2292,8 @@ mod tests {
     fn clean_window_border_preserves_transparent_rounded_corners() {
         let content = vec![200_u8; 8 * 8 * 4];
         let (framed, width, height) =
-            add_clean_window_border(content, 8, 8, 1, 4.0).expect("rounded bordered frame");
+            add_clean_window_border(content, 8, 8, 1, 4.0, AlphaSource::Coverage)
+                .expect("rounded bordered frame");
         assert_eq!((width, height), (10, 10));
         assert_eq!(&framed[..4], &[0, 0, 0, 0]);
         assert!(framed
@@ -1609,6 +2302,106 @@ mod tests {
         let top_center = (5 * 4) as usize;
         assert_eq!(&framed[top_center..top_center + 3], &[188, 180, 176]);
         assert!(framed[top_center + 3] > 200);
+    }
+
+    #[test]
+    fn corner_coverage_replaces_gdi_alpha_but_only_scales_wgc_alpha() {
+        // (stored alpha, corner coverage) -> (PrintWindow alpha, WGC alpha)
+        let cases = [
+            ((0_u8, 255_u8), (255_u8, 0_u8)),
+            ((128, 255), (255, 128)),
+            ((255, 255), (255, 255)),
+            ((255, 128), (128, 128)),
+            ((128, 128), (128, 64)),
+            ((200, 0), (0, 0)),
+            ((0, 0), (0, 0)),
+        ];
+        for ((stored, coverage), (expected_coverage_alpha, expected_content_alpha)) in cases {
+            assert_eq!(
+                AlphaSource::Coverage.combine(stored, coverage),
+                expected_coverage_alpha,
+                "coverage mask for stored={stored} coverage={coverage}"
+            );
+            assert_eq!(
+                AlphaSource::Content.combine(stored, coverage),
+                expected_content_alpha,
+                "content mask for stored={stored} coverage={coverage}"
+            );
+        }
+    }
+
+    #[test]
+    fn opaque_content_masks_identically_under_both_alpha_sources() {
+        // The WGC fix must be a no-op for opaque windows: an alpha-255 source multiplied by
+        // coverage has to reproduce coverage exactly, or every square window changes shape.
+        for coverage in 0..=255_u8 {
+            assert_eq!(
+                AlphaSource::Content.combine(255, coverage),
+                AlphaSource::Coverage.combine(255, coverage),
+                "coverage={coverage}"
+            );
+        }
+    }
+
+    #[test]
+    fn wgc_translucent_content_keeps_its_alpha_through_the_border_frame() {
+        // A uniformly half-transparent acrylic backdrop, big enough that the centre pixel is well
+        // clear of the rounded corners.
+        let content = [90_u8, 80, 70, 128].repeat(8 * 8);
+        let (framed, width, _) =
+            add_clean_window_border(content.clone(), 8, 8, 1, 4.0, AlphaSource::Content)
+                .expect("translucent bordered frame");
+        let centre = ((4 * width) + 4) as usize * 4;
+        assert_eq!(&framed[centre..centre + 4], &[90, 80, 70, 128]);
+
+        // The same buffer down the PrintWindow path is published opaque, because GDI alpha is
+        // garbage there and coverage is the only signal available.
+        let (opaque, _, _) = add_clean_window_border(content, 8, 8, 1, 4.0, AlphaSource::Coverage)
+            .expect("opaque bordered frame");
+        assert_eq!(&opaque[centre..centre + 4], &[90, 80, 70, 255]);
+    }
+
+    #[test]
+    fn wgc_fully_transparent_content_publishes_nothing_but_the_border() {
+        // A fully transparent WGC surface must not be resurrected as opaque black, and the
+        // compositor must not divide by the zero alpha it produces.
+        let content = vec![0_u8; 8 * 8 * 4];
+        let (framed, width, height) =
+            add_clean_window_border(content, 8, 8, 1, 4.0, AlphaSource::Content)
+                .expect("transparent bordered frame");
+        assert_eq!(framed.len(), (width * height) as usize * 4);
+
+        let centre = ((4 * width) + 4) as usize * 4;
+        assert_eq!(&framed[centre..centre + 4], &[0, 0, 0, 0]);
+        for content_y in 0..8_u32 {
+            for content_x in 0..8_u32 {
+                let offset = (((content_y + 1) * width) + content_x + 1) as usize * 4;
+                assert!(
+                    framed[offset + 3] < 255,
+                    "content pixel ({content_x},{content_y}) was published opaque"
+                );
+            }
+        }
+        // The synthetic ring itself is unaffected by the content's transparency.
+        let ring_top_centre = (width / 2) as usize * 4;
+        assert_eq!(
+            &framed[ring_top_centre..ring_top_centre + 3],
+            &WINDOW_BORDER_BGRA
+        );
+        assert!(framed[ring_top_centre + 3] > 200);
+    }
+
+    #[test]
+    fn wgc_translucent_content_survives_thumbnail_scaling() {
+        // StretchBlt drops the alpha byte, so a downscaled acrylic thumbnail used to arrive fully
+        // transparent (or, before this fix, was papered over by the coverage mask).
+        let pixels = [90_u8, 80, 70, 128].repeat(4 * 4);
+        let scaled = scale_bgra_with_dib(&pixels, 4, 4, 2, 2, "test_wgc_alpha_round_trip")
+            .expect("scale translucent WGC pixels through native DIBs");
+        assert_eq!(scaled.len(), 2 * 2 * 4);
+        for pixel in scaled.chunks_exact(4) {
+            assert_eq!(pixel[3], 128, "alpha must survive the GDI stretch");
+        }
     }
 
     #[test]
@@ -1625,22 +2418,50 @@ mod tests {
     }
 
     #[test]
-    fn normalized_wgc_rgb_survives_a_scaler_that_discards_alpha() {
-        let mut pixels = normalize_wgc_content(vec![25, 50, 100, 128]);
-        pixels[3] = 0;
+    fn wgc_rgb_survives_the_native_dib_thumbnail_round_trip() {
+        let premultiplied_pixel = [25_u8, 50, 100, 128];
+
+        let scaled = scale_bgra_with_dib(
+            &premultiplied_pixel.repeat(4),
+            2,
+            2,
+            1,
+            1,
+            "test_wgc_dib_round_trip",
+        )
+        .expect("scale premultiplied WGC pixels through native DIBs");
+        let pixels = normalize_wgc_content(scaled);
+
         assert_eq!(&pixels[..3], &[50, 100, 199]);
+        assert_eq!(pixels[3], 128);
     }
 
     #[test]
-    fn normalized_wgc_rgb_survives_native_dib_thumbnail_round_trip() {
-        let premultiplied_pixel = [25, 50, 100, 128];
-        let pixels = normalize_wgc_content(premultiplied_pixel.repeat(4));
+    fn scaling_before_unpremultiplying_keeps_transparent_pixels_from_darkening_the_result() {
+        // Half opaque white, half fully transparent. Unpremultiplying first zeroes the transparent
+        // half's colour, so the downscale averages a mid-grey into the survivor — a dark fringe
+        // around every translucent or rounded edge. Averaging in premultiplied space carries no
+        // colour at all out of a zero-alpha pixel.
+        let mut source = Vec::new();
+        source.extend_from_slice(&[255, 255, 255, 255]);
+        source.extend_from_slice(&[0, 0, 0, 0]);
+        source.extend_from_slice(&[255, 255, 255, 255]);
+        source.extend_from_slice(&[0, 0, 0, 0]);
 
-        let scaled = scale_bgra_with_dib(&pixels, 2, 2, 1, 1, "test_wgc_dib_round_trip")
-            .expect("scale normalized WGC pixels through native DIBs");
+        let scaled = scale_bgra_with_dib(&source, 2, 2, 1, 1, "test_wgc_premultiplied_downscale")
+            .expect("downscale premultiplied WGC pixels");
+        let straight = normalize_wgc_content(scaled);
 
-        assert_eq!(&scaled[..3], &[50, 100, 199]);
-        assert_ne!(&scaled[..3], &[0, 0, 0]);
+        assert!(
+            straight[..3].iter().all(|&channel| channel >= 250),
+            "half-covered white must stay white, got {:?}",
+            &straight[..3]
+        );
+        assert!(
+            (120..=136).contains(&straight[3]),
+            "half-covered white must be half transparent, got {}",
+            straight[3]
+        );
     }
 
     #[test]
@@ -1757,23 +2578,291 @@ mod tests {
         // SAFETY: The test environment supplies a live window handle and writable RECT storage.
         unsafe { GetWindowRect(hwnd, &mut bounds) }.expect("window bounds");
         let outer = rect_from_native(bounds).expect("valid bounds");
-        let visible_frame = visible_frame_bounds(hwnd, outer);
-        let border = visible_frame.border_thickness;
+        let geometry = window_geometry(hwnd, outer);
+        let border = geometry.border_thickness;
+        assert_eq!(captured.frame.width, geometry.content.width + border * 2);
+        assert_eq!(captured.frame.height, geometry.content.height + border * 2);
         assert_eq!(
-            captured.frame.width,
-            visible_frame.bounds.width + border * 2
+            (
+                captured.frame.metadata.source_rect.x,
+                captured.frame.metadata.source_rect.y
+            ),
+            geometry.published_origin(border)
+        );
+    }
+
+    /// Verifies on a real desktop what the table tests can only assert about arithmetic: that the
+    /// two backends, run against the *same live window*, publish the same rectangle — and reports
+    /// how much translucency each one kept.
+    ///
+    /// Run it against a standard resizable window with:
+    ///
+    /// CAPTASTIC_TEST_WINDOW_HANDLE=<hwnd> cargo test --locked -p captastic-windows \
+    ///     -- --ignored --nocapture both_backends_capture_a_live_window_identically
+    #[test]
+    #[ignore = "requires CAPTASTIC_TEST_WINDOW_HANDLE naming a live interactive window"]
+    fn both_backends_capture_a_live_window_identically() {
+        // SAFETY: Changes DPI virtualization only for this short-lived integration-test thread.
+        let _ = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        let raw = std::env::var("CAPTASTIC_TEST_WINDOW_HANDLE")
+            .expect("set CAPTASTIC_TEST_WINDOW_HANDLE")
+            .parse::<isize>()
+            .expect("numeric window handle");
+        let hwnd = HWND(raw);
+        let metadata = test_desktop().metadata;
+
+        let mut native = RECT::default();
+        // SAFETY: The test environment supplies a live window handle and writable RECT storage.
+        unsafe { GetWindowRect(hwnd, &mut native) }.expect("window bounds");
+        let geometry = window_geometry(hwnd, rect_from_native(native).expect("valid bounds"));
+        println!(
+            "window rect {}x{} at ({},{}); visible frame {}x{} at ({},{}); border {}px",
+            geometry.window.width,
+            geometry.window.height,
+            geometry.window.x,
+            geometry.window.y,
+            geometry.frame.width,
+            geometry.frame.height,
+            geometry.frame.x,
+            geometry.frame.y,
+            geometry.border_thickness,
+        );
+
+        // A responsive window takes the PrintWindow path; the WGC path is invoked directly so both
+        // can be compared for one window in one run.
+        let printed = capture_window_visual(NativeWindowHandle::from_raw(raw), &metadata)
+            .expect("PrintWindow capture");
+        assert_eq!(
+            printed.frame.metadata.backend, "windows-print-window",
+            "the target window must be responsive for this comparison to mean anything"
+        );
+        let captured = capture_window_with_wgc(
+            hwnd,
+            &metadata,
+            None,
+            &geometry,
+            RenderDeadline::starting_now(Duration::from_secs(30)),
+        )
+        .expect("Windows Graphics Capture");
+
+        assert_eq!(
+            (printed.frame.width, printed.frame.height),
+            (captured.frame.width, captured.frame.height),
+            "the backends cropped the window to different sizes"
         );
         assert_eq!(
-            captured.frame.height,
-            visible_frame.bounds.height + border * 2
+            printed.frame.metadata.source_rect, captured.frame.metadata.source_rect,
+            "the backends disagree about where the captured frame sits on the desktop"
+        );
+        assert_eq!(printed.corner_radius_px, captured.corner_radius_px);
+        // The visible DWM frame is exactly what both are expected to have published.
+        assert_eq!(
+            (printed.frame.width, printed.frame.height),
+            (geometry.frame.width, geometry.frame.height)
         );
         assert_eq!(
-            captured.frame.metadata.source_rect.x,
-            visible_frame.bounds.x - border as i32
+            (
+                printed.frame.metadata.source_rect.x,
+                printed.frame.metadata.source_rect.y
+            ),
+            (geometry.frame.x, geometry.frame.y)
         );
-        assert_eq!(
-            captured.frame.metadata.source_rect.y,
-            visible_frame.bounds.y - border as i32
+
+        let translucent = |frame: &CpuFrame| {
+            frame
+                .pixels
+                .chunks_exact(4)
+                .filter(|pixel| (1..255).contains(&pixel[3]))
+                .count()
+        };
+        println!(
+            "published {}x{} at ({},{}) from both backends; partially transparent pixels: PrintWindow {}, WGC {}",
+            printed.frame.width,
+            printed.frame.height,
+            printed.frame.metadata.source_rect.x,
+            printed.frame.metadata.source_rect.y,
+            translucent(&printed.frame),
+            translucent(&captured.frame),
+        );
+    }
+
+    /// A throwaway top-level window whose composited surface has genuine per-pixel alpha.
+    ///
+    /// Acrylic and Mica are the motivating cases for keeping WGC's alpha, but they cannot be
+    /// summoned on demand — a layered window updated with `AC_SRC_ALPHA` reaches DWM the same way
+    /// and is entirely under this test's control.
+    struct TranslucentTestWindow {
+        hwnd: HWND,
+    }
+
+    /// The probe has no behaviour of its own; every message takes the default handling.
+    unsafe extern "system" fn translucent_probe_proc(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> windows::Win32::Foundation::LRESULT {
+        // SAFETY: Win32 supplied these arguments and DefWindowProcW is their intended handler.
+        unsafe {
+            windows::Win32::UI::WindowsAndMessaging::DefWindowProcW(hwnd, message, wparam, lparam)
+        }
+    }
+
+    impl TranslucentTestWindow {
+        fn show(width: u32, height: u32, alpha: u8) -> Result<Self, CaptureError> {
+            let class = windows::core::w!("CaptasticTranslucentCaptureProbe");
+            // SAFETY: A null module name asks for the running executable's handle.
+            let instance = unsafe {
+                windows::Win32::System::LibraryLoader::GetModuleHandleW(
+                    windows::core::PCWSTR::null(),
+                )
+            }
+            .map_err(|error| windows_error("probe_module_handle", error, false))?;
+            let descriptor = windows::Win32::UI::WindowsAndMessaging::WNDCLASSW {
+                lpfnWndProc: Some(translucent_probe_proc),
+                hInstance: instance.into(),
+                lpszClassName: class,
+                ..Default::default()
+            };
+            // A repeated registration fails harmlessly when several tests share the process.
+            // SAFETY: descriptor and its borrowed class name outlive the call.
+            unsafe { windows::Win32::UI::WindowsAndMessaging::RegisterClassW(&descriptor) };
+
+            // SAFETY: The class is registered and no creation parameter is passed.
+            let hwnd = unsafe {
+                windows::Win32::UI::WindowsAndMessaging::CreateWindowExW(
+                    windows::Win32::UI::WindowsAndMessaging::WS_EX_LAYERED
+                        | windows::Win32::UI::WindowsAndMessaging::WS_EX_TOOLWINDOW
+                        | windows::Win32::UI::WindowsAndMessaging::WS_EX_TOPMOST,
+                    class,
+                    windows::core::w!("Captastic translucency probe"),
+                    windows::Win32::UI::WindowsAndMessaging::WS_POPUP,
+                    64,
+                    64,
+                    width as i32,
+                    height as i32,
+                    None,
+                    None,
+                    instance,
+                    None,
+                )
+            };
+            if hwnd.0 == 0 {
+                return Err(last_error("create_translucency_probe"));
+            }
+            let window = Self { hwnd };
+
+            // Pure red premultiplied by `alpha`, which is the representation UpdateLayeredWindow
+            // and Windows Graphics Capture both work in.
+            let mut surface = DibSurface::new(width, height)?;
+            let premultiplied_red = ((u32::from(alpha) * 255 + 127) / 255) as u8;
+            surface.write_pixels(
+                &[0, 0, premultiplied_red, alpha].repeat((width * height) as usize),
+            )?;
+
+            let destination = windows::Win32::Foundation::POINT { x: 64, y: 64 };
+            let origin = windows::Win32::Foundation::POINT { x: 0, y: 0 };
+            let size = windows::Win32::Foundation::SIZE {
+                cx: width as i32,
+                cy: height as i32,
+            };
+            let blend = windows::Win32::Graphics::Gdi::BLENDFUNCTION {
+                BlendOp: 0,
+                BlendFlags: 0,
+                SourceConstantAlpha: u8::MAX,
+                AlphaFormat: windows::Win32::Graphics::Gdi::AC_SRC_ALPHA as u8,
+            };
+            // SAFETY: A null HWND obtains the desktop DC, released immediately below.
+            let screen = unsafe { windows::Win32::Graphics::Gdi::GetDC(None) };
+            // SAFETY: Every borrowed structure and the selected DIB outlive the call.
+            let updated = unsafe {
+                windows::Win32::UI::WindowsAndMessaging::UpdateLayeredWindow(
+                    hwnd,
+                    screen,
+                    Some(&destination),
+                    Some(&size),
+                    surface.device,
+                    Some(&origin),
+                    windows::Win32::Foundation::COLORREF(0),
+                    Some(&blend),
+                    windows::Win32::UI::WindowsAndMessaging::ULW_ALPHA,
+                )
+            };
+            // SAFETY: Balances the GetDC(None) above on this thread.
+            unsafe { windows::Win32::Graphics::Gdi::ReleaseDC(None, screen) };
+            updated.map_err(|error| windows_error("present_translucency_probe", error, false))?;
+
+            // SAFETY: hwnd is this process's live top-level window.
+            unsafe {
+                windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+                    hwnd,
+                    windows::Win32::UI::WindowsAndMessaging::SW_SHOWNOACTIVATE,
+                )
+            };
+            // DWM needs a compose pass before Windows Graphics Capture has anything to hand back.
+            thread::sleep(Duration::from_millis(250));
+            Ok(window)
+        }
+    }
+
+    impl Drop for TranslucentTestWindow {
+        fn drop(&mut self) {
+            // SAFETY: The window was created on this thread and has not been destroyed yet.
+            let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd) };
+        }
+    }
+
+    /// The real-desktop half of the alpha fix: WGC has to *hand back* translucency for the
+    /// publication path to have any to keep.
+    ///
+    /// cargo test --locked -p captastic-windows -- --ignored --nocapture \
+    ///     wgc_publishes_a_translucent_window_translucently
+    #[test]
+    #[ignore = "briefly shows a real translucent window on the interactive desktop"]
+    fn wgc_publishes_a_translucent_window_translucently() {
+        const PROBE_ALPHA: u8 = 128;
+        // SAFETY: Changes DPI virtualization only for this short-lived integration-test thread.
+        let _ = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        let window = TranslucentTestWindow::show(240, 160, PROBE_ALPHA).expect("translucent probe");
+
+        let mut native = RECT::default();
+        // SAFETY: The probe window is live and native is writable for the exact RECT size.
+        unsafe { GetWindowRect(window.hwnd, &mut native) }.expect("probe bounds");
+        let geometry =
+            window_geometry(window.hwnd, rect_from_native(native).expect("valid bounds"));
+        let captured = capture_window_with_wgc(
+            window.hwnd,
+            &test_desktop().metadata,
+            None,
+            &geometry,
+            RenderDeadline::starting_now(Duration::from_secs(30)),
+        )
+        .expect("Windows Graphics Capture of the translucent probe");
+
+        let translucent = captured
+            .frame
+            .pixels
+            .chunks_exact(4)
+            .filter(|pixel| (PROBE_ALPHA - 16..=PROBE_ALPHA + 16).contains(&pixel[3]))
+            .count();
+        let total = (captured.frame.width * captured.frame.height) as usize;
+        println!(
+            "probe published {}x{}: {translucent}/{total} pixels at ~{PROBE_ALPHA} alpha",
+            captured.frame.width, captured.frame.height,
+        );
+        assert!(
+            translucent * 2 > total,
+            "a half-transparent window was published with only {translucent} of {total} pixels translucent"
+        );
+        // The colour must survive unpremultiplication rather than staying at the premultiplied
+        // value it arrived as.
+        let centre = ((captured.frame.height / 2) * captured.frame.width + captured.frame.width / 2)
+            as usize
+            * 4;
+        assert!(
+            captured.frame.pixels[centre + 2] > 240,
+            "the probe's red channel came back at {} instead of ~255",
+            captured.frame.pixels[centre + 2]
         );
     }
 
