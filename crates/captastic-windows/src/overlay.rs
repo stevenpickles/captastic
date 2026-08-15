@@ -98,6 +98,14 @@ const WM_OVERVIEW_RENDER_BATCH: u32 = WM_APP + 1;
 const DIM_ALPHA: u8 = 128;
 const LIVE_HIT_TEST_ALPHA: u8 = 1;
 const _: () = assert!(LIVE_HIT_TEST_ALPHA > 0);
+/// Alpha byte the live background fill stamps on every pixel before the chrome pass. GDI
+/// drawing writes 0 into a 32bpp DIB's reserved byte, so after the chrome is drawn the alpha
+/// byte is an exact per-pixel coverage signal: 0 means some GDI operation painted the pixel,
+/// this sentinel means untouched background. Color cannot carry that signal - the fill is pure
+/// black and so is the outline's contrast halo (M19). The present pass rewrites every alpha
+/// byte, so the sentinel itself never reaches the screen.
+const LIVE_UNDRAWN_ALPHA: u8 = u8::MAX;
+const _: () = assert!(LIVE_UNDRAWN_ALPHA != 0);
 const REGION_CURSOR_SIZE: u32 = 64;
 const REGION_CURSOR_CENTER: i32 = REGION_CURSOR_SIZE as i32 / 2;
 const WINDOW_THUMBNAIL_MAX_PIXELS: u64 = 1_200_000;
@@ -2015,36 +2023,22 @@ fn copy_overlay_to_paint_device(device: HDC, state: &OverlayState) {
 }
 
 fn paint_live_selection_background(state: &OverlayState) {
-    let bounds = RECT {
-        left: 0,
-        top: 0,
-        right: state.back_buffer.width,
-        bottom: state.back_buffer.height,
-    };
-    fill_device_rect(state.back_buffer.device, bounds, COLORREF(0));
+    // SAFETY: Flushes queued GDI work so none of it can land on top of the CPU fill below.
+    let _ = unsafe { GdiFlush() };
+    fill_live_background(&state.back_buffer);
+}
 
-    if let Some(selection) = state
-        .model
-        .selection
-        .and_then(|rect| rect.intersection(state.model.source))
-    {
-        let local = RECT {
-            left: selection.x.saturating_sub(state.model.source.x),
-            top: selection.y.saturating_sub(state.model.source.y),
-            right: i32::try_from(
-                selection
-                    .right()
-                    .saturating_sub(i64::from(state.model.source.x)),
-            )
-            .unwrap_or(state.back_buffer.width),
-            bottom: i32::try_from(
-                selection
-                    .bottom()
-                    .saturating_sub(i64::from(state.model.source.y)),
-            )
-            .unwrap_or(state.back_buffer.height),
-        };
-        fill_device_rect(state.back_buffer.device, local, COLORREF(0));
+/// Fills the whole surface with pure black carrying [`LIVE_UNDRAWN_ALPHA`] in the alpha byte.
+/// Every GDI chrome draw that follows zeroes the alpha of the pixels it touches, which is what
+/// lets the present pass recognize black chrome as chrome instead of background.
+fn fill_live_background(surface: &FrozenSurface) {
+    // SAFETY: The surface uniquely owns this writable DIB on the overlay thread.
+    let pixels = unsafe { std::slice::from_raw_parts_mut(surface.bits, surface.byte_length) };
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel[0] = 0;
+        pixel[1] = 0;
+        pixel[2] = 0;
+        pixel[3] = LIVE_UNDRAWN_ALPHA;
     }
 }
 
@@ -2117,7 +2111,10 @@ fn prepare_live_layer_pixels(state: &OverlayState) {
     for y in 0..height {
         for x in 0..width {
             let offset = (y * width + x) * 4;
-            let colored = pixels[offset] != 0 || pixels[offset + 1] != 0 || pixels[offset + 2] != 0;
+            // GDI zeroed the alpha byte of every pixel the chrome pass painted; the background
+            // fill's sentinel survives everywhere else. This is coverage, not color, so the
+            // pure-black contrast halo and handle rings classify as chrome (M19).
+            let drawn = pixels[offset + 3] == 0;
             let in_selection = selection.is_some_and(|rect| {
                 x >= rect.left.max(0) as usize
                     && x < rect.right.max(0) as usize
@@ -2128,7 +2125,7 @@ fn prepare_live_layer_pixels(state: &OverlayState) {
                 state.model.tool,
                 state.model.dim_background,
                 in_selection,
-                colored,
+                drawn,
             );
         }
     }
@@ -2138,9 +2135,9 @@ const fn live_pixel_alpha(
     tool: CaptureTool,
     dim_background: bool,
     in_selection: bool,
-    colored: bool,
+    drawn: bool,
 ) -> u8 {
-    if matches!(tool, CaptureTool::Window) || colored {
+    if matches!(tool, CaptureTool::Window) || drawn {
         u8::MAX
     } else if in_selection || !dim_background {
         LIVE_HIT_TEST_ALPHA
@@ -5067,6 +5064,54 @@ mod tests {
         );
         assert_eq!(
             live_pixel_alpha(CaptureTool::Region, false, false, false),
+            LIVE_HIT_TEST_ALPHA
+        );
+    }
+
+    #[test]
+    fn black_chrome_pixels_are_opaque_in_live_region_mode() {
+        // Reproduce the live pipeline on a real DIB: sentinel-alpha fill, then pure-black GDI
+        // chrome the way draw_outline's contrast halo and draw_resize_handles' rings paint it.
+        let surface = FrozenSurface::empty(32, 32).expect("surface");
+        fill_live_background(&surface);
+        fill_device_rect(
+            surface.device,
+            RECT {
+                left: 8,
+                top: 8,
+                right: 24,
+                bottom: 24,
+            },
+            COLORREF(0),
+        );
+        // SAFETY: Flushes the queued fill before the CPU reads the DIB bytes.
+        let _ = unsafe { GdiFlush() };
+        // SAFETY: The surface uniquely owns this readable DIB on the test thread.
+        let pixels = unsafe { std::slice::from_raw_parts(surface.bits, surface.byte_length) };
+        let alpha_at = |x: usize, y: usize| pixels[(y * 32 + x) * 4 + 3];
+
+        // GDI zeroed the alpha byte of the drawn black pixels; untouched background keeps the
+        // sentinel. Coverage therefore separates the two even though both are pure black.
+        assert_eq!(alpha_at(16, 16), 0, "drawn black pixel reads as chrome");
+        assert_eq!(
+            alpha_at(2, 2),
+            LIVE_UNDRAWN_ALPHA,
+            "untouched background keeps the sentinel"
+        );
+
+        // And the present-pass classification: drawn black chrome becomes opaque where the old
+        // color heuristic left it at background alpha; genuinely undrawn areas keep the
+        // reserved dim and hit-test values.
+        assert_eq!(
+            live_pixel_alpha(CaptureTool::Region, true, false, true),
+            u8::MAX
+        );
+        assert_eq!(
+            live_pixel_alpha(CaptureTool::Region, true, false, false),
+            DIM_ALPHA
+        );
+        assert_eq!(
+            live_pixel_alpha(CaptureTool::Region, false, true, false),
             LIVE_HIT_TEST_ALPHA
         );
     }
