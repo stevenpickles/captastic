@@ -287,7 +287,7 @@ fn capture_with_preview_fallback(
                 )
             })?;
             recorder.record(request.id, PerfEventKind::SelectionStarted, 0);
-            let ui_store = captastic_config::UiStateStore::for_default_config();
+            let ui_store = captastic_config::UiStateStore::for_default_storage();
             let remembered_ui =
                 load_optional_one_shot_ui_state(&ui_store, &full_frame.metadata.display_id.0);
             let worker = selection::OneShotUiStateWorker::start(ui_store)?;
@@ -483,7 +483,7 @@ fn capture_with_live_selection(mut args: cli::CaptureArgs) -> Result<(), AppErro
     recorder.record(capture_id, PerfEventKind::TriggerEnqueued, 0);
     recorder.record(capture_id, PerfEventKind::TriggerDequeued, 0);
 
-    let ui_store = captastic_config::UiStateStore::for_default_config();
+    let ui_store = captastic_config::UiStateStore::for_default_storage();
     let remembered_ui = load_optional_one_shot_ui_state(&ui_store, &metadata.display_id.0);
     let ui_worker = selection::OneShotUiStateWorker::start(ui_store)?;
     // One-shot: fresh resources per attempt. A live-presenter failure falls back into
@@ -1064,7 +1064,7 @@ mod tests {
             std::env::temp_dir().join(format!("captastic-one-shot-ui-load-{}", std::process::id()));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory).expect("create directory at config path");
-        let store = captastic_config::UiStateStore::for_config(&directory);
+        let store = captastic_config::UiStateStore::at(&directory);
 
         assert_eq!(
             load_optional_one_shot_ui_state(&store, "display-1"),
@@ -1083,7 +1083,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory).expect("create directory at config path");
-        let store = captastic_config::UiStateStore::for_config(&directory);
+        let store = captastic_config::UiStateStore::at(&directory);
         let worker = selection::OneShotUiStateWorker::start(store).expect("start one-shot worker");
         worker
             .controller()

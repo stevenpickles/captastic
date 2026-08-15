@@ -1070,7 +1070,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory).expect("create invalid config path");
-        let store = captastic_config::UiStateStore::for_config(&directory);
+        let store = captastic_config::UiStateStore::at(&directory);
         let worker = OneShotUiStateWorker::start(store).expect("start one-shot worker");
         worker
             .controller()
@@ -1094,7 +1094,7 @@ mod tests {
             std::env::temp_dir().join(format!("captastic-ui-state-failure-{}", std::process::id()));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory).expect("create invalid config path");
-        let store = captastic_config::UiStateStore::for_config(&directory);
+        let store = captastic_config::UiStateStore::at(&directory);
         let (update_sender, update_receiver) = mpsc::channel();
         let (failure_sender, failure_receiver) = mpsc::channel();
         update_sender

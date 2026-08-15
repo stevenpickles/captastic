@@ -15,6 +15,12 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod ui_state;
+
+pub use ui_state::{
+    resolve_display_ui_state, UiState, UiStateStore, STATE_FILE_NAME, STATE_SCHEMA_VERSION,
+};
+
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
 pub const CONFIG_FILE_NAME: &str = "captastic.toml";
 
@@ -299,16 +305,6 @@ pub enum CaptureTool {
     Region,
 }
 
-impl CaptureTool {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::FullDisplay => "full_display",
-            Self::Window => "window",
-            Self::Region => "region",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaptureRegion {
@@ -352,88 +348,7 @@ pub struct DisplayUiState {
     pub region_is_display_local: bool,
 }
 
-#[derive(Clone, Debug)]
-pub struct UiStateStore {
-    path: Option<PathBuf>,
-}
-
-impl UiStateStore {
-    pub fn for_default_config() -> Self {
-        Self {
-            path: default_config_path(),
-        }
-    }
-
-    pub fn for_config(path: impl Into<PathBuf>) -> Self {
-        Self {
-            path: Some(path.into()),
-        }
-    }
-
-    pub fn path(&self) -> Option<&Path> {
-        self.path.as_deref()
-    }
-
-    pub fn prepare_for_open(&self) -> Result<PathBuf, ConfigError> {
-        let path = self.required_path()?;
-        prepare_config_path_for_open(
-            path,
-            default_config_path().as_deref(),
-            ensure_default_config,
-        )
-    }
-
-    fn required_path(&self) -> Result<&Path, ConfigError> {
-        self.path
-            .as_deref()
-            .ok_or(ConfigError::HomeDirectoryUnavailable)
-    }
-
-    pub fn load_display_ui_state(&self, display_id: &str) -> Result<DisplayUiState, ConfigError> {
-        let config = AppConfig::load_optional(self.required_path()?)?;
-        Ok(resolve_display_ui_state(&config.ui, display_id))
-    }
-
-    pub fn save_display_overlay_center(
-        &self,
-        display_id: &str,
-        center_x: f64,
-        center_y: f64,
-    ) -> Result<(), ConfigError> {
-        let path = self.required_path()?;
-        let source = read_optional_config_source(path)?;
-        let updated = update_display_overlay_center(&source, display_id, center_x, center_y)?;
-        write_config_source(path, updated)
-    }
-
-    pub fn save_display_interaction_state(
-        &self,
-        display_id: &str,
-        tool: CaptureTool,
-        region: Option<CaptureRegion>,
-        region_source: Option<CaptureRegionSource>,
-    ) -> Result<(), ConfigError> {
-        let path = self.required_path()?;
-        let source = read_optional_config_source(path)?;
-        let updated =
-            update_display_interaction_state(&source, display_id, tool, region, region_source)?;
-        write_config_source(path, updated)
-    }
-
-    pub fn save_display_confirmed_region(
-        &self,
-        display_id: &str,
-        region: CaptureRegion,
-        source: CaptureRegionSource,
-    ) -> Result<(), ConfigError> {
-        let path = self.required_path()?;
-        let current = read_optional_config_source(path)?;
-        let updated = update_display_confirmed_region(&current, display_id, region, source)?;
-        write_config_source(path, updated)
-    }
-}
-
-fn prepare_config_path_for_open(
+pub(crate) fn prepare_config_path_for_open(
     path: &Path,
     default_path: Option<&Path>,
     ensure_default: impl FnOnce() -> Result<PathBuf, ConfigError>,
@@ -720,101 +635,114 @@ impl AppConfig {
                 "ui.last_region width and height must be greater than zero".to_owned(),
             ));
         }
-        for (display_id, state) in &self.ui.displays {
-            if display_id.trim().is_empty() {
-                return Err(ConfigError::InvalidValue(
-                    "ui.displays keys must not be empty".to_owned(),
-                ));
-            }
-            if state.overlay_x.is_some() != state.overlay_y.is_some() {
-                return Err(ConfigError::InvalidValue(format!(
-                    "ui.displays.{display_id}.overlay_x and overlay_y must either both be set or both be omitted"
-                )));
-            }
-            if state.overlay_center_x.is_some() != state.overlay_center_y.is_some() {
-                return Err(ConfigError::InvalidValue(format!(
-                    "ui.displays.{display_id}.overlay_center_x and overlay_center_y must either both be set or both be omitted"
-                )));
-            }
-            if state
-                .overlay_center_x
-                .zip(state.overlay_center_y)
-                .is_some_and(|(x, y)| {
-                    !x.is_finite()
-                        || !y.is_finite()
-                        || !(0.0..=1.0).contains(&x)
-                        || !(0.0..=1.0).contains(&y)
-                })
-            {
-                return Err(ConfigError::InvalidValue(format!(
-                    "ui.displays.{display_id} overlay center coordinates must be finite values between 0 and 1"
-                )));
-            }
-            if state
-                .last_region
-                .is_some_and(|region| region.width == 0 || region.height == 0)
-            {
-                return Err(ConfigError::InvalidValue(format!(
-                    "ui.displays.{display_id}.last_region width and height must be greater than zero"
-                )));
-            }
-            if let Some(source) = state.last_region_source {
-                if source.width == 0 || source.height == 0 {
-                    return Err(ConfigError::InvalidValue(format!(
-                        "ui.displays.{display_id}.last_region_source dimensions must be greater than zero"
-                    )));
-                }
-                if !matches!(source.rotation_degrees, 0 | 90 | 180 | 270) {
-                    return Err(ConfigError::InvalidValue(format!(
-                        "ui.displays.{display_id}.last_region_source rotation must be 0, 90, 180, or 270 degrees"
-                    )));
-                }
-                if state.last_region.is_none() {
-                    return Err(ConfigError::InvalidValue(format!(
-                        "ui.displays.{display_id}.last_region_source requires last_region"
-                    )));
-                }
-            }
-            match (
-                state.last_confirmed_region,
-                state.last_confirmed_region_source,
-            ) {
-                (Some(region), Some(source)) => {
-                    let right = i64::from(region.x) + i64::from(region.width);
-                    let bottom = i64::from(region.y) + i64::from(region.height);
-                    if region.x < 0
-                        || region.y < 0
-                        || region.width == 0
-                        || region.height == 0
-                        || source.width == 0
-                        || source.height == 0
-                        || right > i64::from(source.width)
-                        || bottom > i64::from(source.height)
-                    {
-                        return Err(ConfigError::InvalidValue(format!(
-                            "ui.displays.{display_id}.last_confirmed_region must fit its source geometry"
-                        )));
-                    }
-                    if !matches!(source.rotation_degrees, 0 | 90 | 180 | 270) {
-                        return Err(ConfigError::InvalidValue(format!(
-                            "ui.displays.{display_id}.last_confirmed_region_source rotation must be 0, 90, 180, or 270 degrees"
-                        )));
-                    }
-                }
-                (None, None) => {}
-                _ => {
-                    return Err(ConfigError::InvalidValue(format!(
-                        "ui.displays.{display_id} confirmed region and source must both be set or both be omitted"
-                    )));
-                }
-            }
-        }
+        validate_display_entries(&self.ui.displays)?;
         Ok(())
     }
 
     pub fn to_toml_pretty(&self) -> Result<String, ConfigError> {
         toml::to_string_pretty(self).map_err(ConfigError::Serialize)
     }
+}
+
+/// Validates the per-display entries shared by the configuration's legacy `[ui]` section and
+/// Captastic's own state file.
+///
+/// Both carry the same `DisplayUiConfig` values and both can be wrong in the same ways: the
+/// configuration because a user hand-edited it, the state file because a previous version wrote
+/// something this one rejects. One function so the two cannot drift apart.
+pub(crate) fn validate_display_entries(
+    displays: &BTreeMap<String, DisplayUiConfig>,
+) -> Result<(), ConfigError> {
+    for (display_id, state) in displays {
+        if display_id.trim().is_empty() {
+            return Err(ConfigError::InvalidValue(
+                "ui.displays keys must not be empty".to_owned(),
+            ));
+        }
+        if state.overlay_x.is_some() != state.overlay_y.is_some() {
+            return Err(ConfigError::InvalidValue(format!(
+                "ui.displays.{display_id}.overlay_x and overlay_y must either both be set or both be omitted"
+            )));
+        }
+        if state.overlay_center_x.is_some() != state.overlay_center_y.is_some() {
+            return Err(ConfigError::InvalidValue(format!(
+                "ui.displays.{display_id}.overlay_center_x and overlay_center_y must either both be set or both be omitted"
+            )));
+        }
+        if state
+            .overlay_center_x
+            .zip(state.overlay_center_y)
+            .is_some_and(|(x, y)| {
+                !x.is_finite()
+                    || !y.is_finite()
+                    || !(0.0..=1.0).contains(&x)
+                    || !(0.0..=1.0).contains(&y)
+            })
+        {
+            return Err(ConfigError::InvalidValue(format!(
+                "ui.displays.{display_id} overlay center coordinates must be finite values between 0 and 1"
+            )));
+        }
+        if state
+            .last_region
+            .is_some_and(|region| region.width == 0 || region.height == 0)
+        {
+            return Err(ConfigError::InvalidValue(format!(
+                "ui.displays.{display_id}.last_region width and height must be greater than zero"
+            )));
+        }
+        if let Some(source) = state.last_region_source {
+            if source.width == 0 || source.height == 0 {
+                return Err(ConfigError::InvalidValue(format!(
+                    "ui.displays.{display_id}.last_region_source dimensions must be greater than zero"
+                )));
+            }
+            if !matches!(source.rotation_degrees, 0 | 90 | 180 | 270) {
+                return Err(ConfigError::InvalidValue(format!(
+                    "ui.displays.{display_id}.last_region_source rotation must be 0, 90, 180, or 270 degrees"
+                )));
+            }
+            if state.last_region.is_none() {
+                return Err(ConfigError::InvalidValue(format!(
+                    "ui.displays.{display_id}.last_region_source requires last_region"
+                )));
+            }
+        }
+        match (
+            state.last_confirmed_region,
+            state.last_confirmed_region_source,
+        ) {
+            (Some(region), Some(source)) => {
+                let right = i64::from(region.x) + i64::from(region.width);
+                let bottom = i64::from(region.y) + i64::from(region.height);
+                if region.x < 0
+                    || region.y < 0
+                    || region.width == 0
+                    || region.height == 0
+                    || source.width == 0
+                    || source.height == 0
+                    || right > i64::from(source.width)
+                    || bottom > i64::from(source.height)
+                {
+                    return Err(ConfigError::InvalidValue(format!(
+                        "ui.displays.{display_id}.last_confirmed_region must fit its source geometry"
+                    )));
+                }
+                if !matches!(source.rotation_degrees, 0 | 90 | 180 | 270) {
+                    return Err(ConfigError::InvalidValue(format!(
+                        "ui.displays.{display_id}.last_confirmed_region_source rotation must be 0, 90, 180, or 270 degrees"
+                    )));
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(ConfigError::InvalidValue(format!(
+                    "ui.displays.{display_id} confirmed region and source must both be set or both be omitted"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn quarantine_damaged_config(
@@ -838,237 +766,7 @@ fn quarantine_damaged_config(
     ))
 }
 
-pub fn load_display_ui_state(display_id: &str) -> Result<DisplayUiState, ConfigError> {
-    UiStateStore::for_default_config().load_display_ui_state(display_id)
-}
-
-pub fn resolve_display_ui_state(ui: &UiConfig, display_id: &str) -> DisplayUiState {
-    let display = ui.displays.get(display_id);
-    let display_region = display.and_then(|state| state.last_region);
-    DisplayUiState {
-        overlay_center: display
-            .and_then(|state| state.overlay_center_x.zip(state.overlay_center_y)),
-        overlay_position: display
-            .and_then(|state| state.overlay_x.zip(state.overlay_y))
-            .or_else(|| ui.overlay_x.zip(ui.overlay_y)),
-        tool: display
-            .and_then(|state| state.last_capture_tool)
-            .or(ui.last_capture_tool),
-        region: display_region.or(ui.last_region),
-        region_source: display.and_then(|state| state.last_region_source),
-        region_is_display_local: display_region.is_some(),
-        confirmed_region: display
-            .and_then(|state| {
-                state
-                    .last_confirmed_region
-                    .zip(state.last_confirmed_region_source)
-            })
-            .map(|(region, source)| ConfirmedRegion { region, source }),
-    }
-}
-
-pub fn save_display_overlay_center(
-    display_id: &str,
-    center_x: f64,
-    center_y: f64,
-) -> Result<(), ConfigError> {
-    UiStateStore::for_default_config().save_display_overlay_center(display_id, center_x, center_y)
-}
-
-fn update_display_overlay_center(
-    source: &str,
-    display_id: &str,
-    center_x: f64,
-    center_y: f64,
-) -> Result<String, ConfigError> {
-    if !center_x.is_finite()
-        || !center_y.is_finite()
-        || !(0.0..=1.0).contains(&center_x)
-        || !(0.0..=1.0).contains(&center_y)
-    {
-        return Err(ConfigError::InvalidValue(
-            "display overlay center coordinates must be finite values between 0 and 1".to_owned(),
-        ));
-    }
-    let mut document = editable_document(source)?;
-    let display_path = format!("ui.displays.{display_id}");
-    let state = display_state(&mut document, display_id)?;
-    *ensure_table(state, &display_path, "overlay_center_x")? = toml_edit::value(center_x);
-    *ensure_table(state, &display_path, "overlay_center_y")? = toml_edit::value(center_y);
-    if let Some(table) = state.as_table_like_mut() {
-        table.remove("overlay_x");
-        table.remove("overlay_y");
-    }
-    Ok(document.to_string())
-}
-
-pub fn save_display_overlay_position(display_id: &str, x: i32, y: i32) -> Result<(), ConfigError> {
-    let path = default_config_path().ok_or(ConfigError::HomeDirectoryUnavailable)?;
-    let source = read_optional_config_source(&path)?;
-    let updated = update_display_overlay_position(&source, display_id, x, y)?;
-    write_config_source(&path, updated)
-}
-
-fn update_display_overlay_position(
-    source: &str,
-    display_id: &str,
-    x: i32,
-    y: i32,
-) -> Result<String, ConfigError> {
-    let mut document = editable_document(source)?;
-    let display_path = format!("ui.displays.{display_id}");
-    let state = display_state(&mut document, display_id)?;
-    *ensure_table(state, &display_path, "overlay_x")? = toml_edit::value(i64::from(x));
-    *ensure_table(state, &display_path, "overlay_y")? = toml_edit::value(i64::from(y));
-    Ok(document.to_string())
-}
-
-pub fn save_display_interaction_state(
-    display_id: &str,
-    tool: CaptureTool,
-    region: Option<CaptureRegion>,
-    region_source: Option<CaptureRegionSource>,
-) -> Result<(), ConfigError> {
-    UiStateStore::for_default_config().save_display_interaction_state(
-        display_id,
-        tool,
-        region,
-        region_source,
-    )
-}
-
-fn update_display_interaction_state(
-    source: &str,
-    display_id: &str,
-    tool: CaptureTool,
-    region: Option<CaptureRegion>,
-    region_source: Option<CaptureRegionSource>,
-) -> Result<String, ConfigError> {
-    if region.is_some_and(|region| region.width == 0 || region.height == 0)
-        || region_source.is_some_and(|source| source.width == 0 || source.height == 0)
-    {
-        return Err(ConfigError::InvalidValue(
-            "last_region and last_region_source dimensions must be greater than zero".to_owned(),
-        ));
-    }
-    let mut document = editable_document(source)?;
-    let display_path = format!("ui.displays.{display_id}");
-    let state = display_state(&mut document, display_id)?;
-    *ensure_table(state, &display_path, "last_capture_tool")? = toml_edit::value(tool.as_str());
-    if let Some(region) = region {
-        let region_path = format!("{display_path}.last_region");
-        *ensure_table(
-            ensure_table(state, &display_path, "last_region")?,
-            &region_path,
-            "x",
-        )? = toml_edit::value(i64::from(region.x));
-        *ensure_table(
-            ensure_table(state, &display_path, "last_region")?,
-            &region_path,
-            "y",
-        )? = toml_edit::value(i64::from(region.y));
-        *ensure_table(
-            ensure_table(state, &display_path, "last_region")?,
-            &region_path,
-            "width",
-        )? = toml_edit::value(i64::from(region.width));
-        *ensure_table(
-            ensure_table(state, &display_path, "last_region")?,
-            &region_path,
-            "height",
-        )? = toml_edit::value(i64::from(region.height));
-        if let Some(region_source) = region_source {
-            let source_path = format!("{display_path}.last_region_source");
-            *ensure_table(
-                ensure_table(state, &display_path, "last_region_source")?,
-                &source_path,
-                "width",
-            )? = toml_edit::value(i64::from(region_source.width));
-            *ensure_table(
-                ensure_table(state, &display_path, "last_region_source")?,
-                &source_path,
-                "height",
-            )? = toml_edit::value(i64::from(region_source.height));
-            *ensure_table(
-                ensure_table(state, &display_path, "last_region_source")?,
-                &source_path,
-                "rotation_degrees",
-            )? = toml_edit::value(i64::from(region_source.rotation_degrees));
-        } else if let Some(table) = state.as_table_like_mut() {
-            table.remove("last_region_source");
-        }
-    }
-    Ok(document.to_string())
-}
-
-/// Mutably indexes into `parent[key]`, mirroring the implicit-table creation that
-/// `toml_edit`'s panicking `Index`/`IndexMut` operators perform for an absent key
-/// (so the on-disk formatting for a normal, all-tables config is unaffected), but
-/// reporting a hand-edited scalar, array, or array-of-tables standing in for an
-/// expected table as a `ConfigError` instead of panicking. `parent_path` names
-/// `parent` itself for the error message. Erroring (rather than silently replacing
-/// the hand-edited value) is deliberate: a save must never destroy content a user
-/// put there on purpose.
-fn ensure_table<'a>(
-    parent: &'a mut toml_edit::Item,
-    parent_path: &str,
-    key: &str,
-) -> Result<&'a mut toml_edit::Item, ConfigError> {
-    parent.get_mut(key).ok_or_else(|| {
-        ConfigError::InvalidValue(format!(
-            "configuration key '{parent_path}' is not a table; remove or fix the hand-edited value"
-        ))
-    })
-}
-
-/// Resolves the `[ui.displays.<display_id>]` table used by every per-display
-/// UI-state writer, creating it (and `[ui]`/`[ui.displays]`) when absent, without
-/// panicking when a hand-edited config has replaced any segment of that path with a
-/// non-table value.
-fn display_state<'a>(
-    document: &'a mut toml_edit::Document,
-    display_id: &str,
-) -> Result<&'a mut toml_edit::Item, ConfigError> {
-    // Indexing the document root itself can never panic: `Document` always wraps a
-    // real `Table`, so `document["ui"]` only ever inserts-or-fetches.
-    let ui = &mut document["ui"];
-    let displays = ensure_table(ui, "ui", "displays")?;
-    ensure_table(displays, "ui.displays", display_id)
-}
-
-fn editable_document(source: &str) -> Result<toml_edit::Document, ConfigError> {
-    if source.trim().is_empty() {
-        Ok(toml_edit::Document::new())
-    } else {
-        source.parse::<toml_edit::Document>().map_err(Into::into)
-    }
-}
-
-fn read_optional_config_source(path: &Path) -> Result<String, ConfigError> {
-    match fs::read_to_string(path) {
-        Ok(source) => Ok(source),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(String::new()),
-        Err(source) => Err(ConfigError::Read {
-            path: path.display().to_string(),
-            source,
-        }),
-    }
-}
-
-fn write_config_source(path: &Path, source: String) -> Result<(), ConfigError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
-            path: parent.display().to_string(),
-            source,
-        })?;
-    }
-    atomic_write(path, source.as_bytes(), replace_file).map_err(|source| ConfigError::Write {
-        path: path.display().to_string(),
-        source,
-    })
-}
-
-fn atomic_write<F>(path: &Path, contents: &[u8], replace: F) -> std::io::Result<()>
+pub(crate) fn atomic_write<F>(path: &Path, contents: &[u8], replace: F) -> std::io::Result<()>
 where
     F: FnOnce(&Path, &Path) -> std::io::Result<()>,
 {
@@ -1245,7 +943,7 @@ fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(crate) fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
     move_file(from, to, true)
 }
 
@@ -1410,171 +1108,6 @@ mod windows_file_move {
         }
         Ok(encoded.into_iter().chain(iter::once(0)).collect())
     }
-}
-
-pub fn load_overlay_position() -> Result<Option<(i32, i32)>, ConfigError> {
-    let config = AppConfig::load_default()?;
-    Ok(config.ui.overlay_x.zip(config.ui.overlay_y))
-}
-
-pub fn save_overlay_position(x: i32, y: i32) -> Result<(), ConfigError> {
-    let path = default_config_path().ok_or(ConfigError::HomeDirectoryUnavailable)?;
-    let source = match fs::read_to_string(&path) {
-        Ok(source) => source,
-        Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
-        Err(source) => {
-            return Err(ConfigError::Read {
-                path: path.display().to_string(),
-                source,
-            });
-        }
-    };
-
-    let updated = update_overlay_position(&source, x, y)?;
-    write_config_source(&path, updated)
-}
-
-fn update_overlay_position(source: &str, x: i32, y: i32) -> Result<String, ConfigError> {
-    let mut document = if source.trim().is_empty() {
-        toml_edit::Document::new()
-    } else {
-        source.parse::<toml_edit::Document>()?
-    };
-    let ui = &mut document["ui"];
-    *ensure_table(ui, "ui", "overlay_x")? = toml_edit::value(i64::from(x));
-    *ensure_table(ui, "ui", "overlay_y")? = toml_edit::value(i64::from(y));
-    Ok(document.to_string())
-}
-
-pub fn save_display_confirmed_region(
-    display_id: &str,
-    region: CaptureRegion,
-    source: CaptureRegionSource,
-) -> Result<(), ConfigError> {
-    UiStateStore::for_default_config().save_display_confirmed_region(display_id, region, source)
-}
-
-fn update_display_confirmed_region(
-    source_text: &str,
-    display_id: &str,
-    region: CaptureRegion,
-    source: CaptureRegionSource,
-) -> Result<String, ConfigError> {
-    if region.width == 0 || region.height == 0 || source.width == 0 || source.height == 0 {
-        return Err(ConfigError::InvalidValue(
-            "confirmed region and source dimensions must be greater than zero".to_owned(),
-        ));
-    }
-    let mut document = editable_document(source_text)?;
-    let display_path = format!("ui.displays.{display_id}");
-    let state = display_state(&mut document, display_id)?;
-    let region_path = format!("{display_path}.last_confirmed_region");
-    *ensure_table(
-        ensure_table(state, &display_path, "last_confirmed_region")?,
-        &region_path,
-        "x",
-    )? = toml_edit::value(i64::from(region.x));
-    *ensure_table(
-        ensure_table(state, &display_path, "last_confirmed_region")?,
-        &region_path,
-        "y",
-    )? = toml_edit::value(i64::from(region.y));
-    *ensure_table(
-        ensure_table(state, &display_path, "last_confirmed_region")?,
-        &region_path,
-        "width",
-    )? = toml_edit::value(i64::from(region.width));
-    *ensure_table(
-        ensure_table(state, &display_path, "last_confirmed_region")?,
-        &region_path,
-        "height",
-    )? = toml_edit::value(i64::from(region.height));
-    let source_path = format!("{display_path}.last_confirmed_region_source");
-    *ensure_table(
-        ensure_table(state, &display_path, "last_confirmed_region_source")?,
-        &source_path,
-        "width",
-    )? = toml_edit::value(i64::from(source.width));
-    *ensure_table(
-        ensure_table(state, &display_path, "last_confirmed_region_source")?,
-        &source_path,
-        "height",
-    )? = toml_edit::value(i64::from(source.height));
-    *ensure_table(
-        ensure_table(state, &display_path, "last_confirmed_region_source")?,
-        &source_path,
-        "rotation_degrees",
-    )? = toml_edit::value(i64::from(source.rotation_degrees));
-    Ok(document.to_string())
-}
-
-pub fn load_capture_history() -> Result<CaptureHistory, ConfigError> {
-    let config = AppConfig::load_default()?;
-    Ok(CaptureHistory {
-        tool: config.ui.last_capture_tool,
-        region: config.ui.last_region,
-    })
-}
-
-pub fn save_capture_history(
-    tool: CaptureTool,
-    region: Option<CaptureRegion>,
-) -> Result<(), ConfigError> {
-    let path = default_config_path().ok_or(ConfigError::HomeDirectoryUnavailable)?;
-    let source = match fs::read_to_string(&path) {
-        Ok(source) => source,
-        Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
-        Err(source) => {
-            return Err(ConfigError::Read {
-                path: path.display().to_string(),
-                source,
-            });
-        }
-    };
-    let updated = update_capture_history(&source, tool, region)?;
-    write_config_source(&path, updated)
-}
-
-fn update_capture_history(
-    source: &str,
-    tool: CaptureTool,
-    region: Option<CaptureRegion>,
-) -> Result<String, ConfigError> {
-    if region.is_some_and(|region| region.width == 0 || region.height == 0) {
-        return Err(ConfigError::InvalidValue(
-            "last_region width and height must be greater than zero".to_owned(),
-        ));
-    }
-    let mut document = if source.trim().is_empty() {
-        toml_edit::Document::new()
-    } else {
-        source.parse::<toml_edit::Document>()?
-    };
-    let ui = &mut document["ui"];
-    *ensure_table(ui, "ui", "last_capture_tool")? = toml_edit::value(tool.as_str());
-    if let Some(region) = region {
-        *ensure_table(
-            ensure_table(ui, "ui", "last_region")?,
-            "ui.last_region",
-            "x",
-        )? = toml_edit::value(i64::from(region.x));
-        *ensure_table(
-            ensure_table(ui, "ui", "last_region")?,
-            "ui.last_region",
-            "y",
-        )? = toml_edit::value(i64::from(region.y));
-        *ensure_table(
-            ensure_table(ui, "ui", "last_region")?,
-            "ui.last_region",
-            "width",
-        )? = toml_edit::value(i64::from(region.width));
-        *ensure_table(
-            ensure_table(ui, "ui", "last_region")?,
-            "ui.last_region",
-            "height",
-        )? = toml_edit::value(i64::from(region.height));
-    }
-    Ok(document.to_string())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2110,7 +1643,7 @@ mod tests {
         windows_file_move::set_file_attributes(&path, READONLY | HIDDEN)
             .expect("set original attributes");
 
-        write_config_source(&path, "after".to_owned()).expect("replace attributed config");
+        atomic_write(&path, b"after", replace_file).expect("replace attributed config");
 
         let attributes = windows_file_move::file_attributes(&path).expect("read final attributes");
         assert_eq!(attributes & (READONLY | HIDDEN), READONLY | HIDDEN);
@@ -2148,7 +1681,8 @@ mod tests {
             .to_toml_pretty()
             .expect("serialize replacement config");
 
-        write_config_source(&path, replacement.clone()).expect("atomically replace config");
+        atomic_write(&path, replacement.as_bytes(), replace_file)
+            .expect("atomically replace config");
 
         assert_eq!(
             fs::read_to_string(&path).expect("read replacement"),
@@ -2199,8 +1733,10 @@ mod tests {
             .expect("load alternate profile UI state");
 
         assert_eq!(state.overlay_center, Some((0.25, 0.75)));
-        assert!(path.exists());
-        assert!(!directory.join(CONFIG_FILE_NAME).exists());
+        // State lands beside the profile it belongs to, and the profile itself is never created
+        // or touched by a state write.
+        assert!(directory.join(STATE_FILE_NAME).exists());
+        assert!(!path.exists());
     }
 
     #[test]
@@ -2453,110 +1989,6 @@ mod tests {
     }
 
     #[test]
-    fn overlay_position_update_preserves_other_settings_and_comments() {
-        let source = "# keep this comment\n[logging]\nlevel = \"debug\"\n\n[ui]\noverlay_x = 1\noverlay_y = 2\n";
-        let updated = update_overlay_position(source, 640, 920).expect("updated TOML");
-        assert!(updated.contains("# keep this comment"));
-        assert!(updated.contains("level = \"debug\""));
-        let config: AppConfig = toml::from_str(&updated).expect("valid Captastic config");
-        assert_eq!(config.ui.overlay_x, Some(640));
-        assert_eq!(config.ui.overlay_y, Some(920));
-    }
-
-    #[test]
-    fn capture_history_update_preserves_comments_and_the_previous_region() {
-        let source = "# keep this comment\n[logging]\nlevel = \"debug\"\n\n[ui]\nlast_capture_tool = \"region\"\n\n[ui.last_region]\nx = 120\ny = 80\nwidth = 640\nheight = 360\n";
-        let updated = update_capture_history(source, CaptureTool::Window, None)
-            .expect("updated capture history");
-        assert!(updated.contains("# keep this comment"));
-        assert!(updated.contains("level = \"debug\""));
-        let config: AppConfig = toml::from_str(&updated).expect("valid Captastic config");
-        assert_eq!(config.ui.last_capture_tool, Some(CaptureTool::Window));
-        assert_eq!(
-            config.ui.last_region,
-            Some(CaptureRegion {
-                x: 120,
-                y: 80,
-                width: 640,
-                height: 360,
-            })
-        );
-    }
-
-    #[test]
-    fn capture_history_update_records_a_confirmed_region() {
-        let region = CaptureRegion {
-            x: -100,
-            y: 40,
-            width: 960,
-            height: 540,
-        };
-        let updated = update_capture_history("", CaptureTool::Region, Some(region))
-            .expect("updated capture history");
-        let config: AppConfig = toml::from_str(&updated).expect("valid Captastic config");
-        assert_eq!(config.ui.last_capture_tool, Some(CaptureTool::Region));
-        assert_eq!(config.ui.last_region, Some(region));
-    }
-
-    #[test]
-    fn capture_history_rejects_a_zero_dimension_region() {
-        let region = CaptureRegion {
-            x: 0,
-            y: 0,
-            width: 0,
-            height: 100,
-        };
-        let error = update_capture_history("", CaptureTool::Region, Some(region))
-            .expect_err("zero-area region must be rejected");
-        assert!(matches!(error, ConfigError::InvalidValue(_)));
-    }
-
-    #[test]
-    fn display_interaction_state_rejects_zero_dimension_region_or_source() {
-        let region = CaptureRegion {
-            x: 0,
-            y: 0,
-            width: 0,
-            height: 100,
-        };
-        let source = CaptureRegionSource {
-            width: 1_920,
-            height: 1_080,
-            rotation_degrees: 0,
-        };
-        let error = update_display_interaction_state(
-            "",
-            "main",
-            CaptureTool::Region,
-            Some(region),
-            Some(source),
-        )
-        .expect_err("zero-area region must be rejected");
-        assert!(matches!(error, ConfigError::InvalidValue(_)));
-
-        let region = CaptureRegion {
-            x: 0,
-            y: 0,
-            width: 200,
-            height: 100,
-        };
-        let source = CaptureRegionSource {
-            width: 0,
-            height: 1_080,
-            rotation_degrees: 0,
-        };
-        let error = update_display_interaction_state(
-            "",
-            "main",
-            CaptureTool::Region,
-            Some(region),
-            Some(source),
-        )
-        .expect_err("zero-area source must be rejected");
-        assert!(matches!(error, ConfigError::InvalidValue(_)));
-    }
-
-    #[test]
     fn saving_a_zero_dimension_region_is_rejected_and_leaves_the_file_untouched() {
         let directory = TestDirectory::new("zero-region-rejected");
         let path = directory.join(CONFIG_FILE_NAME);
@@ -2576,7 +2008,8 @@ mod tests {
         store
             .save_display_interaction_state("main", CaptureTool::Region, Some(region), Some(source))
             .expect("save valid interaction state");
-        let before = fs::read_to_string(&path).expect("read persisted state");
+        let state_path = directory.join(STATE_FILE_NAME);
+        let before = fs::read_to_string(&state_path).expect("read persisted state");
 
         let error = store
             .save_display_interaction_state(
@@ -2593,7 +2026,7 @@ mod tests {
             .expect_err("zero-area region must be rejected");
         assert!(matches!(error, ConfigError::InvalidValue(_)));
 
-        let after = fs::read_to_string(&path).expect("read state after rejected save");
+        let after = fs::read_to_string(&state_path).expect("read state after rejected save");
         assert_eq!(before, after, "rejected save must not modify the file");
     }
 
@@ -2639,198 +2072,6 @@ mod tests {
     }
 
     #[test]
-    fn hand_edited_non_table_ui_state_is_rejected_without_panicking() {
-        for (source, offending_key) in [
-            ("ui = 5\n", "'ui'"),
-            ("[ui]\ndisplays = \"x\"\n", "'ui.displays'"),
-        ] {
-            let error = update_display_overlay_center(source, "main", 0.5, 0.5)
-                .expect_err("non-table ui state must be rejected, not panic");
-            assert!(matches!(error, ConfigError::InvalidValue(_)));
-            assert!(
-                error.to_string().contains(offending_key),
-                "error should name the offending key: {error}"
-            );
-        }
-    }
-
-    #[test]
-    fn hand_edited_scalar_ui_table_rejects_global_ui_state_writers_too() {
-        let error = update_capture_history("ui = 5\n", CaptureTool::Region, None)
-            .expect_err("scalar ui table must be rejected");
-        assert!(matches!(error, ConfigError::InvalidValue(_)));
-
-        let error = update_overlay_position("ui = 5\n", 10, 20)
-            .expect_err("scalar ui table must be rejected");
-        assert!(matches!(error, ConfigError::InvalidValue(_)));
-    }
-
-    #[test]
-    fn saving_over_a_hand_edited_scalar_ui_table_is_rejected_and_leaves_the_file_untouched() {
-        let directory = TestDirectory::new("scalar-ui-rejected");
-        let path = directory.join(CONFIG_FILE_NAME);
-        fs::write(&path, "ui = 5\n").expect("seed hand-edited config");
-        let store = UiStateStore::for_config(&path);
-
-        let error = store
-            .save_display_overlay_center("main", 0.5, 0.5)
-            .expect_err("scalar ui table must be rejected, not panic");
-        assert!(matches!(error, ConfigError::InvalidValue(_)));
-
-        let after = fs::read_to_string(&path).expect("read state after rejected save");
-        assert_eq!(after, "ui = 5\n", "rejected save must not modify the file");
-    }
-
-    #[test]
-    fn display_history_records_a_cancelled_region_interaction() {
-        let source = "[ui.displays.main]\nlast_capture_tool = \"window\"\n";
-        let region = CaptureRegion {
-            x: 420,
-            y: 260,
-            width: 800,
-            height: 450,
-        };
-        let region_source = CaptureRegionSource {
-            width: 1_920,
-            height: 1_080,
-            rotation_degrees: 0,
-        };
-        let updated = update_display_interaction_state(
-            source,
-            "main",
-            CaptureTool::Region,
-            Some(region),
-            Some(region_source),
-        )
-        .expect("cancelled interaction state");
-        let config: AppConfig = toml::from_str(&updated).expect("valid Captastic config");
-        assert_eq!(
-            resolve_display_ui_state(&config.ui, "main"),
-            DisplayUiState {
-                tool: Some(CaptureTool::Region),
-                region: Some(region),
-                region_source: Some(region_source),
-                region_is_display_local: true,
-                ..DisplayUiState::default()
-            }
-        );
-    }
-
-    #[test]
-    fn display_ui_state_is_independent_and_survives_serialization() {
-        let source = "# preserve me\n[ui]\nlast_capture_tool = \"full_display\"\noverlay_x = 40\noverlay_y = 50\n";
-        let updated =
-            update_display_overlay_center(source, "laptop", 0.25, 0.75).expect("laptop toolbar");
-        let updated = update_display_interaction_state(
-            &updated,
-            "laptop",
-            CaptureTool::Region,
-            Some(CaptureRegion {
-                x: 100,
-                y: 80,
-                width: 960,
-                height: 540,
-            }),
-            Some(CaptureRegionSource {
-                width: 1920,
-                height: 1080,
-                rotation_degrees: 0,
-            }),
-        )
-        .expect("laptop history");
-        let updated = update_display_overlay_center(&updated, "external", 0.8, 0.2)
-            .expect("external toolbar");
-        let updated = update_display_interaction_state(
-            &updated,
-            "external",
-            CaptureTool::Window,
-            Some(CaptureRegion {
-                x: 300,
-                y: 200,
-                width: 1280,
-                height: 720,
-            }),
-            Some(CaptureRegionSource {
-                width: 3840,
-                height: 2160,
-                rotation_degrees: 0,
-            }),
-        )
-        .expect("external history");
-        assert!(updated.contains("# preserve me"));
-
-        let config: AppConfig = toml::from_str(&updated).expect("serialized config reloads");
-        config.validate().expect("display UI state validates");
-        assert_eq!(
-            resolve_display_ui_state(&config.ui, "laptop"),
-            DisplayUiState {
-                overlay_center: Some((0.25, 0.75)),
-                overlay_position: Some((40, 50)),
-                tool: Some(CaptureTool::Region),
-                region: Some(CaptureRegion {
-                    x: 100,
-                    y: 80,
-                    width: 960,
-                    height: 540,
-                }),
-                region_source: Some(CaptureRegionSource {
-                    width: 1920,
-                    height: 1080,
-                    rotation_degrees: 0,
-                }),
-                confirmed_region: None,
-                region_is_display_local: true,
-            }
-        );
-        assert_eq!(
-            resolve_display_ui_state(&config.ui, "external"),
-            DisplayUiState {
-                overlay_center: Some((0.8, 0.2)),
-                overlay_position: Some((40, 50)),
-                tool: Some(CaptureTool::Window),
-                region: Some(CaptureRegion {
-                    x: 300,
-                    y: 200,
-                    width: 1280,
-                    height: 720,
-                }),
-                region_source: Some(CaptureRegionSource {
-                    width: 3840,
-                    height: 2160,
-                    rotation_degrees: 0,
-                }),
-                confirmed_region: None,
-                region_is_display_local: true,
-            }
-        );
-    }
-
-    #[test]
-    fn display_ui_state_falls_back_to_legacy_global_values() {
-        let config: AppConfig = toml::from_str(
-            "[ui]\noverlay_x = 40\noverlay_y = 50\nlast_capture_tool = \"region\"\n\n[ui.last_region]\nx = -100\ny = 25\nwidth = 640\nheight = 360\n",
-        )
-        .expect("legacy config");
-        assert_eq!(
-            resolve_display_ui_state(&config.ui, "new-display"),
-            DisplayUiState {
-                overlay_center: None,
-                overlay_position: Some((40, 50)),
-                tool: Some(CaptureTool::Region),
-                region: Some(CaptureRegion {
-                    x: -100,
-                    y: 25,
-                    width: 640,
-                    height: 360,
-                }),
-                region_source: None,
-                confirmed_region: None,
-                region_is_display_local: false,
-            }
-        );
-    }
-
-    #[test]
     fn rejects_incomplete_or_empty_per_display_state() {
         let mut config = AppConfig::default();
         config.ui.displays.insert(
@@ -2870,19 +2111,6 @@ mod tests {
             config.validate(),
             Err(ConfigError::InvalidValue(_))
         ));
-    }
-
-    #[test]
-    fn normalized_overlay_update_replaces_display_pixel_coordinates() {
-        let source = "[ui.displays.external]\noverlay_x = 700\noverlay_y = 1200\n";
-        let updated = update_display_overlay_center(source, "external", 0.625, 0.875)
-            .expect("normalized toolbar position");
-        let config: AppConfig = toml::from_str(&updated).expect("updated config reloads");
-        let state = config.ui.displays.get("external").expect("display state");
-        assert_eq!(state.overlay_center_x, Some(0.625));
-        assert_eq!(state.overlay_center_y, Some(0.875));
-        assert_eq!(state.overlay_x, None);
-        assert_eq!(state.overlay_y, None);
     }
 
     #[test]
@@ -3109,8 +2337,19 @@ mod tests {
     }
 
     #[test]
-    fn canonical_bindings_round_trip_and_ui_updates_preserve_them_and_comments() {
-        let source = "# keep this comment\n[daemon]\ntrigger_queue_capacity = 9\n\n[hotkey]\nrepeat = \"ignore\"\n\n[hotkey.bindings]\nlast_workflow = \"Ctrl+Shift+F9\"\nregion = \"Alt+R\"\nfull_display = \"Win+F12\"\n";
+    fn canonical_bindings_round_trip_through_serialization() {
+        let source = "# keep this comment
+[daemon]
+trigger_queue_capacity = 9
+
+[hotkey]
+repeat = \"ignore\"
+
+[hotkey.bindings]
+last_workflow = \"Ctrl+Shift+F9\"
+region = \"Alt+R\"
+full_display = \"Win+F12\"
+";
         let config: AppConfig = toml::from_str(source).expect("canonical config");
         config.validate().expect("valid bindings");
         let serialized = config.to_toml_pretty().expect("serialize");
@@ -3120,42 +2359,5 @@ mod tests {
             config.hotkey.resolved_bindings().expect("bindings")
         );
         assert_eq!(reloaded.daemon.trigger_queue_capacity, 9);
-
-        let updated = update_display_confirmed_region(
-            source,
-            "display-a",
-            CaptureRegion {
-                x: 10,
-                y: 20,
-                width: 300,
-                height: 200,
-            },
-            CaptureRegionSource {
-                width: 3840,
-                height: 2160,
-                rotation_degrees: 0,
-            },
-        )
-        .expect("UI update");
-        assert!(updated.contains("# keep this comment"));
-        assert!(updated.contains("full_display = \"Win+F12\""));
-        assert!(updated.contains("trigger_queue_capacity = 9"));
-        let updated: AppConfig = toml::from_str(&updated).expect("updated config reloads");
-        assert_eq!(
-            updated.confirmed_regions().get("display-a"),
-            Some(&ConfirmedRegion {
-                region: CaptureRegion {
-                    x: 10,
-                    y: 20,
-                    width: 300,
-                    height: 200,
-                },
-                source: CaptureRegionSource {
-                    width: 3840,
-                    height: 2160,
-                    rotation_degrees: 0,
-                },
-            })
-        );
     }
 }
