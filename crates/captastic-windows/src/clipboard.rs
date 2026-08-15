@@ -60,24 +60,21 @@ impl ClipboardPublisher {
         })
     }
 
-    pub fn publish(&mut self, frame: &CpuFrame) -> Result<ClipboardPublishReport, CaptureError> {
+    /// Commits a prepared payload to the clipboard.
+    ///
+    /// Safe to call again after a retryable failure: every handle it allocates is either
+    /// transferred to the clipboard or freed before returning.
+    pub fn publish(
+        &mut self,
+        payload: &ClipboardPayload<'_>,
+    ) -> Result<ClipboardPublishReport, CaptureError> {
         let publish_started = Instant::now();
-        let layout = DibV5Layout::new(frame)?;
+        let layout = &payload.layout;
         let copy_started = Instant::now();
-        let dib_memory = GlobalMemory::from_frame(frame, &layout)?;
-        let png_started = Instant::now();
-        // `Fast` rather than the default: this runs in the hotkey path, where the user feels the
-        // milliseconds, and even Fast compresses a screenshot roughly 20-45x. The file-output
-        // worker, which is not in that path, uses `Compact`.
-        let png = (frame.alpha == FrameAlpha::Straight)
-            .then(|| encode_frame(frame, PngEffort::Fast))
-            .transpose()
-            .map_err(png_error)?;
-        let png_encode_ns = png
-            .as_ref()
-            .map_or(0, |_| duration_ns(png_started.elapsed()));
-        let png_payload_bytes = png.as_ref().map_or(0, Vec::len);
-        let png_memory = png
+        let dib_memory = GlobalMemory::from_frame(payload.frame, layout)?;
+        let png_payload_bytes = payload.png.as_ref().map_or(0, Vec::len);
+        let png_memory = payload
+            .png
             .as_deref()
             .map(|bytes| GlobalMemory::from_bytes(bytes, "allocate_png"))
             .transpose()?;
@@ -105,12 +102,58 @@ impl ClipboardPublisher {
         Ok(ClipboardPublishReport {
             payload_bytes: layout.payload_bytes,
             png_payload_bytes,
-            png_encode_ns,
+            // Carried from `prepare`: the one-time encode, not this attempt's share of it.
+            png_encode_ns: payload.png_encode_ns,
             allocation_copy_ns,
             open_wait_ns,
             open_retries,
+            // This attempt only. A retried publish reports the attempt that succeeded rather than
+            // the sum of the ones that did not.
             publish_ns: duration_ns(publish_started.elapsed()),
         })
+    }
+}
+
+/// A frame encoded and ready to commit, independent of any one publish attempt.
+pub struct ClipboardPayload<'a> {
+    frame: &'a CpuFrame,
+    layout: DibV5Layout,
+    png: Option<Vec<u8>>,
+    png_encode_ns: u64,
+}
+
+impl<'a> ClipboardPayload<'a> {
+    /// Encodes a frame once, ahead of any publish attempt.
+    ///
+    /// Encoding is the expensive half of a clipboard publish and produces identical bytes every
+    /// time, so a retry has no reason to repeat it. Only the cheap half — the global allocations
+    /// the clipboard takes ownership of, and the session itself — is per-attempt work. Preparing
+    /// deliberately needs no publisher: nothing here touches the clipboard, so a caller cannot
+    /// accidentally hold a session open across an encode.
+    pub fn prepare(frame: &'a CpuFrame) -> Result<Self, CaptureError> {
+        let layout = DibV5Layout::new(frame)?;
+        let png_started = Instant::now();
+        // `Fast` rather than the default: this runs in the hotkey path, where the user feels the
+        // milliseconds, and even Fast compresses a screenshot roughly 20-45x. The file-output
+        // worker, which is not in that path, uses `Compact`.
+        let png = (frame.alpha == FrameAlpha::Straight)
+            .then(|| encode_frame(frame, PngEffort::Fast))
+            .transpose()
+            .map_err(png_error)?;
+        let png_encode_ns = png
+            .as_ref()
+            .map_or(0, |_| duration_ns(png_started.elapsed()));
+        Ok(Self {
+            frame,
+            layout,
+            png,
+            png_encode_ns,
+        })
+    }
+
+    /// The encoded PNG this payload will publish alongside the DIBV5, if any.
+    pub fn png_bytes(&self) -> Option<&[u8]> {
+        self.png.as_deref()
     }
 }
 
@@ -583,6 +626,36 @@ mod tests {
     }
 
     #[test]
+    fn preparing_encodes_once_and_yields_reusable_bytes() {
+        // The retry loop publishes the same payload repeatedly, so the encode must be complete
+        // and self-contained before the first attempt rather than repeated inside each one.
+        let frame =
+            frame(2, 1, 8, vec![10, 20, 30, 64, 40, 50, 60, 255]).with_alpha(FrameAlpha::Straight);
+        let payload = ClipboardPayload::prepare(&frame).expect("prepare");
+
+        let bytes = payload.png_bytes().expect("straight alpha publishes a PNG");
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        // Two reads of the same prepared payload see identical bytes at the same address: the
+        // payload owns its encode rather than producing one on demand.
+        assert_eq!(
+            payload.png_bytes().expect("still present").as_ptr(),
+            bytes.as_ptr()
+        );
+        assert!(payload.png_encode_ns > 0);
+    }
+
+    #[test]
+    fn opaque_frames_prepare_without_a_png_payload() {
+        // Opaque captures go to the clipboard as DIBV5 only, so there is nothing to encode and
+        // the reported encode cost must stay zero rather than counting an absent payload.
+        let frame = frame(2, 1, 8, vec![10, 20, 30, 255, 40, 50, 60, 255]);
+        let payload = ClipboardPayload::prepare(&frame).expect("prepare");
+
+        assert!(payload.png_bytes().is_none());
+        assert_eq!(payload.png_encode_ns, 0);
+    }
+
+    #[test]
     fn png_clipboard_payload_compresses_rather_than_storing() {
         // The regression that retired the hand-rolled encoder: it emitted stored (uncompressed)
         // DEFLATE, so its output was always *larger* than the raw pixels it was given.
@@ -619,7 +692,8 @@ mod tests {
         let mut expected = vec![0_u8; layout.payload_bytes];
         layout.write(&frame, &mut expected).expect("expected DIBV5");
         let mut publisher = ClipboardPublisher::new().expect("publisher");
-        publisher.publish(&frame).expect("publish");
+        let payload = ClipboardPayload::prepare(&frame).expect("prepare");
+        publisher.publish(&payload).expect("publish");
         let actual = read_current_dibv5(publisher.window.hwnd).expect("clipboard readback");
         assert_eq!(actual, expected);
     }
