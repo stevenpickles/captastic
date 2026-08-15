@@ -60,7 +60,7 @@ fn join_capture_worker(join: thread::JoinHandle<()>) {
 
 #[cfg(windows)]
 use captastic_config::{
-    AppConfig, ConfirmedRegion, HotkeyAction, HotkeyBinding, HotkeyChord, PreviewMode, UiConfig,
+    AppConfig, ConfirmedRegion, HotkeyAction, HotkeyBinding, HotkeyChord, PreviewMode, UiState,
 };
 #[cfg(windows)]
 use captastic_core::{
@@ -99,7 +99,7 @@ struct ResolvedDaemonArgs {
     trigger_queue_capacity: usize,
     hotkey_bindings: Vec<HotkeyBinding>,
     confirmed_regions: BTreeMap<String, ConfirmedRegion>,
-    ui: UiConfig,
+    ui: UiState,
     ui_state_store: captastic_config::UiStateStore,
     clipboard_queue_capacity: usize,
     selection_queue_capacity: usize,
@@ -123,12 +123,10 @@ fn resolve_daemon_args_with_default(
     >,
 ) -> Result<ResolvedDaemonArgs, AppError> {
     let mut startup_warnings = Vec::new();
-    let ui_state_store = args
-        .config
-        .as_ref()
-        .map_or_else(captastic_config::UiStateStore::for_default_config, |path| {
-            captastic_config::UiStateStore::for_config(path.clone())
-        });
+    let ui_state_store = args.config.as_ref().map_or_else(
+        captastic_config::UiStateStore::for_default_storage,
+        |path| captastic_config::UiStateStore::for_config(path.clone()),
+    );
     let config = match args.config.as_deref() {
         Some(path) => AppConfig::load(path)?,
         None => {
@@ -148,7 +146,15 @@ fn resolve_daemon_args_with_default(
     };
     config.validate()?;
     let hotkey_bindings = config.hotkey.resolved_bindings()?;
-    let confirmed_regions = config.confirmed_regions();
+    // Remembered state now lives in Captastic's own file rather than the user's configuration;
+    // a store that cannot be read costs the user their remembered layout, not their startup.
+    let ui = ui_state_store.load().unwrap_or_else(|error| {
+        let message = format!("unable to read remembered UI state: {error}");
+        crate::logging::warn(format_args!("{message}"));
+        startup_warnings.push(message);
+        captastic_config::UiState::default()
+    });
+    let confirmed_regions = ui.confirmed_regions();
     let mode = args.mode.unwrap_or(match config.capture.mode.as_str() {
         "fresh" => ModeArg::Fresh,
         _ => ModeArg::Latest,
@@ -181,7 +187,7 @@ fn resolve_daemon_args_with_default(
         clipboard_queue_capacity: config.clipboard.queue_capacity,
         hotkey_bindings,
         confirmed_regions,
-        ui: config.ui.clone(),
+        ui,
         ui_state_store,
         selection_queue_capacity: config.selection.queue_capacity,
         max_captures: args.max_captures,
@@ -1559,7 +1565,7 @@ fn dispatch_live_selection(
     trigger: &TriggerEvent,
     route: ActionRoute,
     metadata: FrameMetadata,
-    cached_ui: &UiConfig,
+    cached_ui: &UiState,
     preview_mode: PreviewMode,
     recorder: EventRecorder,
 ) -> Result<&'static str, AppError> {
@@ -1625,7 +1631,7 @@ fn dispatch_output(
     chord: Option<HotkeyChord>,
     metadata: &FrameMetadata,
     confirmed_regions: &crate::selection::ConfirmedRegionCache,
-    cached_ui: &UiConfig,
+    cached_ui: &UiState,
     preview_mode: PreviewMode,
     json_output: bool,
     cpu_ready_offset_ns: Option<u64>,
