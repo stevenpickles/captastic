@@ -2591,6 +2591,281 @@ mod tests {
         );
     }
 
+    /// Verifies on a real desktop what the table tests can only assert about arithmetic: that the
+    /// two backends, run against the *same live window*, publish the same rectangle — and reports
+    /// how much translucency each one kept.
+    ///
+    /// Run it against a standard resizable window with:
+    ///
+    /// CAPTASTIC_TEST_WINDOW_HANDLE=<hwnd> cargo test --locked -p captastic-windows \
+    ///     -- --ignored --nocapture both_backends_capture_a_live_window_identically
+    #[test]
+    #[ignore = "requires CAPTASTIC_TEST_WINDOW_HANDLE naming a live interactive window"]
+    fn both_backends_capture_a_live_window_identically() {
+        // SAFETY: Changes DPI virtualization only for this short-lived integration-test thread.
+        let _ = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        let raw = std::env::var("CAPTASTIC_TEST_WINDOW_HANDLE")
+            .expect("set CAPTASTIC_TEST_WINDOW_HANDLE")
+            .parse::<isize>()
+            .expect("numeric window handle");
+        let hwnd = HWND(raw);
+        let metadata = test_desktop().metadata;
+
+        let mut native = RECT::default();
+        // SAFETY: The test environment supplies a live window handle and writable RECT storage.
+        unsafe { GetWindowRect(hwnd, &mut native) }.expect("window bounds");
+        let geometry = window_geometry(hwnd, rect_from_native(native).expect("valid bounds"));
+        println!(
+            "window rect {}x{} at ({},{}); visible frame {}x{} at ({},{}); border {}px",
+            geometry.window.width,
+            geometry.window.height,
+            geometry.window.x,
+            geometry.window.y,
+            geometry.frame.width,
+            geometry.frame.height,
+            geometry.frame.x,
+            geometry.frame.y,
+            geometry.border_thickness,
+        );
+
+        // A responsive window takes the PrintWindow path; the WGC path is invoked directly so both
+        // can be compared for one window in one run.
+        let printed = capture_window_visual(NativeWindowHandle::from_raw(raw), &metadata)
+            .expect("PrintWindow capture");
+        assert_eq!(
+            printed.frame.metadata.backend, "windows-print-window",
+            "the target window must be responsive for this comparison to mean anything"
+        );
+        let captured = capture_window_with_wgc(
+            hwnd,
+            &metadata,
+            None,
+            &geometry,
+            RenderDeadline::starting_now(Duration::from_secs(30)),
+        )
+        .expect("Windows Graphics Capture");
+
+        assert_eq!(
+            (printed.frame.width, printed.frame.height),
+            (captured.frame.width, captured.frame.height),
+            "the backends cropped the window to different sizes"
+        );
+        assert_eq!(
+            printed.frame.metadata.source_rect, captured.frame.metadata.source_rect,
+            "the backends disagree about where the captured frame sits on the desktop"
+        );
+        assert_eq!(printed.corner_radius_px, captured.corner_radius_px);
+        // The visible DWM frame is exactly what both are expected to have published.
+        assert_eq!(
+            (printed.frame.width, printed.frame.height),
+            (geometry.frame.width, geometry.frame.height)
+        );
+        assert_eq!(
+            (
+                printed.frame.metadata.source_rect.x,
+                printed.frame.metadata.source_rect.y
+            ),
+            (geometry.frame.x, geometry.frame.y)
+        );
+
+        let translucent = |frame: &CpuFrame| {
+            frame
+                .pixels
+                .chunks_exact(4)
+                .filter(|pixel| (1..255).contains(&pixel[3]))
+                .count()
+        };
+        println!(
+            "published {}x{} at ({},{}) from both backends; partially transparent pixels: PrintWindow {}, WGC {}",
+            printed.frame.width,
+            printed.frame.height,
+            printed.frame.metadata.source_rect.x,
+            printed.frame.metadata.source_rect.y,
+            translucent(&printed.frame),
+            translucent(&captured.frame),
+        );
+    }
+
+    /// A throwaway top-level window whose composited surface has genuine per-pixel alpha.
+    ///
+    /// Acrylic and Mica are the motivating cases for keeping WGC's alpha, but they cannot be
+    /// summoned on demand — a layered window updated with `AC_SRC_ALPHA` reaches DWM the same way
+    /// and is entirely under this test's control.
+    struct TranslucentTestWindow {
+        hwnd: HWND,
+    }
+
+    /// The probe has no behaviour of its own; every message takes the default handling.
+    unsafe extern "system" fn translucent_probe_proc(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> windows::Win32::Foundation::LRESULT {
+        // SAFETY: Win32 supplied these arguments and DefWindowProcW is their intended handler.
+        unsafe {
+            windows::Win32::UI::WindowsAndMessaging::DefWindowProcW(hwnd, message, wparam, lparam)
+        }
+    }
+
+    impl TranslucentTestWindow {
+        fn show(width: u32, height: u32, alpha: u8) -> Result<Self, CaptureError> {
+            let class = windows::core::w!("CaptasticTranslucentCaptureProbe");
+            // SAFETY: A null module name asks for the running executable's handle.
+            let instance = unsafe {
+                windows::Win32::System::LibraryLoader::GetModuleHandleW(
+                    windows::core::PCWSTR::null(),
+                )
+            }
+            .map_err(|error| windows_error("probe_module_handle", error, false))?;
+            let descriptor = windows::Win32::UI::WindowsAndMessaging::WNDCLASSW {
+                lpfnWndProc: Some(translucent_probe_proc),
+                hInstance: instance.into(),
+                lpszClassName: class,
+                ..Default::default()
+            };
+            // A repeated registration fails harmlessly when several tests share the process.
+            // SAFETY: descriptor and its borrowed class name outlive the call.
+            unsafe { windows::Win32::UI::WindowsAndMessaging::RegisterClassW(&descriptor) };
+
+            // SAFETY: The class is registered and no creation parameter is passed.
+            let hwnd = unsafe {
+                windows::Win32::UI::WindowsAndMessaging::CreateWindowExW(
+                    windows::Win32::UI::WindowsAndMessaging::WS_EX_LAYERED
+                        | windows::Win32::UI::WindowsAndMessaging::WS_EX_TOOLWINDOW
+                        | windows::Win32::UI::WindowsAndMessaging::WS_EX_TOPMOST,
+                    class,
+                    windows::core::w!("Captastic translucency probe"),
+                    windows::Win32::UI::WindowsAndMessaging::WS_POPUP,
+                    64,
+                    64,
+                    width as i32,
+                    height as i32,
+                    None,
+                    None,
+                    instance,
+                    None,
+                )
+            };
+            if hwnd.0 == 0 {
+                return Err(last_error("create_translucency_probe"));
+            }
+            let window = Self { hwnd };
+
+            // Pure red premultiplied by `alpha`, which is the representation UpdateLayeredWindow
+            // and Windows Graphics Capture both work in.
+            let mut surface = DibSurface::new(width, height)?;
+            let premultiplied_red = ((u32::from(alpha) * 255 + 127) / 255) as u8;
+            surface.write_pixels(
+                &[0, 0, premultiplied_red, alpha].repeat((width * height) as usize),
+            )?;
+
+            let destination = windows::Win32::Foundation::POINT { x: 64, y: 64 };
+            let origin = windows::Win32::Foundation::POINT { x: 0, y: 0 };
+            let size = windows::Win32::Foundation::SIZE {
+                cx: width as i32,
+                cy: height as i32,
+            };
+            let blend = windows::Win32::Graphics::Gdi::BLENDFUNCTION {
+                BlendOp: 0,
+                BlendFlags: 0,
+                SourceConstantAlpha: u8::MAX,
+                AlphaFormat: windows::Win32::Graphics::Gdi::AC_SRC_ALPHA as u8,
+            };
+            // SAFETY: A null HWND obtains the desktop DC, released immediately below.
+            let screen = unsafe { windows::Win32::Graphics::Gdi::GetDC(None) };
+            // SAFETY: Every borrowed structure and the selected DIB outlive the call.
+            let updated = unsafe {
+                windows::Win32::UI::WindowsAndMessaging::UpdateLayeredWindow(
+                    hwnd,
+                    screen,
+                    Some(&destination),
+                    Some(&size),
+                    surface.device,
+                    Some(&origin),
+                    windows::Win32::Foundation::COLORREF(0),
+                    Some(&blend),
+                    windows::Win32::UI::WindowsAndMessaging::ULW_ALPHA,
+                )
+            };
+            // SAFETY: Balances the GetDC(None) above on this thread.
+            unsafe { windows::Win32::Graphics::Gdi::ReleaseDC(None, screen) };
+            updated.map_err(|error| windows_error("present_translucency_probe", error, false))?;
+
+            // SAFETY: hwnd is this process's live top-level window.
+            unsafe {
+                windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+                    hwnd,
+                    windows::Win32::UI::WindowsAndMessaging::SW_SHOWNOACTIVATE,
+                )
+            };
+            // DWM needs a compose pass before Windows Graphics Capture has anything to hand back.
+            thread::sleep(Duration::from_millis(250));
+            Ok(window)
+        }
+    }
+
+    impl Drop for TranslucentTestWindow {
+        fn drop(&mut self) {
+            // SAFETY: The window was created on this thread and has not been destroyed yet.
+            let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd) };
+        }
+    }
+
+    /// The real-desktop half of the alpha fix: WGC has to *hand back* translucency for the
+    /// publication path to have any to keep.
+    ///
+    /// cargo test --locked -p captastic-windows -- --ignored --nocapture \
+    ///     wgc_publishes_a_translucent_window_translucently
+    #[test]
+    #[ignore = "briefly shows a real translucent window on the interactive desktop"]
+    fn wgc_publishes_a_translucent_window_translucently() {
+        const PROBE_ALPHA: u8 = 128;
+        // SAFETY: Changes DPI virtualization only for this short-lived integration-test thread.
+        let _ = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        let window = TranslucentTestWindow::show(240, 160, PROBE_ALPHA).expect("translucent probe");
+
+        let mut native = RECT::default();
+        // SAFETY: The probe window is live and native is writable for the exact RECT size.
+        unsafe { GetWindowRect(window.hwnd, &mut native) }.expect("probe bounds");
+        let geometry =
+            window_geometry(window.hwnd, rect_from_native(native).expect("valid bounds"));
+        let captured = capture_window_with_wgc(
+            window.hwnd,
+            &test_desktop().metadata,
+            None,
+            &geometry,
+            RenderDeadline::starting_now(Duration::from_secs(30)),
+        )
+        .expect("Windows Graphics Capture of the translucent probe");
+
+        let translucent = captured
+            .frame
+            .pixels
+            .chunks_exact(4)
+            .filter(|pixel| (PROBE_ALPHA - 16..=PROBE_ALPHA + 16).contains(&pixel[3]))
+            .count();
+        let total = (captured.frame.width * captured.frame.height) as usize;
+        println!(
+            "probe published {}x{}: {translucent}/{total} pixels at ~{PROBE_ALPHA} alpha",
+            captured.frame.width, captured.frame.height,
+        );
+        assert!(
+            translucent * 2 > total,
+            "a half-transparent window was published with only {translucent} of {total} pixels translucent"
+        );
+        // The colour must survive unpremultiplication rather than staying at the premultiplied
+        // value it arrived as.
+        let centre = ((captured.frame.height / 2) * captured.frame.width + captured.frame.width / 2)
+            as usize
+            * 4;
+        assert!(
+            captured.frame.pixels[centre + 2] > 240,
+            "the probe's red channel came back at {} instead of ~255",
+            captured.frame.pixels[centre + 2]
+        );
+    }
+
     fn test_desktop() -> CpuFrame {
         let metadata = FrameMetadata {
             capture_id: CaptureId(1),
