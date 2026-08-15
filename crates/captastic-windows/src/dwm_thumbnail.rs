@@ -3,7 +3,7 @@ use windows::Win32::Foundation::{BOOL, HWND, RECT, SIZE};
 use windows::Win32::Graphics::Dwm::{
     DwmQueryThumbnailSourceSize, DwmRegisterThumbnail, DwmUnregisterThumbnail,
     DwmUpdateThumbnailProperties, DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY,
-    DWM_TNP_RECTDESTINATION, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
+    DWM_TNP_RECTDESTINATION, DWM_TNP_VISIBLE,
 };
 
 /// Owns a DWM thumbnail registration and unregisters it before its destination disappears.
@@ -24,16 +24,20 @@ impl DwmThumbnail {
         unsafe { DwmQueryThumbnailSourceSize(self.handle) }
     }
 
+    /// Shows the whole source window, non-client area included.
+    ///
+    /// `DWM_TNP_SOURCECLIENTAREAONLY` is deliberately absent rather than set to `FALSE`. Window
+    /// capture crops to the DWM extended frame bounds — the window as the user sees it, title bar
+    /// and all — so a client-area-only preview would show strictly less than the frame it is
+    /// previewing, and the picker would promise a capture it does not deliver. A fresh
+    /// registration already defaults to whole-window, so naming the flag only to disable it stated
+    /// an intent the value contradicted.
     pub(crate) fn show(&self, destination: RECT, opacity: u8) -> Result<(), Error> {
         let properties = DWM_THUMBNAIL_PROPERTIES {
-            dwFlags: DWM_TNP_RECTDESTINATION
-                | DWM_TNP_OPACITY
-                | DWM_TNP_VISIBLE
-                | DWM_TNP_SOURCECLIENTAREAONLY,
+            dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_OPACITY | DWM_TNP_VISIBLE,
             rcDestination: destination,
             opacity,
             fVisible: BOOL(1),
-            fSourceClientAreaOnly: BOOL(0),
             ..Default::default()
         };
         // SAFETY: The properties value remains valid for the duration of the call and the handle
