@@ -1452,9 +1452,16 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
     if message == WM_NCCREATE {
         // SAFETY: WM_NCCREATE lparam points to a valid CREATESTRUCTW for this call.
         let create = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
-        // SAFETY: Stores the Box pointer passed to CreateWindowExW for later callbacks.
+        // SAFETY: Stores the Box pointer passed to CreateWindowExW for later callbacks. This
+        // must run first and unconditionally so every later message can reach the state.
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize) };
-        return LRESULT(1);
+        // Delegate to DefWindowProcW instead of answering TRUE directly: its WM_NCCREATE
+        // handling stores the window text passed to CreateWindowExW (without it,
+        // GetWindowTextW on the overlay returns nothing) and returns TRUE on success, so
+        // creation proceeds exactly as before - and honestly aborts if default non-client
+        // setup ever fails.
+        // SAFETY: Default non-client creation for this live window.
+        return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     }
     // SAFETY: Retrieves only the pointer installed during WM_NCCREATE.
     let state_pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut OverlayState;
