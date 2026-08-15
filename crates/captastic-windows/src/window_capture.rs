@@ -1,5 +1,6 @@
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -38,6 +39,7 @@ const WINDOW_BORDER_BGRA: [u8; 3] = [188, 180, 176];
 static IN_FLIGHT_WINDOW_RENDERS: AtomicUsize = AtomicUsize::new(0);
 static WINDOW_RENDER_WORKERS: AtomicUsize = AtomicUsize::new(0);
 static DETACHED_WINDOW_RENDERS: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_WINDOW_RENDER_TARGETS: Mutex<BTreeSet<isize>> = Mutex::new(BTreeSet::new());
 const RENDER_ACTIVE: u8 = 0;
 const RENDER_DETACHED: u8 = 1;
 const RENDER_COMPLETED: u8 = 2;
@@ -118,7 +120,7 @@ fn capture_window_bounded(
     reference_metadata: &FrameMetadata,
     max_pixels: Option<u64>,
 ) -> Result<CapturedWindow, CaptureError> {
-    let budget = WindowRenderBudget::acquire()?;
+    let budget = WindowRenderBudget::acquire(handle.raw())?;
     let permit = WindowRenderPermit::acquire()?;
     let metadata = reference_metadata.clone();
     // One deadline, shared: the caller stops waiting at `deadline`, so every backend the worker
@@ -314,6 +316,25 @@ fn capture_window_inner(
     };
     let mut surface = DibSurface::new(capture_bounds.width, capture_bounds.height)?;
     surface.clear();
+    // Re-probe immediately before the blocking call. Everything since the first probe — the DWM
+    // queries, the DIB allocation, and possibly a full WGC attempt — is time the target had to
+    // stop answering, and `PrintWindow` is a synchronous call into its window procedure with no
+    // timeout of its own. A worker that enters it against a hung window never returns, and the
+    // slot it holds is only reclaimed when it does.
+    if !window_is_responsive(hwnd) {
+        log::debug!(
+            "window handle=0x{:X} stopped answering between the responsiveness probe and PrintWindow; refusing to block a render worker on it",
+            handle.raw()
+        );
+        return match probe_wgc_error {
+            // Windows Graphics Capture already failed for this window during the first probe;
+            // there is nothing left to try that will not wedge the worker.
+            Some(error) => Err(error),
+            None => {
+                capture_window_with_wgc(hwnd, reference_metadata, max_pixels, &geometry, deadline)
+            }
+        };
+    }
     // SAFETY: hwnd is the selected live top-level window and surface.device contains a selected
     // writable DIB sized to the complete window bounds. PrintWindow asks the owning application
     // to render itself, so desktop occlusion is not copied into the result.
@@ -698,29 +719,60 @@ struct WindowRenderPermit<'a> {
     released: Arc<AtomicBool>,
 }
 
+/// A worker-lifetime lease: one of the process's render-worker slots, held for one window.
+///
+/// Unlike the in-flight permit (reclaimed at the caller's timeout deadline), this budget is only
+/// released when the spawned thread itself exits, and a worker blocked inside an unresponsive
+/// foreign window procedure may never exit. Pairing the slot with an exclusive claim on the target
+/// window is what stops that from being fatal: a wedged window pins one slot forever, but it can
+/// never take a second, so eight attempts at one bad window no longer disable window capture for
+/// the life of the process.
 #[derive(Debug)]
 struct WindowRenderBudget<'a> {
     workers: &'a AtomicUsize,
+    // Dropped after the slot is returned; ordering between the two does not matter, only that both
+    // happen when the worker exits.
+    _target: WindowRenderTarget<'a>,
+}
+
+/// An exclusive claim on rendering one specific window.
+#[derive(Debug)]
+struct WindowRenderTarget<'a> {
+    claimed: &'a Mutex<BTreeSet<isize>>,
+    target: isize,
 }
 
 impl WindowRenderBudget<'static> {
-    fn acquire() -> Result<Self, CaptureError> {
-        Self::acquire_from(&WINDOW_RENDER_WORKERS, MAX_WINDOW_RENDER_WORKERS)
+    fn acquire(target: isize) -> Result<Self, CaptureError> {
+        Self::acquire_from(
+            &WINDOW_RENDER_WORKERS,
+            &ACTIVE_WINDOW_RENDER_TARGETS,
+            MAX_WINDOW_RENDER_WORKERS,
+            target,
+        )
     }
 }
 
 impl<'a> WindowRenderBudget<'a> {
-    fn acquire_from(workers: &'a AtomicUsize, limit: usize) -> Result<Self, CaptureError> {
+    fn acquire_from(
+        workers: &'a AtomicUsize,
+        claimed: &'a Mutex<BTreeSet<isize>>,
+        limit: usize,
+        target: isize,
+    ) -> Result<Self, CaptureError> {
+        // Claim the window before the slot. Refusing a duplicate costs nothing, and it must happen
+        // first or a repeatedly retried hung window still burns a slot per attempt on its way to
+        // being rejected. If the slot below is unavailable the claim drops again on the `?`.
+        let target = WindowRenderTarget::claim(claimed, target)?;
         let mut current = workers.load(Ordering::Acquire);
         loop {
             if current >= limit {
-                // Unlike the in-flight permit (reclaimed at the caller's timeout deadline), this
-                // worker-lifetime budget is only released when the spawned thread itself exits
-                // (see `Drop for WindowRenderBudget`, moved into the worker closure). If every
-                // slot is taken, an immediate retry cannot succeed until some worker — possibly
-                // one wedged in a foreign window procedure — finally returns.
+                // Every slot is taken by a worker that has not exited. Some of them may be wedged
+                // in a foreign window procedure and never will, so an immediate retry cannot
+                // succeed — this is a distinct condition from transient buffer pressure, and the
+                // kind says so rather than inviting a retry that is guaranteed to fail.
                 return Err(capture_error(
-                    CaptureErrorKind::BufferExhausted,
+                    CaptureErrorKind::WorkersExhausted,
                     "start_window_render",
                     format!(
                         "{current} native window-render workers are still running; refusing to create an unbounded thread backlog"
@@ -735,7 +787,12 @@ impl<'a> WindowRenderBudget<'a> {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Ok(Self { workers }),
+                Ok(_) => {
+                    return Ok(Self {
+                        workers,
+                        _target: target,
+                    })
+                }
                 Err(observed) => current = observed,
             }
         }
@@ -746,6 +803,38 @@ impl Drop for WindowRenderBudget<'_> {
     fn drop(&mut self) {
         self.workers.fetch_sub(1, Ordering::AcqRel);
     }
+}
+
+impl<'a> WindowRenderTarget<'a> {
+    fn claim(claimed: &'a Mutex<BTreeSet<isize>>, target: isize) -> Result<Self, CaptureError> {
+        if !lock_render_targets(claimed).insert(target) {
+            return Err(capture_error(
+                CaptureErrorKind::BufferExhausted,
+                "start_window_render",
+                format!(
+                    "a native render for window handle=0x{target:X} is already running; one window may occupy only one render worker"
+                ),
+                // Unlike the exhausted worker budget, this really can clear on its own: the
+                // render already in flight is usually a different caller's, moments from done.
+                true,
+                None,
+            ));
+        }
+        Ok(Self { claimed, target })
+    }
+}
+
+impl Drop for WindowRenderTarget<'_> {
+    fn drop(&mut self) {
+        lock_render_targets(self.claimed).remove(&self.target);
+    }
+}
+
+/// A poisoned claim set is still a correct claim set: the guarded `BTreeSet` has no invariant a
+/// panicking holder could have broken, and refusing to render anything ever again is worse than
+/// whatever the panic was.
+fn lock_render_targets(claimed: &Mutex<BTreeSet<isize>>) -> MutexGuard<'_, BTreeSet<isize>> {
+    claimed.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl WindowRenderPermit<'static> {
@@ -1622,8 +1711,10 @@ mod tests {
     fn bounded_render_timeout_reclaims_capacity_before_late_completion() {
         let active = Box::leak(Box::new(AtomicUsize::new(0)));
         let workers = Box::leak(Box::new(AtomicUsize::new(0)));
+        let claimed = Box::leak(Box::new(Mutex::new(BTreeSet::new())));
         let permit = WindowRenderPermit::acquire_from(active, 1).expect("render permit");
-        let budget = WindowRenderBudget::acquire_from(workers, 1).expect("worker budget");
+        let budget =
+            WindowRenderBudget::acquire_from(workers, claimed, 1, 0x11).expect("worker budget");
         let (release_sender, release_receiver) = mpsc::sync_channel(0);
 
         let error = run_bounded_window_render(
@@ -1640,7 +1731,7 @@ mod tests {
         assert_eq!(error.kind, CaptureErrorKind::Timeout);
         assert_eq!(active.load(Ordering::Acquire), 0);
         assert_eq!(workers.load(Ordering::Acquire), 1);
-        assert!(WindowRenderBudget::acquire_from(workers, 1).is_err());
+        assert!(WindowRenderBudget::acquire_from(workers, claimed, 1, 0x22).is_err());
         let replacement =
             WindowRenderPermit::acquire_from(active, 1).expect("deadline reclaimed capacity");
         release_sender.send(()).expect("release detached worker");
@@ -1660,8 +1751,10 @@ mod tests {
     fn bounded_render_worker_panic_is_a_non_retryable_native_failure() {
         let active = Box::leak(Box::new(AtomicUsize::new(0)));
         let workers = Box::leak(Box::new(AtomicUsize::new(0)));
+        let claimed = Box::leak(Box::new(Mutex::new(BTreeSet::new())));
         let permit = WindowRenderPermit::acquire_from(active, 1).expect("render permit");
-        let budget = WindowRenderBudget::acquire_from(workers, 1).expect("worker budget");
+        let budget =
+            WindowRenderBudget::acquire_from(workers, claimed, 1, 0x11).expect("worker budget");
 
         // The worker terminates promptly by panicking, so this timeout only bounds a broken
         // harness. Keep it generous: a 1-second budget lost the race to thread spawn plus unwind
@@ -1683,21 +1776,76 @@ mod tests {
     #[test]
     fn native_render_worker_budget_is_a_strict_hard_cap() {
         let workers = AtomicUsize::new(0);
-        let first = WindowRenderBudget::acquire_from(&workers, 2).expect("first worker");
-        let second = WindowRenderBudget::acquire_from(&workers, 2).expect("second worker");
+        let claimed = Mutex::new(BTreeSet::new());
+        let first =
+            WindowRenderBudget::acquire_from(&workers, &claimed, 2, 0x11).expect("first worker");
+        let second =
+            WindowRenderBudget::acquire_from(&workers, &claimed, 2, 0x22).expect("second worker");
 
-        let error = WindowRenderBudget::acquire_from(&workers, 2).expect_err("worker cap");
-        assert_eq!(error.kind, CaptureErrorKind::BufferExhausted);
+        let error =
+            WindowRenderBudget::acquire_from(&workers, &claimed, 2, 0x33).expect_err("worker cap");
+        assert_eq!(error.kind, CaptureErrorKind::WorkersExhausted);
         assert!(error.message.contains("unbounded thread backlog"));
         // The budget is only reclaimed when a worker thread exits, so an immediate retry cannot
         // succeed while the cap is held; unlike the in-flight permit, this must not be retryable.
         assert!(!error.retryable);
-
+        // The rejected attempt must not leave its window claimed behind, or one exhausted moment
+        // would lock that window out until the process restarts.
+        drop(error);
         drop(first);
-        let replacement = WindowRenderBudget::acquire_from(&workers, 2).expect("released slot");
+        let replacement = WindowRenderBudget::acquire_from(&workers, &claimed, 2, 0x33)
+            .expect("released slot, and 0x33 was never left claimed");
         drop(second);
         drop(replacement);
         assert_eq!(workers.load(Ordering::Acquire), 0);
+        assert!(lock_render_targets(&claimed).is_empty());
+    }
+
+    #[test]
+    fn one_window_can_never_occupy_more_than_one_render_worker() {
+        // A window wedged inside its own window procedure holds its slot until the process exits.
+        // Eight retries against that one window used to consume the entire worker budget and
+        // disable window capture process-wide; now the second attempt is refused for free.
+        let workers = AtomicUsize::new(0);
+        let claimed = Mutex::new(BTreeSet::new());
+        let wedged = WindowRenderBudget::acquire_from(&workers, &claimed, 8, 0xBAD)
+            .expect("first render of the wedged window");
+
+        for attempt in 0..8 {
+            let error = WindowRenderBudget::acquire_from(&workers, &claimed, 8, 0xBAD)
+                .expect_err("a repeat attempt must not take a second slot");
+            assert_eq!(error.kind, CaptureErrorKind::BufferExhausted);
+            // The render already in flight is often another caller's and moments from finishing,
+            // so this one really can clear on its own.
+            assert!(error.retryable, "attempt {attempt}");
+            assert_eq!(
+                workers.load(Ordering::Acquire),
+                1,
+                "attempt {attempt} consumed a worker slot"
+            );
+        }
+
+        // Every other window is unaffected, which is the whole point.
+        let healthy = WindowRenderBudget::acquire_from(&workers, &claimed, 8, 0x600D)
+            .expect("an unrelated window still renders");
+        assert_eq!(workers.load(Ordering::Acquire), 2);
+
+        drop(healthy);
+        drop(wedged);
+        assert_eq!(workers.load(Ordering::Acquire), 0);
+        assert!(lock_render_targets(&claimed).is_empty());
+    }
+
+    #[test]
+    fn a_finished_render_releases_its_window_for_the_next_one() {
+        let workers = AtomicUsize::new(0);
+        let claimed = Mutex::new(BTreeSet::new());
+        let first = WindowRenderBudget::acquire_from(&workers, &claimed, 8, 0x11).expect("first");
+        drop(first);
+        let second = WindowRenderBudget::acquire_from(&workers, &claimed, 8, 0x11)
+            .expect("the same window renders again once its worker has exited");
+        drop(second);
+        assert!(lock_render_targets(&claimed).is_empty());
     }
 
     #[test]

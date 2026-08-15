@@ -10,6 +10,13 @@ pub enum CaptureErrorKind {
     DeviceRemoved,
     TopologyChanged,
     BufferExhausted,
+    /// Every capture worker the backend is allowed to run is already occupied.
+    ///
+    /// Distinct from [`Self::BufferExhausted`], which describes transient pressure a moment's wait
+    /// relieves. This capacity is only reclaimed when a worker thread exits, and a worker blocked
+    /// inside an unresponsive foreign process may never exit, so an immediate retry cannot succeed
+    /// and the condition is worth explaining rather than silently retrying.
+    WorkersExhausted,
     InvalidFrame,
     NativeFailure,
     ShuttingDown,
