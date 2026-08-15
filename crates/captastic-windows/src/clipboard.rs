@@ -5,7 +5,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use captastic_core::{
-    CaptureError, CaptureErrorKind, CpuFrame, FrameAlpha, FrameOrigin, PixelFormat,
+    encode_frame, CaptureError, CaptureErrorKind, CpuFrame, FrameAlpha, FrameOrigin, PixelFormat,
+    PngEffort,
 };
 use windows::core::w;
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
@@ -65,9 +66,13 @@ impl ClipboardPublisher {
         let copy_started = Instant::now();
         let dib_memory = GlobalMemory::from_frame(frame, &layout)?;
         let png_started = Instant::now();
+        // `Fast` rather than the default: this runs in the hotkey path, where the user feels the
+        // milliseconds, and even Fast compresses a screenshot roughly 20-45x. The file-output
+        // worker, which is not in that path, uses `Compact`.
         let png = (frame.alpha == FrameAlpha::Straight)
-            .then(|| encode_png(frame))
-            .transpose()?;
+            .then(|| encode_frame(frame, PngEffort::Fast))
+            .transpose()
+            .map_err(png_error)?;
         let png_encode_ns = png
             .as_ref()
             .map_or(0, |_| duration_ns(png_started.elapsed()));
@@ -368,177 +373,20 @@ impl DibV5Layout {
     }
 }
 
-// The maximum payload of a single DEFLATE stored (uncompressed) block: the block's LEN field
-// is a u16, so a block can never hold more than u16::MAX bytes. `push_stored_byte` and
-// `flush_stored_block` both key off this constant directly rather than a `Vec`'s `capacity()`,
-// since `Vec::with_capacity` is permitted to over-allocate and comparing against the live
-// capacity would silently let a block grow past the u16::MAX the LEN field can express.
-const STORED_BLOCK_LIMIT: usize = u16::MAX as usize;
-
-fn encode_png(frame: &CpuFrame) -> Result<Vec<u8>, CaptureError> {
-    if frame.format != PixelFormat::Bgra8Unorm || frame.origin != FrameOrigin::TopLeft {
-        return Err(unsupported(
-            "PNG clipboard publication requires top-left BGRA8 pixels",
-        ));
+/// Translates an encoder failure into the clipboard backend's error vocabulary.
+///
+/// A frame the encoder rejects is a frame this publisher built its DIBV5 from moments earlier, so
+/// the layout is already known good; anything reaching here is a programming error rather than
+/// something a retry would clear.
+fn png_error(error: captastic_core::PngError) -> CaptureError {
+    CaptureError {
+        kind: CaptureErrorKind::InvalidFrame,
+        backend: "windows-clipboard",
+        operation: "encode_png",
+        message: error.to_string(),
+        retryable: false,
+        native_code: None,
     }
-    let row_bytes = usize::try_from(frame.width)
-        .ok()
-        .and_then(|width| width.checked_mul(4))
-        .ok_or_else(|| invalid_frame("PNG row size overflowed"))?;
-    if (frame.stride_bytes as usize) < row_bytes {
-        return Err(invalid_frame("PNG source stride is too small"));
-    }
-    let required = (frame.stride_bytes as usize)
-        .checked_mul(frame.height as usize)
-        .ok_or_else(|| invalid_frame("PNG source size overflowed"))?;
-    if frame.pixels.len() < required {
-        return Err(invalid_frame("PNG source buffer is truncated"));
-    }
-    let raw_length = row_bytes
-        .checked_add(1)
-        .and_then(|row| row.checked_mul(frame.height as usize))
-        .ok_or_else(|| invalid_frame("PNG scanline buffer overflowed"))?;
-    // A terminal block is always emitted, including when the raw byte count ends on a boundary.
-    let block_count = raw_length / STORED_BLOCK_LIMIT + 1;
-    let compressed_length = raw_length
-        .checked_add(block_count.saturating_mul(5))
-        .and_then(|length| length.checked_add(6))
-        .ok_or_else(|| invalid_frame("PNG DEFLATE stream size overflowed"))?;
-    let idat_length = u32::try_from(compressed_length)
-        .map_err(|_| invalid_frame("PNG IDAT exceeds the format size limit"))?;
-    let mut png = Vec::with_capacity(compressed_length.saturating_add(57));
-    png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
-    let mut ihdr = [0_u8; 13];
-    ihdr[0..4].copy_from_slice(&frame.width.to_be_bytes());
-    ihdr[4..8].copy_from_slice(&frame.height.to_be_bytes());
-    ihdr[8] = 8;
-    ihdr[9] = 6; // RGBA.
-    write_png_chunk(&mut png, b"IHDR", &ihdr)?;
-    png.extend_from_slice(&idat_length.to_be_bytes());
-    let idat_crc_start = png.len();
-    png.extend_from_slice(b"IDAT");
-    let idat_payload_start = png.len();
-    png.extend_from_slice(&[0x78, 0x01]);
-    let mut block = Vec::with_capacity(STORED_BLOCK_LIMIT);
-    let mut adler = Adler32::new();
-    for row in 0..frame.height as usize {
-        push_stored_byte(&mut png, &mut block, 0, &mut adler);
-        let start = row * frame.stride_bytes as usize;
-        for pixel in frame.pixels[start..start + row_bytes].chunks_exact(4) {
-            for byte in [pixel[2], pixel[1], pixel[0], pixel[3]] {
-                push_stored_byte(&mut png, &mut block, byte, &mut adler);
-            }
-        }
-    }
-    flush_stored_block(&mut png, &mut block, true);
-    png.extend_from_slice(&adler.finish().to_be_bytes());
-    debug_assert_eq!(png.len() - idat_payload_start, compressed_length);
-    let idat_crc = crc32(&png[idat_crc_start..]);
-    png.extend_from_slice(&idat_crc.to_be_bytes());
-    write_png_chunk(&mut png, b"IEND", &[])?;
-    Ok(png)
-}
-
-#[inline]
-fn push_stored_byte(destination: &mut Vec<u8>, block: &mut Vec<u8>, byte: u8, adler: &mut Adler32) {
-    adler.update(byte);
-    block.push(byte);
-    // Compare against the fixed STORED_BLOCK_LIMIT, not `block.capacity()`: `Vec::with_capacity`
-    // is only a lower bound on the allocation, so a capacity-based check could let `block` grow
-    // past u16::MAX bytes before flushing, which `flush_stored_block` cannot express in the
-    // DEFLATE stored-block LEN field.
-    if block.len() == STORED_BLOCK_LIMIT {
-        flush_stored_block(destination, block, false);
-    }
-}
-
-fn flush_stored_block(destination: &mut Vec<u8>, block: &mut Vec<u8>, final_block: bool) {
-    assert!(
-        block.len() <= STORED_BLOCK_LIMIT,
-        "DEFLATE stored block exceeds the u16 LEN field limit"
-    );
-    destination.push(u8::from(final_block));
-    let length = block.len() as u16;
-    destination.extend_from_slice(&length.to_le_bytes());
-    destination.extend_from_slice(&(!length).to_le_bytes());
-    destination.extend_from_slice(block);
-    block.clear();
-}
-
-fn write_png_chunk(
-    destination: &mut Vec<u8>,
-    kind: &[u8; 4],
-    payload: &[u8],
-) -> Result<(), CaptureError> {
-    let length = u32::try_from(payload.len())
-        .map_err(|_| invalid_frame("PNG chunk exceeds the format size limit"))?;
-    destination.extend_from_slice(&length.to_be_bytes());
-    destination.extend_from_slice(kind);
-    destination.extend_from_slice(payload);
-    destination.extend_from_slice(&crc32_parts(kind, payload).to_be_bytes());
-    Ok(())
-}
-
-struct Adler32 {
-    first: u32,
-    second: u32,
-    pending: u16,
-}
-
-impl Adler32 {
-    fn new() -> Self {
-        Self {
-            first: 1,
-            second: 0,
-            pending: 0,
-        }
-    }
-
-    #[inline]
-    fn update(&mut self, byte: u8) {
-        self.first += u32::from(byte);
-        self.second += self.first;
-        self.pending += 1;
-        if self.pending == 5_552 {
-            self.reduce();
-        }
-    }
-
-    fn reduce(&mut self) {
-        const MODULUS: u32 = 65_521;
-        self.first %= MODULUS;
-        self.second %= MODULUS;
-        self.pending = 0;
-    }
-
-    fn finish(mut self) -> u32 {
-        self.reduce();
-        (self.second << 16) | self.first
-    }
-}
-
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = u32::MAX;
-    for byte in bytes {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            let mask = 0_u32.wrapping_sub(crc & 1);
-            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
-        }
-    }
-    !crc
-}
-
-fn crc32_parts(first: &[u8], second: &[u8]) -> u32 {
-    let mut crc = u32::MAX;
-    for byte in first.iter().chain(second) {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            let mask = 0_u32.wrapping_sub(crc & 1);
-            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
-        }
-    }
-    !crc
 }
 
 fn clipboard_error(
@@ -714,114 +562,48 @@ mod tests {
     }
 
     #[test]
-    fn png_clipboard_payload_is_rgba_and_structurally_complete() {
-        let frame = frame(1, 1, 4, vec![10, 20, 30, 64]).with_alpha(FrameAlpha::Straight);
-        let png = encode_png(&frame).expect("PNG payload");
-        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
-        assert_eq!(&png[12..16], b"IHDR");
-        assert!(png.windows(4).any(|window| window == b"IDAT"));
-        assert!(png.windows(5).any(|window| window == [0, 30, 20, 10, 64]));
-        assert_eq!(&png[png.len() - 8..png.len() - 4], b"IEND");
-    }
+    fn png_clipboard_payload_decodes_to_the_published_pixels() {
+        let frame =
+            frame(2, 1, 8, vec![10, 20, 30, 64, 40, 50, 60, 255]).with_alpha(FrameAlpha::Straight);
+        let png = encode_frame(&frame, PngEffort::Fast).expect("PNG payload");
 
-    /// Decodes the stored-block-only zlib stream `encode_png` emits: a 2-byte zlib header,
-    /// one or more DEFLATE stored blocks (final-flag byte, LE `LEN`, LE `NLEN`, `LEN` literal
-    /// bytes), then a 4-byte big-endian Adler-32 trailer. Returns the reassembled raw bytes
-    /// alongside the number of stored blocks consumed, so tests can assert both content and
-    /// that a multi-block boundary was actually exercised.
-    fn inflate_stored_blocks(zlib: &[u8]) -> (Vec<u8>, usize) {
-        assert!(zlib.len() >= 2, "zlib stream missing its 2-byte header");
-        let mut cursor = &zlib[2..];
-        let mut raw = Vec::new();
-        let mut block_count = 0;
-        loop {
-            assert!(cursor.len() >= 5, "truncated stored-block header");
-            let final_block = cursor[0] != 0;
-            let len = u16::from_le_bytes([cursor[1], cursor[2]]);
-            let nlen = u16::from_le_bytes([cursor[3], cursor[4]]);
-            assert_eq!(
-                len, !nlen,
-                "stored-block LEN/NLEN one's-complement mismatch"
-            );
-            assert!(
-                len as usize <= STORED_BLOCK_LIMIT,
-                "stored block exceeds the u16 LEN field limit"
-            );
-            cursor = &cursor[5..];
-            let len = len as usize;
-            assert!(cursor.len() >= len, "stored block body truncated");
-            raw.extend_from_slice(&cursor[..len]);
-            cursor = &cursor[len..];
-            block_count += 1;
-            if final_block {
-                break;
-            }
-        }
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        let decoder = png::Decoder::new(std::io::Cursor::new(&png));
+        let mut reader = decoder.read_info().expect("valid PNG header");
+        let mut buffer = vec![0; reader.output_buffer_size().expect("bounded buffer")];
+        let info = reader.next_frame(&mut buffer).expect("valid PNG data");
+
+        assert_eq!(info.color_type, png::ColorType::Rgba);
+        assert_eq!((info.width, info.height), (2, 1));
+        // BGRA in, RGBA out, alpha preserved.
         assert_eq!(
-            cursor.len(),
-            4,
-            "expected exactly the Adler-32 trailer after the final block"
+            &buffer[..info.buffer_size()],
+            &[30, 20, 10, 64, 60, 50, 40, 255]
         );
-        let adler = u32::from_be_bytes(cursor.try_into().expect("4 trailer bytes"));
-        let mut recomputed = Adler32::new();
-        for &byte in &raw {
-            recomputed.update(byte);
-        }
-        assert_eq!(
-            adler,
-            recomputed.finish(),
-            "Adler-32 trailer does not match the payload"
-        );
-        (raw, block_count)
     }
 
     #[test]
-    fn png_stored_block_framing_round_trips_across_a_block_boundary() {
-        // width=16384 => row_bytes = 65536, so a single row's filter byte plus pixel bytes
-        // (65537 raw bytes) exceeds STORED_BLOCK_LIMIT (65535) and forces `encode_png` to split
-        // the row across two DEFLATE stored blocks. This is the exact boundary M41 covers:
-        // `Vec::with_capacity(STORED_BLOCK_LIMIT)` is permitted to over-allocate, so a flush
-        // decision keyed off `capacity()` instead of the fixed limit could silently grow a block
-        // past what the stored-block LEN field (a u16) can represent.
-        let width = 16_384_u32;
-        let mut pixels = Vec::with_capacity(width as usize * 4);
-        for i in 0..width {
-            let i = i as u8;
-            pixels.extend_from_slice(&[
-                i.wrapping_mul(7),
-                i.wrapping_mul(13),
-                i.wrapping_mul(17),
-                255,
-            ]);
-        }
-        let frame = frame(width, 1, width * 4, pixels.clone());
+    fn png_clipboard_payload_compresses_rather_than_storing() {
+        // The regression that retired the hand-rolled encoder: it emitted stored (uncompressed)
+        // DEFLATE, so its output was always *larger* than the raw pixels it was given.
+        let width = 512_u32;
+        let height = 512_u32;
+        let frame = frame(
+            width,
+            height,
+            width * 4,
+            vec![0x40; (width * height * 4) as usize],
+        )
+        .with_alpha(FrameAlpha::Straight);
 
-        let png = encode_png(&frame).expect("PNG payload");
+        let png = encode_frame(&frame, PngEffort::Fast).expect("PNG payload");
 
-        let idat_pos = png
-            .windows(4)
-            .position(|window| window == b"IDAT")
-            .expect("IDAT chunk present");
-        let idat_length = u32::from_be_bytes(
-            png[idat_pos - 4..idat_pos]
-                .try_into()
-                .expect("4 length bytes"),
-        ) as usize;
-        let idat_payload = &png[idat_pos + 4..idat_pos + 4 + idat_length];
-        assert_eq!(&idat_payload[..2], &[0x78, 0x01], "zlib header");
-
-        let (raw, block_count) = inflate_stored_blocks(idat_payload);
+        let raw_bytes = (width * height * 4) as usize;
         assert!(
-            block_count >= 2,
-            "expected the oversized row to span multiple stored blocks, got {block_count}"
+            png.len() * 10 < raw_bytes,
+            "a uniform {width}x{height} frame encoded to {} bytes against {raw_bytes} raw",
+            png.len()
         );
-
-        let mut expected_raw = Vec::with_capacity(1 + pixels.len());
-        expected_raw.push(0); // PNG "none" filter byte.
-        for pixel in pixels.chunks_exact(4) {
-            expected_raw.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
-        }
-        assert_eq!(raw, expected_raw);
     }
 
     #[test]
@@ -840,5 +622,90 @@ mod tests {
         publisher.publish(&frame).expect("publish");
         let actual = read_current_dibv5(publisher.window.hwnd).expect("clipboard readback");
         assert_eq!(actual, expected);
+    }
+
+    /// Reports what each encoder effort costs, and buys, on a real captured frame.
+    ///
+    /// This is the harness that retired the hand-rolled stored-DEFLATE encoder — on this content
+    /// it ran at ~19.4 ms/MP and emitted slightly *more* bytes than the raw pixels, against
+    /// ~2-3 ms/MP and a 20-45x reduction for `Fast`. It survives that decision as the check on the
+    /// one that replaced it: `Fast` is on the hotkey path, so its cost is a latency budget, and
+    /// switching the clipboard to `Compact` would be visible here as a 5-6x regression.
+    ///
+    /// A window is the subject rather than the whole desktop because desktop duplication only
+    /// yields on change and an idle machine never produces one; the pixels are the same kind of
+    /// screenshot content either way. Rates are per megapixel so a larger capture extrapolates.
+    ///
+    /// CAPTASTIC_TEST_WINDOW_HANDLE=<hwnd> cargo test --locked -p captastic-windows --release
+    ///     -- --ignored --nocapture png_encoder_latency_and_size_on_a_real_capture
+    #[test]
+    #[ignore = "requires CAPTASTIC_TEST_WINDOW_HANDLE naming a live interactive window"]
+    fn png_encoder_latency_and_size_on_a_real_capture() {
+        use std::time::Instant;
+
+        let raw = std::env::var("CAPTASTIC_TEST_WINDOW_HANDLE")
+            .expect("set CAPTASTIC_TEST_WINDOW_HANDLE")
+            .parse::<isize>()
+            .expect("numeric window handle");
+        let reference = frame(2, 2, 8, vec![0; 16]);
+        let captured = crate::window_capture::capture_window_visual(
+            crate::NativeWindowHandle::from_raw(raw),
+            &reference.metadata,
+        )
+        .expect("window capture")
+        .frame;
+        let opaque = captured.clone().with_alpha(FrameAlpha::Opaque);
+        let megapixels = f64::from(captured.width) * f64::from(captured.height) / 1_000_000.0;
+        let raw_bytes = captured.required_bytes();
+
+        // One warm-up plus three timed runs each; the best run is the least noisy estimate on a
+        // machine that is also running a desktop.
+        let best = |mut run: Box<dyn FnMut() -> usize>| {
+            run();
+            (0..3)
+                .map(|_| {
+                    let started = Instant::now();
+                    let bytes = run();
+                    (started.elapsed(), bytes)
+                })
+                .min_by_key(|(elapsed, _)| *elapsed)
+                .expect("at least one run")
+        };
+        let measure = |frame: CpuFrame, effort: PngEffort| {
+            best(Box::new(move || {
+                encode_frame(&frame, effort).expect("png encode").len()
+            }))
+        };
+
+        let results = [
+            (
+                "Fast, straight alpha -> RGBA (clipboard)",
+                measure(captured.clone(), PngEffort::Fast),
+            ),
+            (
+                "Compact, straight alpha -> RGBA",
+                measure(captured.clone(), PngEffort::Compact),
+            ),
+            (
+                "Compact, opaque -> RGB (file output)",
+                measure(opaque, PngEffort::Compact),
+            ),
+        ];
+
+        println!(
+            "captured frame {}x{} ({megapixels:.2} MP, {:.1} MiB raw)",
+            captured.width,
+            captured.height,
+            raw_bytes as f64 / (1024.0 * 1024.0),
+        );
+        for (label, (elapsed, bytes)) in results {
+            let ms = elapsed.as_secs_f64() * 1000.0;
+            println!(
+                "  {label:36} {ms:8.1} ms ({:6.1} ms/MP)  {:8.2} MiB  ({:.3}x of raw)",
+                ms / megapixels,
+                bytes as f64 / (1024.0 * 1024.0),
+                bytes as f64 / raw_bytes as f64,
+            );
+        }
     }
 }

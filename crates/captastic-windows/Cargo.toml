@@ -10,6 +10,11 @@ captastic-config = { path = "../captastic-config" }
 captastic-core = { path = "../captastic-core" }
 log.workspace = true
 
+# Decoding only, to assert that what the clipboard publishes is readable by an independent
+# implementation. Encoding goes through `captastic_core::encode_frame`.
+[dev-dependencies]
+png.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
     "Foundation",
