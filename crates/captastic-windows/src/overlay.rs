@@ -2554,7 +2554,12 @@ fn refresh_live_window_thumbnails(state: &mut OverlayState) {
                 bottom: bounds.bottom,
             },
         );
-        if live_thumbnail_overlaps_chrome(destination, toolbar, state.model.options_open) {
+        if live_thumbnail_overlaps_chrome(
+            destination,
+            toolbar,
+            state.model.options_open,
+            state.model.display_environment,
+        ) {
             // DWM thumbnails are composed above the destination window's own pixels. Keep this
             // preview in the frozen overview instead so the toolbar and menu remain unobscured.
             continue;
@@ -2577,9 +2582,36 @@ fn live_thumbnail_overlaps_chrome(
     destination: RECT,
     toolbar: ToolbarLayout,
     options_open: bool,
+    environment: DisplayEnvironment,
 ) -> bool {
     rect_overlaps_ui(destination, toolbar.bounds)
+        || rect_overlaps_ui(destination, tooltip_band(environment, toolbar))
         || (options_open && rect_overlaps_ui(destination, toolbar.menu))
+}
+
+/// The strip a hover tooltip can occupy: directly above the toolbar when there is room
+/// (mirroring draw_hover_tooltip's placement rule), otherwise directly below, spanning the
+/// work area horizontally. The band is reserved whenever the toolbar is present - not only
+/// while a tooltip is showing - so live thumbnails and the dimension label never flicker
+/// between states as the hover comes and goes. DWM thumbnails composite above our pixels, so
+/// anything in this band must yield or the tooltip would be occluded.
+fn tooltip_band(environment: DisplayEnvironment, toolbar: ToolbarLayout) -> UiRect {
+    let metrics = environment.metrics;
+    let work_area = environment.work_area;
+    // draw_hover_tooltip's single-line height: text plus padding, floored at px(32).
+    let height = metrics.px(32);
+    let gap = metrics.px(8);
+    let (top, bottom) = if toolbar.bounds.top >= work_area.top + height + metrics.px(16) {
+        (toolbar.bounds.top - height - gap, toolbar.bounds.top)
+    } else {
+        (toolbar.bounds.bottom, toolbar.bounds.bottom + gap + height)
+    };
+    UiRect {
+        left: work_area.left,
+        top,
+        right: work_area.right,
+        bottom,
+    }
 }
 
 fn rect_overlaps_ui(rect: RECT, ui: UiRect) -> bool {
@@ -2952,6 +2984,9 @@ fn draw_region_dimensions(state: &mut OverlayState, rect: Rect) {
         state.model.toolbar_position,
     );
     let mut reserved = vec![toolbar.bounds];
+    // The tooltip paints after the label and would occlude it; reserve its whole potential
+    // band so the label's placement stays stable across hover changes.
+    reserved.push(tooltip_band(state.model.display_environment, toolbar));
     if state.model.options_open {
         reserved.push(toolbar.menu);
     }
@@ -5354,12 +5389,25 @@ mod tests {
             bottom: layout.bounds.bottom - 1,
         };
 
-        assert!(live_thumbnail_overlaps_chrome(menu_overlap, layout, true));
-        assert!(!live_thumbnail_overlaps_chrome(menu_overlap, layout, false));
+        assert!(live_thumbnail_overlaps_chrome(
+            menu_overlap,
+            layout,
+            true,
+            environment
+        ));
+        // With the options menu closed the menu rect is no longer chrome, but for a bottom
+        // toolbar it lies inside the always-reserved tooltip band, so it still yields.
+        assert!(live_thumbnail_overlaps_chrome(
+            menu_overlap,
+            layout,
+            false,
+            environment
+        ));
         assert!(live_thumbnail_overlaps_chrome(
             toolbar_overlap,
             layout,
-            false
+            false,
+            environment
         ));
         assert!(!live_thumbnail_overlaps_chrome(
             RECT {
@@ -5369,7 +5417,26 @@ mod tests {
                 bottom: 64,
             },
             layout,
-            true
+            true,
+            environment
+        ));
+
+        // The default-origin toolbar sits near the bottom, so the tooltip band lies directly
+        // above it; a thumbnail there must yield even while no tooltip is showing.
+        let band = tooltip_band(environment, layout);
+        assert_eq!(band.bottom, layout.bounds.top);
+        assert!(band.top < layout.bounds.top);
+        let band_overlap = RECT {
+            left: layout.bounds.left,
+            top: band.top + 1,
+            right: layout.bounds.left + 10,
+            bottom: band.top + 2,
+        };
+        assert!(live_thumbnail_overlaps_chrome(
+            band_overlap,
+            layout,
+            false,
+            environment
         ));
     }
 
