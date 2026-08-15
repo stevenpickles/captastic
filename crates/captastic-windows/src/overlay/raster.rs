@@ -17,7 +17,8 @@ use windows::Win32::Graphics::Gdi::{
 use captastic_core::{CaptureError, Rect};
 
 use super::layout::{UiMetrics, UiRect};
-use super::{FrozenSurface, LIVE_UNDRAWN_ALPHA, REGION_CURSOR_CENTER, REGION_CURSOR_SIZE};
+use super::shell::{REGION_CURSOR_CENTER, REGION_CURSOR_SIZE};
+use super::{FrozenSurface, LIVE_UNDRAWN_ALPHA};
 
 #[derive(Clone, Copy)]
 pub(super) enum TextAlignment {
