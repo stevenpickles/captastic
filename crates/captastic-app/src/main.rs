@@ -423,7 +423,7 @@ fn capture_with_preview_fallback(
             recorder.record(request.id, PerfEventKind::ClipboardStarted, 0);
             let payload = captastic_windows::ClipboardPayload::prepare(clipboard_frame)?;
             let mut publisher = captastic_windows::ClipboardPublisher::new()?;
-            let report = publisher.publish(&payload)?;
+            let report = publisher.publish(&payload).map_err(report_clipboard_loss)?;
             recorder.record(
                 request.id,
                 PerfEventKind::ClipboardCommitted,
@@ -469,6 +469,22 @@ fn capture_with_preview_fallback(
     #[cfg(windows)]
     finish_one_shot_ui_state(ui_worker);
     Ok(())
+}
+
+/// Converts a failed one-shot clipboard publish, saying so when it cost the user their clipboard.
+///
+/// Win32 requires emptying the clipboard to take ownership of it, so a publish that fails after
+/// that point leaves the user with neither their capture nor what they had copied before. A
+/// one-shot command has no notification area to raise this in, so it goes in the log and the error.
+#[cfg(windows)]
+fn report_clipboard_loss(failure: captastic_windows::ClipboardPublishError) -> AppError {
+    if failure.cleared_previous_contents {
+        crate::logging::warn(format_args!(
+            "clipboard publication failed after the clipboard was emptied; the previous clipboard contents were lost: {}",
+            failure.error
+        ));
+    }
+    AppError::from(failure.error)
 }
 
 #[cfg(windows)]
@@ -649,7 +665,7 @@ fn capture_with_live_selection(mut args: cli::CaptureArgs) -> Result<(), AppErro
         recorder.record(capture_id, PerfEventKind::ClipboardStarted, 0);
         let payload = captastic_windows::ClipboardPayload::prepare(&selected_frame)?;
         let mut publisher = captastic_windows::ClipboardPublisher::new()?;
-        let report = publisher.publish(&payload)?;
+        let report = publisher.publish(&payload).map_err(report_clipboard_loss)?;
         recorder.record(
             capture_id,
             PerfEventKind::ClipboardCommitted,

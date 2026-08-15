@@ -1051,10 +1051,19 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                 if let Some(worker) = workers.clipboard() {
                     while let Some(failure) = worker.try_recv_failure() {
                         if let Some(tray) = tray.as_ref() {
-                            let message = format!(
-                                "Capture {} was not copied to the clipboard. {}",
-                                failure.capture_id.0, failure.message
-                            );
+                            // Losing what the user had copied is a different event from failing
+                            // to add to it, and only the first is worth an apology.
+                            let message = if failure.cleared_previous_contents {
+                                format!(
+                                    "Capture {} was not copied to the clipboard, and your previous clipboard contents were cleared. {}",
+                                    failure.capture_id.0, failure.message
+                                )
+                            } else {
+                                format!(
+                                    "Capture {} was not copied to the clipboard. {}",
+                                    failure.capture_id.0, failure.message
+                                )
+                            };
                             if let Err(error) = tray.show_error(message) {
                                 crate::logging::warn(format_args!(
                                     "failed to surface clipboard error in the notification area: {error}"
@@ -1172,8 +1181,14 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let persistence_failures = teardown.persistence_failures;
     for failure in teardown.clipboard_failures {
         crate::logging::warn(format_args!(
-            "shutdown retained clipboard failure for capture {} in the persistent log: {}",
-            failure.capture_id.0, failure.message
+            "shutdown retained clipboard failure for capture {} in the persistent log: {}{}",
+            failure.capture_id.0,
+            failure.message,
+            if failure.cleared_previous_contents {
+                " (the previous clipboard contents were cleared)"
+            } else {
+                ""
+            }
         ));
     }
     for failure in persistence_failures {

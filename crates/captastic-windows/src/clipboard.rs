@@ -64,27 +64,38 @@ impl ClipboardPublisher {
     ///
     /// Safe to call again after a retryable failure: every handle it allocates is either
     /// transferred to the clipboard or freed before returning.
+    ///
+    /// A failure reports whether it left the clipboard empty. Win32 requires `EmptyClipboard`
+    /// before `SetClipboardData` — emptying is how a process takes ownership — so there is a
+    /// moment where the user's previous contents are gone and the replacement has not landed. It
+    /// cannot be closed, only made as small as possible and, when it does bite, admitted to.
     pub fn publish(
         &mut self,
         payload: &ClipboardPayload<'_>,
-    ) -> Result<ClipboardPublishReport, CaptureError> {
+    ) -> Result<ClipboardPublishReport, ClipboardPublishError> {
         let publish_started = Instant::now();
         let layout = &payload.layout;
         let copy_started = Instant::now();
-        let dib_memory = GlobalMemory::from_frame(payload.frame, layout)?;
+        // Every allocation happens before the clipboard is opened, let alone emptied, so the
+        // failures most likely to occur cannot cost the user what they had copied.
+        let dib_memory = GlobalMemory::from_frame(payload.frame, layout).map_err(intact)?;
         let png_payload_bytes = payload.png.as_ref().map_or(0, Vec::len);
         let png_memory = payload
             .png
             .as_deref()
             .map(|bytes| GlobalMemory::from_bytes(bytes, "allocate_png"))
-            .transpose()?;
+            .transpose()
+            .map_err(intact)?;
         let allocation_copy_ns = duration_ns(copy_started.elapsed());
         let (clipboard, open_retries, open_wait_ns) =
-            ClipboardSession::open(self.window.hwnd, OPEN_TIMEOUT)?;
+            ClipboardSession::open(self.window.hwnd, OPEN_TIMEOUT).map_err(intact)?;
         // SAFETY: This thread owns the successfully opened clipboard session.
         unsafe { EmptyClipboard() }
-            .map_err(|error| clipboard_error("empty_clipboard", error, true))?;
-        dib_memory.transfer_to_clipboard(CF_DIBV5_FORMAT)?;
+            .map_err(|error| intact(clipboard_error("empty_clipboard", error, true)))?;
+        // Past this point the user's previous clipboard contents are gone.
+        dib_memory
+            .transfer_to_clipboard(CF_DIBV5_FORMAT)
+            .map_err(cleared)?;
         let png_payload_bytes = if let Some(png_memory) = png_memory {
             match png_memory.transfer_to_clipboard(self.png_format) {
                 Ok(()) => png_payload_bytes,
@@ -111,6 +122,52 @@ impl ClipboardPublisher {
             // the sum of the ones that did not.
             publish_ns: duration_ns(publish_started.elapsed()),
         })
+    }
+}
+
+/// A failed publish, and whether it cost the user what was on the clipboard before.
+///
+/// The distinction is the whole point: a publish that fails before `EmptyClipboard` is a capture
+/// the user did not get, while one that fails after it is a capture they did not get *and* a
+/// clipboard they no longer have. Only the second is worth interrupting them about.
+#[derive(Clone, Debug)]
+pub struct ClipboardPublishError {
+    pub error: CaptureError,
+    /// True when this attempt emptied the clipboard and then failed to replace its contents.
+    pub cleared_previous_contents: bool,
+}
+
+impl std::fmt::Display for ClipboardPublishError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.error)?;
+        if self.cleared_previous_contents {
+            formatter.write_str(" (the previous clipboard contents were cleared)")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ClipboardPublishError {}
+
+impl From<ClipboardPublishError> for CaptureError {
+    fn from(failure: ClipboardPublishError) -> Self {
+        failure.error
+    }
+}
+
+/// A failure that left the clipboard as it found it.
+fn intact(error: CaptureError) -> ClipboardPublishError {
+    ClipboardPublishError {
+        error,
+        cleared_previous_contents: false,
+    }
+}
+
+/// A failure that happened after the clipboard had been emptied.
+fn cleared(error: CaptureError) -> ClipboardPublishError {
+    ClipboardPublishError {
+        error,
+        cleared_previous_contents: true,
     }
 }
 
