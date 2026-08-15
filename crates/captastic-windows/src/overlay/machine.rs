@@ -191,9 +191,9 @@ pub(super) enum OverlayEffect {
     HideLiveThumbnails,
     /// Rebuild the composed window-overview surface from current thumbnails and chrome.
     RebuildOverviewCache,
-    /// Enumerate windows and render their thumbnails for the chooser. The shell applies this
-    /// synchronously today (M21 — the overlay blocks while it runs); the machine only decides
-    /// when it happens.
+    /// Enumerate windows and start the incremental thumbnail build for the chooser. The shell
+    /// renders batch by batch through posted messages so the pump stays live; the machine only
+    /// decides when a build is wanted.
     BuildWindowOverview,
     /// Capture (or retry) the preview for the given window and feed the outcome back as
     /// [`OverlayInput::WindowPreviewResolved`]. Synchronous and blocking in the shell today

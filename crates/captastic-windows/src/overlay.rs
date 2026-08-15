@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::marker::PhantomData;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
@@ -76,7 +76,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, GA_ROOTOWNER, GWLP_USERDATA, GWL_EXSTYLE, HCURSOR, ICONINFO, IDC_ARROW,
     IDC_CROSS, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, MSG, PM_REMOVE,
     SPI_SETLOGICALDPIOVERRIDE, SPI_SETWORKAREA, SW_SHOW, ULW_ALPHA, WDA_EXCLUDEFROMCAPTURE,
-    WDA_NONE, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
+    WDA_NONE, WM_APP, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
     WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
     WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_QUIT, WM_RBUTTONDOWN, WM_SETTINGCHANGE, WNDCLASSW,
     WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
@@ -91,6 +91,10 @@ use crate::window_capture::{
 };
 
 const CLASS_NAME: PCWSTR = w!("CaptasticFrozenSelectionOverlay");
+/// Posted by the incremental window-overview build: each delivery renders one batch of
+/// thumbnails and posts the next, so the message pump stays live for paint, Escape, and
+/// cancellation between batches. `wparam` carries the build generation.
+const WM_OVERVIEW_RENDER_BATCH: u32 = WM_APP + 1;
 const DIM_ALPHA: u8 = 128;
 const LIVE_HIT_TEST_ALPHA: u8 = 1;
 const _: () = assert!(LIVE_HIT_TEST_ALPHA > 0);
@@ -423,7 +427,7 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
         InitialSelectionTool::Window => CaptureTool::Window,
     };
     let (selection, selection_kind) = initial_selection(tool, last_region, source);
-    let mut state = Box::new(OverlayState {
+    let state = Box::new(OverlayState {
         model: OverlayModel {
             source,
             display_environment,
@@ -465,6 +469,8 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
         // presentable content: the cache starts empty so the first Window-mode compose is
         // forced to rebuild, and the rebuild reclaims the spare buffer below.
         window_overview_cache: None,
+        window_overview_build: None,
+        overview_build_generation: 0,
         spare_overview_surface: cached_overview_surface,
         region_cursor,
         _font_resource: font_resource,
@@ -475,9 +481,9 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
         window_overview_ns: None,
         ui_updates: controller.inner.ui_updates.clone(),
     });
-    if tool == CaptureTool::Window {
-        build_window_overview(&mut state);
-    }
+    // A remembered Window tool no longer builds the chooser synchronously before the window
+    // exists: run_overlay starts the incremental build right after creation, so the overlay
+    // appears at once and the thumbnails stream in - strictly better than a frozen launch.
     run_overlay(state, controller, resources)
 }
 
@@ -601,6 +607,13 @@ struct OverlayState {
     window_thumbnails: Vec<WindowThumbnail>,
     live_window_thumbnails: Vec<LiveWindowThumbnail>,
     window_overview_cache: Option<WindowOverviewCache>,
+    /// The in-flight incremental thumbnail build, if any. Shell inventory work, not product
+    /// state: it survives a tool switch away (frozen; its posted messages are ignored) and
+    /// resumes when the Window tool is re-activated.
+    window_overview_build: Option<WindowOverviewBuild>,
+    /// Monotonic stamp for overview builds; a posted batch message whose generation does not
+    /// match the current build is stale and ignored.
+    overview_build_generation: usize,
     /// A previous run's chooser surface, held purely as a reusable allocation for
     /// [`rebuild_window_overview_cache`]. Its pixels are stale by definition and are always
     /// overdrawn before the surface can reach the screen.
@@ -1310,8 +1323,7 @@ fn run_overlay(
     unsafe {
         (*state_pointer).overlay_hwnd = hwnd;
         if (*state_pointer).model.tool == CaptureTool::Window {
-            refresh_live_window_thumbnails(&mut *state_pointer);
-            rebuild_window_overview_cache(&mut *state_pointer);
+            start_window_overview_build(hwnd, &mut *state_pointer);
         }
     }
     if live_preview {
@@ -1594,6 +1606,12 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
         WM_RBUTTONDOWN | WM_CLOSE => {
             run_machine(hwnd, state_pointer, OverlayInput::CancelRequested)
         }
+        WM_OVERVIEW_RENDER_BATCH => {
+            // SAFETY: The Box remains alive for the message loop; the borrow ends before this
+            // arm returns, and rendering spawns only scoped workers that never message us.
+            render_overview_batch(hwnd, unsafe { &mut *state_pointer }, wparam.0);
+            LRESULT(0)
+        }
         WM_PAINT => {
             paint(hwnd, state_pointer);
             LRESULT(0)
@@ -1711,7 +1729,7 @@ fn apply_overlay_effects(
                 // (M21), and this stage preserves that timing exactly.
                 // SAFETY: The borrow ends before the next effect.
                 let state = unsafe { &mut *state_pointer };
-                build_window_overview(state);
+                start_window_overview_build(hwnd, state);
             }
             OverlayEffect::UpdateWindowPreview { window } => {
                 let rect = {
@@ -2320,81 +2338,181 @@ fn fallback_display_info(state: &OverlayState) -> DisplayInfo {
     }
 }
 
-fn build_window_overview(state: &mut OverlayState) {
+/// The pure scheduling core of the incremental overview build: an ordered render queue of
+/// (handle, attempt) pairs stamped with a generation. Retryable failures re-queue exactly once,
+/// at the back - the same ordering the old synchronous two-pass loop produced (first-pass
+/// successes in enumeration order, retry successes after them).
+struct OverviewBuildQueue {
+    generation: usize,
+    pending: VecDeque<(NativeWindowHandle, u32)>,
+}
+
+impl OverviewBuildQueue {
+    fn new(generation: usize, handles: impl IntoIterator<Item = NativeWindowHandle>) -> Self {
+        Self {
+            generation,
+            pending: handles.into_iter().map(|handle| (handle, 0)).collect(),
+        }
+    }
+
+    /// True when a posted batch message belongs to this build.
+    fn accepts(&self, generation: usize) -> bool {
+        self.generation == generation
+    }
+
+    fn take_batch(&mut self, size: usize) -> Vec<(NativeWindowHandle, u32)> {
+        let size = size.max(1).min(self.pending.len());
+        self.pending.drain(..size).collect()
+    }
+
+    /// Re-queues a retryable failure once; a second failure (or a non-retryable one, which the
+    /// caller never passes here) drops the window from the overview.
+    fn requeue(&mut self, handle: NativeWindowHandle, attempt: u32) -> bool {
+        if attempt == 0 {
+            self.pending.push_back((handle, 1));
+            return true;
+        }
+        false
+    }
+
+    fn is_done(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
+struct WindowOverviewBuild {
+    queue: OverviewBuildQueue,
+    started: Instant,
+}
+
+fn post_overview_batch(hwnd: HWND, generation: usize) {
+    // SAFETY: hwnd is the live overlay window; the message is consumed by this thread's pump.
+    let _ = unsafe {
+        PostMessageW(
+            hwnd,
+            WM_OVERVIEW_RENDER_BATCH,
+            WPARAM(generation),
+            LPARAM(0),
+        )
+    };
+}
+
+/// Starts (or resumes) the incremental chooser build. The chooser chrome appears immediately -
+/// thumbnails stream in batch by batch via [`WM_OVERVIEW_RENDER_BATCH`], keeping the message
+/// pump live for paint, Escape, and cancellation between batches (M21). Re-activating the
+/// Window tool mid-build resumes the existing queue rather than restarting it.
+fn start_window_overview_build(hwnd: HWND, state: &mut OverlayState) {
     let started = Instant::now();
     ensure_window_mode_assets(state);
-    if state.window_thumbnails.is_empty() {
-        let candidates = state.windows.clone().unwrap_or_default();
-        let mut pending = candidates
+    if state.window_overview_build.is_none() && state.window_thumbnails.is_empty() {
+        let handles: Vec<NativeWindowHandle> = state
+            .windows
+            .as_deref()
+            .unwrap_or_default()
             .iter()
             .map(|candidate| candidate.handle)
-            .collect::<Vec<_>>();
-        for attempt in 0..=1 {
-            let mut retry = Vec::new();
-            for batch in pending.chunks(WINDOW_THUMBNAIL_RENDER_BATCH) {
-                let rendered = thread::scope(|scope| {
-                    let workers: Vec<_> = batch
-                        .iter()
-                        .copied()
-                        .map(|handle| {
-                            let metadata = &state.reference_metadata;
-                            scope.spawn(move || {
-                                (
-                                    handle,
-                                    capture_window_thumbnail(
-                                        handle,
-                                        metadata,
-                                        WINDOW_THUMBNAIL_MAX_PIXELS,
-                                    ),
-                                )
-                            })
-                        })
-                        .collect();
-                    workers
-                        .into_iter()
-                        .filter_map(|worker| worker.join().ok())
-                        .collect::<Vec<_>>()
-                });
-                for (handle, capture) in rendered {
-                    let capture = match capture {
-                        Ok(capture) => capture,
-                        Err(error) if attempt == 0 && error.retryable => {
-                            retry.push(handle);
-                            continue;
-                        }
-                        Err(error) => {
-                            log::debug!(
-                                "window handle=0x{:X} omitted from overview after render failure: {error}",
-                                handle.raw()
-                            );
-                            continue;
-                        }
-                    };
-                    let Ok(surface) = FrozenSurface::from_straight_alpha(
-                        capture.frame.width,
-                        capture.frame.height,
-                        &capture.frame.pixels,
-                    ) else {
-                        continue;
-                    };
-                    state.window_thumbnails.push(WindowThumbnail {
-                        handle,
-                        surface,
-                        corner_radius_px: capture.corner_radius_px,
-                    });
-                }
-            }
-            if retry.is_empty() {
-                break;
-            }
-            pending = retry;
+            .collect();
+        if !handles.is_empty() {
+            state.overview_build_generation = state.overview_build_generation.wrapping_add(1);
+            state.window_overview_build = Some(WindowOverviewBuild {
+                queue: OverviewBuildQueue::new(state.overview_build_generation, handles),
+                started,
+            });
         }
     }
     refresh_live_window_thumbnails(state);
     rebuild_window_overview_cache(state);
-    if state.window_overview_ns.is_none() {
-        state.window_overview_ns = Some(duration_ns(started.elapsed()));
+    invalidate(hwnd);
+    match &state.window_overview_build {
+        Some(build) => post_overview_batch(hwnd, build.queue.generation),
+        // Nothing to render (no candidates, or thumbnails already built): the build is complete
+        // as of this call, matching the old synchronous telemetry for the trivial cases.
+        None => {
+            if state.window_overview_ns.is_none() {
+                state.window_overview_ns = Some(duration_ns(started.elapsed()));
+            }
+        }
     }
+}
+
+/// Renders one batch of the in-flight build. Stale deliveries - after a tool switch away, after
+/// completion, or from a superseded build - are ignored via the tool and generation guards.
+fn render_overview_batch(hwnd: HWND, state: &mut OverlayState, generation: usize) {
+    if state.model.tool != CaptureTool::Window {
+        return;
+    }
+    let Some(build) = state.window_overview_build.as_mut() else {
+        return;
+    };
+    if !build.queue.accepts(generation) {
+        return;
+    }
+    let batch = build.queue.take_batch(WINDOW_THUMBNAIL_RENDER_BATCH);
+    let rendered = thread::scope(|scope| {
+        let workers: Vec<_> = batch
+            .iter()
+            .copied()
+            .map(|(handle, attempt)| {
+                let metadata = &state.reference_metadata;
+                scope.spawn(move || {
+                    (
+                        handle,
+                        attempt,
+                        capture_window_thumbnail(handle, metadata, WINDOW_THUMBNAIL_MAX_PIXELS),
+                    )
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .filter_map(|worker| worker.join().ok())
+            .collect::<Vec<_>>()
+    });
+    let build = state
+        .window_overview_build
+        .as_mut()
+        .expect("the build is untouched while its batch renders");
+    let mut new_thumbnails = Vec::new();
+    for (handle, attempt, capture) in rendered {
+        let capture = match capture {
+            Ok(capture) => capture,
+            Err(error) if error.retryable && build.queue.requeue(handle, attempt) => continue,
+            Err(error) => {
+                log::debug!(
+                    "window handle=0x{:X} omitted from overview after render failure: {error}",
+                    handle.raw()
+                );
+                continue;
+            }
+        };
+        let Ok(surface) = FrozenSurface::from_straight_alpha(
+            capture.frame.width,
+            capture.frame.height,
+            &capture.frame.pixels,
+        ) else {
+            continue;
+        };
+        new_thumbnails.push(WindowThumbnail {
+            handle,
+            surface,
+            corner_radius_px: capture.corner_radius_px,
+        });
+    }
+    let finished = build.queue.is_done();
+    let started = build.started;
+    state.window_thumbnails.extend(new_thumbnails);
+    if finished {
+        state.window_overview_build = None;
+        refresh_live_window_thumbnails(state);
+        rebuild_window_overview_cache(state);
+        if state.window_overview_ns.is_none() {
+            state.window_overview_ns = Some(duration_ns(started.elapsed()));
+        }
+    } else {
+        rebuild_window_overview_cache(state);
+        post_overview_batch(hwnd, generation);
+    }
+    invalidate(hwnd);
 }
 
 fn refresh_live_window_thumbnails(state: &mut OverlayState) {
@@ -2900,6 +3018,11 @@ fn centered_rect(x: i32, y: i32, radius: i32) -> RECT {
 
 fn draw_window_overview_static(destination: &FrozenSurface, state: &OverlayState) {
     if state.window_thumbnails.is_empty() {
+        // While a build is in flight the empty inventory is a transient, not a verdict: show
+        // only the chooser background until the first tile lands.
+        if state.window_overview_build.is_some() {
+            return;
+        }
         let tokens = state.model.display_environment.metrics.overview_tokens();
         draw_text(
             destination.device,
@@ -5722,6 +5845,35 @@ mod tests {
         });
         resources.clear();
         assert!(resources.take_matching(8, 8).is_none());
+    }
+
+    #[test]
+    fn overview_build_queue_retries_once_in_order_and_rejects_stale_generations() {
+        let first = NativeWindowHandle::from_raw(1);
+        let second = NativeWindowHandle::from_raw(2);
+        let third = NativeWindowHandle::from_raw(3);
+        let mut queue = OverviewBuildQueue::new(7, [first, second, third]);
+
+        // A batch message stamped with another build's generation is stale.
+        assert!(queue.accepts(7));
+        assert!(!queue.accepts(6));
+        assert!(!queue.accepts(8));
+
+        // Batches drain in enumeration order; a retryable first failure re-queues at the back,
+        // so retried windows land after every first-pass window - the old two-pass ordering.
+        assert_eq!(queue.take_batch(1), vec![(first, 0)]);
+        assert!(queue.requeue(first, 0));
+        assert_eq!(queue.take_batch(1), vec![(second, 0)]);
+        assert_eq!(queue.take_batch(2), vec![(third, 0), (first, 1)]);
+
+        // The second failure of the same window is dropped instead of re-queued.
+        assert!(!queue.requeue(first, 1));
+        assert!(queue.is_done());
+
+        // A zero-size batch request still makes progress instead of looping forever.
+        let mut queue = OverviewBuildQueue::new(1, [first]);
+        assert_eq!(queue.take_batch(0), vec![(first, 0)]);
+        assert!(queue.is_done());
     }
 
     #[test]
