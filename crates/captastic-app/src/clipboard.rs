@@ -3,12 +3,9 @@ use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use captastic_config::{HotkeyAction, HotkeyChord};
 #[cfg(test)]
 use captastic_core::CaptureErrorKind;
-use captastic_core::{
-    validate_event_order, CaptureError, CaptureId, CpuFrame, EventRecorder, PerfEventKind,
-};
+use captastic_core::{validate_event_order, CaptureError, CaptureId, PerfEventKind};
 use serde_json::json;
 
 use crate::error::AppError;
@@ -196,11 +193,15 @@ impl ClipboardWorker {
         })
     }
 
-    pub fn submitter(&self) -> mpsc::SyncSender<ClipboardJob> {
-        self.sender
-            .as_ref()
-            .expect("clipboard worker is running")
-            .clone()
+    /// The clipboard as a destination, addressable without knowing it is the clipboard.
+    pub fn sink(&self) -> crate::output::ChannelSink {
+        crate::output::ChannelSink::new(
+            "clipboard",
+            self.sender
+                .as_ref()
+                .expect("clipboard worker is running")
+                .clone(),
+        )
     }
 
     pub fn try_recv_failure(&self) -> Option<ClipboardFailure> {
@@ -255,31 +256,9 @@ impl Drop for ClipboardWorker {
     }
 }
 
-pub struct ClipboardJob {
-    pub capture_id: CaptureId,
-    pub triggered_at: Instant,
-    pub action: HotkeyAction,
-    pub chord: Option<HotkeyChord>,
-    pub cpu_ready_offset_ns: u64,
-    pub source: &'static str,
-    pub frame: CpuFrame,
-    pub recorder: EventRecorder,
-}
-
-pub enum SubmitError {
-    Full(Box<ClipboardJob>),
-    Disconnected(Box<ClipboardJob>),
-}
-
-pub fn try_submit(
-    sender: &mpsc::SyncSender<ClipboardJob>,
-    job: ClipboardJob,
-) -> Result<(), SubmitError> {
-    sender.try_send(job).map_err(|error| match error {
-        mpsc::TrySendError::Full(job) => SubmitError::Full(Box::new(job)),
-        mpsc::TrySendError::Disconnected(job) => SubmitError::Disconnected(Box::new(job)),
-    })
-}
+/// The clipboard is one destination among what will shortly be several, so it takes the shared
+/// job rather than a shape of its own.
+pub type ClipboardJob = crate::output::OutputJob;
 
 pub fn finish_rejected(mut job: ClipboardJob) -> Result<CaptureId, AppError> {
     job.recorder.record(

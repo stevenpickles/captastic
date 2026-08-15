@@ -9,6 +9,8 @@ mod daemon;
 mod error;
 mod logging;
 #[cfg(windows)]
+mod output;
+#[cfg(windows)]
 mod selection;
 #[cfg(windows)]
 mod worker_registry;

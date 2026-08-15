@@ -192,7 +192,7 @@ struct CaptureWorkerContext {
     done: mpsc::SyncSender<Result<(), AppError>>,
     commands: mpsc::Receiver<CaptureCommand>,
     selection_sender: Option<mpsc::SyncSender<crate::selection::SelectionJob>>,
-    clipboard_sender: Option<mpsc::SyncSender<crate::clipboard::ClipboardJob>>,
+    clipboard_sink: Option<crate::output::ChannelSink>,
 }
 
 #[cfg(windows)]
@@ -214,7 +214,7 @@ fn run_capture_worker(context: CaptureWorkerContext) {
         done: done_sender,
         commands: command_receiver,
         selection_sender,
-        clipboard_sender,
+        clipboard_sink,
     } = context;
     let backend = match super::create_backend(&backend_name, &display_policy) {
         Ok(backend) => backend,
@@ -465,7 +465,9 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                             capture_id,
                             dispatch_output(
                                 selection_sender.as_ref(),
-                                clipboard_sender.as_ref(),
+                                clipboard_sink
+                                    .as_ref()
+                                    .map(|sink| sink as &dyn crate::output::OutputSink),
                                 capture_id,
                                 trigger.received_at,
                                 trigger.source,
@@ -820,10 +822,12 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         .selection
         .then(|| {
             crate::selection::SelectionWorker::start(
+                // No `.expect` here any more: the worker accepts the absence of a destination, so
+                // the configuration validator's `selection requires clipboard` rule no longer
+                // needs restating as a runtime assertion that could outlive it.
                 clipboard_worker
                     .as_ref()
-                    .expect("selection requires clipboard")
-                    .submitter(),
+                    .map(|worker| Box::new(worker.sink()) as Box<dyn crate::output::OutputSink>),
                 command_sender.clone(),
                 notice_sender.clone(),
                 args.json,
@@ -836,9 +840,9 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let selection_sender = selection_worker
         .as_ref()
         .map(crate::selection::SelectionWorker::submitter);
-    let clipboard_sender = clipboard_worker
+    let clipboard_sink = clipboard_worker
         .as_ref()
-        .map(crate::clipboard::ClipboardWorker::submitter);
+        .map(crate::clipboard::ClipboardWorker::sink);
     let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
     let (done_sender, done_receiver) = mpsc::sync_channel::<Result<(), AppError>>(1);
     let capture_stop_requested = Arc::new(AtomicBool::new(false));
@@ -860,7 +864,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         done: done_sender,
         commands: command_receiver,
         selection_sender,
-        clipboard_sender,
+        clipboard_sink,
     };
     let capture_join = thread::Builder::new()
         .name("captastic-capture".to_owned())
@@ -1603,7 +1607,7 @@ fn dispatch_live_selection(
 #[allow(clippy::too_many_arguments)]
 fn dispatch_output(
     selection_sender: Option<&mpsc::SyncSender<crate::selection::SelectionJob>>,
-    clipboard_sender: Option<&mpsc::SyncSender<crate::clipboard::ClipboardJob>>,
+    clipboard_sink: Option<&dyn crate::output::OutputSink>,
     capture_id: CaptureId,
     triggered_at: Instant,
     source: &'static str,
@@ -1657,7 +1661,7 @@ fn dispatch_output(
         match repeat_region_rect(confirmed, metadata) {
             Ok(rect) => {
                 return dispatch_repeat_region(
-                    clipboard_sender,
+                    clipboard_sink,
                     capture_id,
                     triggered_at,
                     source,
@@ -1721,7 +1725,7 @@ fn dispatch_output(
     }
 
     dispatch_clipboard(
-        clipboard_sender,
+        clipboard_sink,
         capture_id,
         triggered_at,
         source,
@@ -1804,7 +1808,7 @@ fn dispatch_selection(
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 fn dispatch_repeat_region(
-    clipboard_sender: Option<&mpsc::SyncSender<crate::clipboard::ClipboardJob>>,
+    clipboard_sink: Option<&dyn crate::output::OutputSink>,
     capture_id: CaptureId,
     triggered_at: Instant,
     source: &'static str,
@@ -1878,7 +1882,7 @@ fn dispatch_repeat_region(
         );
     }
     dispatch_clipboard(
-        clipboard_sender,
+        clipboard_sink,
         capture_id,
         triggered_at,
         source,
@@ -1931,7 +1935,7 @@ fn repeat_region_rect(
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 fn dispatch_clipboard(
-    sender: Option<&mpsc::SyncSender<crate::clipboard::ClipboardJob>>,
+    sink: Option<&dyn crate::output::OutputSink>,
     capture_id: CaptureId,
     triggered_at: Instant,
     source: &'static str,
@@ -1941,7 +1945,7 @@ fn dispatch_clipboard(
     frame: Option<CpuFrame>,
     mut recorder: EventRecorder,
 ) -> Result<&'static str, AppError> {
-    let Some(sender) = sender else {
+    let Some(sink) = sink else {
         recorder.record(
             capture_id,
             PerfEventKind::AttemptFinished,
@@ -1970,23 +1974,19 @@ fn dispatch_clipboard(
         frame,
         recorder,
     };
-    match crate::clipboard::try_submit(sender, job) {
+    match sink.submit(job) {
         Ok(()) => Ok("queued"),
-        Err(crate::clipboard::SubmitError::Full(job)) => {
-            let capture_id = crate::clipboard::finish_rejected(*job)?;
+        Err(rejection) => {
+            // A destination that is behind or gone is not a failed capture, which is why the
+            // status is reported rather than returned as an error.
+            let status = rejection.status();
+            let destination = sink.name();
+            let capture_id = crate::clipboard::finish_rejected(*rejection.into_job())?;
             crate::logging::warn(format_args!(
-                "clipboard {} skipped because the clipboard queue is full; capture remains valid",
+                "{destination} {} skipped ({status}); capture remains valid",
                 capture_id.0
             ));
-            Ok("queue_full")
-        }
-        Err(crate::clipboard::SubmitError::Disconnected(job)) => {
-            let capture_id = crate::clipboard::finish_rejected(*job)?;
-            crate::logging::warn(format_args!(
-                "clipboard {} skipped because the clipboard worker stopped; capture remains valid",
-                capture_id.0
-            ));
-            Ok("worker_disconnected")
+            Ok(status)
         }
     }
 }
@@ -2606,8 +2606,9 @@ mod tests {
         .expect("valid frame");
         let (sender, receiver) = mpsc::sync_channel::<crate::clipboard::ClipboardJob>(1);
         drop(receiver);
+        let sink = crate::output::ChannelSink::new("clipboard", sender);
         let status = dispatch_clipboard(
-            Some(&sender),
+            Some(&sink),
             capture_id,
             triggered_at,
             "test",
