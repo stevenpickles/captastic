@@ -409,18 +409,31 @@ impl StateLock {
                     let _ = writeln!(file, "{}", std::process::id());
                     return Ok(Self { path });
                 }
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                // `AlreadyExists` is the ordinary "somebody has it". `PermissionDenied` means the
+                // same thing on Windows, where a lock file that has been deleted but still has an
+                // open handle sits in a delete-pending state: the name is taken, and creating it
+                // fails with ACCESS_DENIED rather than ALREADY_EXISTS until the last handle
+                // closes. Treating that as a hard error made every release a chance to fail the
+                // next acquire.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::AlreadyExists | ErrorKind::PermissionDenied
+                    ) =>
+                {
                     if break_stale_lock(&path) {
                         continue;
                     }
                     if Instant::now() >= deadline {
                         return Err(ConfigError::Write {
                             path: path.display().to_string(),
+                            // Carries the cause: a genuine permission problem times out exactly
+                            // the way contention does, and the two need telling apart.
                             source: std::io::Error::new(
                                 ErrorKind::TimedOut,
                                 format!(
-                                    "another process held the UI state lock for more than {} ms",
-                                    LOCK_TIMEOUT.as_millis()
+                                    "could not take the UI state lock within {} ms (last attempt: {error})",
+                                    LOCK_TIMEOUT.as_millis(),
                                 ),
                             ),
                         });

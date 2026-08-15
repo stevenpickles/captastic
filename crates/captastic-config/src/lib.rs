@@ -493,21 +493,6 @@ impl AppConfig {
         Ok((config, None))
     }
 
-    pub fn confirmed_regions(&self) -> BTreeMap<String, ConfirmedRegion> {
-        self.ui
-            .displays
-            .iter()
-            .filter_map(|(display_id, state)| {
-                state
-                    .last_confirmed_region
-                    .zip(state.last_confirmed_region_source)
-                    .map(|(region, source)| {
-                        (display_id.clone(), ConfirmedRegion { region, source })
-                    })
-            })
-            .collect()
-    }
-
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.schema_version != CONFIG_SCHEMA_VERSION {
             return Err(ConfigError::UnsupportedSchema(self.schema_version));
