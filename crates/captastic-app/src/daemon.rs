@@ -14,48 +14,20 @@ const CAPTURE_WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(windows)]
 const CAPTURE_WORKER_STOP_POLL: Duration = Duration::from_millis(5);
 #[cfg(windows)]
-const DAEMON_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
-/// Slice of the shutdown budget held back from the capture-worker join for the worker teardown
-/// that follows it. The selection worker's UI-state thread performs the final toolbar and region
-/// write, so a capture worker that refuses to stop must not be able to spend the whole deadline
-/// and take that write down with the process.
+/// Joins the capture worker on the early-startup error paths, before a registry exists.
 #[cfg(windows)]
-const WORKER_TEARDOWN_RESERVE: Duration = Duration::from_millis(500);
-
-/// Splits a shutdown budget: returns the deadline an earlier join must respect so that `reserve`
-/// is left for the teardown that follows it. A budget already shorter than the reserve collapses
-/// to `now`, which still lets an already-finished worker be joined without any waiting.
-#[cfg(windows)]
-pub(crate) fn reserved_deadline(now: Instant, deadline: Instant, reserve: Duration) -> Instant {
-    deadline.checked_sub(reserve).unwrap_or(now).max(now)
-}
-
-/// The other half of [`reserved_deadline`]: returns a deadline that is never sooner than
-/// `now + minimum`, so a step that must run cannot be handed a budget of zero by everything that
-/// ran before it. Reserving alone cannot promise that, because an earlier stage may already have
-/// overrun the shared deadline.
-#[cfg(windows)]
-pub(crate) fn guaranteed_deadline(now: Instant, deadline: Instant, minimum: Duration) -> Instant {
-    deadline.max(now + minimum)
-}
-
-#[cfg(windows)]
-fn join_capture_worker_until(join: thread::JoinHandle<()>, deadline: Instant) {
+fn join_capture_worker(join: thread::JoinHandle<()>) {
+    let deadline = Instant::now() + CAPTURE_WORKER_STOP_TIMEOUT;
     while !join.is_finished() && Instant::now() < deadline {
         thread::sleep(CAPTURE_WORKER_STOP_POLL);
     }
     if join.is_finished() {
         let _ = join.join();
-    } else {
-        crate::logging::error(format_args!(
-            "capture worker did not stop before the daemon shutdown deadline; detaching it so shutdown can continue"
-        ));
+        return;
     }
-}
-
-#[cfg(windows)]
-fn join_capture_worker(join: thread::JoinHandle<()>) {
-    join_capture_worker_until(join, Instant::now() + CAPTURE_WORKER_STOP_TIMEOUT);
+    crate::logging::warn(format_args!(
+        "capture worker did not stop during startup teardown; detaching it"
+    ));
 }
 
 #[cfg(windows)]
@@ -197,6 +169,601 @@ fn resolve_daemon_args_with_default(
     })
 }
 
+/// Everything the capture thread needs, gathered so the thread body can be a named function.
+///
+/// It used to be a 560-line closure inside `run`, which is most of why `run` was unreadable: the
+/// daemon's startup, its capture loop, and its shutdown were one span of code with no boundary
+/// between them.
+#[cfg(windows)]
+struct CaptureWorkerContext {
+    backend_name: String,
+    display_policy: crate::DisplayPolicy,
+    mode: CaptureMode,
+    cpu_frame: bool,
+    selection_enabled: bool,
+    selection_preview: PreviewMode,
+    max_captures: Option<usize>,
+    json_output: bool,
+    confirmed_regions: crate::selection::ConfirmedRegionCache,
+    notices: mpsc::SyncSender<DaemonNotice>,
+    cached_ui: UiState,
+    stop_requested: Arc<AtomicBool>,
+    ready: mpsc::SyncSender<Result<serde_json::Value, AppError>>,
+    done: mpsc::SyncSender<Result<(), AppError>>,
+    commands: mpsc::Receiver<CaptureCommand>,
+    selection_sender: Option<mpsc::SyncSender<crate::selection::SelectionJob>>,
+    clipboard_sender: Option<mpsc::SyncSender<crate::clipboard::ClipboardJob>>,
+}
+
+#[cfg(windows)]
+fn run_capture_worker(context: CaptureWorkerContext) {
+    let CaptureWorkerContext {
+        backend_name,
+        display_policy,
+        mode,
+        cpu_frame,
+        selection_enabled,
+        selection_preview,
+        max_captures,
+        json_output,
+        confirmed_regions: capture_confirmed_regions,
+        notices: capture_notices,
+        cached_ui,
+        stop_requested: worker_stop_requested,
+        ready: ready_sender,
+        done: done_sender,
+        commands: command_receiver,
+        selection_sender,
+        clipboard_sender,
+    } = context;
+    let backend = match super::create_backend(&backend_name, &display_policy) {
+        Ok(backend) => backend,
+        Err(error) => {
+            let _ = ready_sender.send(Err(error));
+            return;
+        }
+    };
+    let ready = json!({
+        "backend": backend.name(),
+        "configured_display": display_policy.as_config_value(),
+        "displays": backend.displays(),
+    });
+    if ready_sender.send(Ok(ready)).is_err() {
+        return;
+    }
+    let mut backend = Some(backend);
+
+    let mut attempts = 0_usize;
+    let mut selections_in_flight = 0_usize;
+    let mut next_capture_id = 1_u64;
+    let mut recovery: Option<BackendRecovery> = None;
+    // Tracks whether the user has already been told about the current outage, so the
+    // unbounded retry loop raises exactly one notice per outage and one on its recovery.
+    let mut recovery_notified = false;
+    loop {
+        if worker_stop_requested.load(Ordering::Acquire) {
+            let _ = done_sender.send(Ok(()));
+            break;
+        }
+        // Every path that increments `attempts` returns to the top of the loop, so the
+        // capture limit is evaluated here instead of inside individual command branches.
+        // Attempts still owned by the selection worker hold the daemon open, because
+        // shutting down cancels the overlay a user is still interacting with.
+        if capture_limit_reached(max_captures, attempts, selections_in_flight) {
+            log::info!("capture limit of {attempts} attempt(s) reached; stopping daemon");
+            let _ = done_sender.send(Ok(()));
+            break;
+        }
+        if recovery
+            .as_ref()
+            .is_some_and(|state| Instant::now() >= state.next_attempt)
+        {
+            backend.take();
+            match super::create_backend(&backend_name, &display_policy) {
+                Ok(replacement) => {
+                    backend = Some(replacement);
+                    recovery = None;
+                    if std::mem::take(&mut recovery_notified) {
+                        let _ = capture_notices.try_send(DaemonNotice::CaptureEngineRecovered);
+                    }
+                    log::info!(
+                        "capture engine reinitialized; validation is deferred until capture"
+                    );
+                }
+                Err(error) => {
+                    let state = recovery
+                        .as_mut()
+                        .expect("recovery state exists while retrying");
+                    state.failed_attempts = state.failed_attempts.saturating_add(1);
+                    state.next_attempt = Instant::now() + recovery_delay(state.failed_attempts);
+                    crate::logging::warn(format_args!(
+                        "capture engine reinitialization failed; retrying in {:.0} ms: {error}",
+                        recovery_delay(state.failed_attempts).as_secs_f64() * 1_000.0
+                    ));
+                    // The retry loop has no ceiling, so without this the user would watch
+                    // hotkeys disappear into a recovering engine with nothing on screen.
+                    if backend_outage_needs_notice(state.failed_attempts, recovery_notified) {
+                        recovery_notified = true;
+                        let _ = capture_notices.try_send(DaemonNotice::CaptureEngineUnavailable);
+                    }
+                }
+            }
+        }
+
+        let command = if let Some(state) = recovery.as_ref() {
+            let wait = state.next_attempt.saturating_duration_since(Instant::now());
+            match command_receiver.recv_timeout(wait) {
+                Ok(command) => command,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match command_receiver.recv() {
+                Ok(command) => command,
+                Err(mpsc::RecvError) => break,
+            }
+        };
+        match command {
+            CaptureCommand::Trigger(trigger) => {
+                if capture_budget_exhausted(max_captures, attempts) {
+                    // Only reachable while an earlier attempt is still selecting; the loop
+                    // stops as soon as that attempt reports back.
+                    log::info!(
+                            "trigger ignored because the capture limit of {attempts} attempt(s) is already spent"
+                        );
+                    continue;
+                }
+                attempts = attempts.saturating_add(1);
+                let capture_id = CaptureId(next_capture_id);
+                next_capture_id = next_capture_id.saturating_add(1);
+                if backend.is_none() {
+                    crate::logging::warn(format_args!(
+                        "capture {} ignored while the capture engine is recovering",
+                        capture_id.0
+                    ));
+                    continue;
+                }
+                if selection_enabled
+                    && selection_preview != PreviewMode::Frozen
+                    && matches!(action_route(trigger.action), ActionRoute::Overlay(_))
+                {
+                    let active_backend = backend
+                        .as_ref()
+                        .expect("backend availability was checked above");
+                    let source = match super::resolve_capture_source(
+                        &display_policy,
+                        active_backend.displays(),
+                    ) {
+                        Ok(source) => source,
+                        Err(error) => {
+                            crate::logging::error(format_args!(
+                                "live selection {} could not resolve its display: {error}",
+                                capture_id.0
+                            ));
+                            continue;
+                        }
+                    };
+                    let metadata = match preview_metadata(
+                        capture_id,
+                        &source,
+                        active_backend.displays(),
+                        mode.clone(),
+                    ) {
+                        Ok(metadata) => metadata,
+                        Err(error) => {
+                            crate::logging::error(format_args!(
+                                "live selection {} could not describe its display: {error}",
+                                capture_id.0
+                            ));
+                            continue;
+                        }
+                    };
+                    let Some(sender) = selection_sender.as_ref() else {
+                        crate::logging::error(format_args!(
+                            "live selection {} has no selection worker",
+                            capture_id.0
+                        ));
+                        continue;
+                    };
+                    let recorder = trigger_recorder(capture_id, &trigger);
+                    let output_status = match output_status_or_fatal(
+                        capture_id,
+                        dispatch_live_selection(
+                            sender,
+                            capture_id,
+                            &trigger,
+                            action_route(trigger.action),
+                            metadata,
+                            &cached_ui,
+                            selection_preview,
+                            recorder,
+                        ),
+                    ) {
+                        Ok(status) => status,
+                        Err(error) => {
+                            let _ = done_sender.send(Err(error));
+                            break;
+                        }
+                    };
+                    if queued_to_selection_worker(output_status) {
+                        selections_in_flight = selections_in_flight.saturating_add(1);
+                    }
+                    log::info!(
+                        "capture {} action={} output={}",
+                        capture_id.0,
+                        trigger.action,
+                        output_status
+                    );
+                    continue;
+                }
+                let (capture_result, mut recorder, recovery_attempts, reinitialize_error) =
+                    capture_with_backend_recovery(
+                        &mut backend,
+                        |active_backend| {
+                            let mut recorder = trigger_recorder(capture_id, &trigger);
+                            let capture_result = super::resolve_capture_source(
+                                &display_policy,
+                                active_backend.displays(),
+                            )
+                            .and_then(|source| {
+                                log::debug!(
+                                    "capture {} action={} resolved source={source:?}",
+                                    capture_id.0,
+                                    trigger.action
+                                );
+                                let request = CaptureRequest {
+                                    id: capture_id,
+                                    triggered_at: trigger.received_at,
+                                    source,
+                                    mode: mode.clone(),
+                                    cpu_frame,
+                                    retain_native_frame: selection_enabled
+                                        && trigger.action != HotkeyAction::FullDisplay,
+                                    cursor: CursorMode::Exclude,
+                                };
+                                active_backend.capture(&request, &mut recorder)
+                            });
+                            (capture_result, recorder)
+                        },
+                        || super::create_backend(&backend_name, &display_policy),
+                        thread::sleep,
+                        |attempt, delay, error| {
+                            crate::logging::warn(format_args!(
+                                "capture {} lost the capture engine; dropping it and retrying {}/{} in {:.0} ms: {error}",
+                                capture_id.0,
+                                attempt,
+                                CAPTURE_RECOVERY_RETRIES,
+                                delay.as_secs_f64() * 1_000.0
+                            ));
+                        },
+                    );
+                if let Some(reinitialize_error) = reinitialize_error {
+                    crate::logging::warn(format_args!(
+                            "capture engine reinitialization failed during capture {}: {reinitialize_error}",
+                            capture_id.0
+                        ));
+                    recovery = Some(BackendRecovery {
+                        failed_attempts: recovery_attempts,
+                        next_attempt: Instant::now() + recovery_delay(recovery_attempts),
+                    });
+                }
+                if recovery_attempts > 0 && capture_result.is_ok() {
+                    log::info!(
+                        "capture engine recovered during capture {} after {} attempt(s)",
+                        capture_id.0,
+                        recovery_attempts
+                    );
+                }
+                match capture_result {
+                    Ok(outcome) => {
+                        let frame_bytes = outcome
+                            .frame
+                            .as_ref()
+                            .map(captastic_core::CpuFrame::required_bytes);
+                        let native_frame_retained = outcome.native_frame.is_some();
+                        let output_status = match output_status_or_fatal(
+                            capture_id,
+                            dispatch_output(
+                                selection_sender.as_ref(),
+                                clipboard_sender.as_ref(),
+                                capture_id,
+                                trigger.received_at,
+                                trigger.source,
+                                trigger.action,
+                                trigger.chord,
+                                &outcome.metadata,
+                                &capture_confirmed_regions,
+                                &cached_ui,
+                                selection_preview,
+                                json_output,
+                                outcome.metadata.cpu_ready_offset_ns,
+                                outcome.frame,
+                                outcome.native_frame,
+                                recorder,
+                            ),
+                        ) {
+                            Ok(status) => status,
+                            Err(error) => {
+                                let _ = done_sender.send(Err(error));
+                                break;
+                            }
+                        };
+                        if queued_to_selection_worker(output_status) {
+                            selections_in_flight = selections_in_flight.saturating_add(1);
+                        }
+                        log::info!(
+                            "capture {} action={}: native {:.3} ms, CPU {} output={} bytes={:?}",
+                            capture_id.0,
+                            trigger.action,
+                            ns_to_ms(outcome.metadata.native_ready_offset_ns),
+                            outcome
+                                .metadata
+                                .cpu_ready_offset_ns
+                                .map(|value| format!("{:.3} ms", ns_to_ms(value)))
+                                .unwrap_or_else(|| "disabled".to_owned()),
+                            output_status,
+                            frame_bytes
+                        );
+                        if json_output {
+                            let value = json!({
+                                "schema_version": 1,
+                                "event": "capture_complete",
+                                "source": trigger.source,
+                                "action": trigger.action,
+                                "chord": trigger.chord.map(|chord| chord.to_string()),
+                                "metadata": outcome.metadata,
+                                "cpu_frame_bytes": frame_bytes,
+                                "native_frame_retained": native_frame_retained,
+                                "output": output_status,
+                            });
+                            println!("{value}");
+                        }
+                    }
+                    Err(error) => {
+                        recorder.record(capture_id, PerfEventKind::AttemptFinished, 0);
+                        if let Err(metrics_error) = validate_event_order(recorder.events()) {
+                            // Telemetry only: the capture already failed, and losing the
+                            // daemon on top of it would take every hotkey with it.
+                            log_metrics_validation_failure(capture_id, &metrics_error);
+                        }
+                        crate::logging::error(format_args!(
+                            "capture {} action={} failed: {error}",
+                            capture_id.0, trigger.action
+                        ));
+                        if requires_backend_recovery(&error) && recovery.is_none() {
+                            backend.take();
+                            recovery = Some(BackendRecovery::immediate());
+                        }
+                    }
+                }
+            }
+            CaptureCommand::LiveSelection(mut request) => {
+                let capture_id = request.job.capture_id;
+                let capture_source =
+                    if request.job.metadata.display_id == DisplayId::virtual_desktop() {
+                        CaptureSource::VirtualDesktop
+                    } else {
+                        CaptureSource::Display(request.job.metadata.display_id.clone())
+                    };
+                if backend.is_none() {
+                    request.job.terminal_error = Some(
+                        "capture engine is recovering after live selection confirmation".to_owned(),
+                    );
+                    request.job.confirmed_selection = Some(request.selection);
+                    match crate::selection::try_submit(
+                        selection_sender
+                            .as_ref()
+                            .expect("live selection requires its worker"),
+                        request.job,
+                    ) {
+                        Ok(()) => {}
+                        Err(crate::selection::SubmitError::Full(job))
+                        | Err(crate::selection::SubmitError::Disconnected(job)) => {
+                            // The attempt ends here, so it can no longer report completion.
+                            selections_in_flight = selections_in_flight.saturating_sub(1);
+                            report_dropped_selection(
+                                    &capture_notices,
+                                    job,
+                                    "its confirmed selection could not be queued while the capture engine was recovering",
+                                );
+                        }
+                    }
+                    continue;
+                }
+                let capture_request = CaptureRequest {
+                    id: capture_id,
+                    triggered_at: request.confirmed_at,
+                    source: capture_source,
+                    mode: mode.clone(),
+                    cpu_frame: true,
+                    retain_native_frame: request.selection.kind
+                        == captastic_windows::SelectionKind::Region,
+                    cursor: CursorMode::Exclude,
+                };
+                let (capture_result, (), recovery_attempts, reinitialize_error) =
+                    capture_with_backend_recovery(
+                        &mut backend,
+                        |active_backend| {
+                            let result =
+                                active_backend.capture(&capture_request, &mut request.job.recorder);
+                            (result, ())
+                        },
+                        || super::create_backend(&backend_name, &display_policy),
+                        thread::sleep,
+                        |attempt, delay, error| {
+                            crate::logging::warn(format_args!(
+                                    "confirmation capture {} lost the engine; retrying {}/{} in {:.0} ms: {error}",
+                                    capture_id.0,
+                                    attempt,
+                                    CAPTURE_RECOVERY_RETRIES,
+                                    delay.as_secs_f64() * 1_000.0
+                                ));
+                        },
+                    );
+                if let Some(reinitialize_error) = reinitialize_error {
+                    recovery = Some(BackendRecovery {
+                        failed_attempts: recovery_attempts,
+                        next_attempt: Instant::now() + recovery_delay(recovery_attempts),
+                    });
+                    crate::logging::warn(format_args!(
+                            "capture engine reinitialization failed during confirmation capture {}: {reinitialize_error}",
+                            capture_id.0
+                        ));
+                }
+                match capture_result {
+                    Ok(outcome) => {
+                        request.job.cpu_ready_offset_ns =
+                            Some(duration_ns(request.job.triggered_at, Instant::now()));
+                        request.job.metadata = outcome.metadata;
+                        request.job.frame = outcome.frame;
+                        request.job.native_frame = outcome.native_frame;
+                        request.job.confirmed_selection = Some(request.selection);
+                    }
+                    Err(error) => {
+                        if requires_backend_recovery(&error) && recovery.is_none() {
+                            backend.take();
+                            recovery = Some(BackendRecovery::immediate());
+                        }
+                        request.job.terminal_error = Some(error.to_string());
+                        request.job.confirmed_selection = Some(request.selection);
+                    }
+                }
+                let sender = selection_sender
+                    .as_ref()
+                    .expect("live selection requires its worker");
+                match crate::selection::try_submit(sender, request.job) {
+                    Ok(()) => {}
+                    Err(crate::selection::SubmitError::Full(job))
+                    | Err(crate::selection::SubmitError::Disconnected(job)) => {
+                        selections_in_flight = selections_in_flight.saturating_sub(1);
+                        report_dropped_selection(
+                            &capture_notices,
+                            job,
+                            "it could not resume after its confirmation capture",
+                        );
+                    }
+                }
+            }
+            CaptureCommand::FrozenSelectionFallback(mut request) => {
+                let capture_id = request.job.capture_id;
+                let capture_source =
+                    if request.job.metadata.display_id == DisplayId::virtual_desktop() {
+                        CaptureSource::VirtualDesktop
+                    } else {
+                        CaptureSource::Display(request.job.metadata.display_id.clone())
+                    };
+                if backend.is_none() {
+                    request.job.terminal_error = Some(
+                        "capture engine is recovering during automatic preview fallback".to_owned(),
+                    );
+                    match crate::selection::try_submit(
+                        selection_sender
+                            .as_ref()
+                            .expect("preview fallback requires its selection worker"),
+                        request.job,
+                    ) {
+                        Ok(()) => {}
+                        Err(crate::selection::SubmitError::Full(job))
+                        | Err(crate::selection::SubmitError::Disconnected(job)) => {
+                            // The attempt ends here, so it can no longer report completion.
+                            selections_in_flight = selections_in_flight.saturating_sub(1);
+                            report_dropped_selection(
+                                    &capture_notices,
+                                    job,
+                                    "its preview fallback could not be queued while the capture engine was recovering",
+                                );
+                        }
+                    }
+                    continue;
+                }
+                let capture_request = CaptureRequest {
+                    id: capture_id,
+                    triggered_at: request.requested_at,
+                    source: capture_source,
+                    mode: mode.clone(),
+                    cpu_frame: true,
+                    retain_native_frame: true,
+                    cursor: CursorMode::Exclude,
+                };
+                let (capture_result, (), recovery_attempts, reinitialize_error) =
+                    capture_with_backend_recovery(
+                        &mut backend,
+                        |active_backend| {
+                            let result =
+                                active_backend.capture(&capture_request, &mut request.job.recorder);
+                            (result, ())
+                        },
+                        || super::create_backend(&backend_name, &display_policy),
+                        thread::sleep,
+                        |attempt, delay, error| {
+                            crate::logging::warn(format_args!(
+                                    "preview fallback capture {} lost the engine; retrying {}/{} in {:.0} ms: {error}",
+                                    capture_id.0,
+                                    attempt,
+                                    CAPTURE_RECOVERY_RETRIES,
+                                    delay.as_secs_f64() * 1_000.0
+                                ));
+                        },
+                    );
+                if let Some(reinitialize_error) = reinitialize_error {
+                    recovery = Some(BackendRecovery {
+                        failed_attempts: recovery_attempts,
+                        next_attempt: Instant::now() + recovery_delay(recovery_attempts),
+                    });
+                    crate::logging::warn(format_args!(
+                            "capture engine reinitialization failed during preview fallback {}: {reinitialize_error}",
+                            capture_id.0
+                        ));
+                }
+                match capture_result {
+                    Ok(outcome) => {
+                        request.job.cpu_ready_offset_ns =
+                            Some(duration_ns(request.job.triggered_at, Instant::now()));
+                        request.job.metadata = outcome.metadata;
+                        request.job.frame = outcome.frame;
+                        request.job.native_frame = outcome.native_frame;
+                        request.job.confirmation_anchored = false;
+                    }
+                    Err(error) => {
+                        if requires_backend_recovery(&error) && recovery.is_none() {
+                            backend.take();
+                            recovery = Some(BackendRecovery::immediate());
+                        }
+                        request.job.terminal_error = Some(error.to_string());
+                    }
+                }
+                let sender = selection_sender
+                    .as_ref()
+                    .expect("preview fallback requires its selection worker");
+                match crate::selection::try_submit(sender, request.job) {
+                    Ok(()) => {}
+                    Err(crate::selection::SubmitError::Full(job))
+                    | Err(crate::selection::SubmitError::Disconnected(job)) => {
+                        selections_in_flight = selections_in_flight.saturating_sub(1);
+                        report_dropped_selection(
+                            &capture_notices,
+                            job,
+                            "it could not resume with its frozen preview fallback",
+                        );
+                    }
+                }
+            }
+            CaptureCommand::SelectionFinished(capture_id) => {
+                selections_in_flight = selections_in_flight.saturating_sub(1);
+                log::debug!(
+                    "selection {} finished; {} selection attempt(s) still in flight",
+                    capture_id.0,
+                    selections_in_flight
+                );
+            }
+            CaptureCommand::Shutdown => {
+                let _ = done_sender.send(Ok(()));
+                break;
+            }
+        }
+    }
+}
+
 #[cfg(windows)]
 pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let args = resolve_daemon_args(args)?;
@@ -275,586 +842,29 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
     let (done_sender, done_receiver) = mpsc::sync_channel::<Result<(), AppError>>(1);
     let capture_stop_requested = Arc::new(AtomicBool::new(false));
-    let worker_stop_requested = capture_stop_requested.clone();
-    let backend_name = args.backend.clone();
-    let display_policy = args.display_policy.clone();
-    let mode = args.mode.clone();
-    let cpu_frame = args.cpu_frame;
-    let selection_enabled = args.selection;
-    let selection_preview = args.selection_preview;
-    let max_captures = args.max_captures;
-    let json_output = args.json;
-    let capture_confirmed_regions = confirmed_regions.clone();
-    let capture_notices = notice_sender.clone();
-    let cached_ui = args.ui.clone();
 
+    let capture_context = CaptureWorkerContext {
+        backend_name: args.backend.clone(),
+        display_policy: args.display_policy.clone(),
+        mode: args.mode.clone(),
+        cpu_frame: args.cpu_frame,
+        selection_enabled: args.selection,
+        selection_preview: args.selection_preview,
+        max_captures: args.max_captures,
+        json_output: args.json,
+        confirmed_regions: confirmed_regions.clone(),
+        notices: notice_sender.clone(),
+        cached_ui: args.ui.clone(),
+        stop_requested: capture_stop_requested.clone(),
+        ready: ready_sender,
+        done: done_sender,
+        commands: command_receiver,
+        selection_sender,
+        clipboard_sender,
+    };
     let capture_join = thread::Builder::new()
         .name("captastic-capture".to_owned())
-        .spawn(move || {
-            let backend = match super::create_backend(&backend_name, &display_policy) {
-                Ok(backend) => backend,
-                Err(error) => {
-                    let _ = ready_sender.send(Err(error));
-                    return;
-                }
-            };
-            let ready = json!({
-                "backend": backend.name(),
-                "configured_display": display_policy.as_config_value(),
-                "displays": backend.displays(),
-            });
-            if ready_sender.send(Ok(ready)).is_err() {
-                return;
-            }
-            let mut backend = Some(backend);
-
-            let mut attempts = 0_usize;
-            let mut selections_in_flight = 0_usize;
-            let mut next_capture_id = 1_u64;
-            let mut recovery: Option<BackendRecovery> = None;
-            // Tracks whether the user has already been told about the current outage, so the
-            // unbounded retry loop raises exactly one notice per outage and one on its recovery.
-            let mut recovery_notified = false;
-            loop {
-                if worker_stop_requested.load(Ordering::Acquire) {
-                    let _ = done_sender.send(Ok(()));
-                    break;
-                }
-                // Every path that increments `attempts` returns to the top of the loop, so the
-                // capture limit is evaluated here instead of inside individual command branches.
-                // Attempts still owned by the selection worker hold the daemon open, because
-                // shutting down cancels the overlay a user is still interacting with.
-                if capture_limit_reached(max_captures, attempts, selections_in_flight) {
-                    log::info!("capture limit of {attempts} attempt(s) reached; stopping daemon");
-                    let _ = done_sender.send(Ok(()));
-                    break;
-                }
-                if recovery
-                    .as_ref()
-                    .is_some_and(|state| Instant::now() >= state.next_attempt)
-                {
-                    backend.take();
-                    match super::create_backend(&backend_name, &display_policy) {
-                        Ok(replacement) => {
-                            backend = Some(replacement);
-                            recovery = None;
-                            if std::mem::take(&mut recovery_notified) {
-                                let _ = capture_notices
-                                    .try_send(DaemonNotice::CaptureEngineRecovered);
-                            }
-                            log::info!("capture engine reinitialized; validation is deferred until capture");
-                        }
-                        Err(error) => {
-                            let state = recovery
-                                .as_mut()
-                                .expect("recovery state exists while retrying");
-                            state.failed_attempts = state.failed_attempts.saturating_add(1);
-                            state.next_attempt =
-                                Instant::now() + recovery_delay(state.failed_attempts);
-                            crate::logging::warn(format_args!(
-                                "capture engine reinitialization failed; retrying in {:.0} ms: {error}",
-                                recovery_delay(state.failed_attempts).as_secs_f64() * 1_000.0
-                            ));
-                            // The retry loop has no ceiling, so without this the user would watch
-                            // hotkeys disappear into a recovering engine with nothing on screen.
-                            if backend_outage_needs_notice(state.failed_attempts, recovery_notified)
-                            {
-                                recovery_notified = true;
-                                let _ = capture_notices
-                                    .try_send(DaemonNotice::CaptureEngineUnavailable);
-                            }
-                        }
-                    }
-                }
-
-                let command = if let Some(state) = recovery.as_ref() {
-                    let wait = state.next_attempt.saturating_duration_since(Instant::now());
-                    match command_receiver.recv_timeout(wait) {
-                        Ok(command) => command,
-                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                    }
-                } else {
-                    match command_receiver.recv() {
-                        Ok(command) => command,
-                        Err(mpsc::RecvError) => break,
-                    }
-                };
-                match command {
-                    CaptureCommand::Trigger(trigger) => {
-                        if capture_budget_exhausted(max_captures, attempts) {
-                            // Only reachable while an earlier attempt is still selecting; the loop
-                            // stops as soon as that attempt reports back.
-                            log::info!(
-                                "trigger ignored because the capture limit of {attempts} attempt(s) is already spent"
-                            );
-                            continue;
-                        }
-                        attempts = attempts.saturating_add(1);
-                        let capture_id = CaptureId(next_capture_id);
-                        next_capture_id = next_capture_id.saturating_add(1);
-                        if backend.is_none() {
-                            crate::logging::warn(format_args!(
-                                "capture {} ignored while the capture engine is recovering",
-                                capture_id.0
-                            ));
-                            continue;
-                        }
-                        if selection_enabled
-                            && selection_preview != PreviewMode::Frozen
-                            && matches!(action_route(trigger.action), ActionRoute::Overlay(_))
-                        {
-                            let active_backend = backend
-                                .as_ref()
-                                .expect("backend availability was checked above");
-                            let source = match super::resolve_capture_source(
-                                &display_policy,
-                                active_backend.displays(),
-                            ) {
-                                Ok(source) => source,
-                                Err(error) => {
-                                    crate::logging::error(format_args!(
-                                        "live selection {} could not resolve its display: {error}",
-                                        capture_id.0
-                                    ));
-                                    continue;
-                                }
-                            };
-                            let metadata = match preview_metadata(
-                                capture_id,
-                                &source,
-                                active_backend.displays(),
-                                mode.clone(),
-                            ) {
-                                Ok(metadata) => metadata,
-                                Err(error) => {
-                                    crate::logging::error(format_args!(
-                                        "live selection {} could not describe its display: {error}",
-                                        capture_id.0
-                                    ));
-                                    continue;
-                                }
-                            };
-                            let Some(sender) = selection_sender.as_ref() else {
-                                crate::logging::error(format_args!(
-                                    "live selection {} has no selection worker",
-                                    capture_id.0
-                                ));
-                                continue;
-                            };
-                            let recorder = trigger_recorder(capture_id, &trigger);
-                            let output_status = match output_status_or_fatal(
-                                capture_id,
-                                dispatch_live_selection(
-                                    sender,
-                                    capture_id,
-                                    &trigger,
-                                    action_route(trigger.action),
-                                    metadata,
-                                    &cached_ui,
-                                    selection_preview,
-                                    recorder,
-                                ),
-                            ) {
-                                Ok(status) => status,
-                                Err(error) => {
-                                    let _ = done_sender.send(Err(error));
-                                    break;
-                                }
-                            };
-                            if queued_to_selection_worker(output_status) {
-                                selections_in_flight = selections_in_flight.saturating_add(1);
-                            }
-                            log::info!(
-                                "capture {} action={} output={}",
-                                capture_id.0,
-                                trigger.action,
-                                output_status
-                            );
-                            continue;
-                        }
-                        let (
-                            capture_result,
-                            mut recorder,
-                            recovery_attempts,
-                            reinitialize_error,
-                        ) = capture_with_backend_recovery(
-                            &mut backend,
-                            |active_backend| {
-                                let mut recorder = trigger_recorder(capture_id, &trigger);
-                                let capture_result = super::resolve_capture_source(
-                                    &display_policy,
-                                    active_backend.displays(),
-                                )
-                                .and_then(|source| {
-                                    log::debug!(
-                                        "capture {} action={} resolved source={source:?}",
-                                        capture_id.0,
-                                        trigger.action
-                                    );
-                                    let request = CaptureRequest {
-                                        id: capture_id,
-                                        triggered_at: trigger.received_at,
-                                        source,
-                                        mode: mode.clone(),
-                                        cpu_frame,
-                                        retain_native_frame: selection_enabled
-                                            && trigger.action != HotkeyAction::FullDisplay,
-                                        cursor: CursorMode::Exclude,
-                                    };
-                                    active_backend.capture(&request, &mut recorder)
-                                });
-                                (capture_result, recorder)
-                            },
-                            || super::create_backend(&backend_name, &display_policy),
-                            thread::sleep,
-                            |attempt, delay, error| {
-                                crate::logging::warn(format_args!(
-                                    "capture {} lost the capture engine; dropping it and retrying {}/{} in {:.0} ms: {error}",
-                                    capture_id.0,
-                                    attempt,
-                                    CAPTURE_RECOVERY_RETRIES,
-                                    delay.as_secs_f64() * 1_000.0
-                                ));
-                            },
-                        );
-                        if let Some(reinitialize_error) = reinitialize_error {
-                            crate::logging::warn(format_args!(
-                                "capture engine reinitialization failed during capture {}: {reinitialize_error}",
-                                capture_id.0
-                            ));
-                            recovery = Some(BackendRecovery {
-                                failed_attempts: recovery_attempts,
-                                next_attempt: Instant::now()
-                                    + recovery_delay(recovery_attempts),
-                            });
-                        }
-                        if recovery_attempts > 0 && capture_result.is_ok() {
-                            log::info!(
-                                "capture engine recovered during capture {} after {} attempt(s)",
-                                capture_id.0,
-                                recovery_attempts
-                            );
-                        }
-                        match capture_result {
-                            Ok(outcome) => {
-                                let frame_bytes = outcome
-                                    .frame
-                                    .as_ref()
-                                    .map(captastic_core::CpuFrame::required_bytes);
-                                let native_frame_retained = outcome.native_frame.is_some();
-                                let output_status = match output_status_or_fatal(
-                                    capture_id,
-                                    dispatch_output(
-                                        selection_sender.as_ref(),
-                                        clipboard_sender.as_ref(),
-                                        capture_id,
-                                        trigger.received_at,
-                                        trigger.source,
-                                        trigger.action,
-                                        trigger.chord,
-                                        &outcome.metadata,
-                                        &capture_confirmed_regions,
-                                        &cached_ui,
-                                        selection_preview,
-                                        json_output,
-                                        outcome.metadata.cpu_ready_offset_ns,
-                                        outcome.frame,
-                                        outcome.native_frame,
-                                        recorder,
-                                    ),
-                                ) {
-                                    Ok(status) => status,
-                                    Err(error) => {
-                                        let _ = done_sender.send(Err(error));
-                                        break;
-                                    }
-                                };
-                                if queued_to_selection_worker(output_status) {
-                                    selections_in_flight = selections_in_flight.saturating_add(1);
-                                }
-                                log::info!(
-                                    "capture {} action={}: native {:.3} ms, CPU {} output={} bytes={:?}",
-                                    capture_id.0,
-                                    trigger.action,
-                                    ns_to_ms(outcome.metadata.native_ready_offset_ns),
-                                    outcome
-                                        .metadata
-                                        .cpu_ready_offset_ns
-                                        .map(|value| format!("{:.3} ms", ns_to_ms(value)))
-                                        .unwrap_or_else(|| "disabled".to_owned()),
-                                    output_status,
-                                    frame_bytes
-                                );
-                                if json_output {
-                                    let value = json!({
-                                        "schema_version": 1,
-                                        "event": "capture_complete",
-                                        "source": trigger.source,
-                                        "action": trigger.action,
-                                        "chord": trigger.chord.map(|chord| chord.to_string()),
-                                        "metadata": outcome.metadata,
-                                        "cpu_frame_bytes": frame_bytes,
-                                        "native_frame_retained": native_frame_retained,
-                                        "output": output_status,
-                                    });
-                                    println!("{value}");
-                                }
-                            }
-                            Err(error) => {
-                                recorder.record(capture_id, PerfEventKind::AttemptFinished, 0);
-                                if let Err(metrics_error) = validate_event_order(recorder.events())
-                                {
-                                    // Telemetry only: the capture already failed, and losing the
-                                    // daemon on top of it would take every hotkey with it.
-                                    log_metrics_validation_failure(capture_id, &metrics_error);
-                                }
-                                crate::logging::error(format_args!(
-                                    "capture {} action={} failed: {error}",
-                                    capture_id.0,
-                                    trigger.action
-                                ));
-                                if requires_backend_recovery(&error) && recovery.is_none() {
-                                    backend.take();
-                                    recovery = Some(BackendRecovery::immediate());
-                                }
-                            }
-                        }
-                    }
-                    CaptureCommand::LiveSelection(mut request) => {
-                        let capture_id = request.job.capture_id;
-                        let capture_source = if request.job.metadata.display_id
-                            == DisplayId::virtual_desktop()
-                        {
-                            CaptureSource::VirtualDesktop
-                        } else {
-                            CaptureSource::Display(request.job.metadata.display_id.clone())
-                        };
-                        if backend.is_none() {
-                            request.job.terminal_error = Some(
-                                "capture engine is recovering after live selection confirmation"
-                                    .to_owned(),
-                            );
-                            request.job.confirmed_selection = Some(request.selection);
-                            match crate::selection::try_submit(
-                                selection_sender
-                                    .as_ref()
-                                    .expect("live selection requires its worker"),
-                                request.job,
-                            ) {
-                                Ok(()) => {}
-                                Err(crate::selection::SubmitError::Full(job))
-                                | Err(crate::selection::SubmitError::Disconnected(job)) => {
-                                    // The attempt ends here, so it can no longer report completion.
-                                    selections_in_flight = selections_in_flight.saturating_sub(1);
-                                    report_dropped_selection(
-                                        &capture_notices,
-                                        job,
-                                        "its confirmed selection could not be queued while the capture engine was recovering",
-                                    );
-                                }
-                            }
-                            continue;
-                        }
-                        let capture_request = CaptureRequest {
-                            id: capture_id,
-                            triggered_at: request.confirmed_at,
-                            source: capture_source,
-                            mode: mode.clone(),
-                            cpu_frame: true,
-                            retain_native_frame: request.selection.kind
-                                == captastic_windows::SelectionKind::Region,
-                            cursor: CursorMode::Exclude,
-                        };
-                        let (capture_result, (), recovery_attempts, reinitialize_error) =
-                            capture_with_backend_recovery(
-                                &mut backend,
-                                |active_backend| {
-                                    let result = active_backend
-                                        .capture(&capture_request, &mut request.job.recorder);
-                                    (result, ())
-                                },
-                                || super::create_backend(&backend_name, &display_policy),
-                                thread::sleep,
-                                |attempt, delay, error| {
-                                    crate::logging::warn(format_args!(
-                                        "confirmation capture {} lost the engine; retrying {}/{} in {:.0} ms: {error}",
-                                        capture_id.0,
-                                        attempt,
-                                        CAPTURE_RECOVERY_RETRIES,
-                                        delay.as_secs_f64() * 1_000.0
-                                    ));
-                                },
-                            );
-                        if let Some(reinitialize_error) = reinitialize_error {
-                            recovery = Some(BackendRecovery {
-                                failed_attempts: recovery_attempts,
-                                next_attempt: Instant::now() + recovery_delay(recovery_attempts),
-                            });
-                            crate::logging::warn(format_args!(
-                                "capture engine reinitialization failed during confirmation capture {}: {reinitialize_error}",
-                                capture_id.0
-                            ));
-                        }
-                        match capture_result {
-                            Ok(outcome) => {
-                                request.job.cpu_ready_offset_ns = Some(duration_ns(
-                                    request.job.triggered_at,
-                                    Instant::now(),
-                                ));
-                                request.job.metadata = outcome.metadata;
-                                request.job.frame = outcome.frame;
-                                request.job.native_frame = outcome.native_frame;
-                                request.job.confirmed_selection = Some(request.selection);
-                            }
-                            Err(error) => {
-                                if requires_backend_recovery(&error) && recovery.is_none() {
-                                    backend.take();
-                                    recovery = Some(BackendRecovery::immediate());
-                                }
-                                request.job.terminal_error = Some(error.to_string());
-                                request.job.confirmed_selection = Some(request.selection);
-                            }
-                        }
-                        let sender = selection_sender
-                            .as_ref()
-                            .expect("live selection requires its worker");
-                        match crate::selection::try_submit(sender, request.job) {
-                            Ok(()) => {}
-                            Err(crate::selection::SubmitError::Full(job))
-                            | Err(crate::selection::SubmitError::Disconnected(job)) => {
-                                selections_in_flight = selections_in_flight.saturating_sub(1);
-                                report_dropped_selection(
-                                    &capture_notices,
-                                    job,
-                                    "it could not resume after its confirmation capture",
-                                );
-                            }
-                        }
-                    }
-                    CaptureCommand::FrozenSelectionFallback(mut request) => {
-                        let capture_id = request.job.capture_id;
-                        let capture_source = if request.job.metadata.display_id
-                            == DisplayId::virtual_desktop()
-                        {
-                            CaptureSource::VirtualDesktop
-                        } else {
-                            CaptureSource::Display(request.job.metadata.display_id.clone())
-                        };
-                        if backend.is_none() {
-                            request.job.terminal_error = Some(
-                                "capture engine is recovering during automatic preview fallback"
-                                    .to_owned(),
-                            );
-                            match crate::selection::try_submit(
-                                selection_sender
-                                    .as_ref()
-                                    .expect("preview fallback requires its selection worker"),
-                                request.job,
-                            ) {
-                                Ok(()) => {}
-                                Err(crate::selection::SubmitError::Full(job))
-                                | Err(crate::selection::SubmitError::Disconnected(job)) => {
-                                    // The attempt ends here, so it can no longer report completion.
-                                    selections_in_flight = selections_in_flight.saturating_sub(1);
-                                    report_dropped_selection(
-                                        &capture_notices,
-                                        job,
-                                        "its preview fallback could not be queued while the capture engine was recovering",
-                                    );
-                                }
-                            }
-                            continue;
-                        }
-                        let capture_request = CaptureRequest {
-                            id: capture_id,
-                            triggered_at: request.requested_at,
-                            source: capture_source,
-                            mode: mode.clone(),
-                            cpu_frame: true,
-                            retain_native_frame: true,
-                            cursor: CursorMode::Exclude,
-                        };
-                        let (capture_result, (), recovery_attempts, reinitialize_error) =
-                            capture_with_backend_recovery(
-                                &mut backend,
-                                |active_backend| {
-                                    let result = active_backend
-                                        .capture(&capture_request, &mut request.job.recorder);
-                                    (result, ())
-                                },
-                                || super::create_backend(&backend_name, &display_policy),
-                                thread::sleep,
-                                |attempt, delay, error| {
-                                    crate::logging::warn(format_args!(
-                                        "preview fallback capture {} lost the engine; retrying {}/{} in {:.0} ms: {error}",
-                                        capture_id.0,
-                                        attempt,
-                                        CAPTURE_RECOVERY_RETRIES,
-                                        delay.as_secs_f64() * 1_000.0
-                                    ));
-                                },
-                            );
-                        if let Some(reinitialize_error) = reinitialize_error {
-                            recovery = Some(BackendRecovery {
-                                failed_attempts: recovery_attempts,
-                                next_attempt: Instant::now() + recovery_delay(recovery_attempts),
-                            });
-                            crate::logging::warn(format_args!(
-                                "capture engine reinitialization failed during preview fallback {}: {reinitialize_error}",
-                                capture_id.0
-                            ));
-                        }
-                        match capture_result {
-                            Ok(outcome) => {
-                                request.job.cpu_ready_offset_ns = Some(duration_ns(
-                                    request.job.triggered_at,
-                                    Instant::now(),
-                                ));
-                                request.job.metadata = outcome.metadata;
-                                request.job.frame = outcome.frame;
-                                request.job.native_frame = outcome.native_frame;
-                                request.job.confirmation_anchored = false;
-                            }
-                            Err(error) => {
-                                if requires_backend_recovery(&error) && recovery.is_none() {
-                                    backend.take();
-                                    recovery = Some(BackendRecovery::immediate());
-                                }
-                                request.job.terminal_error = Some(error.to_string());
-                            }
-                        }
-                        let sender = selection_sender
-                            .as_ref()
-                            .expect("preview fallback requires its selection worker");
-                        match crate::selection::try_submit(sender, request.job) {
-                            Ok(()) => {}
-                            Err(crate::selection::SubmitError::Full(job))
-                            | Err(crate::selection::SubmitError::Disconnected(job)) => {
-                                selections_in_flight = selections_in_flight.saturating_sub(1);
-                                report_dropped_selection(
-                                    &capture_notices,
-                                    job,
-                                    "it could not resume with its frozen preview fallback",
-                                );
-                            }
-                        }
-                    }
-                    CaptureCommand::SelectionFinished(capture_id) => {
-                        selections_in_flight = selections_in_flight.saturating_sub(1);
-                        log::debug!(
-                            "selection {} finished; {} selection attempt(s) still in flight",
-                            capture_id.0,
-                            selections_in_flight
-                        );
-                    }
-                    CaptureCommand::Shutdown => {
-                        let _ = done_sender.send(Ok(()));
-                        break;
-                    }
-                }
-            }
-        })
+        .spawn(move || run_capture_worker(capture_context))
         .map_err(|error| AppError::InvalidArgument(error.to_string()))?;
 
     let ready = ready_receiver.recv().map_err(|error| {
@@ -866,7 +876,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let callback_dropped = dropped.clone();
     let callback_paused = paused.clone();
     let callback_stop_requested = capture_stop_requested.clone();
-    let mut hotkey = match captastic_windows::HotkeyListener::start(
+    let hotkey = match captastic_windows::HotkeyListener::start(
         &args.hotkey_bindings,
         move |action, chord, received_at| {
             if callback_paused.load(Ordering::Acquire)
@@ -905,6 +915,18 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             return Err(error.into());
         }
     };
+    // Everything that has to stop together, in one place. Every shutdown source below asks the
+    // registry rather than repeating the list.
+    let mut workers = crate::worker_registry::WorkerRegistry::new(
+        capture_join,
+        capture_stop_requested.clone(),
+        command_sender.clone(),
+        paused.clone(),
+    );
+    workers
+        .register_selection(selection_worker.take())
+        .register_clipboard(clipboard_worker.take())
+        .register_hotkey(hotkey);
     let startup_enabled = match captastic_windows::startup_command() {
         Ok(command) => command.is_some(),
         Err(error) => {
@@ -995,8 +1017,6 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             .map_err(|error| AppError::InvalidArgument(error.to_string()))?;
     }
 
-    let mut shutdown_sent = false;
-    let mut shutdown_deadline = None;
     let mut tray_shutdown_requested = false;
     let mut last_persistence_notification: Option<String> = None;
     let mut last_notice_message: Option<String> = None;
@@ -1008,32 +1028,17 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         if session_shutdown_requested {
             tray_shutdown_requested = true;
         }
-        if tray_shutdown_requested && shutdown_deadline.is_none() {
-            log::info!(
-                "{}; draining daemon workers",
-                if session_shutdown_requested {
-                    "Windows session is ending"
-                } else {
-                    "notification-area shutdown requested"
-                }
-            );
-            shutdown_deadline = Some(Instant::now() + DAEMON_SHUTDOWN_TIMEOUT);
-            paused.store(true, Ordering::Release);
-            capture_stop_requested.store(true, Ordering::Release);
-            if let Some(worker) = selection_worker.as_mut() {
-                worker.request_stop();
-            }
-            if let Some(worker) = clipboard_worker.as_mut() {
-                worker.request_stop();
-            }
-            if let Err(error) = hotkey.request_stop() {
-                crate::logging::warn(format_args!("failed to request hotkey shutdown: {error}"));
-            }
+        if tray_shutdown_requested {
+            workers.begin_shutdown(if session_shutdown_requested {
+                "Windows session is ending"
+            } else {
+                "notification-area shutdown requested"
+            });
         }
-        if shutdown_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        if workers.deadline_expired() {
             crate::logging::error(format_args!(
                 "daemon shutdown exceeded {} ms; continuing bounded teardown while the capture worker is detached",
-                DAEMON_SHUTDOWN_TIMEOUT.as_millis()
+                crate::worker_registry::DAEMON_SHUTDOWN_TIMEOUT.as_millis()
             ));
             break;
         }
@@ -1043,7 +1048,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                 break;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if let Some(worker) = clipboard_worker.as_ref() {
+                if let Some(worker) = workers.clipboard() {
                     while let Some(failure) = worker.try_recv_failure() {
                         if let Some(tray) = tray.as_ref() {
                             let message = format!(
@@ -1058,7 +1063,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                         }
                     }
                 }
-                if let Some(worker) = selection_worker.as_ref() {
+                if let Some(worker) = workers.selection() {
                     while let Some(failure) = worker.try_recv_persistence_failure() {
                         if let Some(tray) = tray.as_ref() {
                             let message = format!(
@@ -1142,35 +1147,15 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                         }
                     }
                 }
-                if console_shutdown.requested()
-                    || daemon_control.requested()
-                    || tray_shutdown_requested
-                {
-                    if shutdown_deadline.is_none() {
-                        shutdown_deadline = Some(Instant::now() + DAEMON_SHUTDOWN_TIMEOUT);
-                        paused.store(true, Ordering::Release);
-                        capture_stop_requested.store(true, Ordering::Release);
-                        if let Some(worker) = selection_worker.as_mut() {
-                            worker.request_stop();
-                        }
-                        if let Some(worker) = clipboard_worker.as_mut() {
-                            worker.request_stop();
-                        }
-                        if let Err(error) = hotkey.request_stop() {
-                            crate::logging::warn(format_args!(
-                                "failed to request hotkey shutdown: {error}"
-                            ));
-                        }
-                    }
-                    if !shutdown_sent {
-                        match command_sender.try_send(CaptureCommand::Shutdown) {
-                            Ok(()) => shutdown_sent = true,
-                            Err(mpsc::TrySendError::Full(_)) => {}
-                            Err(mpsc::TrySendError::Disconnected(_)) => {
-                                shutdown_sent = true;
-                            }
-                        }
-                    }
+                if console_shutdown.requested() {
+                    workers.begin_shutdown("console shutdown requested");
+                } else if daemon_control.requested() {
+                    workers.begin_shutdown("daemon control requested a stop");
+                } else if tray_shutdown_requested {
+                    workers.begin_shutdown("notification-area shutdown requested");
+                }
+                if workers.is_shutting_down() {
+                    workers.send_capture_shutdown();
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -1181,31 +1166,11 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             }
         }
     }
-    let teardown_deadline =
-        shutdown_deadline.unwrap_or_else(|| Instant::now() + DAEMON_SHUTDOWN_TIMEOUT);
-    capture_stop_requested.store(true, Ordering::Release);
-    if let Some(worker) = selection_worker.as_mut() {
-        worker.request_stop();
-    }
-    if let Some(worker) = clipboard_worker.as_mut() {
-        worker.request_stop();
-    }
-    let hotkey_stop_error = hotkey.stop_before(teardown_deadline).err();
-    let _ = command_sender.try_send(CaptureCommand::Shutdown);
-    // The workers below are stopped serially against one shared deadline, so the capture join runs
-    // against a reserved-back deadline instead of the full one; the selection worker splits its
-    // own slice again to guarantee the UI-state flush a moment to reach disk.
-    join_capture_worker_until(
-        capture_join,
-        reserved_deadline(Instant::now(), teardown_deadline, WORKER_TEARDOWN_RESERVE),
-    );
-    let persistence_failures = selection_worker
-        .take()
-        .map_or_else(Vec::new, |worker| worker.stop_before(teardown_deadline));
-    let clipboard_failures = clipboard_worker
-        .take()
-        .map_or_else(Vec::new, |worker| worker.stop_before(teardown_deadline));
-    for failure in clipboard_failures {
+    let teardown = workers.teardown();
+    let shutdown_sent = teardown.shutdown_sent;
+    let hotkey_stop_error = teardown.hotkey_stop_error;
+    let persistence_failures = teardown.persistence_failures;
+    for failure in teardown.clipboard_failures {
         crate::logging::warn(format_args!(
             "shutdown retained clipboard failure for capture {} in the persistent log: {}",
             failure.capture_id.0, failure.message
@@ -2470,49 +2435,6 @@ mod tests {
             }
         ));
         assert!(receiver.try_recv().is_err());
-    }
-
-    #[test]
-    fn a_slow_capture_join_cannot_spend_the_whole_shutdown_budget() {
-        let now = Instant::now();
-        let teardown_deadline = now + DAEMON_SHUTDOWN_TIMEOUT;
-
-        let capture_deadline = reserved_deadline(now, teardown_deadline, WORKER_TEARDOWN_RESERVE);
-
-        // The capture join stops early enough that the selection worker - and behind it the
-        // UI-state flush - still has the reserve to work with.
-        assert_eq!(
-            capture_deadline,
-            teardown_deadline - WORKER_TEARDOWN_RESERVE
-        );
-        assert_eq!(
-            teardown_deadline.saturating_duration_since(capture_deadline),
-            WORKER_TEARDOWN_RESERVE
-        );
-        assert!(WORKER_TEARDOWN_RESERVE < DAEMON_SHUTDOWN_TIMEOUT);
-    }
-
-    #[test]
-    fn an_exhausted_shutdown_budget_reserves_nothing_and_waits_for_nothing() {
-        let base = Instant::now();
-        // A deadline that has already passed, expressed without subtracting from a real Instant.
-        let now = base + Duration::from_secs(10);
-
-        // Neither an expired deadline nor a budget shorter than the reserve may produce a deadline
-        // in the future or in the past: both collapse to now, which still joins finished workers.
-        assert_eq!(reserved_deadline(now, base, WORKER_TEARDOWN_RESERVE), now);
-        assert_eq!(
-            reserved_deadline(
-                now,
-                now + WORKER_TEARDOWN_RESERVE / 2,
-                WORKER_TEARDOWN_RESERVE
-            ),
-            now
-        );
-        assert_eq!(
-            reserved_deadline(now, now + WORKER_TEARDOWN_RESERVE, WORKER_TEARDOWN_RESERVE),
-            now
-        );
     }
 
     #[test]
