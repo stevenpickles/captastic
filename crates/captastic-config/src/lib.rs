@@ -1244,8 +1244,6 @@ mod tests {
             .expect_err("unknown preview policies must be rejected");
     }
 
-    #[cfg(windows)]
-    #[cfg(windows)]
     #[cfg(unix)]
     #[test]
     fn atomic_write_preserves_existing_unix_permissions() {

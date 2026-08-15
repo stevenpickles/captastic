@@ -493,6 +493,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn atomic_replace_filters_filesystem_controlled_windows_attributes() {
         const READONLY: u32 = 0x1;
@@ -510,6 +511,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn atomic_replace_preserves_hidden_and_readonly_attributes_on_windows() {
         const READONLY: u32 = 0x1;
