@@ -24,7 +24,9 @@ mod window_capture;
 mod window_capture_wgc;
 
 #[cfg(windows)]
-pub use clipboard::{ClipboardPayload, ClipboardPublishReport, ClipboardPublisher};
+pub use clipboard::{
+    ClipboardPayload, ClipboardPublishError, ClipboardPublishReport, ClipboardPublisher,
+};
 #[cfg(windows)]
 pub use console::ConsoleShutdown;
 #[cfg(windows)]

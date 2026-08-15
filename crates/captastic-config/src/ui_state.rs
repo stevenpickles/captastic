@@ -20,10 +20,10 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::fsio::{atomic_write, replace_file};
 use crate::{
-    atomic_write, default_config_path, replace_file, storage_directory, CaptureRegion,
-    CaptureRegionSource, CaptureTool, ConfigError, ConfirmedRegion, DisplayUiConfig,
-    DisplayUiState, UiConfig,
+    default_config_path, storage_directory, CaptureRegion, CaptureRegionSource, CaptureTool,
+    ConfigError, ConfirmedRegion, DisplayUiConfig, DisplayUiState, UiConfig,
 };
 
 pub const STATE_FILE_NAME: &str = "state.toml";

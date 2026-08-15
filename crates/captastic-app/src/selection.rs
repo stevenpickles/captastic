@@ -166,7 +166,7 @@ pub struct SelectionWorker {
 
 impl SelectionWorker {
     pub fn start(
-        clipboard_sender: mpsc::SyncSender<crate::clipboard::ClipboardJob>,
+        output_sink: Option<Box<dyn crate::output::OutputSink>>,
         capture_sender: mpsc::SyncSender<crate::daemon::CaptureCommand>,
         notices: mpsc::SyncSender<crate::daemon::DaemonNotice>,
         json_output: bool,
@@ -495,15 +495,25 @@ impl SelectionWorker {
                             frame: selected_frame,
                             recorder: job.recorder,
                         };
-                        match crate::clipboard::try_submit(&clipboard_sender, clipboard_job) {
-                            Ok(()) => {}
-                            Err(crate::clipboard::SubmitError::Full(job)) => {
-                                report_clipboard_rejection(*job, "queue_full", json_output);
+                        match output_sink.as_ref() {
+                            Some(sink) => {
+                                if let Err(rejection) = sink.submit(clipboard_job) {
+                                    let status = rejection.status();
+                                    report_clipboard_rejection(
+                                        *rejection.into_job(),
+                                        status,
+                                        json_output,
+                                    );
+                                }
                             }
-                            Err(crate::clipboard::SubmitError::Disconnected(job)) => {
+                            // A selection with no destination configured. Previously impossible to
+                            // express: the worker held a clipboard sender and a `.expect` in the
+                            // daemon asserted one existed, restating at runtime a rule the
+                            // configuration validator had already enforced.
+                            None => {
                                 report_clipboard_rejection(
-                                    *job,
-                                    "worker_disconnected",
+                                    clipboard_job,
+                                    "no_destination",
                                     json_output,
                                 );
                             }
@@ -1150,7 +1160,10 @@ mod tests {
         let (capture_sender, _capture_receiver) = mpsc::sync_channel(1);
         let (dropped_sender, _dropped_receiver) = mpsc::sync_channel(1);
         let mut worker = SelectionWorker::start(
-            clipboard_sender,
+            Some(Box::new(crate::output::ChannelSink::new(
+                "clipboard",
+                clipboard_sender,
+            ))),
             capture_sender,
             dropped_sender,
             false,

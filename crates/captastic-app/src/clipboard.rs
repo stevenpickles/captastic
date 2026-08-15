@@ -3,12 +3,9 @@ use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use captastic_config::{HotkeyAction, HotkeyChord};
 #[cfg(test)]
 use captastic_core::CaptureErrorKind;
-use captastic_core::{
-    validate_event_order, CaptureError, CaptureId, CpuFrame, EventRecorder, PerfEventKind,
-};
+use captastic_core::{validate_event_order, CaptureError, CaptureId, PerfEventKind};
 use serde_json::json;
 
 use crate::error::AppError;
@@ -75,7 +72,13 @@ impl ClipboardWorker {
                             thread::sleep,
                             || worker_stop_requested.load(Ordering::Acquire),
                         ),
-                        Err(error) => (Err(error), 0),
+                        Err(error) => (
+                            Err(captastic_windows::ClipboardPublishError {
+                                error,
+                                cleared_previous_contents: false,
+                            }),
+                            0,
+                        ),
                     };
                     match publish_result {
                         Ok(report) => {
@@ -152,7 +155,8 @@ impl ClipboardWorker {
                             ));
                             let _ = failure_sender.try_send(ClipboardFailure {
                                 capture_id: job.capture_id,
-                                message: error.to_string(),
+                                message: error.error.to_string(),
+                                cleared_previous_contents: error.cleared_previous_contents,
                             });
                             if json_output {
                                 println!(
@@ -163,9 +167,9 @@ impl ClipboardWorker {
                                         "capture_id": job.capture_id,
                                         "source": job.source,
                                         "action": job.action,
-                                        "error": error.to_string(),
-                                        "native_code": error.native_code,
-                                        "retryable": error.retryable,
+                                        "error": error.error.to_string(),
+                                        "native_code": error.error.native_code,
+                                        "retryable": error.error.retryable,
                                         "publish_retries": publish_retries,
                                     })
                                 );
@@ -189,11 +193,15 @@ impl ClipboardWorker {
         })
     }
 
-    pub fn submitter(&self) -> mpsc::SyncSender<ClipboardJob> {
-        self.sender
-            .as_ref()
-            .expect("clipboard worker is running")
-            .clone()
+    /// The clipboard as a destination, addressable without knowing it is the clipboard.
+    pub fn sink(&self) -> crate::output::ChannelSink {
+        crate::output::ChannelSink::new(
+            "clipboard",
+            self.sender
+                .as_ref()
+                .expect("clipboard worker is running")
+                .clone(),
+        )
     }
 
     pub fn try_recv_failure(&self) -> Option<ClipboardFailure> {
@@ -237,6 +245,9 @@ impl ClipboardWorker {
 pub struct ClipboardFailure {
     pub capture_id: CaptureId,
     pub message: String,
+    /// True when the failed publish had already emptied the clipboard, so the user lost whatever
+    /// they had copied as well as the capture they asked for.
+    pub cleared_previous_contents: bool,
 }
 
 impl Drop for ClipboardWorker {
@@ -245,31 +256,9 @@ impl Drop for ClipboardWorker {
     }
 }
 
-pub struct ClipboardJob {
-    pub capture_id: CaptureId,
-    pub triggered_at: Instant,
-    pub action: HotkeyAction,
-    pub chord: Option<HotkeyChord>,
-    pub cpu_ready_offset_ns: u64,
-    pub source: &'static str,
-    pub frame: CpuFrame,
-    pub recorder: EventRecorder,
-}
-
-pub enum SubmitError {
-    Full(Box<ClipboardJob>),
-    Disconnected(Box<ClipboardJob>),
-}
-
-pub fn try_submit(
-    sender: &mpsc::SyncSender<ClipboardJob>,
-    job: ClipboardJob,
-) -> Result<(), SubmitError> {
-    sender.try_send(job).map_err(|error| match error {
-        mpsc::TrySendError::Full(job) => SubmitError::Full(Box::new(job)),
-        mpsc::TrySendError::Disconnected(job) => SubmitError::Disconnected(Box::new(job)),
-    })
-}
+/// The clipboard is one destination among what will shortly be several, so it takes the shared
+/// job rather than a shape of its own.
+pub type ClipboardJob = crate::output::OutputJob;
 
 pub fn finish_rejected(mut job: ClipboardJob) -> Result<CaptureId, AppError> {
     job.recorder.record(
@@ -293,15 +282,34 @@ fn ns_to_ms(ns: u64) -> f64 {
     ns as f64 / 1_000_000.0
 }
 
-fn publish_with_retry<T>(
-    mut publish: impl FnMut() -> Result<T, CaptureError>,
+/// Anything a publish can fail with that knows whether it is worth trying again.
+trait Retryable {
+    fn retryable(&self) -> bool;
+}
+
+impl Retryable for CaptureError {
+    fn retryable(&self) -> bool {
+        self.retryable
+    }
+}
+
+impl Retryable for captastic_windows::ClipboardPublishError {
+    fn retryable(&self) -> bool {
+        self.error.retryable
+    }
+}
+
+fn publish_with_retry<T, E: Retryable>(
+    mut publish: impl FnMut() -> Result<T, E>,
     mut wait: impl FnMut(Duration),
     mut stop_requested: impl FnMut() -> bool,
-) -> (Result<T, CaptureError>, u32) {
+) -> (Result<T, E>, u32) {
     let mut retries = 0_u32;
     loop {
         match publish() {
-            Err(error) if error.retryable && retries < PUBLISH_RETRY_LIMIT && !stop_requested() => {
+            Err(error)
+                if error.retryable() && retries < PUBLISH_RETRY_LIMIT && !stop_requested() =>
+            {
                 retries = retries.saturating_add(1);
                 wait(PUBLISH_RETRY_DELAY);
             }
@@ -403,12 +411,61 @@ mod tests {
     }
 
     #[test]
+    fn a_publish_that_cleared_the_clipboard_is_retried_and_reported_as_such() {
+        // Win32 requires emptying the clipboard to take ownership of it, so a publish that fails
+        // afterwards leaves the user with neither their capture nor what they had copied. The
+        // distinction has to survive the retry loop, because it is what the tray apologises for.
+        let mut attempts = 0_u32;
+        let (result, retries) = publish_with_retry(
+            || {
+                attempts = attempts.saturating_add(1);
+                Err::<(), _>(captastic_windows::ClipboardPublishError {
+                    error: publish_error(true),
+                    cleared_previous_contents: true,
+                })
+            },
+            |_| {},
+            || false,
+        );
+
+        assert_eq!(retries, PUBLISH_RETRY_LIMIT);
+        assert_eq!(attempts, PUBLISH_RETRY_LIMIT + 1);
+        let failure = result.expect_err("every attempt failed");
+        assert!(failure.cleared_previous_contents);
+        assert!(failure
+            .to_string()
+            .contains("previous clipboard contents were cleared"));
+    }
+
+    #[test]
+    fn a_publish_that_failed_before_emptying_reports_no_loss() {
+        let (result, _) = publish_with_retry(
+            || {
+                Err::<(), _>(captastic_windows::ClipboardPublishError {
+                    error: publish_error(false),
+                    cleared_previous_contents: false,
+                })
+            },
+            |_| {},
+            || false,
+        );
+
+        let failure = result.expect_err("the attempt failed");
+        assert!(!failure.cleared_previous_contents);
+        assert!(
+            !failure.to_string().contains("cleared"),
+            "a publish that never emptied the clipboard must not claim it did: {failure}"
+        );
+    }
+
+    #[test]
     fn stop_returns_failures_queued_during_worker_teardown() {
         let (failure_sender, failure_receiver) = mpsc::sync_channel(1);
         failure_sender
             .send(ClipboardFailure {
                 capture_id: CaptureId(9),
                 message: "scripted shutdown failure".to_owned(),
+                cleared_previous_contents: false,
             })
             .expect("queue teardown failure");
         let worker = ClipboardWorker {
