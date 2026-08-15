@@ -1644,6 +1644,16 @@ fn build_overlay_selection(
     window: Option<NativeWindowHandle>,
     window_frame: Option<CpuFrame>,
 ) -> OverlaySelection {
+    // Preview counts and bytes are run-scoped cost telemetry, like window_overview_ns: they
+    // describe the chooser inventory this run built and held, whatever kind was confirmed.
+    // The live/frozen split, however, describes presentation at confirm time - leaving the
+    // Window tool hides every live registration, so a non-Window confirm has zero live
+    // previews and the whole inventory counts as frozen.
+    let (live_previews, frozen_previews) = confirm_preview_split(
+        kind,
+        state.live_window_thumbnails.len(),
+        state.window_thumbnails.len(),
+    );
     OverlaySelection {
         rect,
         kind,
@@ -1652,11 +1662,8 @@ fn build_overlay_selection(
         preparation_ns: state.preparation_ns,
         window_overview_ns: state.window_overview_ns,
         window_preview_count: state.window_thumbnails.len(),
-        window_live_preview_count: state.live_window_thumbnails.len(),
-        window_frozen_preview_count: state
-            .window_thumbnails
-            .len()
-            .saturating_sub(state.live_window_thumbnails.len()),
+        window_live_preview_count: live_previews,
+        window_frozen_preview_count: frozen_previews,
         window_preview_bytes: state
             .window_thumbnails
             .iter()
@@ -1664,6 +1671,18 @@ fn build_overlay_selection(
             .sum(),
         window_frame,
     }
+}
+
+/// Splits the chooser inventory into (live, frozen) counts for a confirm of the given kind.
+/// Only a Window confirm can have live DWM previews on screen; every other kind hid them on
+/// the way out of the Window tool.
+const fn confirm_preview_split(kind: SelectionKind, live: usize, total: usize) -> (usize, usize) {
+    let live = if matches!(kind, SelectionKind::Window) {
+        live
+    } else {
+        0
+    };
+    (live, total.saturating_sub(live))
 }
 
 /// Runs one machine transition and applies the returned effects. The model borrow taken for the
@@ -5114,6 +5133,19 @@ mod tests {
             live_pixel_alpha(CaptureTool::Region, false, false, false),
             LIVE_HIT_TEST_ALPHA
         );
+    }
+
+    #[test]
+    fn confirm_telemetry_reports_live_previews_only_for_window_confirms() {
+        // A Window confirm reports the actual live registrations; the rest of the inventory
+        // is frozen.
+        assert_eq!(confirm_preview_split(SelectionKind::Window, 3, 8), (3, 5));
+        // A confirm that merely passed through Window mode hid every live preview on the way
+        // out: the inventory still counts (run-scoped cost), but nothing is live.
+        assert_eq!(confirm_preview_split(SelectionKind::Region, 3, 8), (0, 8));
+        assert_eq!(confirm_preview_split(SelectionKind::Display, 3, 8), (0, 8));
+        // A run that never entered Window mode has no inventory at all.
+        assert_eq!(confirm_preview_split(SelectionKind::Region, 0, 0), (0, 0));
     }
 
     #[test]
