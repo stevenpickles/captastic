@@ -373,6 +373,8 @@ fn capture_window_inner(
         content_height,
         border_width,
         inner_corner_radius,
+        // GDI never writes the alpha byte, so whatever PrintWindow left behind is meaningless.
+        AlphaSource::Coverage,
     )?;
     let corner_radius = inner_corner_radius + border_width as f32;
     let mut metadata = reference_metadata.clone();
@@ -464,7 +466,7 @@ fn capture_window_with_wgc(
         .min(raw.width / 4)
         .min(raw.height / 4);
     let content_bounds = inset_rect(source_bounds, border_thickness).unwrap_or(source_bounds);
-    let content = normalize_wgc_content(crop_bgra(&raw.pixels, source_bounds, content_bounds)?);
+    let content = crop_bgra(&raw.pixels, source_bounds, content_bounds)?;
     let (pixels, content_width, content_height, radius_scale) = if let Some(max_pixels) = max_pixels
     {
         let (width, height) =
@@ -489,6 +491,7 @@ fn capture_window_with_wgc(
     } else {
         (content, content_bounds.width, content_bounds.height, 1.0)
     };
+    let pixels = normalize_wgc_content(pixels);
     let inner_corner_radius =
         (window_corner_radius(hwnd) - border_thickness as f32).max(0.0) * radius_scale;
     let border_width = scaled_border_width(border_thickness, radius_scale);
@@ -498,6 +501,9 @@ fn capture_window_with_wgc(
         content_height,
         border_width,
         inner_corner_radius,
+        // WGC hands back the composited window surface, so an acrylic or Mica backdrop arrives
+        // genuinely translucent. Overwriting that with corner coverage published it opaque.
+        AlphaSource::Content,
     )?;
     let corner_radius_px = inner_corner_radius + border_width as f32;
     let mut metadata = reference_metadata.clone();
@@ -543,14 +549,55 @@ fn capture_window_with_wgc(
 }
 
 fn normalize_wgc_content(mut pixels: Vec<u8>) -> Vec<u8> {
-    // WGC publishes premultiplied BGRA. Convert before any GDI scaling because StretchBlt does
-    // not preserve alpha; waiting until after the blit would interpret every pixel as transparent
-    // and erase its RGB channels.
+    // WGC publishes premultiplied BGRA and Captastic publishes straight alpha. Convert *after* any
+    // scaling: premultiplied is the only representation a resampling filter may average directly,
+    // and unpremultiplying first zeroes the colour of fully transparent pixels, which a downscale
+    // would then bleed as a dark fringe into the rounded corners.
     unpremultiply_bgra(&mut pixels);
     pixels
 }
 
+/// Scales a BGRA buffer through GDI, keeping the alpha channel intact.
+///
+/// `StretchBlt` treats the fourth byte of a 32-bit DIB as padding rather than alpha and is free to
+/// discard it — with `HALFTONE` it does. The alpha channel is therefore resampled separately, as a
+/// grayscale image pushed through the identical filter, and merged back afterwards so the colour
+/// and alpha planes stay aligned.
 fn scale_bgra_with_dib(
+    pixels: &[u8],
+    source_width: u32,
+    source_height: u32,
+    target_width: u32,
+    target_height: u32,
+    operation: &'static str,
+) -> Result<Vec<u8>, CaptureError> {
+    let mut scaled = stretch_bgra_with_dib(
+        pixels,
+        source_width,
+        source_height,
+        target_width,
+        target_height,
+        operation,
+    )?;
+    let alpha_plane: Vec<u8> = pixels
+        .chunks_exact(4)
+        .flat_map(|pixel| [pixel[3], pixel[3], pixel[3], 255])
+        .collect();
+    let scaled_alpha = stretch_bgra_with_dib(
+        &alpha_plane,
+        source_width,
+        source_height,
+        target_width,
+        target_height,
+        operation,
+    )?;
+    for (pixel, alpha) in scaled.chunks_exact_mut(4).zip(scaled_alpha.chunks_exact(4)) {
+        pixel[3] = alpha[0];
+    }
+    Ok(scaled)
+}
+
+fn stretch_bgra_with_dib(
     pixels: &[u8],
     source_width: u32,
     source_height: u32,
@@ -906,12 +953,53 @@ fn logical_corner_radius(
     }
 }
 
-fn apply_window_alpha(pixels: &mut [u8], width: u32, height: u32, radius: f32) {
+/// Whether the alpha channel of a rendered window buffer carries information worth keeping.
+///
+/// The two capture backends disagree, and publishing both through the same mask is what made
+/// translucent windows opaque: geometric corner coverage is the *whole* answer for one and only
+/// half of it for the other.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AlphaSource {
+    /// The buffer has no meaningful alpha of its own, so the corner mask becomes the alpha.
+    ///
+    /// GDI never writes the alpha byte, so a `PrintWindow` render leaves whatever the DIB was
+    /// cleared to (zero) behind every opaque pixel it painted. The synthetic border ring is
+    /// likewise opaque by construction.
+    Coverage,
+    /// The buffer carries real per-pixel alpha, so the corner mask modulates it.
+    ///
+    /// Windows Graphics Capture publishes the composited window surface, where an acrylic or Mica
+    /// backdrop is genuinely translucent. Replacing that alpha with coverage publishes the
+    /// backdrop as if it were opaque, which reads as over-bright against whatever it is composited
+    /// onto later.
+    Content,
+}
+
+impl AlphaSource {
+    /// Combines the alpha already stored in a pixel with the geometric corner `coverage`.
+    fn combine(self, stored: u8, coverage: u8) -> u8 {
+        match self {
+            Self::Coverage => coverage,
+            // Rounded so a fully opaque source pixel reproduces `coverage` exactly, which keeps
+            // the `Coverage` and `Content` masks identical for opaque content.
+            Self::Content => ((u32::from(stored) * u32::from(coverage) + 127) / 255) as u8,
+        }
+    }
+}
+
+fn apply_window_alpha(
+    pixels: &mut [u8],
+    width: u32,
+    height: u32,
+    radius: f32,
+    alpha_source: AlphaSource,
+) {
     let stride = width as usize * 4;
     for y in 0..height {
         for x in 0..width {
-            let alpha = rounded_rect_coverage(x, y, width, height, radius);
+            let coverage = rounded_rect_coverage(x, y, width, height, radius);
             let offset = y as usize * stride + x as usize * 4;
+            let alpha = alpha_source.combine(pixels[offset + 3], coverage);
             pixels[offset + 3] = alpha;
             if alpha == 0 {
                 pixels[offset..offset + 3].fill(0);
@@ -934,6 +1022,7 @@ fn add_clean_window_border(
     content_height: u32,
     border_width: u32,
     inner_corner_radius: f32,
+    alpha_source: AlphaSource,
 ) -> Result<(Vec<u8>, u32, u32), CaptureError> {
     let content_stride = content_width
         .checked_mul(4)
@@ -951,6 +1040,7 @@ fn add_clean_window_border(
             content_width,
             content_height,
             inner_corner_radius,
+            alpha_source,
         );
         return Ok((content, content_width, content_height));
     }
@@ -977,35 +1067,52 @@ fn add_clean_window_border(
         pixel[..3].copy_from_slice(&WINDOW_BORDER_BGRA);
         pixel[3] = 255;
     }
-    apply_window_alpha(&mut framed, width, height, outer_corner_radius);
+    // The ring is synthetic and opaque, so its own mask never has content alpha to preserve.
+    apply_window_alpha(
+        &mut framed,
+        width,
+        height,
+        outer_corner_radius,
+        AlphaSource::Coverage,
+    );
 
     for content_y in 0..content_height {
         for content_x in 0..content_width {
-            let content_alpha = u32::from(rounded_rect_coverage(
+            // `coverage` is *area*: how much of this output pixel the rounded content rectangle
+            // occupies, with the border ring occupying the rest. It is deliberately kept separate
+            // from the content's own transparency below, because the two combine differently —
+            // area splits the pixel between content and ring, transparency does not.
+            let coverage = rounded_rect_coverage(
                 content_x,
                 content_y,
                 content_width,
                 content_height,
                 inner_corner_radius,
-            ));
-            if content_alpha == 0 {
+            );
+            if coverage == 0 {
                 continue;
             }
             let source_offset = content_y as usize * content_stride + content_x as usize * 4;
             let output_x = content_x + border_width;
             let output_y = content_y + border_width;
             let output_offset = output_y as usize * stride + output_x as usize * 4;
-            if content_alpha == 255 {
+            let source_alpha = alpha_source.combine(content[source_offset + 3], 255);
+            if coverage == 255 {
                 framed[output_offset..output_offset + 3]
                     .copy_from_slice(&content[source_offset..source_offset + 3]);
-                framed[output_offset + 3] = 255;
+                framed[output_offset + 3] = source_alpha;
                 continue;
             }
 
+            let content_alpha = u32::from(alpha_source.combine(source_alpha, coverage));
             let background_alpha = u32::from(framed[output_offset + 3]);
-            let remaining = 255 - content_alpha;
-            let retained_background_alpha = (background_alpha * remaining + 127) / 255;
+            let uncovered = 255 - u32::from(coverage);
+            let retained_background_alpha = (background_alpha * uncovered + 127) / 255;
             let output_alpha = content_alpha + retained_background_alpha;
+            if output_alpha == 0 {
+                framed[output_offset..output_offset + 4].fill(0);
+                continue;
+            }
             for channel in 0..3 {
                 let premultiplied = u32::from(content[source_offset + channel]) * content_alpha
                     + u32::from(framed[output_offset + channel]) * retained_background_alpha;
@@ -1572,7 +1679,7 @@ mod tests {
     #[test]
     fn rounded_window_mask_has_transparent_antialiased_corners() {
         let mut pixels = vec![128_u8; 16 * 16 * 4];
-        apply_window_alpha(&mut pixels, 16, 16, 8.0);
+        apply_window_alpha(&mut pixels, 16, 16, 8.0, AlphaSource::Coverage);
         assert_eq!(pixels[3], 0);
         assert_eq!(pixels[(8 * 16 + 8) * 4 + 3], 255);
         assert!(pixels
@@ -1585,7 +1692,8 @@ mod tests {
     fn clean_window_border_expands_the_frame_without_changing_content() {
         let content = vec![10, 20, 30, 0, 40, 50, 60, 0];
         let (framed, width, height) =
-            add_clean_window_border(content, 2, 1, 1, 0.0).expect("bordered frame");
+            add_clean_window_border(content, 2, 1, 1, 0.0, AlphaSource::Coverage)
+                .expect("bordered frame");
         assert_eq!((width, height), (4, 3));
         let pixel = |x: u32, y: u32| {
             let offset = (y * width + x) as usize * 4;
@@ -1600,7 +1708,8 @@ mod tests {
     fn clean_window_border_preserves_transparent_rounded_corners() {
         let content = vec![200_u8; 8 * 8 * 4];
         let (framed, width, height) =
-            add_clean_window_border(content, 8, 8, 1, 4.0).expect("rounded bordered frame");
+            add_clean_window_border(content, 8, 8, 1, 4.0, AlphaSource::Coverage)
+                .expect("rounded bordered frame");
         assert_eq!((width, height), (10, 10));
         assert_eq!(&framed[..4], &[0, 0, 0, 0]);
         assert!(framed
@@ -1609,6 +1718,106 @@ mod tests {
         let top_center = (5 * 4) as usize;
         assert_eq!(&framed[top_center..top_center + 3], &[188, 180, 176]);
         assert!(framed[top_center + 3] > 200);
+    }
+
+    #[test]
+    fn corner_coverage_replaces_gdi_alpha_but_only_scales_wgc_alpha() {
+        // (stored alpha, corner coverage) -> (PrintWindow alpha, WGC alpha)
+        let cases = [
+            ((0_u8, 255_u8), (255_u8, 0_u8)),
+            ((128, 255), (255, 128)),
+            ((255, 255), (255, 255)),
+            ((255, 128), (128, 128)),
+            ((128, 128), (128, 64)),
+            ((200, 0), (0, 0)),
+            ((0, 0), (0, 0)),
+        ];
+        for ((stored, coverage), (expected_coverage_alpha, expected_content_alpha)) in cases {
+            assert_eq!(
+                AlphaSource::Coverage.combine(stored, coverage),
+                expected_coverage_alpha,
+                "coverage mask for stored={stored} coverage={coverage}"
+            );
+            assert_eq!(
+                AlphaSource::Content.combine(stored, coverage),
+                expected_content_alpha,
+                "content mask for stored={stored} coverage={coverage}"
+            );
+        }
+    }
+
+    #[test]
+    fn opaque_content_masks_identically_under_both_alpha_sources() {
+        // The WGC fix must be a no-op for opaque windows: an alpha-255 source multiplied by
+        // coverage has to reproduce coverage exactly, or every square window changes shape.
+        for coverage in 0..=255_u8 {
+            assert_eq!(
+                AlphaSource::Content.combine(255, coverage),
+                AlphaSource::Coverage.combine(255, coverage),
+                "coverage={coverage}"
+            );
+        }
+    }
+
+    #[test]
+    fn wgc_translucent_content_keeps_its_alpha_through_the_border_frame() {
+        // A uniformly half-transparent acrylic backdrop, big enough that the centre pixel is well
+        // clear of the rounded corners.
+        let content = [90_u8, 80, 70, 128].repeat(8 * 8);
+        let (framed, width, _) =
+            add_clean_window_border(content.clone(), 8, 8, 1, 4.0, AlphaSource::Content)
+                .expect("translucent bordered frame");
+        let centre = ((4 * width) + 4) as usize * 4;
+        assert_eq!(&framed[centre..centre + 4], &[90, 80, 70, 128]);
+
+        // The same buffer down the PrintWindow path is published opaque, because GDI alpha is
+        // garbage there and coverage is the only signal available.
+        let (opaque, _, _) = add_clean_window_border(content, 8, 8, 1, 4.0, AlphaSource::Coverage)
+            .expect("opaque bordered frame");
+        assert_eq!(&opaque[centre..centre + 4], &[90, 80, 70, 255]);
+    }
+
+    #[test]
+    fn wgc_fully_transparent_content_publishes_nothing_but_the_border() {
+        // A fully transparent WGC surface must not be resurrected as opaque black, and the
+        // compositor must not divide by the zero alpha it produces.
+        let content = vec![0_u8; 8 * 8 * 4];
+        let (framed, width, height) =
+            add_clean_window_border(content, 8, 8, 1, 4.0, AlphaSource::Content)
+                .expect("transparent bordered frame");
+        assert_eq!(framed.len(), (width * height) as usize * 4);
+
+        let centre = ((4 * width) + 4) as usize * 4;
+        assert_eq!(&framed[centre..centre + 4], &[0, 0, 0, 0]);
+        for content_y in 0..8_u32 {
+            for content_x in 0..8_u32 {
+                let offset = (((content_y + 1) * width) + content_x + 1) as usize * 4;
+                assert!(
+                    framed[offset + 3] < 255,
+                    "content pixel ({content_x},{content_y}) was published opaque"
+                );
+            }
+        }
+        // The synthetic ring itself is unaffected by the content's transparency.
+        let ring_top_centre = (width / 2) as usize * 4;
+        assert_eq!(
+            &framed[ring_top_centre..ring_top_centre + 3],
+            &WINDOW_BORDER_BGRA
+        );
+        assert!(framed[ring_top_centre + 3] > 200);
+    }
+
+    #[test]
+    fn wgc_translucent_content_survives_thumbnail_scaling() {
+        // StretchBlt drops the alpha byte, so a downscaled acrylic thumbnail used to arrive fully
+        // transparent (or, before this fix, was papered over by the coverage mask).
+        let pixels = [90_u8, 80, 70, 128].repeat(4 * 4);
+        let scaled = scale_bgra_with_dib(&pixels, 4, 4, 2, 2, "test_wgc_alpha_round_trip")
+            .expect("scale translucent WGC pixels through native DIBs");
+        assert_eq!(scaled.len(), 2 * 2 * 4);
+        for pixel in scaled.chunks_exact(4) {
+            assert_eq!(pixel[3], 128, "alpha must survive the GDI stretch");
+        }
     }
 
     #[test]
@@ -1625,22 +1834,50 @@ mod tests {
     }
 
     #[test]
-    fn normalized_wgc_rgb_survives_a_scaler_that_discards_alpha() {
-        let mut pixels = normalize_wgc_content(vec![25, 50, 100, 128]);
-        pixels[3] = 0;
+    fn wgc_rgb_survives_the_native_dib_thumbnail_round_trip() {
+        let premultiplied_pixel = [25_u8, 50, 100, 128];
+
+        let scaled = scale_bgra_with_dib(
+            &premultiplied_pixel.repeat(4),
+            2,
+            2,
+            1,
+            1,
+            "test_wgc_dib_round_trip",
+        )
+        .expect("scale premultiplied WGC pixels through native DIBs");
+        let pixels = normalize_wgc_content(scaled);
+
         assert_eq!(&pixels[..3], &[50, 100, 199]);
+        assert_eq!(pixels[3], 128);
     }
 
     #[test]
-    fn normalized_wgc_rgb_survives_native_dib_thumbnail_round_trip() {
-        let premultiplied_pixel = [25, 50, 100, 128];
-        let pixels = normalize_wgc_content(premultiplied_pixel.repeat(4));
+    fn scaling_before_unpremultiplying_keeps_transparent_pixels_from_darkening_the_result() {
+        // Half opaque white, half fully transparent. Unpremultiplying first zeroes the transparent
+        // half's colour, so the downscale averages a mid-grey into the survivor — a dark fringe
+        // around every translucent or rounded edge. Averaging in premultiplied space carries no
+        // colour at all out of a zero-alpha pixel.
+        let mut source = Vec::new();
+        source.extend_from_slice(&[255, 255, 255, 255]);
+        source.extend_from_slice(&[0, 0, 0, 0]);
+        source.extend_from_slice(&[255, 255, 255, 255]);
+        source.extend_from_slice(&[0, 0, 0, 0]);
 
-        let scaled = scale_bgra_with_dib(&pixels, 2, 2, 1, 1, "test_wgc_dib_round_trip")
-            .expect("scale normalized WGC pixels through native DIBs");
+        let scaled = scale_bgra_with_dib(&source, 2, 2, 1, 1, "test_wgc_premultiplied_downscale")
+            .expect("downscale premultiplied WGC pixels");
+        let straight = normalize_wgc_content(scaled);
 
-        assert_eq!(&scaled[..3], &[50, 100, 199]);
-        assert_ne!(&scaled[..3], &[0, 0, 0]);
+        assert!(
+            straight[..3].iter().all(|&channel| channel >= 250),
+            "half-covered white must stay white, got {:?}",
+            &straight[..3]
+        );
+        assert!(
+            (120..=136).contains(&straight[3]),
+            "half-covered white must be half transparent, got {}",
+            straight[3]
+        );
     }
 
     #[test]
