@@ -473,10 +473,35 @@ fn capture_window_inner(
             None,
         )
     })?;
-    Ok(CapturedWindow {
+    let capture = CapturedWindow {
         frame,
         corner_radius_px: corner_radius,
-    })
+    };
+    log_published_window_frame(handle.raw(), &capture, max_pixels.is_some());
+    Ok(capture)
+}
+
+/// Records which backend produced a frame that is about to be published.
+///
+/// The backend name travels with the frame in `FrameMetadata`, but that only helps whoever is
+/// holding the frame. The two paths differ in how they crop, how they treat alpha, and how much
+/// they copy, and either one can run for any given window depending on how it answered a probe
+/// milliseconds earlier — so a capture that comes out misaligned or oddly bright has to be
+/// traceable to the path that produced it from the log alone.
+fn log_published_window_frame(handle: isize, capture: &CapturedWindow, thumbnail: bool) {
+    let metadata = &capture.frame.metadata;
+    log::debug!(
+        "window handle=0x{handle:X} published a {kind} frame from {backend}: {width}x{height} at ({x},{y}), {alpha:?} alpha, corner radius {radius:.1}px, {copies} copies",
+        kind = if thumbnail { "thumbnail" } else { "full-size" },
+        backend = metadata.backend,
+        width = capture.frame.width,
+        height = capture.frame.height,
+        x = metadata.source_rect.x,
+        y = metadata.source_rect.y,
+        alpha = capture.frame.alpha,
+        radius = capture.corner_radius_px,
+        copies = metadata.copy_count,
+    );
 }
 
 fn unpremultiply_bgra(pixels: &mut [u8]) {
@@ -612,10 +637,12 @@ fn capture_window_with_wgc(
             None,
         )
     })?;
-    Ok(CapturedWindow {
+    let capture = CapturedWindow {
         frame,
         corner_radius_px,
-    })
+    };
+    log_published_window_frame(hwnd.0, &capture, max_pixels.is_some());
+    Ok(capture)
 }
 
 fn normalize_wgc_content(mut pixels: Vec<u8>) -> Vec<u8> {
