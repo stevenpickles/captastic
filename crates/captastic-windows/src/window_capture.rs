@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use captastic_core::{CaptureError, CaptureErrorKind, CpuFrame, FrameAlpha, FrameMetadata, Rect};
 use windows::core::Error as WindowsError;
@@ -121,20 +121,61 @@ fn capture_window_bounded(
     let budget = WindowRenderBudget::acquire()?;
     let permit = WindowRenderPermit::acquire()?;
     let metadata = reference_metadata.clone();
-    run_bounded_window_render(permit, budget, WINDOW_RENDER_TIMEOUT, move || {
+    // One deadline, shared: the caller stops waiting at `deadline`, so every backend the worker
+    // drives has to stop waiting by then too.
+    let deadline = RenderDeadline::starting_now(WINDOW_RENDER_TIMEOUT);
+    run_bounded_window_render(permit, budget, deadline, move || {
         // Capture geometry must use physical pixels. Thread DPI awareness is not inherited
         // reliably by newly spawned workers, and mixing virtualized GetWindowRect values with
         // physical DWM bounds leaves asymmetric one- or two-pixel frame artifacts.
         // SAFETY: Changes DPI virtualization only for this short-lived render worker.
         let _ = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
-        capture_window_inner(handle, &metadata, max_pixels)
+        capture_window_inner(handle, &metadata, max_pixels, deadline)
     })
+}
+
+/// The wall-clock instant a bounded window render stops being useful.
+///
+/// The worker is abandoned once the deadline passes and anything it produces afterwards is thrown
+/// away, so a backend that waits internally has to know when waiting stops paying. Sizing an inner
+/// budget independently of this one is what let a legitimately slow WGC capture spend the caller's
+/// entire deadline and still be discarded — having burned a worker-lifetime slot to produce a
+/// frame nobody read.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RenderDeadline {
+    expires_at: Instant,
+}
+
+impl RenderDeadline {
+    pub(crate) fn starting_now(budget: Duration) -> Self {
+        Self {
+            expires_at: Instant::now() + budget,
+        }
+    }
+
+    pub(crate) fn remaining(&self) -> Duration {
+        self.expires_at.saturating_duration_since(Instant::now())
+    }
+
+    /// Clamps a backend's own timeout to the time the caller can still use.
+    ///
+    /// `reserve` is the work that must still happen *after* the wait for its result to reach the
+    /// caller — without it a backend can wait right up to the deadline and then miss it while
+    /// publishing what it waited for.
+    pub(crate) fn bounded_wait(&self, preferred: Duration, reserve: Duration) -> Duration {
+        bounded_wait(preferred, self.remaining(), reserve)
+    }
+}
+
+/// The arithmetic behind [`RenderDeadline::bounded_wait`], separated so it can be tabulated.
+fn bounded_wait(preferred: Duration, remaining: Duration, reserve: Duration) -> Duration {
+    preferred.min(remaining.saturating_sub(reserve))
 }
 
 fn run_bounded_window_render<T>(
     permit: WindowRenderPermit<'static>,
     budget: WindowRenderBudget<'static>,
-    timeout: Duration,
+    deadline: RenderDeadline,
     render: impl FnOnce() -> Result<T, CaptureError> + Send + 'static,
 ) -> Result<T, CaptureError>
 where
@@ -161,7 +202,9 @@ where
                 None,
             )
         })?;
-    match receiver.recv_timeout(timeout) {
+    // The worker inherits the same deadline, and it started counting a spawn ago — so it gives up
+    // marginally before this wait does, which is the safe direction.
+    match receiver.recv_timeout(deadline.remaining()) {
         Ok(result) => result,
         Err(mpsc::RecvTimeoutError::Timeout) => {
             // The detached worker may remain blocked inside a foreign window procedure. Its
@@ -179,7 +222,7 @@ where
                 "print_selected_window",
                 format!(
                     "the selected window did not render within {} ms",
-                    timeout.as_millis()
+                    WINDOW_RENDER_TIMEOUT.as_millis()
                 ),
                 true,
                 None,
@@ -233,6 +276,7 @@ fn capture_window_inner(
     handle: NativeWindowHandle,
     reference_metadata: &FrameMetadata,
     max_pixels: Option<u64>,
+    deadline: RenderDeadline,
 ) -> Result<CapturedWindow, CaptureError> {
     let hwnd = HWND(handle.raw());
     let mut native_bounds = RECT::default();
@@ -255,7 +299,7 @@ fn capture_window_inner(
             "window handle=0x{:X} did not answer the responsiveness probe; using Windows Graphics Capture",
             handle.raw()
         );
-        match capture_window_with_wgc(hwnd, reference_metadata, max_pixels, &geometry) {
+        match capture_window_with_wgc(hwnd, reference_metadata, max_pixels, &geometry, deadline) {
             Ok(capture) => return Ok(capture),
             Err(error) => {
                 log::debug!(
@@ -288,7 +332,7 @@ fn capture_window_inner(
             "window handle=0x{:X} rejected PrintWindow; trying Windows Graphics Capture",
             handle.raw()
         );
-        return capture_window_with_wgc(hwnd, reference_metadata, max_pixels, &geometry);
+        return capture_window_with_wgc(hwnd, reference_metadata, max_pixels, &geometry, deadline);
     }
     if region_is_blank(surface.as_bytes(), capture_bounds, visible_bounds)? {
         if probe_wgc_error.is_none() {
@@ -296,7 +340,8 @@ fn capture_window_inner(
                 "window handle=0x{:X} PrintWindow reported success but rendered a blank frame; trying Windows Graphics Capture",
                 handle.raw()
             );
-            match capture_window_with_wgc(hwnd, reference_metadata, max_pixels, &geometry) {
+            match capture_window_with_wgc(hwnd, reference_metadata, max_pixels, &geometry, deadline)
+            {
                 Ok(capture) => return Ok(capture),
                 Err(error) => {
                     log::debug!(
@@ -449,8 +494,9 @@ fn capture_window_with_wgc(
     reference_metadata: &FrameMetadata,
     max_pixels: Option<u64>,
     geometry: &WindowGeometry,
+    deadline: RenderDeadline,
 ) -> Result<CapturedWindow, CaptureError> {
-    let raw = capture_window_wgc_frame(hwnd)?;
+    let raw = capture_window_wgc_frame(hwnd, deadline)?;
     let source_bounds = Rect {
         x: 0,
         y: 0,
@@ -1476,6 +1522,75 @@ mod tests {
     }
 
     #[test]
+    fn inner_waits_are_bounded_by_what_the_caller_can_still_use() {
+        let ms = Duration::from_millis;
+        // (preferred, remaining, reserve) -> effective wait
+        let cases = [
+            // Plenty of deadline left: the backend keeps its own preferred bound.
+            ((ms(300), ms(700), ms(200)), ms(300)),
+            ((ms(300), ms(500), ms(200)), ms(300)),
+            // Squeezed: the caller's remaining time wins, minus what publishing still costs.
+            ((ms(300), ms(400), ms(200)), ms(200)),
+            ((ms(250), ms(300), ms(100)), ms(200)),
+            // Exactly enough to publish and no more, and past that point.
+            ((ms(300), ms(200), ms(200)), Duration::ZERO),
+            ((ms(300), ms(50), ms(200)), Duration::ZERO),
+            ((ms(300), Duration::ZERO, ms(200)), Duration::ZERO),
+        ];
+        for ((preferred, remaining, reserve), expected) in cases {
+            assert_eq!(
+                bounded_wait(preferred, remaining, reserve),
+                expected,
+                "preferred={preferred:?} remaining={remaining:?} reserve={reserve:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_whole_wgc_budget_fits_inside_the_outer_render_deadline() {
+        // The failure this guards: 300 ms first-frame wait plus 250 ms map retry, sized without
+        // reference to the 700 ms outer deadline, could outlast a device creation slow enough to
+        // matter — and the frame it finally produced was thrown away, having consumed a
+        // worker-lifetime slot for nothing.
+        let first_frame = Duration::from_millis(300);
+        let map = Duration::from_millis(250);
+        let readback_reserve = Duration::from_millis(200);
+        let publish_reserve = Duration::from_millis(100);
+        for device_creation_ms in [0, 50, 100, 200, 400, 600, 700, 900] {
+            let after_device =
+                WINDOW_RENDER_TIMEOUT.saturating_sub(Duration::from_millis(device_creation_ms));
+            let first_frame_wait = bounded_wait(first_frame, after_device, readback_reserve);
+            let after_first_frame = after_device.saturating_sub(first_frame_wait);
+            let map_wait = bounded_wait(map, after_first_frame, publish_reserve);
+            let waited = first_frame_wait + map_wait;
+            assert!(
+                waited <= after_device,
+                "device creation of {device_creation_ms} ms left {after_device:?} but the inner waits still asked for {waited:?}"
+            );
+            // ...and whenever the path runs at all, the readback and the border rebuild that
+            // follow the last wait still have room before the caller stops listening.
+            assert!(
+                first_frame_wait.is_zero() || after_device - waited >= publish_reserve,
+                "device creation of {device_creation_ms} ms left no room to publish"
+            );
+        }
+    }
+
+    #[test]
+    fn an_expired_deadline_offers_no_wait_at_all() {
+        let expired = RenderDeadline::starting_now(Duration::ZERO);
+        assert_eq!(expired.remaining(), Duration::ZERO);
+        assert_eq!(
+            expired.bounded_wait(Duration::from_millis(300), Duration::from_millis(200)),
+            Duration::ZERO
+        );
+
+        let fresh = RenderDeadline::starting_now(WINDOW_RENDER_TIMEOUT);
+        assert!(fresh.remaining() > Duration::ZERO);
+        assert!(fresh.remaining() <= WINDOW_RENDER_TIMEOUT);
+    }
+
+    #[test]
     fn render_permit_deadline_reclaims_capacity_idempotently() {
         let active = AtomicUsize::new(0);
         let first = WindowRenderPermit::acquire_from(&active, 2).expect("first permit");
@@ -1511,10 +1626,15 @@ mod tests {
         let budget = WindowRenderBudget::acquire_from(workers, 1).expect("worker budget");
         let (release_sender, release_receiver) = mpsc::sync_channel(0);
 
-        let error = run_bounded_window_render(permit, budget, Duration::ZERO, move || {
-            release_receiver.recv().expect("release late worker");
-            Ok(7_u8)
-        })
+        let error = run_bounded_window_render(
+            permit,
+            budget,
+            RenderDeadline::starting_now(Duration::ZERO),
+            move || {
+                release_receiver.recv().expect("release late worker");
+                Ok(7_u8)
+            },
+        )
         .expect_err("worker must exceed the immediate deadline");
 
         assert_eq!(error.kind, CaptureErrorKind::Timeout);
@@ -1546,11 +1666,13 @@ mod tests {
         // The worker terminates promptly by panicking, so this timeout only bounds a broken
         // harness. Keep it generous: a 1-second budget lost the race to thread spawn plus unwind
         // on coverage-instrumented CI runners and misreported the panic as a Timeout.
-        let error =
-            run_bounded_window_render::<u8>(permit, budget, Duration::from_secs(60), || {
-                panic!("scripted render panic")
-            })
-            .expect_err("panic disconnects the bounded worker");
+        let error = run_bounded_window_render::<u8>(
+            permit,
+            budget,
+            RenderDeadline::starting_now(Duration::from_secs(60)),
+            || panic!("scripted render panic"),
+        )
+        .expect_err("panic disconnects the bounded worker");
 
         assert_eq!(error.kind, CaptureErrorKind::NativeFailure);
         assert!(!error.retryable);
