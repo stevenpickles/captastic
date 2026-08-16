@@ -487,13 +487,16 @@ pub fn display_containing_pointer(displays: &[DisplayInfo]) -> Result<DisplayId,
         .map(|display| display.id.clone())
         .ok_or_else(|| {
             manager_error(
-                CaptureErrorKind::TopologyChanged,
+                CaptureErrorKind::PointerOutsideDisplays,
                 "resolve_pointer_display",
                 format!(
-                    "pointer position ({}, {}) is outside the current display topology",
+                    "pointer position ({}, {}) is on no attached display",
                     point.x, point.y
                 ),
-                true,
+                // Not retryable: retrying re-reads the same cursor position against the same
+                // displays. Reported as TopologyChanged until 2026-08, which made every occurrence
+                // tear down and rebuild the capture engine three times before failing anyway.
+                false,
             )
         })
 }
