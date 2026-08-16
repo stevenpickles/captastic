@@ -852,7 +852,14 @@ fn benchmark(args: BenchmarkArgs) -> Result<(), AppError> {
     let options = benchmark::BenchmarkOptions {
         iterations: args.iterations,
         warmup: args.warmup,
-        mode: capture_mode(args.mode),
+        // Paired with `--frame-age-us`: one sets how stale the retained frame is, the other how
+        // stale the caller will accept, which is what makes the staleness path reachable here.
+        mode: match args.mode {
+            cli::ModeArg::Latest => CaptureMode::Latest {
+                max_age_ms: (args.max_frame_age_ms != 0).then_some(args.max_frame_age_ms),
+            },
+            other => capture_mode(other),
+        },
         cpu_frame: args.cpu_frame,
         source,
         trigger_queue_capacity: 4,
