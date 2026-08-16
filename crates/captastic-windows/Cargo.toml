@@ -14,6 +14,7 @@ log.workspace = true
 # implementation. Encoding goes through `captastic_core::encode_frame`.
 [dev-dependencies]
 png.workspace = true
+proptest.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [

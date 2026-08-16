@@ -21,6 +21,10 @@ log = { version = "=0.4.20", features = ["std"] }
 # Pulls flate2/miniz_oxide as its DEFLATE backend: pure Rust, no C toolchain, exact-pinnable
 # through the committed lockfile like every other dependency here.
 png = "=0.18.1"
+# Dev-only, like png: property tests for the coordinate and rotation transforms. Default features
+# bring in process forking and a temp-file crate to survive a panicking test case; these transforms
+# are pure arithmetic, so a failure is a failed assertion and none of that machinery is needed.
+proptest = { version = "=1.11.0", default-features = false, features = ["std", "bit-set"] }
 serde = { version = "=1.0.195", features = ["derive"] }
 serde_json = "=1.0.111"
 thiserror = "=1.0.56"
