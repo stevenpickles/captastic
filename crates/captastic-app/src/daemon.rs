@@ -792,6 +792,24 @@ fn run_capture_worker(context: CaptureWorkerContext) {
             }
         }
     }
+    abandon_backend(backend);
+}
+
+/// Releases the capture backend without running its destructor.
+///
+/// Every way out of the capture loop is a way out of the process: the daemon cannot serve a hotkey
+/// without this worker, so `run` proceeds to teardown and returns as soon as the worker stops.
+///
+/// That makes the destructor pure cost. Releasing a D3D device and its duplication means calls into
+/// the display driver, which is one of the two places a worker gets stuck — and it happens after
+/// the worker has told the daemon it is finished but before its thread ends, so the daemon is
+/// watching `is_finished` and spending shutdown budget on it. A driver that takes too long there
+/// gets the worker detached and leaks the same objects anyway, only later and while also holding a
+/// thread. The kernel reclaims every one of them at process exit regardless, so declining to run
+/// the destructor gives up nothing and takes the driver off the shutdown path.
+#[cfg(windows)]
+fn abandon_backend<B>(backend: Option<B>) {
+    std::mem::forget(backend);
 }
 
 #[cfg(windows)]
@@ -1325,6 +1343,12 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             "shutdown retained a daemon notice in the persistent log: {}",
             notice.message()
         ));
+    }
+    // Silent on a run that detached nothing, which is nearly all of them. A line that only appears
+    // when something was abandoned is one worth reading; a line reporting zero every time is not.
+    let detached = captastic_core::process_detach_ledger().summary();
+    if !detached.is_empty() {
+        crate::logging::warn(format_args!("{}", detached.to_line()));
     }
     console_shutdown.signal_drained();
     if let Some(tray) = tray.as_ref() {
@@ -2926,6 +2950,27 @@ mod tests {
         // Dropped before the back-off, exactly as a completed one would leave it, so the caller
         // takes the same "engine is recovering" branch either way.
         assert!(backend.is_none());
+    }
+
+    #[test]
+    fn the_capture_backend_is_abandoned_rather_than_dropped() {
+        struct CountsItsDrop(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for CountsItsDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        abandon_backend(Some(CountsItsDrop(std::sync::Arc::clone(&drops))));
+        assert_eq!(drops.load(Ordering::Acquire), 0);
+
+        // The control, because "no destructor ran" is only meaningful next to proof that one
+        // would have: this is what the capture worker used to do on its way out, with the driver
+        // call inside it and the shutdown budget still running.
+        drop(Some(CountsItsDrop(std::sync::Arc::clone(&drops))));
+        assert_eq!(drops.load(Ordering::Acquire), 1);
     }
 
     #[test]
