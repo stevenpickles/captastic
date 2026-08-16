@@ -987,7 +987,12 @@ pub struct OutputConfig {
     /// Where captures are written. `None` selects [`default_output_directory`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub directory: Option<PathBuf>,
+    /// Names a capture, without its extension. See `DEFAULT_FILENAME_TEMPLATE`.
+    pub filename_template: String,
 }
+
+/// The default capture name: sortable, and identical for every capture but the moment it was taken.
+pub const DEFAULT_FILENAME_TEMPLATE: &str = "captastic-{timestamp}";
 
 impl Default for OutputConfig {
     fn default() -> Self {
@@ -996,6 +1001,7 @@ impl Default for OutputConfig {
             format: "png".to_owned(),
             queue_capacity: 2,
             directory: None,
+            filename_template: DEFAULT_FILENAME_TEMPLATE.to_owned(),
         }
     }
 }

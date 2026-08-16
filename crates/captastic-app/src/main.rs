@@ -10,6 +10,8 @@ mod daemon;
 mod error;
 #[cfg(windows)]
 mod file_output;
+#[cfg(windows)]
+mod filename_template;
 mod logging;
 #[cfg(windows)]
 mod output;
@@ -512,7 +514,12 @@ fn write_one_shot_file_output(
             )
         })?;
     recorder.record(capture_id, PerfEventKind::EncodeStarted, 0);
-    let (path, bytes, encode_ns, write_ns) = file_output::write_capture_now(&directory, frame)?;
+    let (path, bytes, encode_ns, write_ns) = file_output::write_capture_now(
+        &directory,
+        &config.output.filename_template,
+        captastic_config::HotkeyAction::FullDisplay,
+        frame,
+    )?;
     recorder.record(capture_id, PerfEventKind::EncodeFinished, encode_ns);
     recorder.record(capture_id, PerfEventKind::FileWriteStarted, 0);
     recorder.record(capture_id, PerfEventKind::FileWriteFinished, write_ns);

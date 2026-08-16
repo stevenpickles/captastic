@@ -50,9 +50,12 @@ struct WriteReport {
 impl FileOutputWorker {
     pub fn start(
         directory: PathBuf,
+        filename_template: String,
         json_output: bool,
         queue_capacity: usize,
     ) -> Result<Self, AppError> {
+        crate::filename_template::validate_template(&filename_template)
+            .map_err(AppError::InvalidArgument)?;
         // Created up front rather than on first capture: a directory that cannot be created is a
         // configuration problem, and the user should hear about it at startup rather than
         // discovering it the first time they press the hotkey.
@@ -67,6 +70,7 @@ impl FileOutputWorker {
         let stop_requested = Arc::new(AtomicBool::new(false));
         let worker_stop_requested = stop_requested.clone();
         let worker_directory = directory.clone();
+        let worker_template = filename_template;
         let join = thread::Builder::new()
             .name("captastic-file-output".to_owned())
             .spawn(move || loop {
@@ -78,7 +82,7 @@ impl FileOutputWorker {
                     Err(mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 };
-                match write_capture(&worker_directory, &mut job) {
+                match write_capture(&worker_directory, &worker_template, &mut job) {
                     Ok(report) => report_written(&job, &report, json_output),
                     Err(error) => {
                         crate::logging::error(format_args!(
@@ -177,8 +181,11 @@ impl Drop for FileOutputWorker {
 /// that refuses to overwrite.
 pub fn write_capture_now(
     directory: &Path,
+    template: &str,
+    action: captastic_config::HotkeyAction,
     frame: &captastic_core::CpuFrame,
 ) -> Result<(PathBuf, usize, u64, u64), AppError> {
+    crate::filename_template::validate_template(template).map_err(AppError::InvalidArgument)?;
     std::fs::create_dir_all(directory).map_err(|error| {
         AppError::InvalidArgument(format!(
             "failed to create output directory {}: {error}",
@@ -191,9 +198,22 @@ pub fn write_capture_now(
     })?;
     let encode_ns = duration_ns(encode_started.elapsed());
     let write_started = Instant::now();
-    let (path, _) =
-        write_without_clobbering(directory, &timestamp_stem(SystemTime::now()), &encoded)
-            .map_err(AppError::BackendUnavailable)?;
+    let stem = crate::filename_template::expand(
+        template,
+        &crate::filename_template::TemplateContext {
+            timestamp_micros: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_micros()),
+            display: &frame.metadata.display_id.0,
+            mode: action.as_str(),
+            width: frame.width,
+            height: frame.height,
+            application: None,
+            title: None,
+        },
+    );
+    let (path, _) = write_without_clobbering(directory, &stem, &encoded)
+        .map_err(AppError::BackendUnavailable)?;
     Ok((
         path,
         encoded.len(),
@@ -203,7 +223,11 @@ pub fn write_capture_now(
 }
 
 /// Encodes and writes one capture, recording what it cost on the job's own trace.
-fn write_capture(directory: &Path, job: &mut OutputJob) -> Result<WriteReport, String> {
+fn write_capture(
+    directory: &Path,
+    template: &str,
+    job: &mut OutputJob,
+) -> Result<WriteReport, String> {
     job.recorder
         .record(job.capture_id, PerfEventKind::EncodeStarted, elapsed(job));
     let encode_started = Instant::now();
@@ -222,7 +246,7 @@ fn write_capture(directory: &Path, job: &mut OutputJob) -> Result<WriteReport, S
     );
     let write_started = Instant::now();
     let (path, collisions) =
-        write_without_clobbering(directory, &timestamp_stem(SystemTime::now()), &encoded)?;
+        write_without_clobbering(directory, &capture_stem(template, job), &encoded)?;
     let write_ns = duration_ns(write_started.elapsed());
     job.recorder
         .record(job.capture_id, PerfEventKind::FileWriteFinished, write_ns);
@@ -248,12 +272,19 @@ fn write_without_clobbering(
     contents: &[u8],
 ) -> Result<(PathBuf, u32), String> {
     for attempt in 0..MAX_COLLISION_ATTEMPTS {
-        let name = if attempt == 0 {
-            format!("{stem}.png")
+        let candidate = if attempt == 0 {
+            stem.to_owned()
         } else {
-            format!("{stem}-{}.png", attempt + 1)
+            format!("{stem}-{}", attempt + 1)
         };
-        let path = directory.join(name);
+        // The containment check runs on every write, not only in the sanitizer's tests. It should
+        // be impossible for a sanitized stem to fail it; that is exactly why it is cheap to keep.
+        let Some(path) = crate::filename_template::resolve(directory, &candidate, "png") else {
+            return Err(format!(
+                "refusing to write {candidate}.png: it would land outside {}",
+                directory.display()
+            ));
+        };
         match captastic_config::atomic_write(&path, contents, captastic_config::finalize_new) {
             Ok(()) => return Ok((path, attempt)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -268,13 +299,25 @@ fn write_without_clobbering(
     ))
 }
 
-/// A sortable, filesystem-safe name stem: `captastic-20260815-221030-123`.
-fn timestamp_stem(now: SystemTime) -> String {
-    let micros = now
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_micros());
-    let (year, month, day, hour, minute, second, millis) = crate::clock::utc_parts(micros);
-    format!("captastic-{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}-{millis:03}")
+/// Names a capture from the user's template and what the capture knows about itself.
+fn capture_stem(template: &str, job: &OutputJob) -> String {
+    crate::filename_template::expand(
+        template,
+        &crate::filename_template::TemplateContext {
+            timestamp_micros: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_micros()),
+            display: &job.frame.metadata.display_id.0,
+            mode: job.action.as_str(),
+            width: job.frame.width,
+            height: job.frame.height,
+            // Not yet plumbed: the overlay knows the captured window's title and owner, but the
+            // selection does not carry them out. The template grammar accepts both tokens today
+            // so the vocabulary is stable; they expand to nothing until that plumbing lands.
+            application: None,
+            title: None,
+        },
+    )
 }
 
 fn report_written(job: &OutputJob, report: &WriteReport, json_output: bool) {
@@ -356,14 +399,40 @@ mod tests {
     }
 
     #[test]
-    fn a_timestamp_stem_is_sortable_and_filesystem_safe() {
-        let stem = timestamp_stem(UNIX_EPOCH + Duration::from_micros(1_709_164_800_000_001));
-        assert_eq!(stem, "captastic-20240229-000000-000");
+    fn a_rejected_template_stops_the_worker_starting() {
+        // The template comes from the user's configuration, so a typo should be a startup error
+        // rather than something discovered when a capture lands under a strange name.
+        let directory = test_directory("bad-template");
+
+        let Err(error) =
+            FileOutputWorker::start(directory.clone(), "captastic-{tilte}".to_owned(), false, 1)
+        else {
+            panic!("an unknown token must be rejected");
+        };
+        assert!(error.to_string().contains("unknown token"), "{error}");
+
+        std::fs::remove_dir_all(directory).expect("clean up");
+    }
+
+    #[test]
+    fn the_write_path_refuses_a_stem_that_would_escape() {
+        // The guarantee has to hold at the point of writing, not only in the sanitizer's own
+        // tests: a caller that reached here with an unsanitized stem must still be stopped.
+        let directory = test_directory("escape");
+
+        let error = write_without_clobbering(&directory, "../escape", b"capture")
+            .expect_err("a traversing stem must be refused");
+        assert!(error.contains("outside"), "{error}");
         assert!(
-            stem.chars()
-                .all(|character| character.is_ascii_alphanumeric() || character == '-'),
-            "{stem} contains a character some filesystem will object to"
+            !directory
+                .parent()
+                .expect("a parent")
+                .join("escape.png")
+                .exists(),
+            "a file was written outside the output directory"
         );
+
+        std::fs::remove_dir_all(directory).expect("clean up");
     }
 
     #[test]
@@ -422,7 +491,13 @@ mod tests {
         // about it at startup rather than the first time they press the hotkey.
         let directory = test_directory("creates");
         let nested = directory.join("captures").join("nested");
-        let worker = FileOutputWorker::start(nested.clone(), false, 1).expect("start worker");
+        let worker = FileOutputWorker::start(
+            nested.clone(),
+            captastic_config::DEFAULT_FILENAME_TEMPLATE.to_owned(),
+            false,
+            1,
+        )
+        .expect("start worker");
 
         assert!(nested.is_dir());
         assert_eq!(worker.directory(), nested);
@@ -437,7 +512,12 @@ mod tests {
         let blocked = directory.join("in-the-way");
         std::fs::write(&blocked, b"not a directory").expect("seed a file");
 
-        let Err(error) = FileOutputWorker::start(blocked.join("captures"), false, 1) else {
+        let Err(error) = FileOutputWorker::start(
+            blocked.join("captures"),
+            captastic_config::DEFAULT_FILENAME_TEMPLATE.to_owned(),
+            false,
+            1,
+        ) else {
             panic!("a blocked directory must fail at startup");
         };
         assert!(error.to_string().contains("output directory"), "{error}");

@@ -69,6 +69,7 @@ struct ResolvedDaemonArgs {
     file_output: bool,
     output_directory: std::path::PathBuf,
     output_queue_capacity: usize,
+    output_filename_template: String,
     selection: bool,
     selection_preview: PreviewMode,
     trigger_queue_capacity: usize,
@@ -167,6 +168,7 @@ fn resolve_daemon_args_with_default(
                     .to_owned(),
             ))?,
         output_queue_capacity: config.output.queue_capacity,
+        output_filename_template: config.output.filename_template.clone(),
         selection: args.selection.unwrap_or(config.selection.enabled),
         selection_preview: config.selection.preview,
         trigger_queue_capacity: config.daemon.trigger_queue_capacity,
@@ -836,6 +838,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         .then(|| {
             crate::file_output::FileOutputWorker::start(
                 args.output_directory.clone(),
+                args.output_filename_template.clone(),
                 args.json,
                 args.output_queue_capacity,
             )
