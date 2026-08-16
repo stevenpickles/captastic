@@ -66,15 +66,16 @@ use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClassNameW,
-    GetForegroundWindow, GetMessageW, GetWindowLongPtrW, GetWindowThreadProcessId, IsWindow,
-    LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW, SetCursor, SetForegroundWindow,
-    SetWindowDisplayAffinity, SetWindowLongPtrW, ShowWindow, TranslateMessage, UpdateLayeredWindow,
-    CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_CROSS, IDC_SIZENESW,
-    IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, MSG, SPI_SETLOGICALDPIOVERRIDE, SPI_SETWORKAREA, SW_SHOW,
-    ULW_ALPHA, WDA_EXCLUDEFROMCAPTURE, WM_APP, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY,
-    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN,
-    WM_SETTINGCHANGE, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    GetForegroundWindow, GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
+    IsWindow, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW, SetCursor,
+    SetForegroundWindow, SetWindowDisplayAffinity, SetWindowLongPtrW, ShowWindow, TranslateMessage,
+    UpdateLayeredWindow, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
+    IDC_CROSS, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, MSG, SPI_SETLOGICALDPIOVERRIDE,
+    SPI_SETWORKAREA, SW_SHOW, ULW_ALPHA, WDA_EXCLUDEFROMCAPTURE, WM_APP, WM_CAPTURECHANGED,
+    WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY,
+    WM_PAINT, WM_RBUTTONDOWN, WM_SETTINGCHANGE, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 #[cfg(test)]
 use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, PM_NOREMOVE, WM_QUIT};
@@ -651,10 +652,20 @@ struct WindowPreview {
     corner_radius_px: f32,
 }
 
+/// One tile in the window chooser.
+///
+/// A tile always knows the shape of the window behind it, because that is what the layout and the
+/// selection outline are built from. It does not always have pixels: when DWM draws the tile as a
+/// live preview, rendering the window ourselves would cost ~60 ms to produce something the
+/// compositor immediately covers.
 struct WindowThumbnail {
     handle: NativeWindowHandle,
-    surface: FrozenSurface,
+    /// The source window's size, for layout and outline geometry.
+    source_width: i32,
+    source_height: i32,
     corner_radius_px: f32,
+    /// Rendered pixels, present only when this tile is drawn by Captastic rather than by DWM.
+    surface: Option<FrozenSurface>,
 }
 
 struct LiveWindowThumbnail {
@@ -1296,10 +1307,13 @@ fn build_overlay_selection(
         window_preview_count: state.window_thumbnails.len(),
         window_live_preview_count: live_previews,
         window_frozen_preview_count: frozen_previews,
+        // Only tiles Captastic rendered hold pixels; a DWM-drawn tile costs none, which is the
+        // point of this number falling.
         window_preview_bytes: state
             .window_thumbnails
             .iter()
-            .map(|thumbnail| thumbnail.surface.byte_length)
+            .filter_map(|thumbnail| thumbnail.surface.as_ref())
+            .map(|surface| surface.byte_length)
             .sum(),
         window_frame,
     }
@@ -1418,6 +1432,8 @@ fn apply_overlay_effects(
                 let state = unsafe { &mut *state_pointer };
                 refresh_live_window_thumbnails(state);
                 rebuild_window_overview_cache(state);
+                // Moving chrome can uncover a tile DWM was drawing, which then needs pixels.
+                ensure_overview_batch_posted(hwnd, state);
             }
             OverlayEffect::PersistToolbarCenter { position } => {
                 // SAFETY: Shared borrow released at the block's end.
@@ -1928,6 +1944,18 @@ impl OverviewBuildQueue {
         false
     }
 
+    /// Adds a window that turned out to need a render after all, unless it is already queued.
+    ///
+    /// A tile can lose its live preview at any time — the toolbar moves over it, or a DWM
+    /// registration stops working — and then it needs pixels it was never going to be given.
+    fn enqueue(&mut self, handle: NativeWindowHandle) -> bool {
+        if self.pending.iter().any(|(queued, _)| *queued == handle) {
+            return false;
+        }
+        self.pending.push_back((handle, 0));
+        true
+    }
+
     fn is_done(&self) -> bool {
         self.pending.is_empty()
     }
@@ -1965,10 +1993,14 @@ fn start_window_overview_build(hwnd: HWND, state: &mut OverlayState) {
             .iter()
             .map(|candidate| candidate.handle)
             .collect();
-        if !handles.is_empty() {
+        // Every window gets a tile immediately, shaped from what DWM already knows. Only the
+        // windows DWM cannot draw are queued for a render, because rendering one it *can* draw
+        // costs tens of milliseconds to produce pixels the compositor covers a moment later.
+        let needs_render = seed_window_tiles(state, &handles);
+        if !needs_render.is_empty() {
             state.overview_build_generation = state.overview_build_generation.wrapping_add(1);
             state.window_overview_build = Some(WindowOverviewBuild {
-                queue: OverviewBuildQueue::new(state.overview_build_generation, handles),
+                queue: OverviewBuildQueue::new(state.overview_build_generation, needs_render),
                 started,
             });
         }
@@ -2047,13 +2079,26 @@ fn render_overview_batch(hwnd: HWND, state: &mut OverlayState, generation: usize
         };
         new_thumbnails.push(WindowThumbnail {
             handle,
-            surface,
+            source_width: surface.width,
+            source_height: surface.height,
             corner_radius_px: capture.corner_radius_px,
+            surface: Some(surface),
         });
     }
     let finished = build.queue.is_done();
     let started = build.started;
-    state.window_thumbnails.extend(new_thumbnails);
+    // A render either fills in a tile DWM could not draw, or adds one in frozen mode. Replacing
+    // in place keeps the chooser's ordering stable while tiles arrive.
+    for rendered in new_thumbnails {
+        match state
+            .window_thumbnails
+            .iter_mut()
+            .find(|tile| tile.handle == rendered.handle)
+        {
+            Some(tile) => *tile = rendered,
+            None => state.window_thumbnails.push(rendered),
+        }
+    }
     if finished {
         state.window_overview_build = None;
         refresh_live_window_thumbnails(state);
@@ -2061,11 +2106,87 @@ fn render_overview_batch(hwnd: HWND, state: &mut OverlayState, generation: usize
         if state.window_overview_ns.is_none() {
             state.window_overview_ns = Some(duration_ns(started.elapsed()));
         }
+        // The refresh above may have found a tile that still needs rendering.
+        ensure_overview_batch_posted(hwnd, state);
     } else {
         rebuild_window_overview_cache(state);
         post_overview_batch(hwnd, generation);
     }
     invalidate(hwnd);
+}
+
+/// Builds a tile for each window, and reports which of them still need pixels.
+///
+/// In live mode a tile needs only the shape of its window, which `DwmQueryThumbnailSourceSize`
+/// answers in about a millisecond without capturing anything. In frozen mode there is no
+/// compositor drawing tiles for us, so every window needs a render.
+fn seed_window_tiles(
+    state: &mut OverlayState,
+    handles: &[NativeWindowHandle],
+) -> Vec<NativeWindowHandle> {
+    let mut needs_render = Vec::new();
+    for handle in handles {
+        let source = state
+            .live_preview
+            .then(|| dwm_source_size(state.overlay_hwnd, *handle))
+            .flatten()
+            .or_else(|| native_window_size(*handle));
+        let Some((source_width, source_height)) = source else {
+            // Nothing can say how big this window is, so it cannot be laid out at all.
+            log::debug!(
+                "window handle=0x{:X} reported no size; omitted from the chooser",
+                handle.raw()
+            );
+            continue;
+        };
+        // Frozen mode draws every tile itself, so every tile needs pixels.
+        if !state.live_preview {
+            needs_render.push(*handle);
+        }
+        state.window_thumbnails.push(WindowThumbnail {
+            handle: *handle,
+            source_width,
+            source_height,
+            // Read from DWM attributes rather than derived from a capture, so a tile has its
+            // outline shape before — or without — ever being rendered.
+            corner_radius_px: crate::window_capture::window_corner_radius(HWND(handle.raw())),
+            surface: None,
+        });
+    }
+    needs_render
+}
+
+/// The size DWM holds for a window, without capturing it.
+///
+/// Registered and dropped immediately: the registration exists only to ask the question, and the
+/// real one that draws the tile is made later, once the layout is known.
+fn dwm_source_size(destination: HWND, handle: NativeWindowHandle) -> Option<(i32, i32)> {
+    if destination.0 == 0 {
+        return None;
+    }
+    let thumbnail = DwmThumbnail::register(destination, HWND(handle.raw())).ok()?;
+    let size = thumbnail.source_size().ok()?;
+    (size.cx > 0 && size.cy > 0).then_some((size.cx, size.cy))
+}
+
+/// The window's own bounds, for anything DWM will not describe.
+fn native_window_size(handle: NativeWindowHandle) -> Option<(i32, i32)> {
+    let mut bounds = RECT::default();
+    // SAFETY: The handle came from the enumeration pass that populated this chooser.
+    unsafe { GetWindowRect(HWND(handle.raw()), &mut bounds) }.ok()?;
+    let width = bounds.right - bounds.left;
+    let height = bounds.bottom - bounds.top;
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+/// Drives a build that was created outside `start_window_overview_build`.
+///
+/// `queue_uncovered_window_tiles` can start one at any time — a toolbar drag is enough — and a
+/// queue nothing posts a batch for never renders anything.
+fn ensure_overview_batch_posted(hwnd: HWND, state: &OverlayState) {
+    if let Some(build) = state.window_overview_build.as_ref() {
+        post_overview_batch(hwnd, build.queue.generation);
+    }
 }
 
 fn refresh_live_window_thumbnails(state: &mut OverlayState) {
@@ -2131,6 +2252,45 @@ fn refresh_live_window_thumbnails(state: &mut OverlayState) {
             handle: window.handle,
             thumbnail,
         });
+    }
+    queue_uncovered_window_tiles(state);
+}
+
+/// Queues a render for any tile that ends up with neither a live preview nor pixels.
+///
+/// A tile can lose its live preview at any moment and for reasons that have nothing to do with
+/// how it was built: the toolbar is dragged over it, a menu opens above it, or DWM stops drawing
+/// it. Seeding decided which tiles needed rendering *at the time*; this is what keeps that
+/// decision honest afterwards.
+fn queue_uncovered_window_tiles(state: &mut OverlayState) {
+    let uncovered: Vec<NativeWindowHandle> = state
+        .window_thumbnails
+        .iter()
+        .filter(|tile| tile.surface.is_none())
+        .map(|tile| tile.handle)
+        .filter(|handle| {
+            !state
+                .live_window_thumbnails
+                .iter()
+                .any(|preview| preview.handle == *handle)
+        })
+        .collect();
+    if uncovered.is_empty() {
+        return;
+    }
+    match state.window_overview_build.as_mut() {
+        Some(build) => {
+            for handle in uncovered {
+                build.queue.enqueue(handle);
+            }
+        }
+        None => {
+            state.overview_build_generation = state.overview_build_generation.wrapping_add(1);
+            state.window_overview_build = Some(WindowOverviewBuild {
+                queue: OverviewBuildQueue::new(state.overview_build_generation, uncovered),
+                started: Instant::now(),
+            });
+        }
     }
 }
 
@@ -2267,7 +2427,7 @@ fn window_overview_rects(state: &OverlayState) -> Vec<UiRect> {
     let dimensions: Vec<(i32, i32)> = state
         .window_thumbnails
         .iter()
-        .map(|thumbnail| (thumbnail.surface.width, thumbnail.surface.height))
+        .map(|thumbnail| (thumbnail.source_width, thumbnail.source_height))
         .collect();
     layout_floating_windows(
         state.surface.width,
@@ -2550,7 +2710,15 @@ fn draw_window_overview_static(destination: &FrozenSurface, state: &OverlayState
         let preview = selected
             .then(|| ready_window_preview(state, Some(thumbnail.handle)))
             .flatten();
-        let surface = preview.map_or(&thumbnail.surface, |preview| &preview.surface);
+        let surface = match preview {
+            Some(preview) => &preview.surface,
+            // A tile with neither a live preview nor a render is one whose frozen render is
+            // still queued; the chooser background stands in until it lands.
+            None => match thumbnail.surface.as_ref() {
+                Some(surface) => surface,
+                None => continue,
+            },
+        };
         draw_window_surface(destination, surface, rect);
     }
 }
@@ -2570,12 +2738,23 @@ fn draw_window_overview_interactive(state: &OverlayState) {
             let preview = selected
                 .then(|| ready_window_preview(state, Some(thumbnail.handle)))
                 .flatten();
-            let (surface, corner_radius_px) = preview.map_or(
-                (&thumbnail.surface, thumbnail.corner_radius_px),
-                |preview| (&preview.surface, preview.corner_radius_px),
+            let (source_width, source_height, corner_radius_px) = preview.map_or(
+                (
+                    thumbnail.source_width,
+                    thumbnail.source_height,
+                    thumbnail.corner_radius_px,
+                ),
+                |preview| {
+                    (
+                        preview.surface.width,
+                        preview.surface.height,
+                        preview.corner_radius_px,
+                    )
+                },
             );
-            let destination = fitted_surface_rect(surface, rect, true);
-            let scaled_radius = scaled_corner_radius(surface, destination, corner_radius_px);
+            let destination = fitted_surface_rect(source_width, source_height, rect, true);
+            let scaled_radius =
+                scaled_corner_radius(source_width, source_height, destination, corner_radius_px);
             const OUTLINE_WIDTH: i32 = 3;
             draw_antialiased_rounded_outline(
                 &state.back_buffer,
@@ -4111,6 +4290,44 @@ mod tests {
         let mut queue = OverviewBuildQueue::new(1, [first]);
         assert_eq!(queue.take_batch(0), vec![(first, 0)]);
         assert!(queue.is_done());
+    }
+
+    #[test]
+    fn a_tile_that_loses_its_live_preview_is_queued_once() {
+        // A tile can stop being drawn by DWM at any moment — the toolbar moves over it, a menu
+        // opens above it — and then it needs pixels it was deliberately never given. Repeated
+        // chrome movement must not queue the same window again and again behind itself.
+        let uncovered = NativeWindowHandle::from_raw(1);
+        let other = NativeWindowHandle::from_raw(2);
+        let mut queue = OverviewBuildQueue::new(3, [other]);
+
+        assert!(queue.enqueue(uncovered), "a new window is queued");
+        assert!(
+            !queue.enqueue(uncovered),
+            "a window already waiting must not be queued twice"
+        );
+        assert!(!queue.enqueue(other), "nor one from the original build");
+
+        assert_eq!(queue.take_batch(2), vec![(other, 0), (uncovered, 0)]);
+        assert!(queue.is_done());
+
+        // Once drained, the same window can be queued again: it may have been covered and
+        // uncovered a second time.
+        assert!(queue.enqueue(uncovered));
+        assert!(!queue.is_done());
+    }
+
+    #[test]
+    fn the_confirm_split_counts_rendered_tiles_as_frozen() {
+        // With live previews the inventory is no longer all-rendered, so the split now means
+        // "drawn by DWM" against "drawn by us" — which is what it was always trying to say.
+        assert_eq!(confirm_preview_split(SelectionKind::Window, 8, 10), (8, 2));
+        // Leaving the Window tool hides every registration, so nothing is live at confirm time.
+        assert_eq!(confirm_preview_split(SelectionKind::Region, 8, 10), (0, 10));
+        assert_eq!(
+            confirm_preview_split(SelectionKind::Window, 10, 10),
+            (10, 0)
+        );
     }
 
     #[test]
