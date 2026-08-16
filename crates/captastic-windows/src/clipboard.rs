@@ -389,6 +389,14 @@ impl DibV5Layout {
                     "DIBV5 publication requires BGRA8 pixels, and this frame is RGBA8",
                 ))
             }
+            // No BITMAPV5HEADER compression describes half-float samples, so there is nothing to
+            // publish this as. Narrowing it to 8 bits first would be tone mapping done by the
+            // clipboard, which is the wrong place for it even once Captastic can do it at all.
+            PixelEncoding::HalfFloatRgba => {
+                return Err(unsupported(
+                    "DIBV5 publication requires 8-bit pixels, and this frame is half-float",
+                ))
+            }
         }
         if frame.origin != FrameOrigin::TopLeft {
             return Err(unsupported("DIBV5 publication requires top-left pixels"));
@@ -670,6 +678,29 @@ mod tests {
                 required: 4
             })
         ));
+    }
+
+    #[test]
+    fn dibv5_refuses_half_float_pixels() {
+        let frame = CpuFrame::new(
+            Arc::from(vec![0_u8; 8]),
+            1,
+            1,
+            8,
+            PixelFormat::Rgba16Float,
+            FrameOrigin::TopLeft,
+            ColorSpace::ScRgb,
+            frame(1, 1, 4, vec![0; 4]).metadata.clone(),
+        )
+        .expect("a valid half-float frame");
+
+        let error = DibV5Layout::new(&frame).expect_err("half-float frame");
+        assert_eq!(error.kind, CaptureErrorKind::Unsupported);
+        assert!(
+            error.message.contains("half-float"),
+            "the refusal should say what was wrong with the frame: {}",
+            error.message
+        );
     }
 
     #[test]

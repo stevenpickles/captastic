@@ -9,7 +9,7 @@ use std::io::Write;
 
 use thiserror::Error;
 
-use crate::frame::{CpuFrame, FrameAlpha, FrameOrigin, PixelEncoding, PixelFormat};
+use crate::frame::{ColorSpace, CpuFrame, FrameAlpha, FrameOrigin, PixelEncoding, PixelFormat};
 
 /// How hard the DEFLATE backend works on a frame.
 ///
@@ -45,6 +45,11 @@ pub enum PngError {
     /// the honest answer.
     #[error("PNG encoding requires 8-bit pixels, and {format:?} is not")]
     UnsupportedFormat { format: PixelFormat },
+    /// Also rejected rather than converted, and for the same reason: mapping scRGB into sRGB is a
+    /// tone-mapping decision, and making it silently would publish a washed-out or clipped image
+    /// that looks like a capture bug rather than a missing feature.
+    #[error("PNG encoding cannot describe {color_space:?} samples")]
+    UnsupportedColorSpace { color_space: ColorSpace },
     #[error("frame dimensions must be non-zero")]
     EmptyDimensions,
     #[error("stride {stride} is smaller than the minimum row size {minimum}")]
@@ -130,7 +135,23 @@ impl FrameLayout {
         // encoding is settled before any of the arithmetic that assumes it.
         let swizzle = match frame.format().encoding() {
             PixelEncoding::EightBitRgba { blue_first } => blue_first,
+            PixelEncoding::HalfFloatRgba => {
+                return Err(PngError::UnsupportedFormat {
+                    format: frame.format(),
+                })
+            }
         };
+        // An 8-bit PNG carries no way to say "these samples are linear and 1.0 is not the
+        // maximum", short of an embedded ICC profile. Writing one anyway would produce a file that
+        // every viewer reads as sRGB, which is a picture of the right pixels interpreted wrongly.
+        match frame.color_space {
+            ColorSpace::Srgb | ColorSpace::Unknown => {}
+            ColorSpace::ScRgb => {
+                return Err(PngError::UnsupportedColorSpace {
+                    color_space: frame.color_space,
+                })
+            }
+        }
         let source_row_bytes = usize::try_from(frame.width())
             .ok()
             .and_then(|width| width.checked_mul(4))
@@ -204,7 +225,7 @@ mod tests {
     use super::*;
     use crate::capture::{CaptureId, CaptureMode};
     use crate::display::{DisplayId, Rect};
-    use crate::frame::{ColorSpace, FrameMetadata, TimingProvenance};
+    use crate::frame::{FrameMetadata, TimingProvenance};
     use crate::FrameError;
 
     fn frame(width: u32, height: u32, stride_bytes: u32, pixels: Vec<u8>) -> CpuFrame {
@@ -358,6 +379,32 @@ mod tests {
     /// and buffer disagree, because no such `CpuFrame` can be built.
     ///
     /// The rejection is now where the caller actually meets it.
+    /// The refusal exists because the alternative is worse than an error: an unrecognized format
+    /// would otherwise take the RGBA branch and be encoded as though its bytes meant something
+    /// else, producing a valid PNG of the wrong picture.
+    #[test]
+    fn half_float_frames_are_refused_rather_than_encoded_as_eight_bit() {
+        let frame = frame_in(PixelFormat::Rgba16Float, 1, 1, 8, vec![0; 8]);
+        assert_eq!(
+            encode_frame(&frame, PngEffort::Compact),
+            Err(PngError::UnsupportedFormat {
+                format: PixelFormat::Rgba16Float
+            })
+        );
+    }
+
+    #[test]
+    fn scrgb_samples_are_refused_rather_than_published_as_srgb() {
+        let mut frame = frame(1, 1, 4, vec![10, 20, 30, 255]);
+        frame.color_space = ColorSpace::ScRgb;
+        assert_eq!(
+            encode_frame(&frame, PngEffort::Compact),
+            Err(PngError::UnsupportedColorSpace {
+                color_space: ColorSpace::ScRgb
+            })
+        );
+    }
+
     #[test]
     fn a_stride_narrower_than_the_row_cannot_become_a_frame() {
         assert_eq!(

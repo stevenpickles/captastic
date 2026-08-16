@@ -3222,6 +3222,35 @@ mod tests {
 
     use super::*;
 
+    /// The overlay presenter blits the frozen frame into a 32-bit top-down DIB and hit-tests
+    /// against it at four bytes per pixel. A half-float frame reaching that code would be drawn as
+    /// a quarter of the desktop stretched over the whole screen, which is a far worse outcome than
+    /// declining to open the overlay - and the fallback for declining already exists.
+    #[test]
+    fn the_selection_overlay_refuses_pixels_it_cannot_present() {
+        let mut metadata = frame_metadata_for_tests();
+        metadata.source_rect = Rect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        };
+        let frame = CpuFrame::new(
+            Arc::from(vec![0_u8; 8]),
+            1,
+            1,
+            8,
+            PixelFormat::Rgba16Float,
+            FrameOrigin::TopLeft,
+            ColorSpace::ScRgb,
+            metadata,
+        )
+        .expect("a valid half-float frame");
+
+        let error = validate_frame(&frame).expect_err("a half-float frame cannot be presented");
+        assert_eq!(error.kind, CaptureErrorKind::Unsupported);
+    }
+
     #[test]
     fn draining_a_pending_quit_clears_the_thread_quit_flag() {
         // The quit flag is per-thread state, so exercise it on a thread of its own.
@@ -4364,6 +4393,30 @@ mod tests {
         let mut spare = Some(FrozenSurface::empty(8, 8).expect("surface"));
         assert!(reusable_overview_surface(None, &mut spare, 16, 16).is_none());
         assert!(spare.is_none());
+    }
+
+    fn frame_metadata_for_tests() -> FrameMetadata {
+        FrameMetadata {
+            capture_id: CaptureId(1),
+            backend: "test".to_owned(),
+            display_id: DisplayId::primary(),
+            source_rect: Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            rotation_degrees: 0,
+            capture_mode: CaptureMode::Latest { max_age_ms: None },
+            presentation_offset_ns: Some(0),
+            timing_provenance: TimingProvenance::Synthetic,
+            native_ready_offset_ns: 0,
+            cpu_ready_offset_ns: Some(0),
+            frame_age_ns: Some(0),
+            frame_generation: Some(1),
+            copy_count: 1,
+            pool_slot: Some(0),
+        }
     }
 
     fn ready_preview_state(handle: NativeWindowHandle) -> WindowPreviewState {

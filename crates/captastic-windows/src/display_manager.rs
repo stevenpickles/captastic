@@ -701,6 +701,49 @@ mod tests {
         .with_alpha(FrameAlpha::Opaque)
     }
 
+    /// The same fixture in a format the compositor cannot copy byte-for-byte.
+    fn half_float_frame(info: &DisplayInfo) -> CpuFrame {
+        let template = solid_frame(info, 0x20);
+        let stride = info.bounds.width * 8;
+        CpuFrame::new(
+            vec![0_u8; stride as usize * info.bounds.height as usize].into(),
+            info.bounds.width,
+            info.bounds.height,
+            stride,
+            PixelFormat::Rgba16Float,
+            FrameOrigin::TopLeft,
+            ColorSpace::ScRgb,
+            template.metadata.clone(),
+        )
+        .expect("a valid half-float frame")
+    }
+
+    #[test]
+    fn virtual_desktop_composition_refuses_pixels_it_cannot_copy() {
+        // Composition memcpys rows on the assumption that a pixel is four bytes of BGRA. A wider
+        // pixel has to be refused rather than copied at the wrong width, which would produce a
+        // composite of the right size holding a quarter of the image and three quarters of
+        // whatever followed it.
+        let info = display(
+            "solo",
+            Rect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 2,
+            },
+            0,
+            true,
+        );
+        let mut destination = vec![0_u8; 4 * 2 * 4];
+
+        let error = copy_frame_into(&half_float_frame(&info), info.bounds, &mut destination, 16)
+            .expect_err("a half-float frame cannot be composed");
+
+        assert_eq!(error.kind, CaptureErrorKind::InvalidFrame);
+        assert!(destination.iter().all(|byte| *byte == 0));
+    }
+
     fn pixel(frame: &CpuFrame, x: u32, y: u32) -> [u8; 4] {
         let start = y as usize * frame.stride_bytes() as usize + x as usize * 4;
         frame.pixels()[start..start + 4].try_into().unwrap()

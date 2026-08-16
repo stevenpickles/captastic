@@ -9,12 +9,19 @@ use crate::{CaptureId, CaptureMode, DisplayId, FrameError, Rect};
 pub enum PixelFormat {
     Bgra8Unorm,
     Rgba8Unorm,
+    /// Four IEEE half-precision channels, red first: `DXGI_FORMAT_R16G16B16A16_FLOAT`.
+    ///
+    /// What a Windows desktop composes into when HDR is enabled on any attached display. Channel
+    /// values are not confined to `0.0..=1.0`: in scRGB, 1.0 is the sRGB white point and brighter
+    /// pixels exceed it, which is the whole reason the format is wider.
+    Rgba16Float,
 }
 
 impl PixelFormat {
     pub const fn bytes_per_pixel(self) -> u32 {
         match self {
             Self::Bgra8Unorm | Self::Rgba8Unorm => 4,
+            Self::Rgba16Float => 8,
         }
     }
 
@@ -29,6 +36,7 @@ impl PixelFormat {
         match self {
             Self::Bgra8Unorm => PixelEncoding::EightBitRgba { blue_first: true },
             Self::Rgba8Unorm => PixelEncoding::EightBitRgba { blue_first: false },
+            Self::Rgba16Float => PixelEncoding::HalfFloatRgba,
         }
     }
 }
@@ -41,6 +49,13 @@ impl PixelFormat {
 pub enum PixelEncoding {
     /// Four bytes: three 8-bit unsigned channels then 8 bits of alpha.
     EightBitRgba { blue_first: bool },
+    /// Eight bytes: three 16-bit half-float channels, red first, then 16 bits of alpha.
+    ///
+    /// No sink consumes these yet. Every one of them refuses, which is the point of the variant
+    /// existing before there is anything to produce it: the refusals are written and tested now,
+    /// while the alternative to writing them is only a compile error, rather than later, when the
+    /// alternative is a silently wrong image.
+    HalfFloatRgba,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -53,6 +68,12 @@ pub enum FrameOrigin {
 #[serde(rename_all = "snake_case")]
 pub enum ColorSpace {
     Srgb,
+    /// Linear, sRGB primaries, with 1.0 at the sRGB white point and highlights above it.
+    ///
+    /// The colour space of a Windows HDR desktop, and inseparable in practice from
+    /// [`PixelFormat::Rgba16Float`] - eight-bit channels have nowhere to put the values that
+    /// distinguish it.
+    ScRgb,
     Unknown,
 }
 
@@ -362,6 +383,71 @@ mod tests {
         assert_eq!(cropped.metadata.source_rect.x, 101);
         assert_eq!(cropped.metadata.copy_count, 2);
         assert_eq!(cropped.metadata.pool_slot, None);
+    }
+
+    #[test]
+    fn a_wider_pixel_widens_every_layout_rule_that_depends_on_it() {
+        // Eight bytes per pixel, so a two-pixel row needs sixteen. The same numbers that describe
+        // a valid four-byte frame describe an invalid eight-byte one, which is the whole reason
+        // stride validation is a function of the format rather than a constant.
+        assert_eq!(PixelFormat::Rgba16Float.bytes_per_pixel(), 8);
+        assert_eq!(
+            validate_layout(16, 2, 1, 8, PixelFormat::Rgba16Float),
+            Err(FrameError::InvalidStride {
+                stride: 8,
+                minimum: 16
+            })
+        );
+        assert_eq!(
+            validate_layout(16, 2, 1, 16, PixelFormat::Rgba16Float),
+            Ok(16)
+        );
+        assert_eq!(
+            validate_layout(16, 2, 2, 16, PixelFormat::Rgba16Float),
+            Err(FrameError::BufferTooShort {
+                actual: 16,
+                required: 32
+            })
+        );
+    }
+
+    #[test]
+    fn a_half_float_frame_crops_by_its_own_pixel_width() {
+        let mut metadata = test_frame().metadata.clone();
+        metadata.source_rect = Rect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 1,
+        };
+        // Two pixels of eight bytes, distinguishable by their first byte.
+        let pixels: Vec<u8> = (0..16_u8).collect();
+        let frame = CpuFrame::new(
+            Arc::from(pixels),
+            2,
+            1,
+            16,
+            PixelFormat::Rgba16Float,
+            FrameOrigin::TopLeft,
+            ColorSpace::ScRgb,
+            metadata,
+        )
+        .expect("a valid half-float frame");
+
+        let cropped = frame
+            .crop(Rect {
+                x: 1,
+                y: 0,
+                width: 1,
+                height: 1,
+            })
+            .expect("valid crop");
+
+        // Eight bytes taken, not four: cropping reads the format rather than assuming BGRA8.
+        assert_eq!(cropped.stride_bytes(), 8);
+        assert_eq!(cropped.pixels(), &[8, 9, 10, 11, 12, 13, 14, 15]);
+        assert_eq!(cropped.format(), PixelFormat::Rgba16Float);
+        assert_eq!(cropped.color_space, ColorSpace::ScRgb);
     }
 
     #[test]
