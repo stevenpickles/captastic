@@ -44,6 +44,7 @@ pub(crate) fn guaranteed_deadline(now: Instant, deadline: Instant, minimum: Dura
 /// What a completed teardown has to report back to the daemon.
 pub(crate) struct TeardownReport {
     pub clipboard_failures: Vec<crate::clipboard::ClipboardFailure>,
+    pub file_output_failures: Vec<crate::file_output::FileOutputFailure>,
     pub persistence_failures: Vec<String>,
     pub hotkey_stop_error: Option<captastic_core::CaptureError>,
     /// Whether the capture worker was ever told to shut down through its command channel, which
@@ -63,6 +64,7 @@ pub(crate) struct WorkerRegistry {
     capture: CaptureWorker,
     selection: Option<crate::selection::SelectionWorker>,
     clipboard: Option<crate::clipboard::ClipboardWorker>,
+    file_output: Option<crate::file_output::FileOutputWorker>,
     hotkey: Option<captastic_windows::HotkeyListener>,
     /// Set while shutting down so late hotkey and tray triggers stop producing work.
     paused: Arc<AtomicBool>,
@@ -87,6 +89,7 @@ impl WorkerRegistry {
             },
             selection: None,
             clipboard: None,
+            file_output: None,
             hotkey: None,
             paused,
             deadline: None,
@@ -109,6 +112,14 @@ impl WorkerRegistry {
         self
     }
 
+    pub(crate) fn register_file_output(
+        &mut self,
+        worker: Option<crate::file_output::FileOutputWorker>,
+    ) -> &mut Self {
+        self.file_output = worker;
+        self
+    }
+
     pub(crate) fn register_hotkey(
         &mut self,
         listener: captastic_windows::HotkeyListener,
@@ -123,6 +134,10 @@ impl WorkerRegistry {
 
     pub(crate) fn clipboard(&self) -> Option<&crate::clipboard::ClipboardWorker> {
         self.clipboard.as_ref()
+    }
+
+    pub(crate) fn file_output(&self) -> Option<&crate::file_output::FileOutputWorker> {
+        self.file_output.as_ref()
     }
 
     pub(crate) fn is_shutting_down(&self) -> bool {
@@ -151,6 +166,9 @@ impl WorkerRegistry {
             worker.request_stop();
         }
         if let Some(worker) = self.clipboard.as_mut() {
+            worker.request_stop();
+        }
+        if let Some(worker) = self.file_output.as_mut() {
             worker.request_stop();
         }
         if let Some(hotkey) = self.hotkey.as_mut() {
@@ -217,8 +235,15 @@ impl WorkerRegistry {
             .clipboard
             .take()
             .map_or_else(Vec::new, |worker| worker.stop_before(deadline));
+        // Last, and against the full deadline: a capture that has been encoded but not yet
+        // written is the one piece of work whose loss the user would actually see.
+        let file_output_failures = self
+            .file_output
+            .take()
+            .map_or_else(Vec::new, |worker| worker.stop_before(deadline));
         TeardownReport {
             clipboard_failures,
+            file_output_failures,
             persistence_failures,
             hotkey_stop_error,
             shutdown_sent: self.capture.shutdown_sent,

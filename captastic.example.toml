@@ -48,11 +48,14 @@ enabled = true
 queue_capacity = 1
 
 [output]
-# File output is not implemented yet (roadmap milestone 4); enabled must remain false.
+# Write every capture to disk, alongside the clipboard or instead of it.
 enabled = false
 # "png" is the only supported format today.
 format = "png"
 queue_capacity = 2
+# Absolute path. Omit to use <home>/Pictures/Captastic. A daemon's working directory is whatever
+# launched it, so a relative path would put captures somewhere you could not predict.
+# directory = 'C:\Users\you\Pictures\Captastic'
 
 [metrics]
 enabled = true

@@ -213,6 +213,16 @@ pub fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
     move_file(from, to, true)
 }
 
+/// Moves `from` onto `to`, failing with `AlreadyExists` rather than overwriting.
+///
+/// The `replace` half of [`atomic_write`] for anything that must not clobber a file it did not
+/// create — a capture written into a directory the user also keeps things in, say. Checking for
+/// the destination first and then replacing would leave a window in which somebody else creates
+/// it; refusing the move closes that window, because the refusal *is* the check.
+pub fn finalize_new(from: &Path, to: &Path) -> std::io::Result<()> {
+    move_file(from, to, false)
+}
+
 #[cfg(not(windows))]
 fn move_file(from: &Path, to: &Path, replace_existing: bool) -> std::io::Result<()> {
     if !replace_existing && to.exists() {

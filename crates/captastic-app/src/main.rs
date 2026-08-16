@@ -5,8 +5,11 @@ mod build_info;
 mod cli;
 #[cfg(windows)]
 mod clipboard;
+mod clock;
 mod daemon;
 mod error;
+#[cfg(windows)]
+mod file_output;
 mod logging;
 #[cfg(windows)]
 mod output;
@@ -448,6 +451,10 @@ fn capture_with_preview_fallback(
             ));
         }
     }
+    #[cfg(windows)]
+    let file_output_value = write_one_shot_file_output(frame.as_ref(), &mut recorder, request.id)?;
+    #[cfg(not(windows))]
+    let file_output_value: Option<serde_json::Value> = None;
     recorder.record(request.id, PerfEventKind::AttemptFinished, 0);
     captastic_core::validate_event_order(recorder.events())?;
     let metadata = frame
@@ -462,6 +469,7 @@ fn capture_with_preview_fallback(
         "native_frame_retained": native_frame.is_some(),
         "selection": selection_value,
         "clipboard": clipboard_value,
+        "file_output": file_output_value,
     });
     if args.json {
         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -471,6 +479,49 @@ fn capture_with_preview_fallback(
     #[cfg(windows)]
     finish_one_shot_ui_state(ui_worker);
     Ok(())
+}
+
+/// Writes a one-shot capture to disk when `[output]` is enabled.
+///
+/// One-shot commands read the same configuration the daemon does, so a user who has turned file
+/// output on gets it from `captastic capture` too rather than only from the background daemon.
+#[cfg(windows)]
+fn write_one_shot_file_output(
+    frame: Option<&captastic_core::CpuFrame>,
+    recorder: &mut captastic_core::EventRecorder,
+    capture_id: captastic_core::CaptureId,
+) -> Result<Option<serde_json::Value>, AppError> {
+    let config = captastic_config::AppConfig::load_default().unwrap_or_default();
+    if !config.output.enabled {
+        return Ok(None);
+    }
+    let Some(frame) = frame else {
+        return Err(AppError::BackendUnavailable(
+            "file output was requested but no CPU frame was returned".to_owned(),
+        ));
+    };
+    let directory = config
+        .output
+        .directory
+        .clone()
+        .or_else(captastic_config::default_output_directory)
+        .ok_or_else(|| {
+            AppError::BackendUnavailable(
+                "unable to determine a default output directory from USERPROFILE or HOME"
+                    .to_owned(),
+            )
+        })?;
+    recorder.record(capture_id, PerfEventKind::EncodeStarted, 0);
+    let (path, bytes, encode_ns, write_ns) = file_output::write_capture_now(&directory, frame)?;
+    recorder.record(capture_id, PerfEventKind::EncodeFinished, encode_ns);
+    recorder.record(capture_id, PerfEventKind::FileWriteStarted, 0);
+    recorder.record(capture_id, PerfEventKind::FileWriteFinished, write_ns);
+    Ok(Some(json!({
+        "path": path.display().to_string(),
+        "bytes": bytes,
+        "encode_ns": encode_ns,
+        "write_ns": write_ns,
+    })))
 }
 
 /// Converts a failed one-shot clipboard publish, saying so when it cost the user their clipboard.
