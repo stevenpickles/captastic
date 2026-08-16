@@ -30,6 +30,11 @@ pub struct OutputJob {
     pub source: &'static str,
     pub frame: CpuFrame,
     pub recorder: EventRecorder,
+    /// The captured window's title, when the capture was of a window. Untrusted text: whichever
+    /// application owns the window chose it, so every consumer sanitizes before use.
+    pub window_title: Option<String>,
+    /// The file stem of the executable owning the captured window, where it could be read.
+    pub window_application: Option<String>,
 }
 
 /// Why a sink would not take a job, with the job handed back so the caller can account for it.
@@ -78,6 +83,7 @@ pub trait OutputSink: Send + Sync {
 /// A sink backed by a bounded channel to a worker thread.
 ///
 /// The whole of the current clipboard delivery mechanism, and what the file worker will reuse.
+#[derive(Clone)]
 pub struct ChannelSink {
     name: &'static str,
     sender: mpsc::SyncSender<OutputJob>,
@@ -152,6 +158,8 @@ mod tests {
             )
             .expect("test frame"),
             recorder: EventRecorder::with_capacity(4),
+            window_title: None,
+            window_application: None,
         }
     }
 
@@ -208,6 +216,26 @@ mod tests {
         }
         assert!(clipboard.try_recv().is_ok());
         assert!(file.try_recv().is_ok());
+    }
+
+    #[test]
+    fn a_job_carries_window_identity_for_naming() {
+        // The filename template's `{title}` and `{application}` come from here. Both are optional
+        // because a direct capture has no window and an elevated process will not name itself.
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let sink = ChannelSink::new("file", sender);
+
+        let mut job = job();
+        job.window_title = Some("Some Document - Editor".to_owned());
+        job.window_application = Some("editor".to_owned());
+        sink.submit(job).expect("accepted");
+
+        let delivered = receiver.try_recv().expect("delivered");
+        assert_eq!(
+            delivered.window_title.as_deref(),
+            Some("Some Document - Editor")
+        );
+        assert_eq!(delivered.window_application.as_deref(), Some("editor"));
     }
 
     #[test]

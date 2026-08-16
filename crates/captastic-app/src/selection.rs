@@ -166,7 +166,7 @@ pub struct SelectionWorker {
 
 impl SelectionWorker {
     pub fn start(
-        output_sink: Option<Box<dyn crate::output::OutputSink>>,
+        output_sinks: Vec<Box<dyn crate::output::OutputSink>>,
         capture_sender: mpsc::SyncSender<crate::daemon::CaptureCommand>,
         notices: mpsc::SyncSender<crate::daemon::DaemonNotice>,
         json_output: bool,
@@ -483,21 +483,50 @@ impl SelectionWorker {
                                 })
                             );
                         }
-                        let clipboard_job = crate::clipboard::ClipboardJob {
-                            capture_id: job.capture_id,
-                            triggered_at: job.triggered_at,
-                            action: job.action,
-                            chord: job.chord,
-                            cpu_ready_offset_ns: job
-                                .cpu_ready_offset_ns
-                                .unwrap_or_else(|| duration_ns(job.triggered_at.elapsed())),
-                            source: job.source,
-                            frame: selected_frame,
-                            recorder: job.recorder,
-                        };
-                        match output_sink.as_ref() {
-                            Some(sink) => {
-                                if let Err(rejection) = sink.submit(clipboard_job) {
+                        let cpu_ready_offset_ns = job
+                            .cpu_ready_offset_ns
+                            .unwrap_or_else(|| duration_ns(job.triggered_at.elapsed()));
+                        if output_sinks.is_empty() {
+                            // A selection with no destination configured. Previously impossible to
+                            // express: the worker held a clipboard sender and a `.expect` in the
+                            // daemon asserted one existed, restating at runtime a rule the
+                            // configuration validator had already enforced.
+                            report_clipboard_rejection(
+                                crate::output::OutputJob {
+                                    capture_id: job.capture_id,
+                                    triggered_at: job.triggered_at,
+                                    action: job.action,
+                                    chord: job.chord,
+                                    cpu_ready_offset_ns,
+                                    source: job.source,
+                                    frame: selected_frame,
+                                    recorder: job.recorder,
+                                    window_title: None,
+                                    window_application: None,
+                                },
+                                "no_destination",
+                                json_output,
+                            );
+                        } else {
+                            // Every destination, not just the first: a selection is a capture like
+                            // any other, and a region chosen in the overlay belongs on disk too if
+                            // the user asked for file output.
+                            for sink in &output_sinks {
+                                let destination_job = crate::output::OutputJob {
+                                    capture_id: job.capture_id,
+                                    triggered_at: job.triggered_at,
+                                    action: job.action,
+                                    chord: job.chord,
+                                    cpu_ready_offset_ns,
+                                    source: job.source,
+                                    frame: selected_frame.clone(),
+                                    // Forked per destination: they run concurrently and their
+                                    // events cannot be ordered against each other (ADR 0002).
+                                    recorder: job.recorder.clone(),
+                                    window_title: selection.window_title.clone(),
+                                    window_application: selection.window_application.clone(),
+                                };
+                                if let Err(rejection) = sink.submit(destination_job) {
                                     let status = rejection.status();
                                     report_clipboard_rejection(
                                         *rejection.into_job(),
@@ -505,17 +534,6 @@ impl SelectionWorker {
                                         json_output,
                                     );
                                 }
-                            }
-                            // A selection with no destination configured. Previously impossible to
-                            // express: the worker held a clipboard sender and a `.expect` in the
-                            // daemon asserted one existed, restating at runtime a rule the
-                            // configuration validator had already enforced.
-                            None => {
-                                report_clipboard_rejection(
-                                    clipboard_job,
-                                    "no_destination",
-                                    json_output,
-                                );
                             }
                         }
                     }
@@ -1160,10 +1178,10 @@ mod tests {
         let (capture_sender, _capture_receiver) = mpsc::sync_channel(1);
         let (dropped_sender, _dropped_receiver) = mpsc::sync_channel(1);
         let mut worker = SelectionWorker::start(
-            Some(Box::new(crate::output::ChannelSink::new(
+            vec![Box::new(crate::output::ChannelSink::new(
                 "clipboard",
                 clipboard_sender,
-            ))),
+            ))],
             capture_sender,
             dropped_sender,
             false,
