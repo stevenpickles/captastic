@@ -56,6 +56,10 @@ queue_capacity = 2
 # Absolute path. Omit to use <home>/Pictures/Captastic. A daemon's working directory is whatever
 # launched it, so a relative path would put captures somewhere you could not predict.
 # directory = 'C:\Users\you\Pictures\Captastic'
+# Names each capture, without the extension. Tokens: {timestamp} {date} {time} {display} {mode}
+# {width} {height} {application} {title}. Values coming from a window are sanitized, and a name can
+# never place a capture outside the directory above.
+filename_template = "captastic-{timestamp}"
 
 [metrics]
 enabled = true
