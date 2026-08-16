@@ -456,7 +456,7 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                             (capture_result, recorder)
                         },
                         || super::create_backend(&backend_name, &display_policy),
-                        thread::sleep,
+                        |delay| wait_for_backoff(delay, &worker_stop_requested),
                         |attempt, delay, error| {
                             crate::logging::warn(format_args!(
                                 "capture {} lost the capture engine; dropping it and retrying {}/{} in {:.0} ms: {error}",
@@ -619,7 +619,7 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                             (result, ())
                         },
                         || super::create_backend(&backend_name, &display_policy),
-                        thread::sleep,
+                        |delay| wait_for_backoff(delay, &worker_stop_requested),
                         |attempt, delay, error| {
                             crate::logging::warn(format_args!(
                                     "confirmation capture {} lost the engine; retrying {}/{} in {:.0} ms: {error}",
@@ -724,7 +724,7 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                             (result, ())
                         },
                         || super::create_backend(&backend_name, &display_policy),
-                        thread::sleep,
+                        |delay| wait_for_backoff(delay, &worker_stop_requested),
                         |attempt, delay, error| {
                             crate::logging::warn(format_args!(
                                     "preview fallback capture {} lost the engine; retrying {}/{} in {:.0} ms: {error}",
@@ -1549,6 +1549,45 @@ impl BackendRecovery {
     }
 }
 
+/// Whether a recovery back-off ran to completion or was cut short by a shutdown.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BackoffOutcome {
+    Elapsed,
+    Stopping,
+}
+
+/// How long a recovery back-off may sleep before looking at the stop flag again.
+#[cfg(windows)]
+const RECOVERY_BACKOFF_POLL: Duration = Duration::from_millis(10);
+
+/// Sleeps out a recovery back-off, abandoning it as soon as the daemon has been asked to stop.
+///
+/// The back-off doubles up to two seconds, and the capture worker's share of the shutdown budget is
+/// 2.5 (three seconds less [`WORKER_TEARDOWN_RESERVE`]). A plain `sleep` therefore spends most of
+/// that budget waiting to retry a backend the daemon is about to throw away, and two of them in a
+/// row spend all of it — at which point the worker is detached, leaking a thread and a D3D device,
+/// for no better reason than that it was asleep. Polling costs a wakeup every 10 ms during an
+/// outage the user is already waiting out.
+#[cfg(windows)]
+fn wait_for_backoff(delay: Duration, stop_requested: &AtomicBool) -> BackoffOutcome {
+    let deadline = Instant::now() + delay;
+    loop {
+        if stop_requested.load(Ordering::Acquire) {
+            log::info!(
+                "abandoning the capture-engine recovery back-off with {:.0} ms left; the daemon is shutting down",
+                deadline.saturating_duration_since(Instant::now()).as_secs_f64() * 1_000.0
+            );
+            return BackoffOutcome::Stopping;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return BackoffOutcome::Elapsed;
+        }
+        thread::sleep(remaining.min(RECOVERY_BACKOFF_POLL));
+    }
+}
+
 #[cfg(windows)]
 fn recovery_delay(failed_attempts: u32) -> Duration {
     let exponent = failed_attempts.saturating_sub(1).min(5);
@@ -1578,7 +1617,7 @@ fn capture_with_backend_recovery<T, R>(
     backend: &mut Option<Box<dyn CaptureBackend>>,
     mut attempt_capture: impl FnMut(&mut dyn CaptureBackend) -> (Result<T, CaptureError>, R),
     mut rebuild_backend: impl FnMut() -> Result<Box<dyn CaptureBackend>, AppError>,
-    mut wait: impl FnMut(Duration),
+    mut wait: impl FnMut(Duration) -> BackoffOutcome,
     mut on_retry: impl FnMut(u32, Duration, &CaptureError),
 ) -> (Result<T, CaptureError>, R, u32, Option<AppError>) {
     let mut recovery_attempts = 0_u32;
@@ -1598,7 +1637,13 @@ fn capture_with_backend_recovery<T, R>(
         let delay = recovery_delay(recovery_attempts);
         on_retry(recovery_attempts, delay, error);
         backend.take();
-        wait(delay);
+        if wait(delay) == BackoffOutcome::Stopping {
+            // Building a fresh D3D device for a daemon that is on its way out is work nobody will
+            // use, and it is work that happens inside the shutdown budget. The caller sees the
+            // original capture error with the backend already dropped, which is the same state a
+            // failed rebuild leaves behind, so the outage is recorded either way.
+            return (capture_result, recorder, recovery_attempts, None);
+        }
         match rebuild_backend() {
             Ok(replacement) => *backend = Some(replacement),
             Err(reinitialize_error) => {
@@ -2812,7 +2857,10 @@ mod tests {
                 rebuilds = rebuilds.saturating_add(1);
                 Ok(Box::new(FakeBackend::new(FakeBackendConfig::default())))
             },
-            |delay| waits.push(delay),
+            |delay| {
+                waits.push(delay);
+                BackoffOutcome::Elapsed
+            },
             |_, _, error| retry_kinds.push(error.kind),
         );
 
@@ -2823,6 +2871,84 @@ mod tests {
         assert_eq!(waits, vec![Duration::from_millis(50)]);
         assert_eq!(retry_kinds, vec![CaptureErrorKind::AccessLost]);
         assert!(rebuild_error.is_none());
+    }
+
+    #[test]
+    fn a_shutdown_during_the_back_off_stops_retrying_instead_of_rebuilding() {
+        let mut backend: Option<Box<dyn CaptureBackend>> =
+            Some(Box::new(FakeBackend::new(FakeBackendConfig {
+                // Long enough that every retry would fail too, so a retry that does happen is not
+                // hidden by a capture that would have succeeded anyway.
+                failure_script: (1..=4)
+                    .map(|attempt| FakeFailure::new(attempt, CaptureErrorKind::AccessLost, true))
+                    .collect(),
+                ..FakeBackendConfig::default()
+            })));
+        let request = CaptureRequest {
+            id: CaptureId(1),
+            triggered_at: Instant::now(),
+            source: CaptureSource::Display(DisplayId::primary()),
+            mode: CaptureMode::Latest { max_age_ms: None },
+            cpu_frame: true,
+            retain_native_frame: false,
+            cursor: CursorMode::Exclude,
+        };
+        let mut rebuilds = 0_u32;
+
+        let (result, _recorder, attempts, rebuild_error) = capture_with_backend_recovery(
+            &mut backend,
+            |active_backend| {
+                let mut recorder = EventRecorder::with_capacity(8);
+                let result = active_backend.capture(&request, &mut recorder);
+                (result, recorder)
+            },
+            || {
+                rebuilds = rebuilds.saturating_add(1);
+                Ok(Box::new(FakeBackend::new(FakeBackendConfig::default())))
+            },
+            |_| BackoffOutcome::Stopping,
+            |_, _, _| {},
+        );
+
+        // The retry was counted - the daemon really did decide to recover - but no D3D device was
+        // built for a process that is leaving, and the loop did not sit through a second back-off
+        // on the way to the retry ceiling.
+        assert_eq!(attempts, 1);
+        assert_eq!(rebuilds, 0);
+        assert!(rebuild_error.is_none());
+        assert!(matches!(
+            result,
+            Err(CaptureError {
+                kind: CaptureErrorKind::AccessLost,
+                ..
+            })
+        ));
+        // Dropped before the back-off, exactly as a completed one would leave it, so the caller
+        // takes the same "engine is recovering" branch either way.
+        assert!(backend.is_none());
+    }
+
+    #[test]
+    fn a_back_off_that_is_never_interrupted_waits_out_its_whole_delay() {
+        let stop_requested = AtomicBool::new(false);
+        let delay = Duration::from_millis(30);
+        let started = Instant::now();
+
+        assert_eq!(
+            wait_for_backoff(delay, &stop_requested),
+            BackoffOutcome::Elapsed
+        );
+        assert!(started.elapsed() >= delay);
+
+        // A flag already set costs nothing: shutdown does not have to wait out one poll interval
+        // per pending back-off before the worker can look at its command channel again.
+        stop_requested.store(true, Ordering::Release);
+        let interrupted_at = Instant::now();
+        assert_eq!(
+            wait_for_backoff(Duration::from_secs(2), &stop_requested),
+            BackoffOutcome::Stopping
+        );
+        assert!(interrupted_at.elapsed() < Duration::from_millis(500));
     }
 
     #[test]
