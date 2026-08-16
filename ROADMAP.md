@@ -212,9 +212,10 @@ capture critical path.
 
 ## Milestone 5 — Capture quality and resilience
 
-**Status:** Not started. Precede the soak-test exit criteria with a documented detach budget for
-timed-out capture and window-render threads (counted in metrics, recorded in an ADR) so handle and
-memory accounting is honest, and extend the core pixel-format contract before HDR work begins.
+**Status:** Pre-work under way (issue #19). The detach budget is done: timed-out capture and
+window-render workers are counted against documented per-kind ceilings and the policy is ADR 0005,
+so the handle and memory accounting the soak-test criteria depend on is now explicit. The core
+pixel-format contract still needs extending before HDR work begins.
 
 **Outcome:** Captastic handles the remaining pixel formats and Windows lifecycle transitions with
 explicit, tested behavior.
@@ -403,12 +404,15 @@ alongside the overlay extraction and Milestone 4. The order below reflects what 
 
 ## Recommended next branch
 
-Milestone 5's pre-work. FakeBackend contract fidelity is the piece with leverage beyond its own
-milestone: much of Milestone 4 shipped with daemon-side behaviour verified only by unit tests,
+Milestone 5's remaining pre-work (issue #19). Two of its items are done — FakeBackend now honours
+the freshness contract it was ignoring, and the detach budget is documented and counted — leaving
+the pixel-format contract extension for 16f/scRGB, property-based coverage of the coordinate and
+rotation transforms, and two folded-in review findings.
+
+FakeBackend fidelity keeps its leverage beyond this milestone and is worth extending further as
+gaps appear: much of Milestone 4 shipped with daemon-side behaviour verified only by unit tests,
 because a second daemon cannot start while one holds the session control event, and a fake backend
 that honestly reproduces the real contract is what would close that gap for everything after it.
-The detach-budget ADR is owed regardless — capture and window-render workers are already detached at
-their deadlines, and the accounting for that is currently implicit.
 
 Milestone 1's remaining work is the higher priority by roadmap order, but it is gated on hardware
 rather than effort: multi-adapter composition cannot be honestly validated on a single-adapter,

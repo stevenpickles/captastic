@@ -262,8 +262,17 @@ fn join_capture_worker_until(join: JoinHandle<()>, deadline: Instant) {
     }
     // Left running on purpose. The capture worker can be blocked inside a foreign window
     // procedure, and a blocking join would hand the process's exit over to whatever is wedged.
+    //
+    // Recorded rather than merely logged because this is the one detach with no upper bound on
+    // what it holds: a window render abandons one window's device context, this abandons the
+    // capture backend and whatever it had mapped. There is exactly one capture worker, so it can
+    // happen at most once per run - which is what makes the leak affordable, not incidental.
+    let detached =
+        captastic_core::process_detach_ledger().detached(captastic_core::DetachKind::CaptureWorker);
     crate::logging::warn(format_args!(
-        "capture worker did not stop within its shutdown budget; detaching it"
+        "capture worker did not stop within its shutdown budget; detaching it and exiting with it still running (detach {} of {} allowed)",
+        detached.total,
+        captastic_core::DetachKind::CaptureWorker.ceiling()
     ));
 }
 

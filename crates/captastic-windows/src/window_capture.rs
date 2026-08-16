@@ -4,7 +4,10 @@ use std::sync::{mpsc, Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use captastic_core::{CaptureError, CaptureErrorKind, CpuFrame, FrameAlpha, FrameMetadata, Rect};
+use captastic_core::{
+    process_detach_ledger, CaptureError, CaptureErrorKind, CpuFrame, DetachCount, DetachKind,
+    DetachLedger, FrameAlpha, FrameMetadata, Rect,
+};
 use windows::core::Error as WindowsError;
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
@@ -38,7 +41,10 @@ const _: () = assert!(MAX_IN_FLIGHT_WINDOW_RENDERS > 1);
 const WINDOW_BORDER_BGRA: [u8; 3] = [188, 180, 176];
 static IN_FLIGHT_WINDOW_RENDERS: AtomicUsize = AtomicUsize::new(0);
 static WINDOW_RENDER_WORKERS: AtomicUsize = AtomicUsize::new(0);
-static DETACHED_WINDOW_RENDERS: AtomicUsize = AtomicUsize::new(0);
+// The worker budget is what actually enforces the detach ceiling, because a detached render holds
+// its slot until it exits. The ledger only documents the number, so the two have to agree or the
+// documented ceiling describes a limit nothing imposes.
+const _: () = assert!(MAX_WINDOW_RENDER_WORKERS == DetachKind::WindowRender.ceiling());
 static ACTIVE_WINDOW_RENDER_TARGETS: Mutex<BTreeSet<isize>> = Mutex::new(BTreeSet::new());
 const RENDER_ACTIVE: u8 = 0;
 const RENDER_DETACHED: u8 = 1;
@@ -213,10 +219,26 @@ where
             // lease expires at the caller's deadline so unrelated windows can still be rendered;
             // release is idempotent when the worker eventually exits.
             timeout_permit.release();
-            if mark_render_detached(&render_state, &DETACHED_WINDOW_RENDERS) {
-                log::warn!(
-                    "window render exceeded its deadline; {} detached native render worker(s) remain",
-                    DETACHED_WINDOW_RENDERS.load(Ordering::Acquire)
+            if let Some(detached) = mark_render_detached(&render_state, process_detach_ledger()) {
+                let at_ceiling = detached.at_ceiling(DetachKind::WindowRender);
+                // At the ceiling every worker slot is held by a render that never came back, so
+                // the next window capture is refused outright rather than merely slow. That is a
+                // different thing to report than one wedged window, and it is reported louder.
+                log::log!(
+                    if at_ceiling {
+                        log::Level::Error
+                    } else {
+                        log::Level::Warn
+                    },
+                    "window render exceeded its deadline; {} detached render worker(s) still running of {} ceiling, {} detached in total{}",
+                    detached.live,
+                    DetachKind::WindowRender.ceiling(),
+                    detached.total,
+                    if at_ceiling {
+                        " — further window renders will be refused until one returns"
+                    } else {
+                        ""
+                    }
                 );
             }
             Err(capture_error(
@@ -247,11 +269,15 @@ struct RenderCompletion(Arc<AtomicU8>);
 
 impl Drop for RenderCompletion {
     fn drop(&mut self) {
-        complete_render(&self.0, &DETACHED_WINDOW_RENDERS);
+        complete_render(&self.0, process_detach_ledger());
     }
 }
 
-fn mark_render_detached(state: &AtomicU8, detached_count: &AtomicUsize) -> bool {
+/// Marks a render detached, returning the ledger's counts if this call is the one that detached it.
+///
+/// `None` means the worker had already finished — the caller and the worker raced at the deadline,
+/// and the worker won.
+fn mark_render_detached(state: &AtomicU8, ledger: &DetachLedger) -> Option<DetachCount> {
     if state
         .compare_exchange(
             RENDER_ACTIVE,
@@ -261,16 +287,15 @@ fn mark_render_detached(state: &AtomicU8, detached_count: &AtomicUsize) -> bool 
         )
         .is_ok()
     {
-        detached_count.fetch_add(1, Ordering::AcqRel);
-        true
+        Some(ledger.detached(DetachKind::WindowRender))
     } else {
-        false
+        None
     }
 }
 
-fn complete_render(state: &AtomicU8, detached_count: &AtomicUsize) {
+fn complete_render(state: &AtomicU8, ledger: &DetachLedger) {
     if state.swap(RENDER_COMPLETED, Ordering::AcqRel) == RENDER_DETACHED {
-        detached_count.fetch_sub(1, Ordering::AcqRel);
+        ledger.rejoined(DetachKind::WindowRender);
     }
 }
 
@@ -1881,17 +1906,28 @@ mod tests {
 
     #[test]
     fn detached_render_telemetry_handles_completion_races() {
-        let detached = AtomicUsize::new(0);
+        let ledger = DetachLedger::new();
         let timed_out = AtomicU8::new(RENDER_ACTIVE);
-        assert!(mark_render_detached(&timed_out, &detached));
-        assert_eq!(detached.load(Ordering::Acquire), 1);
-        complete_render(&timed_out, &detached);
-        assert_eq!(detached.load(Ordering::Acquire), 0);
+        assert_eq!(
+            mark_render_detached(&timed_out, &ledger),
+            Some(DetachCount { live: 1, total: 1 })
+        );
+        complete_render(&timed_out, &ledger);
+        assert_eq!(
+            ledger.count(DetachKind::WindowRender),
+            DetachCount { live: 0, total: 1 }
+        );
 
+        // The worker finished a moment before the caller gave up on it. Nothing was detached, so
+        // the total must not move either - this is the count that says how often detaching really
+        // happens, and a race the worker won is not an instance of it.
         let completed_first = AtomicU8::new(RENDER_ACTIVE);
-        complete_render(&completed_first, &detached);
-        assert!(!mark_render_detached(&completed_first, &detached));
-        assert_eq!(detached.load(Ordering::Acquire), 0);
+        complete_render(&completed_first, &ledger);
+        assert!(mark_render_detached(&completed_first, &ledger).is_none());
+        assert_eq!(
+            ledger.count(DetachKind::WindowRender),
+            DetachCount { live: 0, total: 1 }
+        );
     }
 
     #[test]
