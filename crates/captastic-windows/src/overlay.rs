@@ -49,7 +49,7 @@ use machine::{
 use crate::dwm_thumbnail::{fit_source_in_bounds, DwmThumbnail};
 use captastic_core::{
     CaptureError, CaptureErrorKind, CpuFrame, DisplayId, DisplayInfo, FrameMetadata, FrameOrigin,
-    PixelFormat, Rect,
+    PixelEncoding, Rect,
 };
 #[cfg(test)]
 use captastic_core::{CaptureId, CaptureMode, ColorSpace, TimingProvenance};
@@ -1799,9 +1799,9 @@ fn update_window_preview(state: &mut OverlayState, target: Option<NativeWindowHa
     // refreshes Unavailable, and no other overlay state is touched either way.
     state.window_preview = match capture_window_visual(handle, &state.reference_metadata) {
         Ok(capture) => match FrozenSurface::from_straight_alpha(
-            capture.frame.width,
-            capture.frame.height,
-            &capture.frame.pixels,
+            capture.frame.width(),
+            capture.frame.height(),
+            capture.frame.pixels(),
         ) {
             Ok(surface) => Some(WindowPreviewState::Ready(Box::new(WindowPreview {
                 handle,
@@ -2071,9 +2071,9 @@ fn render_overview_batch(hwnd: HWND, state: &mut OverlayState, generation: usize
             }
         };
         let Ok(surface) = FrozenSurface::from_straight_alpha(
-            capture.frame.width,
-            capture.frame.height,
-            &capture.frame.pixels,
+            capture.frame.width(),
+            capture.frame.height(),
+            capture.frame.pixels(),
         ) else {
             continue;
         };
@@ -3171,28 +3171,32 @@ fn update_cursor(handle: Option<ResizeHandle>, region_cursor: &RegionCursor) {
 
 fn tight_pixels(frame: &CpuFrame) -> Result<Arc<[u8]>, CaptureError> {
     let tight_stride = frame
-        .width
+        .width()
         .checked_mul(4)
         .ok_or_else(|| invalid_frame("overlay row size overflowed"))?
         as usize;
-    if frame.stride_bytes as usize == tight_stride {
-        return Ok(frame.pixels.clone());
+    if frame.stride_bytes() as usize == tight_stride {
+        return Ok(frame.pixels_shared().clone());
     }
     let length = tight_stride
-        .checked_mul(frame.height as usize)
+        .checked_mul(frame.height() as usize)
         .ok_or_else(|| invalid_frame("overlay image size overflowed"))?;
     let mut pixels = vec![0_u8; length];
-    for row in 0..frame.height as usize {
-        let source_start = row * frame.stride_bytes as usize;
+    for row in 0..frame.height() as usize {
+        let source_start = row * frame.stride_bytes() as usize;
         let destination_start = row * tight_stride;
         pixels[destination_start..destination_start + tight_stride]
-            .copy_from_slice(&frame.pixels[source_start..source_start + tight_stride]);
+            .copy_from_slice(&frame.pixels()[source_start..source_start + tight_stride]);
     }
     Ok(Arc::from(pixels))
 }
 
 fn validate_frame(frame: &CpuFrame) -> Result<(), CaptureError> {
-    if frame.format != PixelFormat::Bgra8Unorm || frame.origin != FrameOrigin::TopLeft {
+    let is_bgra8 = matches!(
+        frame.format().encoding(),
+        PixelEncoding::EightBitRgba { blue_first: true }
+    );
+    if !is_bgra8 || frame.origin != FrameOrigin::TopLeft {
         return Err(CaptureError {
             kind: CaptureErrorKind::Unsupported,
             backend: "windows-overlay",
@@ -3202,8 +3206,8 @@ fn validate_frame(frame: &CpuFrame) -> Result<(), CaptureError> {
             native_code: None,
         });
     }
-    if frame.width != frame.metadata.source_rect.width
-        || frame.height != frame.metadata.source_rect.height
+    if frame.width() != frame.metadata.source_rect.width
+        || frame.height() != frame.metadata.source_rect.height
     {
         return Err(invalid_frame(
             "overlay frame dimensions do not match source bounds",
@@ -3214,7 +3218,38 @@ fn validate_frame(frame: &CpuFrame) -> Result<(), CaptureError> {
 
 #[cfg(test)]
 mod tests {
+    use captastic_core::PixelFormat;
+
     use super::*;
+
+    /// The overlay presenter blits the frozen frame into a 32-bit top-down DIB and hit-tests
+    /// against it at four bytes per pixel. A half-float frame reaching that code would be drawn as
+    /// a quarter of the desktop stretched over the whole screen, which is a far worse outcome than
+    /// declining to open the overlay - and the fallback for declining already exists.
+    #[test]
+    fn the_selection_overlay_refuses_pixels_it_cannot_present() {
+        let mut metadata = frame_metadata_for_tests();
+        metadata.source_rect = Rect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        };
+        let frame = CpuFrame::new(
+            Arc::from(vec![0_u8; 8]),
+            1,
+            1,
+            8,
+            PixelFormat::Rgba16Float,
+            FrameOrigin::TopLeft,
+            ColorSpace::ScRgb,
+            metadata,
+        )
+        .expect("a valid half-float frame");
+
+        let error = validate_frame(&frame).expect_err("a half-float frame cannot be presented");
+        assert_eq!(error.kind, CaptureErrorKind::Unsupported);
+    }
 
     #[test]
     fn draining_a_pending_quit_clears_the_thread_quit_flag() {
@@ -4358,6 +4393,30 @@ mod tests {
         let mut spare = Some(FrozenSurface::empty(8, 8).expect("surface"));
         assert!(reusable_overview_surface(None, &mut spare, 16, 16).is_none());
         assert!(spare.is_none());
+    }
+
+    fn frame_metadata_for_tests() -> FrameMetadata {
+        FrameMetadata {
+            capture_id: CaptureId(1),
+            backend: "test".to_owned(),
+            display_id: DisplayId::primary(),
+            source_rect: Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            rotation_degrees: 0,
+            capture_mode: CaptureMode::Latest { max_age_ms: None },
+            presentation_offset_ns: Some(0),
+            timing_provenance: TimingProvenance::Synthetic,
+            native_ready_offset_ns: 0,
+            cpu_ready_offset_ns: Some(0),
+            frame_age_ns: Some(0),
+            frame_generation: Some(1),
+            copy_count: 1,
+            pool_slot: Some(0),
+        }
     }
 
     fn ready_preview_state(handle: NativeWindowHandle) -> WindowPreviewState {

@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use captastic_core::{
-    encode_frame, CaptureError, CaptureErrorKind, CpuFrame, FrameAlpha, FrameOrigin, PixelFormat,
+    encode_frame, CaptureError, CaptureErrorKind, CpuFrame, FrameAlpha, FrameOrigin, PixelEncoding,
     PngEffort,
 };
 use windows::core::w;
@@ -193,7 +193,7 @@ impl<'a> ClipboardPayload<'a> {
         // `Fast` rather than the default: this runs in the hotkey path, where the user feels the
         // milliseconds, and even Fast compresses a screenshot roughly 20-45x. The file-output
         // worker, which is not in that path, uses `Compact`.
-        let png = (frame.alpha == FrameAlpha::Straight)
+        let png = (frame.alpha() == FrameAlpha::Straight)
             .then(|| encode_frame(frame, PngEffort::Fast))
             .transpose()
             .map_err(png_error)?;
@@ -379,30 +379,47 @@ struct DibV5Layout {
 
 impl DibV5Layout {
     fn new(frame: &CpuFrame) -> Result<Self, CaptureError> {
-        if frame.format != PixelFormat::Bgra8Unorm {
-            return Err(unsupported("DIBV5 publication requires BGRA8 pixels"));
+        // A DIBV5 payload is 8-bit BGRA and nothing else. Matched on the encoding rather than
+        // tested for inequality so that a pixel of another width cannot reach the row copy below
+        // by simply not being the one format this happened to name.
+        match frame.format().encoding() {
+            PixelEncoding::EightBitRgba { blue_first: true } => {}
+            PixelEncoding::EightBitRgba { blue_first: false } => {
+                return Err(unsupported(
+                    "DIBV5 publication requires BGRA8 pixels, and this frame is RGBA8",
+                ))
+            }
+            // No BITMAPV5HEADER compression describes half-float samples, so there is nothing to
+            // publish this as. Narrowing it to 8 bits first would be tone mapping done by the
+            // clipboard, which is the wrong place for it even once Captastic can do it at all.
+            PixelEncoding::HalfFloatRgba => {
+                return Err(unsupported(
+                    "DIBV5 publication requires 8-bit pixels, and this frame is half-float",
+                ))
+            }
         }
         if frame.origin != FrameOrigin::TopLeft {
             return Err(unsupported("DIBV5 publication requires top-left pixels"));
         }
-        let width = i32::try_from(frame.width)
+        let width = i32::try_from(frame.width())
             .map_err(|_| invalid_frame("clipboard width exceeds the DIBV5 limit"))?;
-        let height = i32::try_from(frame.height)
+        let height = i32::try_from(frame.height())
             .map_err(|_| invalid_frame("clipboard height exceeds the DIBV5 limit"))?;
         if width == 0 || height == 0 {
             return Err(invalid_frame("clipboard frame dimensions must be nonzero"));
         }
-        let tight_stride = usize::try_from(frame.width)
+        let tight_stride = usize::try_from(frame.width())
             .ok()
             .and_then(|value| value.checked_mul(4))
             .ok_or_else(|| invalid_frame("clipboard row size overflowed"))?;
-        if (frame.stride_bytes as usize) < tight_stride {
+        if (frame.stride_bytes() as usize) < tight_stride {
             return Err(invalid_frame("clipboard source stride is too small"));
         }
         let pixel_bytes = tight_stride
-            .checked_mul(frame.height as usize)
+            .checked_mul(frame.height() as usize)
             .ok_or_else(|| invalid_frame("clipboard pixel size overflowed"))?;
-        if frame.pixels.len() < (frame.stride_bytes as usize).saturating_mul(frame.height as usize)
+        if frame.pixels().len()
+            < (frame.stride_bytes() as usize).saturating_mul(frame.height() as usize)
         {
             return Err(invalid_frame("clipboard source buffer is truncated"));
         }
@@ -431,7 +448,7 @@ impl DibV5Layout {
             bV5RedMask: 0x00ff_0000,
             bV5GreenMask: 0x0000_ff00,
             bV5BlueMask: 0x0000_00ff,
-            bV5AlphaMask: if frame.alpha == FrameAlpha::Straight {
+            bV5AlphaMask: if frame.alpha() == FrameAlpha::Straight {
                 0xff00_0000
             } else {
                 0
@@ -461,13 +478,13 @@ impl DibV5Layout {
                 header_bytes,
             )
         };
-        let source_stride = frame.stride_bytes as usize;
+        let source_stride = frame.stride_bytes() as usize;
         let pixels = &mut destination[header_bytes..];
-        for row in 0..frame.height as usize {
+        for row in 0..frame.height() as usize {
             let source_start = row * source_stride;
             let destination_start = row * self.tight_stride;
             pixels[destination_start..destination_start + self.tight_stride]
-                .copy_from_slice(&frame.pixels[source_start..source_start + self.tight_stride]);
+                .copy_from_slice(&frame.pixels()[source_start..source_start + self.tight_stride]);
         }
         Ok(())
     }
@@ -562,7 +579,8 @@ fn read_current_dibv5(owner: HWND) -> Result<Vec<u8>, CaptureError> {
 #[cfg(test)]
 mod tests {
     use captastic_core::{
-        CaptureId, CaptureMode, ColorSpace, DisplayId, FrameMetadata, Rect, TimingProvenance,
+        CaptureId, CaptureMode, ColorSpace, DisplayId, FrameMetadata, PixelFormat, Rect,
+        TimingProvenance,
     };
     use std::sync::Arc;
 
@@ -602,6 +620,25 @@ mod tests {
         .expect("valid fixture")
     }
 
+    /// The fallible half of `frame`, for the layouts `CpuFrame` refuses to build.
+    fn build_frame(
+        width: u32,
+        height: u32,
+        stride_bytes: u32,
+        pixels: Vec<u8>,
+    ) -> Result<CpuFrame, captastic_core::FrameError> {
+        CpuFrame::new(
+            Arc::from(pixels),
+            width,
+            height,
+            stride_bytes,
+            PixelFormat::Bgra8Unorm,
+            FrameOrigin::TopLeft,
+            ColorSpace::Srgb,
+            frame(1, 1, 4, vec![0; 4]).metadata.clone(),
+        )
+    }
+
     #[test]
     fn dibv5_layout_is_top_down_bgra_and_removes_padding() {
         let frame = frame(
@@ -627,13 +664,42 @@ mod tests {
         );
     }
 
+    /// This used to build a valid frame and then swap in a shorter buffer, to reach the layout's
+    /// own truncation check. `CpuFrame` no longer permits that, so the rejection is asserted where
+    /// a caller now meets it - at construction. The check in `DibV5Layout::new` stays: it guards
+    /// an unchecked slice of `stride * height` bytes, and one comparison per capture is a cheap
+    /// price for not trusting a future constructor to have validated anything.
     #[test]
-    fn dibv5_rejects_a_truncated_source() {
-        let mut frame = frame(1, 1, 4, vec![1, 2, 3, 4]);
-        frame.pixels = Arc::from([1_u8, 2, 3]);
-        assert_eq!(
-            DibV5Layout::new(&frame).expect_err("truncated frame").kind,
-            CaptureErrorKind::InvalidFrame
+    fn a_truncated_source_cannot_become_a_frame() {
+        assert!(matches!(
+            build_frame(1, 1, 4, vec![1, 2, 3]),
+            Err(captastic_core::FrameError::BufferTooShort {
+                actual: 3,
+                required: 4
+            })
+        ));
+    }
+
+    #[test]
+    fn dibv5_refuses_half_float_pixels() {
+        let frame = CpuFrame::new(
+            Arc::from(vec![0_u8; 8]),
+            1,
+            1,
+            8,
+            PixelFormat::Rgba16Float,
+            FrameOrigin::TopLeft,
+            ColorSpace::ScRgb,
+            frame(1, 1, 4, vec![0; 4]).metadata.clone(),
+        )
+        .expect("a valid half-float frame");
+
+        let error = DibV5Layout::new(&frame).expect_err("half-float frame");
+        assert_eq!(error.kind, CaptureErrorKind::Unsupported);
+        assert!(
+            error.message.contains("half-float"),
+            "the refusal should say what was wrong with the frame: {}",
+            error.message
         );
     }
 
@@ -786,7 +852,7 @@ mod tests {
         .expect("window capture")
         .frame;
         let opaque = captured.clone().with_alpha(FrameAlpha::Opaque);
-        let megapixels = f64::from(captured.width) * f64::from(captured.height) / 1_000_000.0;
+        let megapixels = f64::from(captured.width()) * f64::from(captured.height()) / 1_000_000.0;
         let raw_bytes = captured.required_bytes();
 
         // One warm-up plus three timed runs each; the best run is the least noisy estimate on a
@@ -825,8 +891,8 @@ mod tests {
 
         println!(
             "captured frame {}x{} ({megapixels:.2} MP, {:.1} MiB raw)",
-            captured.width,
-            captured.height,
+            captured.width(),
+            captured.height(),
             raw_bytes as f64 / (1024.0 * 1024.0),
         );
         for (label, (elapsed, bytes)) in results {

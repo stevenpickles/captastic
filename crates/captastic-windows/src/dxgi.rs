@@ -2371,9 +2371,9 @@ mod tests {
             .expect("cross-thread GPU materialization must not hang")
             .expect("GPU materialization")
             .expect("DXGI frame");
-        assert_eq!(actual.frame.width, expected.width);
-        assert_eq!(actual.frame.height, expected.height);
-        assert_eq!(&*actual.frame.pixels, &*expected.pixels);
+        assert_eq!(actual.frame.width(), expected.width());
+        assert_eq!(actual.frame.height(), expected.height());
+        assert_eq!(actual.frame.pixels(), expected.pixels());
     }
     fn labeled_bgra(width: u32, height: u32, stride: usize) -> Vec<u8> {
         let mut pixels = vec![0xee; stride * height as usize];

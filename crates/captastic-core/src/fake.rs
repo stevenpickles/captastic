@@ -601,8 +601,8 @@ mod tests {
         assert_eq!(outcome.metadata.source_rect, portrait_bounds());
         assert_eq!(outcome.metadata.rotation_degrees, 90);
         let frame = outcome.frame.expect("CPU frame");
-        assert_eq!(frame.width, 1080);
-        assert_eq!(frame.height, 1920);
+        assert_eq!(frame.width(), 1080);
+        assert_eq!(frame.height(), 1920);
     }
 
     #[test]

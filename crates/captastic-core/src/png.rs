@@ -9,7 +9,7 @@ use std::io::Write;
 
 use thiserror::Error;
 
-use crate::frame::{CpuFrame, FrameAlpha, FrameOrigin, PixelFormat};
+use crate::frame::{ColorSpace, CpuFrame, FrameAlpha, FrameOrigin, PixelEncoding, PixelFormat};
 
 /// How hard the DEFLATE backend works on a frame.
 ///
@@ -39,6 +39,17 @@ impl PngEffort {
 pub enum PngError {
     #[error("PNG encoding requires top-left pixels, not {origin:?}")]
     UnsupportedOrigin { origin: FrameOrigin },
+    /// Rejected rather than converted. Narrowing a wide-gamut or high-dynamic-range pixel to eight
+    /// bits is tone mapping, not a cast: done naively it clips every highlight the format existed
+    /// to carry, and silently. Until Captastic has a tone-mapping stage worth naming, refusing is
+    /// the honest answer.
+    #[error("PNG encoding requires 8-bit pixels, and {format:?} is not")]
+    UnsupportedFormat { format: PixelFormat },
+    /// Also rejected rather than converted, and for the same reason: mapping scRGB into sRGB is a
+    /// tone-mapping decision, and making it silently would publish a washed-out or clipped image
+    /// that looks like a capture bug rather than a missing feature.
+    #[error("PNG encoding cannot describe {color_space:?} samples")]
+    UnsupportedColorSpace { color_space: ColorSpace },
     #[error("frame dimensions must be non-zero")]
     EmptyDimensions,
     #[error("stride {stride} is smaller than the minimum row size {minimum}")]
@@ -64,7 +75,7 @@ pub fn encode_frame(frame: &CpuFrame, effort: PngEffort) -> Result<Vec<u8>, PngE
     // wastes more memory than the reallocations save.
     let mut png = Vec::with_capacity(layout.encoded_capacity_hint());
 
-    let mut encoder = png::Encoder::new(&mut png, frame.width, frame.height);
+    let mut encoder = png::Encoder::new(&mut png, frame.width(), frame.height());
     encoder.set_color(layout.color_type);
     encoder.set_depth(png::BitDepth::Eight);
     encoder.set_compression(effort.compression());
@@ -77,9 +88,9 @@ pub fn encode_frame(frame: &CpuFrame, effort: PngEffort) -> Result<Vec<u8>, PngE
         // a 4K frame is 33 MB, and the point of this path is to keep file output off the capture
         // thread's memory footprint as well as its clock.
         let mut row = vec![0_u8; layout.output_row_bytes];
-        for source_row in 0..frame.height as usize {
-            let start = source_row * frame.stride_bytes as usize;
-            let source = &frame.pixels[start..start + layout.source_row_bytes];
+        for source_row in 0..frame.height() as usize {
+            let start = source_row * frame.stride_bytes() as usize;
+            let source = &frame.pixels()[start..start + layout.source_row_bytes];
             layout.convert_row(source, &mut row);
             stream.write_all(&row).map_err(|error| PngError::Writer {
                 message: error.to_string(),
@@ -117,34 +128,55 @@ impl FrameLayout {
                 origin: frame.origin,
             });
         }
-        if frame.width == 0 || frame.height == 0 {
+        if frame.width() == 0 || frame.height() == 0 {
             return Err(PngError::EmptyDimensions);
         }
-        let source_row_bytes = usize::try_from(frame.width)
+        // Every path below reads four bytes per pixel and writes eight bits per channel, so the
+        // encoding is settled before any of the arithmetic that assumes it.
+        let swizzle = match frame.format().encoding() {
+            PixelEncoding::EightBitRgba { blue_first } => blue_first,
+            PixelEncoding::HalfFloatRgba => {
+                return Err(PngError::UnsupportedFormat {
+                    format: frame.format(),
+                })
+            }
+        };
+        // An 8-bit PNG carries no way to say "these samples are linear and 1.0 is not the
+        // maximum", short of an embedded ICC profile. Writing one anyway would produce a file that
+        // every viewer reads as sRGB, which is a picture of the right pixels interpreted wrongly.
+        match frame.color_space {
+            ColorSpace::Srgb | ColorSpace::Unknown => {}
+            ColorSpace::ScRgb => {
+                return Err(PngError::UnsupportedColorSpace {
+                    color_space: frame.color_space,
+                })
+            }
+        }
+        let source_row_bytes = usize::try_from(frame.width())
             .ok()
             .and_then(|width| width.checked_mul(4))
             .ok_or(PngError::SizeOverflow)?;
         let minimum = u32::try_from(source_row_bytes).map_err(|_| PngError::SizeOverflow)?;
-        if frame.stride_bytes < minimum {
+        if frame.stride_bytes() < minimum {
             return Err(PngError::InvalidStride {
-                stride: frame.stride_bytes,
+                stride: frame.stride_bytes(),
                 minimum,
             });
         }
         // The last row is only required to hold its pixels, not a full stride of padding, but
         // `CpuFrame::new` already validates against the full stride and every producer allocates
         // that way. Requiring it here keeps the row loop's slicing unconditional.
-        let required = (frame.stride_bytes as usize)
-            .checked_mul(frame.height as usize)
+        let required = (frame.stride_bytes() as usize)
+            .checked_mul(frame.height() as usize)
             .ok_or(PngError::SizeOverflow)?;
-        if frame.pixels.len() < required {
+        if frame.pixels().len() < required {
             return Err(PngError::BufferTooShort {
-                actual: frame.pixels.len(),
+                actual: frame.pixels().len(),
                 required,
             });
         }
-        let keep_alpha = frame.alpha == FrameAlpha::Straight;
-        let output_row_bytes = usize::try_from(frame.width)
+        let keep_alpha = frame.alpha() == FrameAlpha::Straight;
+        let output_row_bytes = usize::try_from(frame.width())
             .ok()
             .and_then(|width| width.checked_mul(if keep_alpha { 4 } else { 3 }))
             .ok_or(PngError::SizeOverflow)?;
@@ -156,8 +188,8 @@ impl FrameLayout {
             },
             source_row_bytes,
             output_row_bytes,
-            height: frame.height as usize,
-            swizzle: frame.format == PixelFormat::Bgra8Unorm,
+            height: frame.height() as usize,
+            swizzle,
             keep_alpha,
         })
     }
@@ -193,9 +225,39 @@ mod tests {
     use super::*;
     use crate::capture::{CaptureId, CaptureMode};
     use crate::display::{DisplayId, Rect};
-    use crate::frame::{ColorSpace, FrameMetadata, TimingProvenance};
+    use crate::frame::{FrameMetadata, TimingProvenance};
+    use crate::FrameError;
 
     fn frame(width: u32, height: u32, stride_bytes: u32, pixels: Vec<u8>) -> CpuFrame {
+        frame_in(PixelFormat::Bgra8Unorm, width, height, stride_bytes, pixels)
+    }
+
+    fn frame_in(
+        format: PixelFormat,
+        width: u32,
+        height: u32,
+        stride_bytes: u32,
+        pixels: Vec<u8>,
+    ) -> CpuFrame {
+        build_frame_in(format, width, height, stride_bytes, pixels).expect("test frame is valid")
+    }
+
+    fn build_frame(
+        width: u32,
+        height: u32,
+        stride_bytes: u32,
+        pixels: Vec<u8>,
+    ) -> Result<CpuFrame, FrameError> {
+        build_frame_in(PixelFormat::Bgra8Unorm, width, height, stride_bytes, pixels)
+    }
+
+    fn build_frame_in(
+        format: PixelFormat,
+        width: u32,
+        height: u32,
+        stride_bytes: u32,
+        pixels: Vec<u8>,
+    ) -> Result<CpuFrame, FrameError> {
         let metadata = FrameMetadata {
             capture_id: CaptureId(1),
             backend: "test".to_owned(),
@@ -222,12 +284,11 @@ mod tests {
             width,
             height,
             stride_bytes,
-            PixelFormat::Bgra8Unorm,
+            format,
             FrameOrigin::TopLeft,
             ColorSpace::Srgb,
             metadata,
         )
-        .expect("test frame is valid")
     }
 
     /// Decodes a PNG back to interleaved 8-bit samples plus its color type.
@@ -265,8 +326,7 @@ mod tests {
 
     #[test]
     fn rgba_sources_are_not_swizzled() {
-        let mut source = frame(1, 1, 4, vec![10, 20, 30, 255]);
-        source.format = PixelFormat::Rgba8Unorm;
+        let source = frame_in(PixelFormat::Rgba8Unorm, 1, 1, 4, vec![10, 20, 30, 255]);
         let encoded = encode_frame(&source, PngEffort::Compact).expect("encode");
 
         let (_, _, _, samples) = decode(&encoded);
@@ -313,13 +373,43 @@ mod tests {
         assert_eq!(decode(&compact).3, decode(&fast).3);
     }
 
+    /// These two used to build a valid frame and then corrupt it - a narrower stride, a shorter
+    /// buffer - to reach the encoder's own layout checks. Neither is expressible any more, which
+    /// was the point of privatizing the fields: the encoder cannot be handed a frame whose stride
+    /// and buffer disagree, because no such `CpuFrame` can be built.
+    ///
+    /// The rejection is now where the caller actually meets it.
+    /// The refusal exists because the alternative is worse than an error: an unrecognized format
+    /// would otherwise take the RGBA branch and be encoded as though its bytes meant something
+    /// else, producing a valid PNG of the wrong picture.
     #[test]
-    fn a_stride_narrower_than_the_row_is_rejected() {
-        let mut narrow = frame(2, 1, 8, vec![0; 8]);
-        narrow.stride_bytes = 7;
+    fn half_float_frames_are_refused_rather_than_encoded_as_eight_bit() {
+        let frame = frame_in(PixelFormat::Rgba16Float, 1, 1, 8, vec![0; 8]);
         assert_eq!(
-            encode_frame(&narrow, PngEffort::Compact),
-            Err(PngError::InvalidStride {
+            encode_frame(&frame, PngEffort::Compact),
+            Err(PngError::UnsupportedFormat {
+                format: PixelFormat::Rgba16Float
+            })
+        );
+    }
+
+    #[test]
+    fn scrgb_samples_are_refused_rather_than_published_as_srgb() {
+        let mut frame = frame(1, 1, 4, vec![10, 20, 30, 255]);
+        frame.color_space = ColorSpace::ScRgb;
+        assert_eq!(
+            encode_frame(&frame, PngEffort::Compact),
+            Err(PngError::UnsupportedColorSpace {
+                color_space: ColorSpace::ScRgb
+            })
+        );
+    }
+
+    #[test]
+    fn a_stride_narrower_than_the_row_cannot_become_a_frame() {
+        assert_eq!(
+            build_frame(2, 1, 7, vec![0; 8]).err(),
+            Some(FrameError::InvalidStride {
                 stride: 7,
                 minimum: 8
             })
@@ -327,12 +417,10 @@ mod tests {
     }
 
     #[test]
-    fn a_truncated_pixel_buffer_is_rejected_rather_than_sliced() {
-        let mut truncated = frame(2, 2, 8, vec![0; 16]);
-        truncated.pixels = Arc::from(vec![0_u8; 12]);
+    fn a_truncated_pixel_buffer_cannot_become_a_frame() {
         assert_eq!(
-            encode_frame(&truncated, PngEffort::Compact),
-            Err(PngError::BufferTooShort {
+            build_frame(2, 2, 8, vec![0; 12]).err(),
+            Some(FrameError::BufferTooShort {
                 actual: 12,
                 required: 16
             })

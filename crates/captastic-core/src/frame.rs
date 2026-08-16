@@ -9,14 +9,53 @@ use crate::{CaptureId, CaptureMode, DisplayId, FrameError, Rect};
 pub enum PixelFormat {
     Bgra8Unorm,
     Rgba8Unorm,
+    /// Four IEEE half-precision channels, red first: `DXGI_FORMAT_R16G16B16A16_FLOAT`.
+    ///
+    /// What a Windows desktop composes into when HDR is enabled on any attached display. Channel
+    /// values are not confined to `0.0..=1.0`: in scRGB, 1.0 is the sRGB white point and brighter
+    /// pixels exceed it, which is the whole reason the format is wider.
+    Rgba16Float,
 }
 
 impl PixelFormat {
     pub const fn bytes_per_pixel(self) -> u32 {
         match self {
             Self::Bgra8Unorm | Self::Rgba8Unorm => 4,
+            Self::Rgba16Float => 8,
         }
     }
+
+    /// How one pixel is actually laid out in memory.
+    ///
+    /// Consumers branch on this rather than on the format, and the difference matters at the point
+    /// a new format is added. A second name for a four-byte 8-bit pixel needs no decision from a
+    /// sink that already handles one; a pixel of a different width or a different numeric type
+    /// needs a decision from every sink there is. Matching on the encoding is what makes the
+    /// compiler ask only the second question.
+    pub const fn encoding(self) -> PixelEncoding {
+        match self {
+            Self::Bgra8Unorm => PixelEncoding::EightBitRgba { blue_first: true },
+            Self::Rgba8Unorm => PixelEncoding::EightBitRgba { blue_first: false },
+            Self::Rgba16Float => PixelEncoding::HalfFloatRgba,
+        }
+    }
+}
+
+/// The memory layout of a single pixel, as distinct from the name of its format.
+///
+/// Deliberately not `#[non_exhaustive]`: adding a variant should stop every sink in the workspace
+/// from compiling, which is the entire reason this type exists.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PixelEncoding {
+    /// Four bytes: three 8-bit unsigned channels then 8 bits of alpha.
+    EightBitRgba { blue_first: bool },
+    /// Eight bytes: three 16-bit half-float channels, red first, then 16 bits of alpha.
+    ///
+    /// No sink consumes these yet. Every one of them refuses, which is the point of the variant
+    /// existing before there is anything to produce it: the refusals are written and tested now,
+    /// while the alternative to writing them is only a compile error, rather than later, when the
+    /// alternative is a silently wrong image.
+    HalfFloatRgba,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -29,6 +68,12 @@ pub enum FrameOrigin {
 #[serde(rename_all = "snake_case")]
 pub enum ColorSpace {
     Srgb,
+    /// Linear, sRGB primaries, with 1.0 at the sRGB white point and highlights above it.
+    ///
+    /// The colour space of a Windows HDR desktop, and inseparable in practice from
+    /// [`PixelFormat::Rgba16Float`] - eight-bit channels have nowhere to put the values that
+    /// distinguish it.
+    ScRgb,
     Unknown,
 }
 
@@ -70,16 +115,23 @@ pub struct FrameMetadata {
     pub pool_slot: Option<u16>,
 }
 
+/// A frame of pixels whose layout has been validated against its buffer.
+///
+/// The layout-bearing fields are private, and that is the whole of what `CpuFrame` guarantees:
+/// `pixels` really does hold `stride_bytes * height` bytes, `stride_bytes` really is wide enough
+/// for `width` pixels of `format`. Every consumer that indexes into `pixels` relies on all three
+/// agreeing, and while they were public the validation in [`CpuFrame::new`] described the frame at
+/// the moment it was built rather than the frame in hand.
 #[derive(Clone, Debug)]
 pub struct CpuFrame {
-    pub pixels: Arc<[u8]>,
-    pub width: u32,
-    pub height: u32,
-    pub stride_bytes: u32,
-    pub format: PixelFormat,
+    pixels: Arc<[u8]>,
+    width: u32,
+    height: u32,
+    stride_bytes: u32,
+    format: PixelFormat,
     pub origin: FrameOrigin,
     pub color_space: ColorSpace,
-    pub alpha: FrameAlpha,
+    alpha: FrameAlpha,
     pub metadata: FrameMetadata,
 }
 
@@ -113,6 +165,42 @@ impl CpuFrame {
     pub fn with_alpha(mut self, alpha: FrameAlpha) -> Self {
         self.alpha = alpha;
         self
+    }
+
+    /// The validated pixel buffer.
+    ///
+    /// Read it with `stride_bytes`, never with `width * 4`: a frame may carry row padding, and
+    /// not every format is four bytes per pixel.
+    pub fn pixels(&self) -> &[u8] {
+        &self.pixels
+    }
+
+    /// The same buffer as a handle that can be cloned without copying it.
+    ///
+    /// Separate from [`CpuFrame::pixels`] because sharing a frame and reading one are different
+    /// intentions, and only the first has any reason to name `Arc`.
+    pub fn pixels_shared(&self) -> &Arc<[u8]> {
+        &self.pixels
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn stride_bytes(&self) -> u32 {
+        self.stride_bytes
+    }
+
+    pub fn format(&self) -> PixelFormat {
+        self.format
+    }
+
+    pub fn alpha(&self) -> FrameAlpha {
+        self.alpha
     }
 
     pub fn required_bytes(&self) -> usize {
@@ -295,6 +383,71 @@ mod tests {
         assert_eq!(cropped.metadata.source_rect.x, 101);
         assert_eq!(cropped.metadata.copy_count, 2);
         assert_eq!(cropped.metadata.pool_slot, None);
+    }
+
+    #[test]
+    fn a_wider_pixel_widens_every_layout_rule_that_depends_on_it() {
+        // Eight bytes per pixel, so a two-pixel row needs sixteen. The same numbers that describe
+        // a valid four-byte frame describe an invalid eight-byte one, which is the whole reason
+        // stride validation is a function of the format rather than a constant.
+        assert_eq!(PixelFormat::Rgba16Float.bytes_per_pixel(), 8);
+        assert_eq!(
+            validate_layout(16, 2, 1, 8, PixelFormat::Rgba16Float),
+            Err(FrameError::InvalidStride {
+                stride: 8,
+                minimum: 16
+            })
+        );
+        assert_eq!(
+            validate_layout(16, 2, 1, 16, PixelFormat::Rgba16Float),
+            Ok(16)
+        );
+        assert_eq!(
+            validate_layout(16, 2, 2, 16, PixelFormat::Rgba16Float),
+            Err(FrameError::BufferTooShort {
+                actual: 16,
+                required: 32
+            })
+        );
+    }
+
+    #[test]
+    fn a_half_float_frame_crops_by_its_own_pixel_width() {
+        let mut metadata = test_frame().metadata.clone();
+        metadata.source_rect = Rect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 1,
+        };
+        // Two pixels of eight bytes, distinguishable by their first byte.
+        let pixels: Vec<u8> = (0..16_u8).collect();
+        let frame = CpuFrame::new(
+            Arc::from(pixels),
+            2,
+            1,
+            16,
+            PixelFormat::Rgba16Float,
+            FrameOrigin::TopLeft,
+            ColorSpace::ScRgb,
+            metadata,
+        )
+        .expect("a valid half-float frame");
+
+        let cropped = frame
+            .crop(Rect {
+                x: 1,
+                y: 0,
+                width: 1,
+                height: 1,
+            })
+            .expect("valid crop");
+
+        // Eight bytes taken, not four: cropping reads the format rather than assuming BGRA8.
+        assert_eq!(cropped.stride_bytes(), 8);
+        assert_eq!(cropped.pixels(), &[8, 9, 10, 11, 12, 13, 14, 15]);
+        assert_eq!(cropped.format(), PixelFormat::Rgba16Float);
+        assert_eq!(cropped.color_space, ColorSpace::ScRgb);
     }
 
     #[test]

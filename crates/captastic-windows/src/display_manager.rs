@@ -3,7 +3,8 @@ use std::sync::Arc;
 use captastic_core::{
     BackendCapabilities, CaptureBackend, CaptureError, CaptureErrorKind, CaptureOutcome,
     CaptureRequest, CaptureSource, ColorSpace, CpuFrame, DisplayId, DisplayInfo, DisplayTopology,
-    EventRecorder, FrameMetadata, FrameOrigin, PerfEventKind, PixelFormat, Rect, TimingProvenance,
+    EventRecorder, FrameMetadata, FrameOrigin, PerfEventKind, PixelEncoding, PixelFormat, Rect,
+    TimingProvenance,
 };
 use windows::Win32::Foundation::POINT;
 use windows::Win32::UI::WindowsAndMessaging::GetPhysicalCursorPos;
@@ -382,10 +383,17 @@ fn copy_frame_into(
     destination: &mut [u8],
     destination_stride: usize,
 ) -> Result<(), CaptureError> {
-    if frame.format != PixelFormat::Bgra8Unorm
-        || frame.origin != FrameOrigin::TopLeft
-        || frame.width != frame.metadata.source_rect.width
-        || frame.height != frame.metadata.source_rect.height
+    let PixelEncoding::EightBitRgba { blue_first: true } = frame.format().encoding() else {
+        return Err(manager_error(
+            CaptureErrorKind::InvalidFrame,
+            "compose_virtual_desktop",
+            "virtual-desktop composition requires 8-bit BGRA pixels",
+            false,
+        ));
+    };
+    if frame.origin != FrameOrigin::TopLeft
+        || frame.width() != frame.metadata.source_rect.width
+        || frame.height() != frame.metadata.source_rect.height
     {
         return Err(manager_error(
             CaptureErrorKind::InvalidFrame,
@@ -420,10 +428,10 @@ fn copy_frame_into(
         )
     })?;
     let frame_right = local_x
-        .checked_add(frame.width as usize)
+        .checked_add(frame.width() as usize)
         .filter(|right| *right <= bounds.width as usize);
     let frame_bottom = local_y
-        .checked_add(frame.height as usize)
+        .checked_add(frame.height() as usize)
         .filter(|bottom| *bottom <= bounds.height as usize);
     if frame_right.is_none() || frame_bottom.is_none() {
         return Err(manager_error(
@@ -433,9 +441,9 @@ fn copy_frame_into(
             true,
         ));
     }
-    let row_bytes = frame.width as usize * 4;
-    for row in 0..frame.height as usize {
-        let source_start = row * frame.stride_bytes as usize;
+    let row_bytes = frame.width() as usize * 4;
+    for row in 0..frame.height() as usize {
+        let source_start = row * frame.stride_bytes() as usize;
         let destination_start = (local_y + row) * destination_stride + local_x * 4;
         let destination_end = destination_start.checked_add(row_bytes).ok_or_else(|| {
             manager_error(
@@ -454,7 +462,7 @@ fn copy_frame_into(
             ));
         }
         destination[destination_start..destination_end]
-            .copy_from_slice(&frame.pixels[source_start..source_start + row_bytes]);
+            .copy_from_slice(&frame.pixels()[source_start..source_start + row_bytes]);
     }
     Ok(())
 }
@@ -693,9 +701,52 @@ mod tests {
         .with_alpha(FrameAlpha::Opaque)
     }
 
+    /// The same fixture in a format the compositor cannot copy byte-for-byte.
+    fn half_float_frame(info: &DisplayInfo) -> CpuFrame {
+        let template = solid_frame(info, 0x20);
+        let stride = info.bounds.width * 8;
+        CpuFrame::new(
+            vec![0_u8; stride as usize * info.bounds.height as usize].into(),
+            info.bounds.width,
+            info.bounds.height,
+            stride,
+            PixelFormat::Rgba16Float,
+            FrameOrigin::TopLeft,
+            ColorSpace::ScRgb,
+            template.metadata.clone(),
+        )
+        .expect("a valid half-float frame")
+    }
+
+    #[test]
+    fn virtual_desktop_composition_refuses_pixels_it_cannot_copy() {
+        // Composition memcpys rows on the assumption that a pixel is four bytes of BGRA. A wider
+        // pixel has to be refused rather than copied at the wrong width, which would produce a
+        // composite of the right size holding a quarter of the image and three quarters of
+        // whatever followed it.
+        let info = display(
+            "solo",
+            Rect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 2,
+            },
+            0,
+            true,
+        );
+        let mut destination = vec![0_u8; 4 * 2 * 4];
+
+        let error = copy_frame_into(&half_float_frame(&info), info.bounds, &mut destination, 16)
+            .expect_err("a half-float frame cannot be composed");
+
+        assert_eq!(error.kind, CaptureErrorKind::InvalidFrame);
+        assert!(destination.iter().all(|byte| *byte == 0));
+    }
+
     fn pixel(frame: &CpuFrame, x: u32, y: u32) -> [u8; 4] {
-        let start = y as usize * frame.stride_bytes as usize + x as usize * 4;
-        frame.pixels[start..start + 4].try_into().unwrap()
+        let start = y as usize * frame.stride_bytes() as usize + x as usize * 4;
+        frame.pixels()[start..start + 4].try_into().unwrap()
     }
 
     #[test]
@@ -812,7 +863,7 @@ mod tests {
             &mut pool,
         )
         .unwrap();
-        assert_eq!((frame.width, frame.height), (6, 3));
+        assert_eq!((frame.width(), frame.height()), (6, 3));
         assert_eq!(frame.metadata.source_rect, bounds);
         assert_eq!(pixel(&frame, 0, 1), [1, 1, 1, 0xff]);
         assert_eq!(pixel(&frame, 3, 0), [2, 2, 2, 0xff]);
@@ -870,7 +921,7 @@ mod tests {
         let mut pool = CompositeBufferPool::new(1);
         let composite =
             compose_virtual_desktop(&[frame], portrait.bounds, &request(), &mut pool).unwrap();
-        assert_eq!((composite.width, composite.height), (2, 3));
+        assert_eq!((composite.width(), composite.height()), (2, 3));
         assert_eq!(composite.metadata.rotation_degrees, 0);
         assert_eq!(composite.metadata.source_rect, portrait.bounds);
     }
@@ -899,7 +950,7 @@ mod tests {
             height: 1,
         };
         let cropped = composite.crop(selection).unwrap();
-        assert_eq!((cropped.width, cropped.height), (2, 1));
+        assert_eq!((cropped.width(), cropped.height()), (2, 1));
         assert_eq!(cropped.metadata.source_rect, selection);
         assert_eq!(pixel(&cropped, 0, 0), [4, 4, 4, 0xff]);
     }
@@ -987,7 +1038,7 @@ mod tests {
             &mut pool,
         )
         .unwrap();
-        assert_eq!((new.width, new.height), (3, 2));
+        assert_eq!((new.width(), new.height()), (3, 2));
         assert_eq!(new.metadata.source_rect, changed.bounds);
     }
 
