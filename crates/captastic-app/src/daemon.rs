@@ -1007,6 +1007,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         }
     };
     if let Some(tray) = tray.as_ref() {
+        refresh_tray_history(&args.history_store, tray);
         for warning in &args.startup_warnings {
             if let Err(error) =
                 tray.show_error_with_title("Captastic configuration recovered", warning.clone())
@@ -1142,6 +1143,13 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                     }
                 }
                 if let Some(worker) = workers.file_output() {
+                    if worker.took_write() {
+                        // The first capture is what makes the history entries usable; after that
+                        // this is a cheap no-op against a flag the tray already holds.
+                        if let Some(tray) = tray.as_ref() {
+                            refresh_tray_history(&args.history_store, tray);
+                        }
+                    }
                     while let Some(failure) = worker.try_recv_failure() {
                         if let Some(tray) = tray.as_ref() {
                             let message = format!(
@@ -1231,6 +1239,19 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                 }
                             }
                             captastic_windows::TrayEvent::OpenLogs => open_logs_from_tray(),
+                            captastic_windows::TrayEvent::OpenLastCapture => {
+                                open_last_capture_from_tray(&args.history_store, tray);
+                            }
+                            captastic_windows::TrayEvent::ShowInFolder => {
+                                show_last_capture_in_folder(&args.history_store, tray);
+                            }
+                            captastic_windows::TrayEvent::PruneHistory => {
+                                prune_history_from_tray(
+                                    &args.history_store,
+                                    args.history_retention,
+                                    tray,
+                                );
+                            }
                             captastic_windows::TrayEvent::ToggleStartup => {
                                 toggle_startup_from_tray(tray)
                             }
@@ -1324,6 +1345,126 @@ fn open_config_from_tray(store: &captastic_config::UiStateStore) -> Result<(), S
             .map_err(|error| format!("failed to open configuration: {error}")),
         Ok(path) => Err(format!("configuration does not exist: {}", path.display())),
         Err(error) => Err(format!("failed to prepare the configuration: {error}")),
+    }
+}
+
+/// Opens the most recent capture, or explains why it cannot.
+#[cfg(windows)]
+fn open_last_capture_from_tray(
+    store: &captastic_config::HistoryStore,
+    tray: &captastic_windows::TrayIcon,
+) {
+    match latest_capture(store) {
+        Ok(Some(path)) => {
+            if let Err(error) = captastic_windows::open_path(&path) {
+                notify_history_problem(
+                    tray,
+                    format!("Captastic could not open the capture: {error}"),
+                );
+            }
+        }
+        Ok(None) => notify_history_problem(
+            tray,
+            "Captastic has no remembered capture to open. It may have been moved or deleted."
+                .to_owned(),
+        ),
+        Err(error) => notify_history_problem(
+            tray,
+            format!("Captastic could not read its capture history: {error}"),
+        ),
+    }
+}
+
+/// Reveals the most recent capture in the file manager.
+///
+/// Opens the containing directory rather than selecting the file: `open_path` hands the path to
+/// the shell, and a directory is the one thing that reliably means "show me where this lives".
+#[cfg(windows)]
+fn show_last_capture_in_folder(
+    store: &captastic_config::HistoryStore,
+    tray: &captastic_windows::TrayIcon,
+) {
+    match latest_capture(store) {
+        Ok(Some(path)) => {
+            let Some(directory) = path.parent() else {
+                notify_history_problem(tray, "The remembered capture has no folder.".to_owned());
+                return;
+            };
+            if let Err(error) = captastic_windows::open_path(directory) {
+                notify_history_problem(
+                    tray,
+                    format!("Captastic could not open the folder: {error}"),
+                );
+            }
+        }
+        Ok(None) => notify_history_problem(
+            tray,
+            "Captastic has no remembered capture to show. It may have been moved or deleted."
+                .to_owned(),
+        ),
+        Err(error) => notify_history_problem(
+            tray,
+            format!("Captastic could not read its capture history: {error}"),
+        ),
+    }
+}
+
+/// Applies retention now, rather than waiting for the next capture to do it.
+#[cfg(windows)]
+fn prune_history_from_tray(
+    store: &captastic_config::HistoryStore,
+    retention: captastic_config::RetentionPolicy,
+    tray: &captastic_windows::TrayIcon,
+) {
+    match store.prune(retention, std::time::SystemTime::now()) {
+        Ok(dropped) => {
+            log::info!(
+                "capture history pruned; {} entr(ies) forgotten",
+                dropped.len()
+            );
+            refresh_tray_history(store, tray);
+        }
+        Err(error) => notify_history_problem(
+            tray,
+            format!("Captastic could not prune its capture history: {error}"),
+        ),
+    }
+}
+
+/// The newest remembered capture that still exists on disk.
+///
+/// A capture the user has since moved or deleted is not an answer to "open the last one", so the
+/// history is asked to forget it and the one before it is offered instead.
+#[cfg(windows)]
+fn latest_capture(
+    store: &captastic_config::HistoryStore,
+) -> Result<Option<std::path::PathBuf>, captastic_config::ConfigError> {
+    let mut history = store.load()?;
+    history.forget_missing();
+    Ok(history.most_recent().map(|entry| entry.path.clone()))
+}
+
+/// Tells the tray whether there is anything for its history entries to act on.
+#[cfg(windows)]
+fn refresh_tray_history(
+    store: &captastic_config::HistoryStore,
+    tray: &captastic_windows::TrayIcon,
+) {
+    let has_history = matches!(latest_capture(store), Ok(Some(_)));
+    if let Err(error) = tray.set_has_history(has_history) {
+        crate::logging::warn(format_args!(
+            "failed to update the notification-area history entries: {error}"
+        ));
+    }
+}
+
+#[cfg(windows)]
+fn notify_history_problem(tray: &captastic_windows::TrayIcon, message: String) {
+    crate::logging::warn(format_args!("{message}"));
+    if let Err(error) = tray.show_error_with_title("Captastic capture history", message) {
+        crate::logging::warn(format_args!(
+            "failed to surface a capture-history problem in the notification area: {error}"
+        ));
     }
 }
 

@@ -35,6 +35,7 @@ const WINDOW_NAME: PCWSTR = w!("Captastic");
 const TASKBAR_CREATED_NAME: PCWSTR = w!("TaskbarCreated");
 const TRAY_CALLBACK: u32 = WM_APP + 1;
 const TRAY_SET_STARTUP: u32 = WM_APP + 2;
+const TRAY_SET_HAS_HISTORY: u32 = WM_APP + 5;
 const TRAY_SHOW_ERROR: u32 = WM_APP + 3;
 const TRAY_ICON_ID: u32 = 1;
 const APPLICATION_ICON_RESOURCE_ID: usize = 1;
@@ -43,7 +44,10 @@ const COMMAND_PAUSE: usize = 1_002;
 const COMMAND_CONFIG: usize = 1_003;
 const COMMAND_LOGS: usize = 1_004;
 const COMMAND_STARTUP: usize = 1_005;
-const COMMAND_EXIT: usize = 1_006;
+const COMMAND_OPEN_LAST: usize = 1_006;
+const COMMAND_SHOW_IN_FOLDER: usize = 1_007;
+const COMMAND_PRUNE_HISTORY: usize = 1_008;
+const COMMAND_EXIT: usize = 1_009;
 const SESSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(4);
 const TRAY_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const TRAY_STOP_POLL: Duration = Duration::from_millis(5);
@@ -58,6 +62,12 @@ pub enum TrayEvent {
     PausedChanged(bool),
     OpenConfig,
     OpenLogs,
+    /// Open the most recently written capture.
+    OpenLastCapture,
+    /// Reveal the most recently written capture in the file manager.
+    ShowInFolder,
+    /// Apply retention now, rather than waiting for the next capture to do it.
+    PruneHistory,
     ToggleStartup,
     Exit,
 }
@@ -141,6 +151,21 @@ impl TrayIcon {
             )
         }
         .map_err(|error| native_error("update_startup_menu", error))
+    }
+
+    /// Tells the tray whether there is a remembered capture, which decides whether the history
+    /// menu entries are usable.
+    pub fn set_has_history(&self, has_history: bool) -> Result<(), CaptureError> {
+        // SAFETY: hwnd identifies the live hidden tray window owned by the tray thread.
+        unsafe {
+            PostMessageW(
+                HWND(self.hwnd),
+                TRAY_SET_HAS_HISTORY,
+                WPARAM(usize::from(has_history)),
+                LPARAM(0),
+            )
+        }
+        .map_err(|error| native_error("update_history_menu", error))
     }
 
     pub fn show_error(&self, message: impl Into<String>) -> Result<(), CaptureError> {
@@ -422,6 +447,7 @@ mod machine {
     pub(super) struct TrayModel {
         pub(super) paused: bool,
         pub(super) startup_enabled: bool,
+        pub(super) has_history: bool,
         pub(super) icon: IconState,
         pub(super) session: SessionPhase,
         /// Latched on the first exit request (menu Exit or `WM_CLOSE`). No transition consults
@@ -436,6 +462,8 @@ mod machine {
             Self {
                 paused: false,
                 startup_enabled,
+                // Nothing is known about history until the daemon reports it.
+                has_history: false,
                 icon: IconState::Absent,
                 session: SessionPhase::Idle,
                 exit_requested: false,
@@ -474,6 +502,7 @@ mod machine {
         IconContextMenu,
         Menu(TrayMenuCommand),
         StartupStateChanged(bool),
+        HistoryAvailabilityChanged(bool),
         NotificationsPosted,
         QueryEndSession,
         EndSession {
@@ -493,6 +522,9 @@ mod machine {
         Pause,
         OpenConfig,
         OpenLogs,
+        OpenLastCapture,
+        ShowInFolder,
+        PruneHistory,
         ToggleStartup,
         Exit,
     }
@@ -514,6 +546,9 @@ mod machine {
         ShowMenu {
             paused: bool,
             startup_enabled: bool,
+            /// Whether there is a remembered capture to open, which decides whether the history
+            /// entries are usable or greyed.
+            has_history: bool,
         },
         /// Drain the queued notifications into balloons.
         DrainNotifications,
@@ -583,6 +618,7 @@ mod machine {
                 vec![TrayEffect::ShowMenu {
                     paused: model.paused,
                     startup_enabled: model.startup_enabled,
+                    has_history: model.has_history,
                 }],
                 Handled,
             ),
@@ -609,6 +645,18 @@ mod machine {
             TrayInput::Menu(TrayMenuCommand::OpenLogs) => {
                 (vec![TrayEffect::SendEvent(TrayEvent::OpenLogs)], Handled)
             }
+            TrayInput::Menu(TrayMenuCommand::OpenLastCapture) => (
+                vec![TrayEffect::SendEvent(TrayEvent::OpenLastCapture)],
+                Handled,
+            ),
+            TrayInput::Menu(TrayMenuCommand::ShowInFolder) => (
+                vec![TrayEffect::SendEvent(TrayEvent::ShowInFolder)],
+                Handled,
+            ),
+            TrayInput::Menu(TrayMenuCommand::PruneHistory) => (
+                vec![TrayEffect::SendEvent(TrayEvent::PruneHistory)],
+                Handled,
+            ),
             TrayInput::Menu(TrayMenuCommand::ToggleStartup) => (
                 vec![TrayEffect::SendEvent(TrayEvent::ToggleStartup)],
                 Handled,
@@ -619,6 +667,11 @@ mod machine {
             }
             TrayInput::StartupStateChanged(enabled) => {
                 model.startup_enabled = enabled;
+                (Vec::new(), Handled)
+            }
+            TrayInput::HistoryAvailabilityChanged(has_history) => {
+                // Only read when the menu is next opened, so there is nothing to redraw.
+                model.has_history = has_history;
                 (Vec::new(), Handled)
             }
             TrayInput::NotificationsPosted => {
@@ -776,6 +829,15 @@ fn translate_tray_message(
                 TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::OpenConfig))
             }
             COMMAND_LOGS => TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::OpenLogs)),
+            COMMAND_OPEN_LAST => {
+                TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::OpenLastCapture))
+            }
+            COMMAND_SHOW_IN_FOLDER => {
+                TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::ShowInFolder))
+            }
+            COMMAND_PRUNE_HISTORY => {
+                TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::PruneHistory))
+            }
             COMMAND_STARTUP => {
                 TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::ToggleStartup))
             }
@@ -783,6 +845,9 @@ fn translate_tray_message(
             _ => TranslatedMessage::Consumed,
         },
         TRAY_SET_STARTUP => TranslatedMessage::Input(TrayInput::StartupStateChanged(wparam.0 != 0)),
+        TRAY_SET_HAS_HISTORY => {
+            TranslatedMessage::Input(TrayInput::HistoryAvailabilityChanged(wparam.0 != 0))
+        }
         TRAY_SHOW_ERROR => TranslatedMessage::Input(TrayInput::NotificationsPosted),
         WM_QUERYENDSESSION => TranslatedMessage::Input(TrayInput::QueryEndSession),
         WM_ENDSESSION => TranslatedMessage::Input(TrayInput::EndSession {
@@ -849,8 +914,9 @@ fn apply_tray_effect(hwnd: HWND, state_pointer: *mut TrayState, effect: machine:
         TrayEffect::ShowMenu {
             paused,
             startup_enabled,
+            has_history,
         } => {
-            if let Err(error) = show_context_menu(hwnd, paused, startup_enabled) {
+            if let Err(error) = show_context_menu(hwnd, paused, startup_enabled, has_history) {
                 log::warn!("failed to show tray menu: {error}");
             }
         }
@@ -1070,7 +1136,12 @@ fn tray_data(
     data
 }
 
-fn show_context_menu(hwnd: HWND, paused: bool, startup_enabled: bool) -> Result<(), CaptureError> {
+fn show_context_menu(
+    hwnd: HWND,
+    paused: bool,
+    startup_enabled: bool,
+    has_history: bool,
+) -> Result<(), CaptureError> {
     // SAFETY: Creates an empty popup menu owned by this function.
     let menu =
         unsafe { CreatePopupMenu() }.map_err(|error| native_error("create_tray_menu", error))?;
@@ -1096,6 +1167,43 @@ fn show_context_menu(hwnd: HWND, paused: bool, startup_enabled: bool) -> Result<
         // SAFETY: menu and static labels are live for each call.
         unsafe { AppendMenuW(menu, MF_STRING, COMMAND_LOGS, w!("Open Logs")) }
             .map_err(|error| native_error("append_logs_menu", error))?;
+        // Greyed rather than hidden when there is nothing to open: a menu whose shape changes
+        // under you is harder to use than one whose items are visibly unavailable.
+        let history_flags = if has_history {
+            MF_STRING
+        } else {
+            MF_STRING | MF_GRAYED
+        };
+        // SAFETY: menu and static labels are live for each call.
+        unsafe {
+            AppendMenuW(
+                menu,
+                history_flags,
+                COMMAND_OPEN_LAST,
+                w!("Open Last Capture"),
+            )
+        }
+        .map_err(|error| native_error("append_open_last_menu", error))?;
+        // SAFETY: menu and static labels are live for each call.
+        unsafe {
+            AppendMenuW(
+                menu,
+                history_flags,
+                COMMAND_SHOW_IN_FOLDER,
+                w!("Show in Folder"),
+            )
+        }
+        .map_err(|error| native_error("append_show_in_folder_menu", error))?;
+        // SAFETY: menu and static labels are live for each call.
+        unsafe {
+            AppendMenuW(
+                menu,
+                history_flags,
+                COMMAND_PRUNE_HISTORY,
+                w!("Prune Capture History"),
+            )
+        }
+        .map_err(|error| native_error("append_prune_history_menu", error))?;
         let startup_flags = if startup_enabled {
             MF_STRING | MF_CHECKED
         } else {
@@ -1642,6 +1750,52 @@ mod tests {
     }
 
     #[test]
+    fn history_commands_reach_the_daemon_as_events() {
+        let mut model = TrayModel::new(false);
+        for (command, expected) in [
+            (TrayMenuCommand::OpenLastCapture, TrayEvent::OpenLastCapture),
+            (TrayMenuCommand::ShowInFolder, TrayEvent::ShowInFolder),
+            (TrayMenuCommand::PruneHistory, TrayEvent::PruneHistory),
+        ] {
+            let (effects, handled) = transition(&mut model, TrayInput::Menu(command));
+            assert_eq!(handled, MessageDisposition::Handled);
+            assert_eq!(effects, vec![TrayEffect::SendEvent(expected)]);
+        }
+    }
+
+    #[test]
+    fn the_menu_learns_whether_there_is_a_capture_to_open() {
+        // The entries are greyed until the daemon says otherwise, so a fresh install does not
+        // offer to open something that does not exist.
+        let mut model = TrayModel::new(false);
+        let (effects, _) = transition(&mut model, TrayInput::IconContextMenu);
+        assert_eq!(
+            effects,
+            vec![TrayEffect::ShowMenu {
+                paused: false,
+                startup_enabled: false,
+                has_history: false,
+            }]
+        );
+
+        // Learning about history redraws nothing: the menu reads it when it next opens.
+        let (effects, handled) =
+            transition(&mut model, TrayInput::HistoryAvailabilityChanged(true));
+        assert_eq!(handled, MessageDisposition::Handled);
+        assert!(effects.is_empty());
+
+        let (effects, _) = transition(&mut model, TrayInput::IconContextMenu);
+        assert_eq!(
+            effects,
+            vec![TrayEffect::ShowMenu {
+                paused: false,
+                startup_enabled: false,
+                has_history: true,
+            }]
+        );
+    }
+
+    #[test]
     fn menu_snapshots_track_state_mutated_while_the_menu_was_open() {
         let mut model = TrayModel::new(true);
         let (effects, _) = transition(&mut model, TrayInput::IconContextMenu);
@@ -1650,6 +1804,7 @@ mod tests {
             vec![TrayEffect::ShowMenu {
                 paused: false,
                 startup_enabled: true,
+                has_history: false,
             }]
         );
 
@@ -1658,12 +1813,14 @@ mod tests {
         // out, and the next menu reflects them.
         let _ = transition(&mut model, TrayInput::Menu(TrayMenuCommand::Pause));
         let _ = transition(&mut model, TrayInput::StartupStateChanged(false));
+        let _ = transition(&mut model, TrayInput::HistoryAvailabilityChanged(true));
         let (effects, _) = transition(&mut model, TrayInput::IconContextMenu);
         assert_eq!(
             effects,
             vec![TrayEffect::ShowMenu {
                 paused: true,
                 startup_enabled: false,
+                has_history: true,
             }]
         );
     }

@@ -26,6 +26,9 @@ const MAX_COLLISION_ATTEMPTS: u32 = 100;
 pub struct FileOutputWorker {
     sender: Option<mpsc::SyncSender<OutputJob>>,
     failure_receiver: mpsc::Receiver<FileOutputFailure>,
+    /// Announces successful writes so the daemon can enable the history menu entries. Bounded and
+    /// lossy on purpose: it carries "there is at least one capture now", not a record of each.
+    written_receiver: mpsc::Receiver<()>,
     stop_requested: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
     directory: PathBuf,
@@ -68,6 +71,7 @@ impl FileOutputWorker {
         })?;
         let (sender, receiver) = mpsc::sync_channel::<OutputJob>(queue_capacity);
         let (failure_sender, failure_receiver) = mpsc::sync_channel(queue_capacity);
+        let (written_sender, written_receiver) = mpsc::sync_channel(1);
         let stop_requested = Arc::new(AtomicBool::new(false));
         let worker_stop_requested = stop_requested.clone();
         let worker_directory = directory.clone();
@@ -88,6 +92,9 @@ impl FileOutputWorker {
                     Ok(report) => {
                         report_written(&job, &report, json_output);
                         worker_history.record(&job, &report);
+                        // A full channel means the daemon has not drained the previous signal
+                        // yet, which already says what this one would.
+                        let _ = written_sender.try_send(());
                     }
                     Err(error) => {
                         crate::logging::error(format_args!(
@@ -119,6 +126,7 @@ impl FileOutputWorker {
         Ok(Self {
             sender: Some(sender),
             failure_receiver,
+            written_receiver,
             stop_requested,
             join: Some(join),
             directory,
@@ -142,6 +150,11 @@ impl FileOutputWorker {
 
     pub fn try_recv_failure(&self) -> Option<FileOutputFailure> {
         self.failure_receiver.try_recv().ok()
+    }
+
+    /// Whether a capture has been written since this was last asked.
+    pub fn took_write(&self) -> bool {
+        self.written_receiver.try_recv().is_ok()
     }
 
     pub fn stop_before(mut self, deadline: Instant) -> Vec<FileOutputFailure> {
