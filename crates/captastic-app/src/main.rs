@@ -523,6 +523,32 @@ fn write_one_shot_file_output(
     recorder.record(capture_id, PerfEventKind::EncodeFinished, encode_ns);
     recorder.record(capture_id, PerfEventKind::FileWriteStarted, 0);
     recorder.record(capture_id, PerfEventKind::FileWriteFinished, write_ns);
+    // One-shot captures join the same history the daemon writes, so "Open Last Capture" means
+    // the last capture rather than the last one the daemon happened to take.
+    let policy = config.history.retention();
+    if policy.max_items > 0 {
+        let entry = captastic_config::HistoryEntry {
+            path: path.clone(),
+            captured_at_micros: captastic_config::HistoryEntry::micros_since_epoch(
+                std::time::SystemTime::now(),
+            ),
+            bytes: bytes as u64,
+            width: frame.width,
+            height: frame.height,
+            display: frame.metadata.display_id.0.clone(),
+            mode: "full_display".to_owned(),
+        };
+        if let Err(error) = captastic_config::HistoryStore::for_default_storage().record(
+            entry,
+            policy,
+            std::time::SystemTime::now(),
+        ) {
+            // The capture is already on disk; losing the note is the smaller harm.
+            crate::logging::warn(format_args!(
+                "capture was written but could not be recorded in history: {error}"
+            ));
+        }
+    }
     Ok(Some(json!({
         "path": path.display().to_string(),
         "bytes": bytes,

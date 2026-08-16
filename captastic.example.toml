@@ -61,6 +61,14 @@ queue_capacity = 2
 # never place a capture outside the directory above.
 filename_template = "captastic-{timestamp}"
 
+[history]
+# How many recent captures to remember, so they can be reopened later. Zero turns history off.
+max_items = 50
+# Forget captures older than this many days. Zero means age is not a reason to forget.
+max_age_days = 30
+# Forget the oldest once remembered captures exceed this many bytes. Zero disables the limit.
+max_total_bytes = 0
+
 [metrics]
 enabled = true
 ring_capacity = 10000

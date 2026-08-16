@@ -13,10 +13,8 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{ErrorKind, Write};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::thread;
-use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -28,16 +26,6 @@ use crate::{
 
 pub const STATE_FILE_NAME: &str = "state.toml";
 pub const STATE_SCHEMA_VERSION: u32 = 1;
-
-/// How long a writer waits for another process to finish its read-modify-write cycle.
-///
-/// Generous relative to the work being serialized (a few kilobytes of TOML and one atomic
-/// replace), because the alternative to waiting is losing the update.
-const LOCK_TIMEOUT: Duration = Duration::from_millis(2_000);
-/// How long a lock file may sit untouched before it is assumed to belong to a process that died
-/// holding it. Well above `LOCK_TIMEOUT`, so a merely slow writer is never robbed of its lock.
-const LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
-const LOCK_RETRY_DELAY: Duration = Duration::from_millis(5);
 
 /// Everything Captastic remembers between runs.
 ///
@@ -310,7 +298,7 @@ impl UiStateStore {
                 source,
             })?;
         }
-        let _lock = StateLock::acquire(path)?;
+        let _lock = crate::fsio::FileLock::acquire(path)?;
         let mut state = match read_state(path)? {
             Some(state) => state,
             None => self.migrated_state(),
@@ -389,114 +377,11 @@ fn write_state(path: &Path, state: &UiState) -> Result<(), ConfigError> {
     })
 }
 
-/// A cross-process advisory lock over one state file.
-struct StateLock {
-    path: PathBuf,
-}
-
-impl StateLock {
-    fn acquire(state_path: &Path) -> Result<Self, ConfigError> {
-        let path = lock_path(state_path);
-        let deadline = Instant::now() + LOCK_TIMEOUT;
-        loop {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut file) => {
-                    // Contents are diagnostic only; the file's existence is the lock.
-                    let _ = writeln!(file, "{}", std::process::id());
-                    return Ok(Self { path });
-                }
-                // `AlreadyExists` is the ordinary "somebody has it". `PermissionDenied` means the
-                // same thing on Windows, where a lock file that has been deleted but still has an
-                // open handle sits in a delete-pending state: the name is taken, and creating it
-                // fails with ACCESS_DENIED rather than ALREADY_EXISTS until the last handle
-                // closes. Treating that as a hard error made every release a chance to fail the
-                // next acquire.
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        ErrorKind::AlreadyExists | ErrorKind::PermissionDenied
-                    ) =>
-                {
-                    if break_stale_lock(&path) {
-                        continue;
-                    }
-                    if Instant::now() >= deadline {
-                        return Err(ConfigError::Write {
-                            path: path.display().to_string(),
-                            // Carries the cause: a genuine permission problem times out exactly
-                            // the way contention does, and the two need telling apart.
-                            source: std::io::Error::new(
-                                ErrorKind::TimedOut,
-                                format!(
-                                    "could not take the UI state lock within {} ms (last attempt: {error})",
-                                    LOCK_TIMEOUT.as_millis(),
-                                ),
-                            ),
-                        });
-                    }
-                    thread::sleep(LOCK_RETRY_DELAY);
-                }
-                Err(source) => {
-                    return Err(ConfigError::Write {
-                        path: path.display().to_string(),
-                        source,
-                    })
-                }
-            }
-        }
-    }
-}
-
-impl Drop for StateLock {
-    fn drop(&mut self) {
-        // A failure here leaves a lock that the staleness check will clear.
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-fn lock_path(state_path: &Path) -> PathBuf {
-    let mut name = state_path
-        .file_name()
-        .map(std::ffi::OsString::from)
-        .unwrap_or_else(|| std::ffi::OsString::from(STATE_FILE_NAME));
-    name.push(".lock");
-    state_path
-        .parent()
-        .map_or_else(|| PathBuf::from(&name), |parent| parent.join(&name))
-}
-
-/// Removes a lock whose holder has plainly gone away, reporting whether it did.
-///
-/// A process killed mid-write would otherwise lock its own state file out permanently. The window
-/// is deliberately far longer than any legitimate hold, so a slow writer keeps its lock; two
-/// processes both deciding a lock is stale is harmless, because whichever loses the subsequent
-/// `create_new` simply goes back to waiting.
-fn break_stale_lock(path: &Path) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
-        // Already gone: the holder released it between our open and this check.
-        return true;
-    };
-    let held_for = metadata
-        .modified()
-        .ok()
-        .and_then(|modified| modified.elapsed().ok());
-    if held_for.is_some_and(|elapsed| elapsed > LOCK_STALE_AFTER) {
-        log::warn!(
-            "clearing a UI state lock held for more than {} s at {}; its owner probably exited without releasing it",
-            LOCK_STALE_AFTER.as_secs(),
-            path.display()
-        );
-        return fs::remove_file(path).is_ok();
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
+    use std::thread;
+    use std::time::Duration;
+
     use super::*;
     use crate::CONFIG_FILE_NAME;
 
@@ -657,19 +542,23 @@ mod tests {
     fn a_stale_lock_is_broken_rather_than_blocking_forever() {
         let directory = TestDirectory::new("stale-lock");
         let state_path = directory.join(STATE_FILE_NAME);
-        let lock = lock_path(&state_path);
+        let lock = crate::fsio::lock_path(&state_path);
         fs::write(&lock, "99999\n").expect("plant a lock");
 
         // Fresh: the lock stands, and a writer gives up rather than stealing it.
-        assert!(!break_stale_lock(&lock));
+        assert!(!crate::fsio::break_stale_lock(&lock));
         let error = UiStateStore::at(&state_path)
             .save_display_overlay_center("display-1", 0.5, 0.5)
             .expect_err("a held lock blocks the write");
-        assert!(error.to_string().contains("UI state lock"), "{error}");
+        assert!(
+            error.to_string().contains("could not take the lock"),
+            "{error}"
+        );
         assert!(lock.exists());
 
         // Backdated past the staleness window: the abandoned lock is cleared and the write lands.
-        let stale = std::time::SystemTime::now() - LOCK_STALE_AFTER - Duration::from_secs(60);
+        let stale =
+            std::time::SystemTime::now() - crate::fsio::LOCK_STALE_AFTER - Duration::from_secs(60);
         set_modified(&lock, stale);
         UiStateStore::at(&state_path)
             .save_display_overlay_center("display-1", 0.5, 0.5)
@@ -697,7 +586,7 @@ mod tests {
         assert!(store
             .save_display_overlay_center("display-1", 0.5, 0.5)
             .is_err());
-        assert!(!lock_path(&state_path).exists());
+        assert!(!crate::fsio::lock_path(&state_path).exists());
     }
 
     #[test]
