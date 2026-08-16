@@ -137,6 +137,11 @@ pub struct OverlaySelection {
     pub rect: Rect,
     pub kind: SelectionKind,
     pub window: Option<NativeWindowHandle>,
+    /// The captured window's title, for naming the capture after it. Set by whichever application
+    /// owns the window, so every consumer treats it as untrusted text.
+    pub window_title: Option<String>,
+    /// The file stem of the executable owning the captured window, where it could be read.
+    pub window_application: Option<String>,
     pub selection_ns: u64,
     pub preparation_ns: u64,
     pub window_overview_ns: Option<u64>,
@@ -1274,10 +1279,17 @@ fn build_overlay_selection(
         state.live_window_thumbnails.len(),
         state.window_thumbnails.len(),
     );
+    // Resolved here rather than after the overlay closes: the window is certainly alive at the
+    // moment it is confirmed, and may not be by the time the capture is delivered.
+    let (window_title, window_application) = window
+        .map(|handle| super::overlay::window_enumeration::describe_window(HWND(handle.raw())))
+        .unwrap_or((None, None));
     OverlaySelection {
         rect,
         kind,
         window,
+        window_title,
+        window_application,
         selection_ns: duration_ns(state.started.elapsed()),
         preparation_ns: state.preparation_ns,
         window_overview_ns: state.window_overview_ns,

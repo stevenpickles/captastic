@@ -859,6 +859,17 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         .clipboard
         .then(|| crate::clipboard::ClipboardWorker::start(args.json, args.clipboard_queue_capacity))
         .transpose()?;
+    // Clipboard first so it keeps its place in the logs when file output joins it.
+    let destinations: Vec<crate::output::ChannelSink> = clipboard_worker
+        .as_ref()
+        .map(crate::clipboard::ClipboardWorker::sink)
+        .into_iter()
+        .chain(
+            file_output_worker
+                .as_ref()
+                .map(crate::file_output::FileOutputWorker::sink),
+        )
+        .collect();
     let (command_sender, command_receiver) = mpsc::sync_channel(args.trigger_queue_capacity);
     // Both workers can be forced to abandon work the user asked for; the main thread owns the
     // notification area, so notices travel to it on their own bounded channel rather than through
@@ -870,12 +881,14 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         .selection
         .then(|| {
             crate::selection::SelectionWorker::start(
-                // No `.expect` here any more: the worker accepts the absence of a destination, so
-                // the configuration validator's `selection requires clipboard` rule no longer
-                // needs restating as a runtime assertion that could outlive it.
-                clipboard_worker
-                    .as_ref()
-                    .map(|worker| Box::new(worker.sink()) as Box<dyn crate::output::OutputSink>),
+                // Every destination, so a capture confirmed in the overlay reaches the same
+                // places a direct one does. No `.expect` here any more either: an empty list is a
+                // thing the type can say, and the configuration validator already rejects a
+                // selection with nowhere to send its result.
+                destinations
+                    .iter()
+                    .map(|sink| Box::new(sink.clone()) as Box<dyn crate::output::OutputSink>)
+                    .collect(),
                 command_sender.clone(),
                 notice_sender.clone(),
                 args.json,
@@ -888,17 +901,6 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let selection_sender = selection_worker
         .as_ref()
         .map(crate::selection::SelectionWorker::submitter);
-    // Clipboard first so it keeps its place in the logs when file output joins it.
-    let destinations: Vec<crate::output::ChannelSink> = clipboard_worker
-        .as_ref()
-        .map(crate::clipboard::ClipboardWorker::sink)
-        .into_iter()
-        .chain(
-            file_output_worker
-                .as_ref()
-                .map(crate::file_output::FileOutputWorker::sink),
-        )
-        .collect();
     let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
     let (done_sender, done_receiver) = mpsc::sync_channel::<Result<(), AppError>>(1);
     let capture_stop_requested = Arc::new(AtomicBool::new(false));
@@ -2218,6 +2220,10 @@ fn dispatch_destinations(
             chord,
             cpu_ready_offset_ns,
             source,
+            // A direct capture has no window behind it; the selection worker supplies these for
+            // captures confirmed in the overlay.
+            window_title: None,
+            window_application: None,
             // Cloned per destination: the frame is reference-counted, and the recorder forks so
             // each destination writes its own trace of the same capture.
             frame: frame.clone(),

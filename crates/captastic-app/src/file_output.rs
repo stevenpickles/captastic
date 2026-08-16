@@ -415,11 +415,8 @@ fn capture_stem(template: &str, job: &OutputJob) -> String {
             mode: job.action.as_str(),
             width: job.frame.width,
             height: job.frame.height,
-            // Not yet plumbed: the overlay knows the captured window's title and owner, but the
-            // selection does not carry them out. The template grammar accepts both tokens today
-            // so the vocabulary is stable; they expand to nothing until that plumbing lands.
-            application: None,
-            title: None,
+            application: job.window_application.as_deref(),
+            title: job.window_title.as_deref(),
         },
     )
 }

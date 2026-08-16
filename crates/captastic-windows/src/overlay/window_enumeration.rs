@@ -248,6 +248,49 @@ fn is_cloaked_window(hwnd: HWND) -> bool {
         && cloaked != 0
 }
 
+/// The title and owning application of a window, for naming a capture after it.
+///
+/// Both are best-effort. A title can be empty, and a process can refuse to name itself — an
+/// elevated one will, and Captastic is not elevated. Neither is worth failing a capture over, so
+/// both are `Option` and the filename template treats an absent value as empty.
+pub(crate) fn describe_window(hwnd: HWND) -> (Option<String>, Option<String>) {
+    (window_text(hwnd), window_application(hwnd))
+}
+
+/// The file stem of the executable owning `hwnd` — "Firefox" rather than a full path.
+fn window_application(hwnd: HWND) -> Option<String> {
+    let mut process_id = 0_u32;
+    // SAFETY: process_id is writable storage; the call only reads the window's owning ids.
+    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
+    if thread_id == 0 || process_id == 0 {
+        return None;
+    }
+    // SAFETY: Requests the narrowest right that can name a process. Fails for anything running at
+    // a higher integrity level, which is expected and handled as "unknown".
+    let process =
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }.ok()?;
+    let mut buffer = [0_u16; 260];
+    let mut length = buffer.len() as u32;
+    // SAFETY: buffer and length are writable storage sized for each other, and process is a live
+    // handle closed immediately below.
+    let queried = unsafe {
+        QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut length,
+        )
+    };
+    // SAFETY: Balances the OpenProcess above; the handle is not used afterwards.
+    let _ = unsafe { CloseHandle(process) };
+    queried.ok()?;
+    let path = String::from_utf16_lossy(&buffer[..length as usize]);
+    std::path::Path::new(&path)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .filter(|stem| !stem.is_empty())
+}
+
 fn window_text(hwnd: HWND) -> Option<String> {
     // SAFETY: Reads the current title length without retaining the enumerated handle.
     let length = unsafe { GetWindowTextLengthW(hwnd) };
