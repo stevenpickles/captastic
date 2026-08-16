@@ -70,16 +70,23 @@ pub struct FrameMetadata {
     pub pool_slot: Option<u16>,
 }
 
+/// A frame of pixels whose layout has been validated against its buffer.
+///
+/// The layout-bearing fields are private, and that is the whole of what `CpuFrame` guarantees:
+/// `pixels` really does hold `stride_bytes * height` bytes, `stride_bytes` really is wide enough
+/// for `width` pixels of `format`. Every consumer that indexes into `pixels` relies on all three
+/// agreeing, and while they were public the validation in [`CpuFrame::new`] described the frame at
+/// the moment it was built rather than the frame in hand.
 #[derive(Clone, Debug)]
 pub struct CpuFrame {
-    pub pixels: Arc<[u8]>,
-    pub width: u32,
-    pub height: u32,
-    pub stride_bytes: u32,
-    pub format: PixelFormat,
+    pixels: Arc<[u8]>,
+    width: u32,
+    height: u32,
+    stride_bytes: u32,
+    format: PixelFormat,
     pub origin: FrameOrigin,
     pub color_space: ColorSpace,
-    pub alpha: FrameAlpha,
+    alpha: FrameAlpha,
     pub metadata: FrameMetadata,
 }
 
@@ -113,6 +120,42 @@ impl CpuFrame {
     pub fn with_alpha(mut self, alpha: FrameAlpha) -> Self {
         self.alpha = alpha;
         self
+    }
+
+    /// The validated pixel buffer.
+    ///
+    /// Read it with `stride_bytes`, never with `width * 4`: a frame may carry row padding, and
+    /// not every format is four bytes per pixel.
+    pub fn pixels(&self) -> &[u8] {
+        &self.pixels
+    }
+
+    /// The same buffer as a handle that can be cloned without copying it.
+    ///
+    /// Separate from [`CpuFrame::pixels`] because sharing a frame and reading one are different
+    /// intentions, and only the first has any reason to name `Arc`.
+    pub fn pixels_shared(&self) -> &Arc<[u8]> {
+        &self.pixels
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn stride_bytes(&self) -> u32 {
+        self.stride_bytes
+    }
+
+    pub fn format(&self) -> PixelFormat {
+        self.format
+    }
+
+    pub fn alpha(&self) -> FrameAlpha {
+        self.alpha
     }
 
     pub fn required_bytes(&self) -> usize {

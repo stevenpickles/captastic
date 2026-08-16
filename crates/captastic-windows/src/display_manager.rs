@@ -382,10 +382,10 @@ fn copy_frame_into(
     destination: &mut [u8],
     destination_stride: usize,
 ) -> Result<(), CaptureError> {
-    if frame.format != PixelFormat::Bgra8Unorm
+    if frame.format() != PixelFormat::Bgra8Unorm
         || frame.origin != FrameOrigin::TopLeft
-        || frame.width != frame.metadata.source_rect.width
-        || frame.height != frame.metadata.source_rect.height
+        || frame.width() != frame.metadata.source_rect.width
+        || frame.height() != frame.metadata.source_rect.height
     {
         return Err(manager_error(
             CaptureErrorKind::InvalidFrame,
@@ -420,10 +420,10 @@ fn copy_frame_into(
         )
     })?;
     let frame_right = local_x
-        .checked_add(frame.width as usize)
+        .checked_add(frame.width() as usize)
         .filter(|right| *right <= bounds.width as usize);
     let frame_bottom = local_y
-        .checked_add(frame.height as usize)
+        .checked_add(frame.height() as usize)
         .filter(|bottom| *bottom <= bounds.height as usize);
     if frame_right.is_none() || frame_bottom.is_none() {
         return Err(manager_error(
@@ -433,9 +433,9 @@ fn copy_frame_into(
             true,
         ));
     }
-    let row_bytes = frame.width as usize * 4;
-    for row in 0..frame.height as usize {
-        let source_start = row * frame.stride_bytes as usize;
+    let row_bytes = frame.width() as usize * 4;
+    for row in 0..frame.height() as usize {
+        let source_start = row * frame.stride_bytes() as usize;
         let destination_start = (local_y + row) * destination_stride + local_x * 4;
         let destination_end = destination_start.checked_add(row_bytes).ok_or_else(|| {
             manager_error(
@@ -454,7 +454,7 @@ fn copy_frame_into(
             ));
         }
         destination[destination_start..destination_end]
-            .copy_from_slice(&frame.pixels[source_start..source_start + row_bytes]);
+            .copy_from_slice(&frame.pixels()[source_start..source_start + row_bytes]);
     }
     Ok(())
 }
@@ -694,8 +694,8 @@ mod tests {
     }
 
     fn pixel(frame: &CpuFrame, x: u32, y: u32) -> [u8; 4] {
-        let start = y as usize * frame.stride_bytes as usize + x as usize * 4;
-        frame.pixels[start..start + 4].try_into().unwrap()
+        let start = y as usize * frame.stride_bytes() as usize + x as usize * 4;
+        frame.pixels()[start..start + 4].try_into().unwrap()
     }
 
     #[test]
@@ -812,7 +812,7 @@ mod tests {
             &mut pool,
         )
         .unwrap();
-        assert_eq!((frame.width, frame.height), (6, 3));
+        assert_eq!((frame.width(), frame.height()), (6, 3));
         assert_eq!(frame.metadata.source_rect, bounds);
         assert_eq!(pixel(&frame, 0, 1), [1, 1, 1, 0xff]);
         assert_eq!(pixel(&frame, 3, 0), [2, 2, 2, 0xff]);
@@ -870,7 +870,7 @@ mod tests {
         let mut pool = CompositeBufferPool::new(1);
         let composite =
             compose_virtual_desktop(&[frame], portrait.bounds, &request(), &mut pool).unwrap();
-        assert_eq!((composite.width, composite.height), (2, 3));
+        assert_eq!((composite.width(), composite.height()), (2, 3));
         assert_eq!(composite.metadata.rotation_degrees, 0);
         assert_eq!(composite.metadata.source_rect, portrait.bounds);
     }
@@ -899,7 +899,7 @@ mod tests {
             height: 1,
         };
         let cropped = composite.crop(selection).unwrap();
-        assert_eq!((cropped.width, cropped.height), (2, 1));
+        assert_eq!((cropped.width(), cropped.height()), (2, 1));
         assert_eq!(cropped.metadata.source_rect, selection);
         assert_eq!(pixel(&cropped, 0, 0), [4, 4, 4, 0xff]);
     }
@@ -987,7 +987,7 @@ mod tests {
             &mut pool,
         )
         .unwrap();
-        assert_eq!((new.width, new.height), (3, 2));
+        assert_eq!((new.width(), new.height()), (3, 2));
         assert_eq!(new.metadata.source_rect, changed.bounds);
     }
 

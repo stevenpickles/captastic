@@ -519,11 +519,11 @@ fn log_published_window_frame(handle: isize, capture: &CapturedWindow, thumbnail
         "window handle=0x{handle:X} published a {kind} frame from {backend}: {width}x{height} at ({x},{y}), {alpha:?} alpha, corner radius {radius:.1}px, {copies} copies",
         kind = if thumbnail { "thumbnail" } else { "full-size" },
         backend = metadata.backend,
-        width = capture.frame.width,
-        height = capture.frame.height,
+        width = capture.frame.width(),
+        height = capture.frame.height(),
         x = metadata.source_rect.x,
         y = metadata.source_rect.y,
-        alpha = capture.frame.alpha,
+        alpha = capture.frame.alpha(),
         radius = capture.corner_radius_px,
         copies = metadata.copy_count,
     );
@@ -2533,7 +2533,10 @@ mod tests {
             },
         )
         .expect("display selection should be materialized");
-        assert!(Arc::ptr_eq(&desktop.pixels, &selected.pixels));
+        assert!(Arc::ptr_eq(
+            desktop.pixels_shared(),
+            selected.pixels_shared()
+        ));
         assert_eq!(desktop.metadata.source_rect, selected.metadata.source_rect);
     }
 
@@ -2586,10 +2589,13 @@ mod tests {
             },
         )
         .expect("previewed window frame should be materialized without another native render");
-        assert!(Arc::ptr_eq(&preview.pixels, &selected.pixels));
         assert!(Arc::ptr_eq(
-            &preview.pixels,
-            &captured_window_frame(&OverlaySelection {
+            preview.pixels_shared(),
+            selected.pixels_shared()
+        ));
+        assert!(Arc::ptr_eq(
+            preview.pixels_shared(),
+            captured_window_frame(&OverlaySelection {
                 rect: preview.metadata.source_rect,
                 kind: SelectionKind::Window,
                 window: None,
@@ -2605,7 +2611,7 @@ mod tests {
                 window_frame: Some(preview.clone()),
             })
             .expect("window confirmation should expose its native frame")
-            .pixels
+            .pixels_shared()
         ));
     }
 
@@ -2628,8 +2634,11 @@ mod tests {
         let outer = rect_from_native(bounds).expect("valid bounds");
         let geometry = window_geometry(hwnd, outer);
         let border = geometry.border_thickness;
-        assert_eq!(captured.frame.width, geometry.content.width + border * 2);
-        assert_eq!(captured.frame.height, geometry.content.height + border * 2);
+        assert_eq!(captured.frame.width(), geometry.content.width + border * 2);
+        assert_eq!(
+            captured.frame.height(),
+            geometry.content.height + border * 2
+        );
         assert_eq!(
             (
                 captured.frame.metadata.source_rect.x,
@@ -2694,8 +2703,8 @@ mod tests {
         .expect("Windows Graphics Capture");
 
         assert_eq!(
-            (printed.frame.width, printed.frame.height),
-            (captured.frame.width, captured.frame.height),
+            (printed.frame.width(), printed.frame.height()),
+            (captured.frame.width(), captured.frame.height()),
             "the backends cropped the window to different sizes"
         );
         assert_eq!(
@@ -2705,7 +2714,7 @@ mod tests {
         assert_eq!(printed.corner_radius_px, captured.corner_radius_px);
         // The visible DWM frame is exactly what both are expected to have published.
         assert_eq!(
-            (printed.frame.width, printed.frame.height),
+            (printed.frame.width(), printed.frame.height()),
             (geometry.frame.width, geometry.frame.height)
         );
         assert_eq!(
@@ -2718,15 +2727,15 @@ mod tests {
 
         let translucent = |frame: &CpuFrame| {
             frame
-                .pixels
+                .pixels()
                 .chunks_exact(4)
                 .filter(|pixel| (1..255).contains(&pixel[3]))
                 .count()
         };
         println!(
             "published {}x{} at ({},{}) from both backends; partially transparent pixels: PrintWindow {}, WGC {}",
-            printed.frame.width,
-            printed.frame.height,
+            printed.frame.width(),
+            printed.frame.height(),
             printed.frame.metadata.source_rect.x,
             printed.frame.metadata.source_rect.y,
             translucent(&printed.frame),
@@ -2889,14 +2898,15 @@ mod tests {
 
         let translucent = captured
             .frame
-            .pixels
+            .pixels()
             .chunks_exact(4)
             .filter(|pixel| (PROBE_ALPHA - 16..=PROBE_ALPHA + 16).contains(&pixel[3]))
             .count();
-        let total = (captured.frame.width * captured.frame.height) as usize;
+        let total = (captured.frame.width() * captured.frame.height()) as usize;
         println!(
             "probe published {}x{}: {translucent}/{total} pixels at ~{PROBE_ALPHA} alpha",
-            captured.frame.width, captured.frame.height,
+            captured.frame.width(),
+            captured.frame.height(),
         );
         assert!(
             translucent * 2 > total,
@@ -2904,13 +2914,13 @@ mod tests {
         );
         // The colour must survive unpremultiplication rather than staying at the premultiplied
         // value it arrived as.
-        let centre = ((captured.frame.height / 2) * captured.frame.width + captured.frame.width / 2)
-            as usize
+        let centre = ((captured.frame.height() / 2) * captured.frame.width()
+            + captured.frame.width() / 2) as usize
             * 4;
         assert!(
-            captured.frame.pixels[centre + 2] > 240,
+            captured.frame.pixels()[centre + 2] > 240,
             "the probe's red channel came back at {} instead of ~255",
-            captured.frame.pixels[centre + 2]
+            captured.frame.pixels()[centre + 2]
         );
     }
 

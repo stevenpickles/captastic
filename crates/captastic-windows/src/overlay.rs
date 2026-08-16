@@ -1799,9 +1799,9 @@ fn update_window_preview(state: &mut OverlayState, target: Option<NativeWindowHa
     // refreshes Unavailable, and no other overlay state is touched either way.
     state.window_preview = match capture_window_visual(handle, &state.reference_metadata) {
         Ok(capture) => match FrozenSurface::from_straight_alpha(
-            capture.frame.width,
-            capture.frame.height,
-            &capture.frame.pixels,
+            capture.frame.width(),
+            capture.frame.height(),
+            capture.frame.pixels(),
         ) {
             Ok(surface) => Some(WindowPreviewState::Ready(Box::new(WindowPreview {
                 handle,
@@ -2071,9 +2071,9 @@ fn render_overview_batch(hwnd: HWND, state: &mut OverlayState, generation: usize
             }
         };
         let Ok(surface) = FrozenSurface::from_straight_alpha(
-            capture.frame.width,
-            capture.frame.height,
-            &capture.frame.pixels,
+            capture.frame.width(),
+            capture.frame.height(),
+            capture.frame.pixels(),
         ) else {
             continue;
         };
@@ -3171,28 +3171,28 @@ fn update_cursor(handle: Option<ResizeHandle>, region_cursor: &RegionCursor) {
 
 fn tight_pixels(frame: &CpuFrame) -> Result<Arc<[u8]>, CaptureError> {
     let tight_stride = frame
-        .width
+        .width()
         .checked_mul(4)
         .ok_or_else(|| invalid_frame("overlay row size overflowed"))?
         as usize;
-    if frame.stride_bytes as usize == tight_stride {
-        return Ok(frame.pixels.clone());
+    if frame.stride_bytes() as usize == tight_stride {
+        return Ok(frame.pixels_shared().clone());
     }
     let length = tight_stride
-        .checked_mul(frame.height as usize)
+        .checked_mul(frame.height() as usize)
         .ok_or_else(|| invalid_frame("overlay image size overflowed"))?;
     let mut pixels = vec![0_u8; length];
-    for row in 0..frame.height as usize {
-        let source_start = row * frame.stride_bytes as usize;
+    for row in 0..frame.height() as usize {
+        let source_start = row * frame.stride_bytes() as usize;
         let destination_start = row * tight_stride;
         pixels[destination_start..destination_start + tight_stride]
-            .copy_from_slice(&frame.pixels[source_start..source_start + tight_stride]);
+            .copy_from_slice(&frame.pixels()[source_start..source_start + tight_stride]);
     }
     Ok(Arc::from(pixels))
 }
 
 fn validate_frame(frame: &CpuFrame) -> Result<(), CaptureError> {
-    if frame.format != PixelFormat::Bgra8Unorm || frame.origin != FrameOrigin::TopLeft {
+    if frame.format() != PixelFormat::Bgra8Unorm || frame.origin != FrameOrigin::TopLeft {
         return Err(CaptureError {
             kind: CaptureErrorKind::Unsupported,
             backend: "windows-overlay",
@@ -3202,8 +3202,8 @@ fn validate_frame(frame: &CpuFrame) -> Result<(), CaptureError> {
             native_code: None,
         });
     }
-    if frame.width != frame.metadata.source_rect.width
-        || frame.height != frame.metadata.source_rect.height
+    if frame.width() != frame.metadata.source_rect.width
+        || frame.height() != frame.metadata.source_rect.height
     {
         return Err(invalid_frame(
             "overlay frame dimensions do not match source bounds",

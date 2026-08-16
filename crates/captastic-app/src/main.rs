@@ -535,8 +535,8 @@ fn write_one_shot_file_output(
                 std::time::SystemTime::now(),
             ),
             bytes: bytes as u64,
-            width: frame.width,
-            height: frame.height,
+            width: frame.width(),
+            height: frame.height(),
             display: frame.metadata.display_id.0.clone(),
             mode: "full_display".to_owned(),
         };
