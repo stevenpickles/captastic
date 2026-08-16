@@ -2874,6 +2874,113 @@ mod tests {
         );
     }
 
+    /// Measures what opening the window chooser costs, split between the two mechanisms.
+    ///
+    /// The frozen inventory renders every window through PrintWindow or WGC and scales it; the
+    /// live previews ask DWM to composite surfaces it already holds. Both currently run when live
+    /// previews are enabled, and this is the number that says whether that matters.
+    ///
+    /// CAPTASTIC_TEST_WINDOW_HANDLES=1234,5678 cargo test --locked -p captastic-windows --release
+    ///     -- --ignored --nocapture window_overview_frozen_versus_live_preview_cost
+    #[test]
+    #[ignore = "requires CAPTASTIC_TEST_WINDOW_HANDLES listing live interactive windows"]
+    fn window_overview_frozen_versus_live_preview_cost() {
+        use crate::dwm_thumbnail::DwmThumbnail;
+        use std::time::Instant;
+
+        // The chooser's own budget, so the numbers describe what it actually does.
+        const THUMBNAIL_MAX_PIXELS: u64 = 1_200_000;
+
+        // SAFETY: Changes DPI virtualization only for this short-lived integration-test thread.
+        let _ = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        let handles: Vec<isize> = std::env::var("CAPTASTIC_TEST_WINDOW_HANDLES")
+            .expect("set CAPTASTIC_TEST_WINDOW_HANDLES")
+            .split(',')
+            .filter_map(|raw| raw.trim().parse::<isize>().ok())
+            .collect();
+        assert!(!handles.is_empty(), "no window handles supplied");
+        let metadata = test_desktop().metadata;
+        // A hidden destination for the DWM registrations; nothing is ever shown on screen.
+        let destination = TranslucentTestWindow::show(16, 16, 255).expect("destination window");
+
+        let mut frozen_total = Duration::ZERO;
+        let mut live_total = Duration::ZERO;
+        let mut frozen_failures = 0_usize;
+        let mut live_failures = 0_usize;
+
+        println!(
+            "{:>12}  {:>12}  {:>12}  window",
+            "frozen (ms)", "live (ms)", "ratio"
+        );
+        for raw in &handles {
+            let handle = NativeWindowHandle::from_raw(*raw);
+
+            // The frozen inventory: a real native render, scaled to the chooser's budget.
+            let started = Instant::now();
+            let frozen = capture_window_thumbnail(handle, &metadata, THUMBNAIL_MAX_PIXELS);
+            let frozen_elapsed = started.elapsed();
+
+            // The live preview: register with DWM, ask for the source size, place it. This is
+            // every per-window call the chooser makes on that path.
+            let started = Instant::now();
+            let live = DwmThumbnail::register(destination.hwnd, HWND(*raw)).and_then(|thumbnail| {
+                let size = thumbnail.source_size()?;
+                thumbnail.show(
+                    RECT {
+                        left: 0,
+                        top: 0,
+                        right: 160,
+                        bottom: 90,
+                    },
+                    255,
+                )?;
+                Ok(size)
+            });
+            let live_elapsed = started.elapsed();
+
+            if frozen.is_err() {
+                frozen_failures += 1;
+            }
+            if live.is_err() {
+                live_failures += 1;
+            }
+            frozen_total += frozen_elapsed;
+            live_total += live_elapsed;
+
+            let frozen_ms = frozen_elapsed.as_secs_f64() * 1000.0;
+            let live_ms = live_elapsed.as_secs_f64() * 1000.0;
+            println!(
+                "{frozen_ms:>12.2}  {live_ms:>12.2}  {:>12}  0x{raw:X}{}{}",
+                if live_ms > 0.0 {
+                    format!("{:.0}x", frozen_ms / live_ms)
+                } else {
+                    "-".to_owned()
+                },
+                if frozen.is_err() {
+                    " [frozen failed]"
+                } else {
+                    ""
+                },
+                if live.is_err() { " [live failed]" } else { "" },
+            );
+        }
+
+        println!(
+            "
+{} window(s): frozen inventory {:.1} ms total ({} failed), live previews {:.1} ms total ({} failed)",
+            handles.len(),
+            frozen_total.as_secs_f64() * 1000.0,
+            frozen_failures,
+            live_total.as_secs_f64() * 1000.0,
+            live_failures,
+        );
+        println!(
+            "opening the chooser in live mode currently pays both: {:.1} ms, of which {:.1} ms is the frozen render that the DWM previews draw over",
+            (frozen_total + live_total).as_secs_f64() * 1000.0,
+            frozen_total.as_secs_f64() * 1000.0,
+        );
+    }
+
     fn test_desktop() -> CpuFrame {
         let metadata = FrameMetadata {
             capture_id: CaptureId(1),
