@@ -212,10 +212,17 @@ capture critical path.
 
 ## Milestone 5 — Capture quality and resilience
 
-**Status:** Pre-work under way (issue #19). The detach budget is done: timed-out capture and
-window-render workers are counted against documented per-kind ceilings and the policy is ADR 0005,
-so the handle and memory accounting the soak-test criteria depend on is now explicit. The core
-pixel-format contract still needs extending before HDR work begins.
+**Status:** Pre-work complete (issue #19); the milestone proper is not started. Timed-out capture
+and window-render workers are counted against documented per-kind ceilings under ADR 0005, so the
+handle and memory accounting the soak criteria depend on is explicit. The core pixel-format
+contract covers 16-bit float and scRGB, and every sink refuses them by name rather than
+misinterpreting their bytes — so the exit criterion that HDR input is never silently clipped is
+already met for the destinations, and the remaining work is detecting HDR sources and deciding what
+tone mapping should do. `FakeBackend` honours the freshness contract the recovery tests depend on.
+
+The first exit criterion to plan around is the soak. It is the one that needs a machine left alone
+for a long time rather than a design decision, and the detach ledger is what makes its result
+readable.
 
 **Outcome:** Captastic handles the remaining pixel formats and Windows lifecycle transitions with
 explicit, tested behavior.
@@ -404,15 +411,16 @@ alongside the overlay extraction and Milestone 4. The order below reflects what 
 
 ## Recommended next branch
 
-Milestone 5's remaining pre-work (issue #19). Two of its items are done — FakeBackend now honours
-the freshness contract it was ignoring, and the detach budget is documented and counted — leaving
-the pixel-format contract extension for 16f/scRGB, property-based coverage of the coordinate and
-rotation transforms, and two folded-in review findings.
+Milestone 5's lifecycle-recovery and soak work, now that its pre-work (issue #19) is complete.
+Display hot-plug, sleep/wake, lock/unlock and GPU reset are the tests most likely to find something,
+because they exercise the recovery paths that shipped with the least live verification — and they
+are testable on this machine, unlike the multi-adapter work and unlike HDR tone mapping, which needs
+an HDR display to judge rather than merely to compile.
 
-FakeBackend fidelity keeps its leverage beyond this milestone and is worth extending further as
-gaps appear: much of Milestone 4 shipped with daemon-side behaviour verified only by unit tests,
-because a second daemon cannot start while one holds the session control event, and a fake backend
-that honestly reproduces the real contract is what would close that gap for everything after it.
+FakeBackend fidelity keeps its leverage beyond this milestone and is worth extending as gaps appear:
+much of Milestone 4 shipped with daemon-side behaviour verified only by unit tests, because a second
+daemon cannot start while one holds the session control event, and a fake backend that honestly
+reproduces the real contract is what would close that gap for everything after it.
 
 Milestone 1's remaining work is the higher priority by roadmap order, but it is gated on hardware
 rather than effort: multi-adapter composition cannot be honestly validated on a single-adapter,
