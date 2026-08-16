@@ -105,6 +105,16 @@ pub enum DisplayTopologyError {
         display_id: String,
         rotation_degrees: u16,
     },
+    /// The offending value is carried as text rather than as an `f32`.
+    ///
+    /// NaN is the value this variant most often reports, and it is the one value that compares
+    /// unequal to itself — an error holding it could never be matched against an expected error,
+    /// which is the one thing a caller wants to do with it.
+    #[error("display {display_id} has an unusable scale factor {scale_factor}")]
+    InvalidScaleFactor {
+        display_id: String,
+        scale_factor: String,
+    },
 }
 
 /// An immutable view of attached displays used to resolve one capture action.
@@ -135,6 +145,20 @@ impl DisplayTopology {
                 return Err(DisplayTopologyError::UnsupportedRotation {
                     display_id: display.id.0.clone(),
                     rotation_degrees: display.rotation_degrees,
+                });
+            }
+            // A topology is compared against its successor to decide whether anything changed, and
+            // NaN compares unequal to itself — so one NaN scale factor makes every topology differ
+            // from the one before it, including from itself, and the daemon sees a display change
+            // that never happened. Zero is the other unusable value: it is what a DPI query that
+            // succeeds while reporting nothing produces, and everything downstream divides by it.
+            //
+            // There is no upper bound here on purpose. Any finite positive factor is arithmetically
+            // sound, and a ceiling invented today is a legitimate future display rejected later.
+            if !display.scale_factor.is_finite() || display.scale_factor <= 0.0 {
+                return Err(DisplayTopologyError::InvalidScaleFactor {
+                    display_id: display.id.0.clone(),
+                    scale_factor: display.scale_factor.to_string(),
                 });
             }
         }
@@ -388,5 +412,320 @@ mod tests {
                 rotation_degrees: 45,
             })
         );
+    }
+
+    #[test]
+    fn a_nan_scale_factor_makes_a_topology_differ_from_itself_and_is_rejected() {
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let mut unusable = display("only", bounds, 0, true);
+        unusable.scale_factor = f32::NAN;
+
+        // The hazard, before the rejection that exists because of it: topology change detection
+        // compares the new topology against the old one, and this display is not equal to itself.
+        // A daemon holding it would rebuild on every comparison, having observed no change at all.
+        assert_ne!(unusable, unusable.clone());
+
+        assert_eq!(
+            DisplayTopology::new(1, vec![unusable]),
+            Err(DisplayTopologyError::InvalidScaleFactor {
+                display_id: "only".to_owned(),
+                scale_factor: "NaN".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn scale_factors_are_accepted_when_finite_and_positive() {
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let topology_with = |scale_factor: f32| {
+            let mut only = display("only", bounds, 0, true);
+            only.scale_factor = scale_factor;
+            DisplayTopology::new(1, vec![only])
+        };
+
+        // Zero is what a DPI query that succeeds while reporting nothing produces, and everything
+        // downstream divides by it.
+        for rejected in [0.0, -1.0, f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            assert!(
+                topology_with(rejected).is_err(),
+                "scale factor {rejected} should be rejected"
+            );
+        }
+        // No upper bound is imposed, so an unfamiliar high-DPI display is described rather than
+        // refused. Every one of these is arithmetically sound.
+        for accepted in [1.0, 1.25, 2.0, 3.5, 0.5, f32::MIN_POSITIVE, 1e30] {
+            assert!(
+                topology_with(accepted).is_ok(),
+                "scale factor {accepted} should be accepted"
+            );
+        }
+    }
+
+    /// Properties of the desktop-coordinate algebra.
+    ///
+    /// The example tests above pin the layouts Captastic is actually run against. These cover the
+    /// part those cannot: that the algebra holds for arbitrary layouts, and in particular that it
+    /// holds left and above the origin. Every secondary display placed to the left of or above the
+    /// primary has negative coordinates, so the negative half-plane is not an edge case here — it
+    /// is half of every real virtual desktop, and Milestone 1 asks for it to survive every crop
+    /// and overlay operation.
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Coordinates spanning both sides of the origin, sized like real desktops rather than
+        /// like the integer types. A `Rect` at `i32::MIN` spanning `u32::MAX` is representable and
+        /// no display can produce one; generating those would only measure how the arithmetic
+        /// saturates, which is not what any of these properties are about.
+        fn any_rect() -> impl Strategy<Value = Rect> {
+            (
+                -20_000i32..=20_000,
+                -20_000i32..=20_000,
+                1u32..=20_000,
+                1u32..=20_000,
+            )
+                .prop_map(|(x, y, width, height)| Rect {
+                    x,
+                    y,
+                    width,
+                    height,
+                })
+        }
+
+        fn any_point() -> impl Strategy<Value = (i32, i32)> {
+            (-20_000i32..=20_000, -20_000i32..=20_000)
+        }
+
+        fn displays_from(bounds: Vec<Rect>) -> Vec<DisplayInfo> {
+            bounds
+                .into_iter()
+                .enumerate()
+                .map(|(index, bounds)| DisplayInfo {
+                    id: DisplayId(format!("display-{index}")),
+                    name: format!("display-{index}"),
+                    bounds,
+                    scale_factor: 1.0,
+                    rotation_degrees: 0,
+                    is_primary: index == 0,
+                })
+                .collect()
+        }
+
+        fn topology_of(displays: Vec<DisplayInfo>) -> DisplayTopology {
+            DisplayTopology::new(1, displays)
+                .expect("generated displays satisfy every topology invariant")
+        }
+
+        fn topology_from(bounds: Vec<Rect>) -> DisplayTopology {
+            topology_of(displays_from(bounds))
+        }
+
+        fn any_display_bounds() -> impl Strategy<Value = Vec<Rect>> {
+            prop::collection::vec(any_rect(), 1..=5)
+        }
+
+        proptest! {
+            /// Overlap is a property of a pair of rectangles, not of the order they arrive in.
+            #[test]
+            fn intersection_is_commutative(left in any_rect(), right in any_rect()) {
+                prop_assert_eq!(left.intersection(right), right.intersection(left));
+            }
+
+            /// `contains` and `intersection` are written independently — one compares a point
+            /// against four edges, the other clamps four edges against four edges — and every
+            /// hit test in the overlay depends on them agreeing.
+            #[test]
+            fn a_point_lies_in_the_intersection_exactly_when_it_lies_in_both(
+                left in any_rect(),
+                right in any_rect(),
+                (x, y) in any_point(),
+            ) {
+                let in_both = left.contains(x, y) && right.contains(x, y);
+                let in_intersection = left
+                    .intersection(right)
+                    .is_some_and(|intersection| intersection.contains(x, y));
+                prop_assert_eq!(in_both, in_intersection);
+            }
+
+            /// An empty overlap has to be reported as `None` rather than as a zero-area rectangle,
+            /// because `largest_intersection` ranks by area and a zero-area candidate would make a
+            /// display that the selection does not touch eligible to win a tie.
+            #[test]
+            fn an_intersection_is_never_empty(left in any_rect(), right in any_rect()) {
+                if let Some(intersection) = left.intersection(right) {
+                    prop_assert!(intersection.width > 0 && intersection.height > 0);
+                    prop_assert!(intersection.area() <= left.area().min(right.area()));
+                }
+            }
+
+            /// The virtual desktop is exactly the bounding box of its displays: no display sticks
+            /// out of it, and it is no larger than it has to be. Computed here by min/max against
+            /// the implementation's successive-union fold.
+            #[test]
+            fn virtual_bounds_is_the_exact_bounding_box(bounds in any_display_bounds()) {
+                let topology = topology_from(bounds.clone());
+                let virtual_bounds = topology.virtual_bounds().expect("a non-empty topology");
+
+                let left = bounds.iter().map(|rect| i64::from(rect.x)).min().expect("non-empty");
+                let top = bounds.iter().map(|rect| i64::from(rect.y)).min().expect("non-empty");
+                let right = bounds.iter().map(|rect| rect.right()).max().expect("non-empty");
+                let bottom = bounds.iter().map(|rect| rect.bottom()).max().expect("non-empty");
+
+                prop_assert_eq!(i64::from(virtual_bounds.x), left);
+                prop_assert_eq!(i64::from(virtual_bounds.y), top);
+                prop_assert_eq!(virtual_bounds.right(), right);
+                prop_assert_eq!(virtual_bounds.bottom(), bottom);
+                for rect in &bounds {
+                    prop_assert!(virtual_bounds.intersection(*rect) == Some(*rect));
+                }
+            }
+
+            /// Enumeration order is the display driver's business. Two daemons that enumerated the
+            /// same displays in different orders must resolve a selection to the same display, or
+            /// the same region captures different pixels on different runs — which is what the
+            /// documented ID tie-break exists to prevent.
+            #[test]
+            fn display_resolution_does_not_depend_on_enumeration_order(
+                bounds in any_display_bounds(),
+                selection in any_rect(),
+                (x, y) in any_point(),
+            ) {
+                // Reordering the displays, not the identities: a display carries its ID with it,
+                // and the tie-break is on the ID rather than on the position. Reversing the bounds
+                // under fixed IDs would be a different topology, not the same one enumerated
+                // differently - which is how the first draft of this test failed.
+                let displays = displays_from(bounds);
+                let forwards = topology_of(displays.clone());
+                let backwards = topology_of(displays.into_iter().rev().collect());
+
+                prop_assert_eq!(
+                    forwards.largest_intersection(selection).map(|display| display.bounds),
+                    backwards.largest_intersection(selection).map(|display| display.bounds)
+                );
+                prop_assert_eq!(
+                    forwards.containing_point(x, y).map(|display| display.bounds),
+                    backwards.containing_point(x, y).map(|display| display.bounds)
+                );
+            }
+
+            /// Whatever `largest_intersection` returns, no other display overlaps the selection by
+            /// more; and it returns nothing only when nothing overlaps at all.
+            #[test]
+            fn largest_intersection_wins_on_area(
+                bounds in any_display_bounds(),
+                selection in any_rect(),
+            ) {
+                let topology = topology_from(bounds.clone());
+                let best = topology.largest_intersection(selection);
+                let areas = bounds
+                    .iter()
+                    .filter_map(|rect| rect.intersection(selection).map(|overlap| overlap.area()));
+
+                match best {
+                    None => prop_assert_eq!(areas.count(), 0),
+                    Some(display) => {
+                        let winning_area = display
+                            .bounds
+                            .intersection(selection)
+                            .expect("the winner overlaps the selection")
+                            .area();
+                        prop_assert_eq!(areas.max(), Some(winning_area));
+                    }
+                }
+            }
+
+            /// Two displays placed edge to edge — the ordinary dual-monitor layout — divide the
+            /// pixels between them exactly. A point in both is a pixel column captured twice; a
+            /// point in neither is a column no display owns. `contains` is half-open for precisely
+            /// this reason, and the convention is invisible to any test of one rectangle alone:
+            /// checking `contains` against `intersection` cannot see it either, since a shifted
+            /// convention shifts both of them together.
+            #[test]
+            fn edge_adjacent_displays_claim_every_pixel_exactly_once(
+                left in any_rect(),
+                neighbour_width in 1u32..=20_000,
+                offset_from_seam in -2i64..=2,
+                row in 0u32..=3,
+            ) {
+                let neighbour = Rect {
+                    x: i32::try_from(left.right()).expect("generated bounds stay inside i32"),
+                    y: left.y,
+                    width: neighbour_width,
+                    height: left.height,
+                };
+                // Sampled at the seam rather than uniformly. A random point in this coordinate
+                // range lands on the shared edge about once in forty thousand tries, so a uniform
+                // point tests the interiors of two rectangles and never the boundary between them
+                // — which is the only place the half-open convention is observable.
+                let x = i32::try_from(i64::from(neighbour.x) + offset_from_seam)
+                    .expect("the seam and its neighbourhood stay inside i32");
+                let y = left
+                    .y
+                    .saturating_add(i32::try_from(row.min(left.height - 1)).expect("a small row"));
+
+                prop_assert!(
+                    !(left.contains(x, y) && neighbour.contains(x, y)),
+                    "({},{}) belongs to two displays at once", x, y
+                );
+                let inside_the_pair = i64::from(x) >= i64::from(left.x)
+                    && i64::from(x) < neighbour.right()
+                    && i64::from(y) >= i64::from(left.y)
+                    && i64::from(y) < left.bottom();
+                prop_assert_eq!(
+                    inside_the_pair,
+                    left.contains(x, y) || neighbour.contains(x, y),
+                    "({},{}) belongs to neither display", x, y
+                );
+            }
+
+            /// The case the ID tie-break exists for, which random layouts almost never produce:
+            /// two candidates of exactly equal area. Two displays sharing one set of bounds tie
+            /// against every selection by construction, so this is the only test here that
+            /// actually reaches the tie-break, and it pins which way it goes rather than only
+            /// that it is consistent.
+            #[test]
+            fn an_exact_tie_resolves_to_the_lowest_id_in_any_order(
+                bounds in any_rect(),
+                selection in any_rect(),
+            ) {
+                let displays = displays_from(vec![bounds, bounds]);
+                let forwards = topology_of(displays.clone());
+                let backwards = topology_of(displays.into_iter().rev().collect());
+
+                let expected = bounds
+                    .intersection(selection)
+                    .map(|_| DisplayId("display-0".to_owned()));
+                prop_assert_eq!(
+                    forwards.largest_intersection(selection).map(|display| display.id.clone()),
+                    expected.clone()
+                );
+                prop_assert_eq!(
+                    backwards.largest_intersection(selection).map(|display| display.id.clone()),
+                    expected
+                );
+            }
+
+            /// Every display can be found by its own identifier, whatever the layout.
+            #[test]
+            fn every_display_resolves_by_its_own_id(bounds in any_display_bounds()) {
+                let topology = topology_from(bounds);
+                for display in topology.displays() {
+                    prop_assert_eq!(
+                        topology.resolve(&display.id).map(|found| &found.id),
+                        Some(&display.id)
+                    );
+                }
+            }
+        }
     }
 }

@@ -2553,4 +2553,152 @@ mod tests {
             assert_eq!(normalized_region, cropped, "rotation {rotation}");
         }
     }
+
+    /// Properties of rotation normalization and of the region mapping that reads back through it.
+    ///
+    /// Both are hand-derived index arithmetic across four rotations, written in opposite
+    /// directions: one moves pixels from the rotated texture into the upright frame, the other
+    /// moves a rectangle from the upright frame back into the rotated texture. The example tests
+    /// above check one 3x2 and one 4x3 frame with one selection each, which is exactly the size
+    /// where an off-by-one in a `- 1 -` term can hide.
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn any_rotation() -> impl Strategy<Value = u16> {
+            prop::sample::select(vec![0u16, 90, 180, 270])
+        }
+
+        /// The rotation that undoes `rotation`.
+        fn inverse_of(rotation: u16) -> u16 {
+            (360 - rotation) % 360
+        }
+
+        fn normalize(
+            raw: &[u8],
+            width: u32,
+            height: u32,
+            stride: usize,
+            rotation: u16,
+        ) -> (Vec<u8>, PixelLayout) {
+            let layout =
+                normalized_layout(width, height, rotation).expect("generated dimensions are valid");
+            let mut normalized =
+                vec![0; frame_byte_len(layout.width, layout.height).expect("frame fits in memory")];
+            normalize_bgra_into(raw, width, height, stride, rotation, &mut normalized)
+                .expect("generated frames satisfy the normalization contract");
+            (normalized, layout)
+        }
+
+        /// Picks `start` and `length` inside `extent`, from two arbitrary seeds.
+        fn span_within(extent: u32, start_seed: u32, length_seed: u32) -> (u32, u32) {
+            let start = start_seed % extent;
+            let length = 1 + length_seed % (extent - start);
+            (start, length)
+        }
+
+        proptest! {
+            /// Rotating a frame and rotating it back returns the frame. This is the one property
+            /// here with no reference implementation to be wrong in the same way: it compares the
+            /// transform against its own inverse, so a mirrored axis or a dropped `- 1` cannot
+            /// cancel out.
+            #[test]
+            fn rotating_a_frame_back_restores_it(
+                width in 1u32..=12,
+                height in 1u32..=12,
+                padding in 0usize..=8,
+                rotation in any_rotation(),
+            ) {
+                // Row padding of a mapped DXGI texture, which normalization also has to remove.
+                let stride = width as usize * 4 + padding;
+                let raw = labeled_bgra(width, height, stride);
+
+                let (rotated, layout) = normalize(&raw, width, height, stride, rotation);
+                let (restored, restored_layout) = normalize(
+                    &rotated,
+                    layout.width,
+                    layout.height,
+                    layout.stride as usize,
+                    inverse_of(rotation),
+                );
+
+                prop_assert_eq!(restored_layout.width, width);
+                prop_assert_eq!(restored_layout.height, height);
+                // Compared against a tightly packed original: the padding is gone after the first
+                // pass, and its removal is part of what is being checked.
+                let packed = labeled_bgra(width, height, width as usize * 4);
+                prop_assert_eq!(blue_channel(&restored), blue_channel(&packed));
+            }
+
+            /// Reading one region back through the rotation must produce the same pixels as
+            /// normalizing the whole frame and cropping it. This is the promise the GPU-region
+            /// readback fast path makes: it exists to avoid normalizing pixels nobody asked for,
+            /// and it is only sound while the shortcut is invisible in the result.
+            #[test]
+            fn a_region_read_through_the_rotation_matches_cropping_the_whole_frame(
+                raw_width in 1u32..=10,
+                raw_height in 1u32..=10,
+                x_seed in 0u32..1_000,
+                y_seed in 0u32..1_000,
+                width_seed in 0u32..1_000,
+                height_seed in 0u32..1_000,
+                rotation in any_rotation(),
+            ) {
+                let raw_stride = raw_width as usize * 4;
+                let raw = labeled_bgra(raw_width, raw_height, raw_stride);
+                let (full, layout) = normalize(&raw, raw_width, raw_height, raw_stride, rotation);
+
+                let (x, width) = span_within(layout.width, x_seed, width_seed);
+                let (y, height) = span_within(layout.height, y_seed, height_seed);
+                let selection = Rect {
+                    x: x as i32,
+                    y: y as i32,
+                    width,
+                    height,
+                };
+
+                let raw_selection =
+                    raw_selection_for_rotation(selection, raw_width, raw_height, rotation)
+                        .expect("a selection inside the normalized frame maps back");
+
+                // Whatever the rotation, the region has to land inside the texture it will be
+                // copied from, and cover the same number of pixels it did upright.
+                prop_assert!(raw_selection.x >= 0 && raw_selection.y >= 0);
+                prop_assert!(raw_selection.right() <= i64::from(raw_width));
+                prop_assert!(raw_selection.bottom() <= i64::from(raw_height));
+                prop_assert_eq!(raw_selection.area(), selection.area());
+
+                // What the readback does: copy the sub-rectangle out of the rotated texture, then
+                // normalize only that.
+                let selected_stride = raw_selection.width as usize * 4;
+                let mut selected_raw = vec![0; selected_stride * raw_selection.height as usize];
+                for row in 0..raw_selection.height as usize {
+                    let source = (raw_selection.y as usize + row) * raw_stride
+                        + raw_selection.x as usize * 4;
+                    let destination = row * selected_stride;
+                    selected_raw[destination..destination + selected_stride]
+                        .copy_from_slice(&raw[source..source + selected_stride]);
+                }
+                let (region, region_layout) = normalize(
+                    &selected_raw,
+                    raw_selection.width,
+                    raw_selection.height,
+                    selected_stride,
+                    rotation,
+                );
+                prop_assert_eq!(region_layout.width, selection.width);
+                prop_assert_eq!(region_layout.height, selection.height);
+
+                // What it must equal: the same rectangle cut out of the fully normalized frame.
+                let full_stride = layout.stride as usize;
+                let crop_stride = selection.width as usize * 4;
+                let mut cropped = Vec::with_capacity(region.len());
+                for row in 0..selection.height as usize {
+                    let start = (y as usize + row) * full_stride + x as usize * 4;
+                    cropped.extend_from_slice(&full[start..start + crop_stride]);
+                }
+                prop_assert_eq!(blue_channel(&region), blue_channel(&cropped));
+            }
+        }
+    }
 }
