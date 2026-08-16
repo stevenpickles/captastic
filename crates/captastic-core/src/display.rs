@@ -105,6 +105,16 @@ pub enum DisplayTopologyError {
         display_id: String,
         rotation_degrees: u16,
     },
+    /// The offending value is carried as text rather than as an `f32`.
+    ///
+    /// NaN is the value this variant most often reports, and it is the one value that compares
+    /// unequal to itself — an error holding it could never be matched against an expected error,
+    /// which is the one thing a caller wants to do with it.
+    #[error("display {display_id} has an unusable scale factor {scale_factor}")]
+    InvalidScaleFactor {
+        display_id: String,
+        scale_factor: String,
+    },
 }
 
 /// An immutable view of attached displays used to resolve one capture action.
@@ -135,6 +145,20 @@ impl DisplayTopology {
                 return Err(DisplayTopologyError::UnsupportedRotation {
                     display_id: display.id.0.clone(),
                     rotation_degrees: display.rotation_degrees,
+                });
+            }
+            // A topology is compared against its successor to decide whether anything changed, and
+            // NaN compares unequal to itself — so one NaN scale factor makes every topology differ
+            // from the one before it, including from itself, and the daemon sees a display change
+            // that never happened. Zero is the other unusable value: it is what a DPI query that
+            // succeeds while reporting nothing produces, and everything downstream divides by it.
+            //
+            // There is no upper bound here on purpose. Any finite positive factor is arithmetically
+            // sound, and a ceiling invented today is a legitimate future display rejected later.
+            if !display.scale_factor.is_finite() || display.scale_factor <= 0.0 {
+                return Err(DisplayTopologyError::InvalidScaleFactor {
+                    display_id: display.id.0.clone(),
+                    scale_factor: display.scale_factor.to_string(),
                 });
             }
         }
@@ -388,5 +412,62 @@ mod tests {
                 rotation_degrees: 45,
             })
         );
+    }
+
+    #[test]
+    fn a_nan_scale_factor_makes_a_topology_differ_from_itself_and_is_rejected() {
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let mut unusable = display("only", bounds, 0, true);
+        unusable.scale_factor = f32::NAN;
+
+        // The hazard, before the rejection that exists because of it: topology change detection
+        // compares the new topology against the old one, and this display is not equal to itself.
+        // A daemon holding it would rebuild on every comparison, having observed no change at all.
+        assert_ne!(unusable, unusable.clone());
+
+        assert_eq!(
+            DisplayTopology::new(1, vec![unusable]),
+            Err(DisplayTopologyError::InvalidScaleFactor {
+                display_id: "only".to_owned(),
+                scale_factor: "NaN".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn scale_factors_are_accepted_when_finite_and_positive() {
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let topology_with = |scale_factor: f32| {
+            let mut only = display("only", bounds, 0, true);
+            only.scale_factor = scale_factor;
+            DisplayTopology::new(1, vec![only])
+        };
+
+        // Zero is what a DPI query that succeeds while reporting nothing produces, and everything
+        // downstream divides by it.
+        for rejected in [0.0, -1.0, f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            assert!(
+                topology_with(rejected).is_err(),
+                "scale factor {rejected} should be rejected"
+            );
+        }
+        // No upper bound is imposed, so an unfamiliar high-DPI display is described rather than
+        // refused. Every one of these is arithmetically sound.
+        for accepted in [1.0, 1.25, 2.0, 3.5, 0.5, f32::MIN_POSITIVE, 1e30] {
+            assert!(
+                topology_with(accepted).is_ok(),
+                "scale factor {accepted} should be accepted"
+            );
+        }
     }
 }
