@@ -160,31 +160,36 @@ pub(super) fn bilinear_scale_bgra(
     }
 }
 
+/// Fits a source of `source_width` x `source_height` inside `bounds`, preserving aspect.
+///
+/// Takes dimensions rather than a surface because a chooser tile drawn by DWM has no surface of
+/// its own — only the size of the window behind it.
 pub(super) fn fitted_surface_rect(
-    surface: &FrozenSurface,
+    source_width: i32,
+    source_height: i32,
     bounds: UiRect,
     allow_upscale: bool,
 ) -> UiRect {
     let available_width = (bounds.right - bounds.left).max(1);
     let available_height = (bounds.bottom - bounds.top).max(1);
-    let (mut width, mut height) = if i64::from(surface.width) * i64::from(available_height)
-        > i64::from(surface.height) * i64::from(available_width)
+    let (mut width, mut height) = if i64::from(source_width) * i64::from(available_height)
+        > i64::from(source_height) * i64::from(available_width)
     {
         (
             available_width,
-            (i64::from(surface.height) * i64::from(available_width) / i64::from(surface.width))
+            (i64::from(source_height) * i64::from(available_width) / i64::from(source_width))
                 as i32,
         )
     } else {
         (
-            (i64::from(surface.width) * i64::from(available_height) / i64::from(surface.height))
+            (i64::from(source_width) * i64::from(available_height) / i64::from(source_height))
                 as i32,
             available_height,
         )
     };
-    if !allow_upscale && surface.width <= available_width && surface.height <= available_height {
-        width = surface.width;
-        height = surface.height;
+    if !allow_upscale && source_width <= available_width && source_height <= available_height {
+        width = source_width;
+        height = source_height;
     }
     let x = bounds.left + (available_width - width) / 2;
     let y = bounds.top + (available_height - height) / 2;
@@ -197,15 +202,16 @@ pub(super) fn fitted_surface_rect(
 }
 
 pub(super) fn scaled_corner_radius(
-    surface: &FrozenSurface,
+    source_width: i32,
+    source_height: i32,
     destination: UiRect,
     source_radius: f32,
 ) -> f32 {
-    if source_radius <= 0.0 || surface.width <= 0 || surface.height <= 0 {
+    if source_radius <= 0.0 || source_width <= 0 || source_height <= 0 {
         return 0.0;
     }
-    let width_scale = (destination.right - destination.left).max(1) as f32 / surface.width as f32;
-    let height_scale = (destination.bottom - destination.top).max(1) as f32 / surface.height as f32;
+    let width_scale = (destination.right - destination.left).max(1) as f32 / source_width as f32;
+    let height_scale = (destination.bottom - destination.top).max(1) as f32 / source_height as f32;
     source_radius * width_scale.min(height_scale)
 }
 
@@ -425,7 +431,7 @@ pub(super) fn scale_premultiplied_surface(
 }
 
 pub(super) fn draw_window_surface(device: &FrozenSurface, surface: &FrozenSurface, bounds: UiRect) {
-    let destination = fitted_surface_rect(surface, bounds, true);
+    let destination = fitted_surface_rect(surface.width, surface.height, bounds, true);
     let width = (destination.right - destination.left).max(1);
     let height = (destination.bottom - destination.top).max(1);
     if width != surface.width || height != surface.height {
@@ -1077,7 +1083,8 @@ mod tests {
     fn spotlight_preserves_native_size_when_the_window_fits() {
         let surface = FrozenSurface::empty(800, 600).expect("test preview surface");
         let destination = fitted_surface_rect(
-            &surface,
+            surface.width,
+            surface.height,
             UiRect {
                 left: 0,
                 top: 0,

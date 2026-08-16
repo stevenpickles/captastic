@@ -1178,7 +1178,11 @@ fn region_is_blank(source: &[u8], source_bounds: Rect, region: Rect) -> Result<b
     Ok(true)
 }
 
-fn window_corner_radius(hwnd: HWND) -> f32 {
+/// The corner radius DWM rounds a window to, in physical source pixels.
+///
+/// Public to the crate so the chooser can shape a tile's selection outline without capturing the
+/// window: this reads DWM attributes and nothing else.
+pub(crate) fn window_corner_radius(hwnd: HWND) -> f32 {
     // Maximized windows meet the monitor edges and DWM does not round them.
     // SAFETY: hwnd is the same live top-level window validated for the capture operation.
     if unsafe { IsZoomed(hwnd) }.as_bool() {
@@ -2905,12 +2909,14 @@ mod tests {
 
         let mut frozen_total = Duration::ZERO;
         let mut live_total = Duration::ZERO;
+        let mut seed_total = Duration::ZERO;
         let mut frozen_failures = 0_usize;
         let mut live_failures = 0_usize;
+        let mut needs_render = 0_usize;
 
         println!(
-            "{:>12}  {:>12}  {:>12}  window",
-            "frozen (ms)", "live (ms)", "ratio"
+            "{:>12}  {:>12}  {:>12}  {:>12}  window",
+            "frozen (ms)", "live (ms)", "seed (ms)", "ratio"
         );
         for raw in &handles {
             let handle = NativeWindowHandle::from_raw(*raw);
@@ -2938,6 +2944,19 @@ mod tests {
             });
             let live_elapsed = started.elapsed();
 
+            // What the chooser now does per window before deciding whether to render it: ask DWM
+            // for the source size and read the corner radius, both attribute reads.
+            let started = Instant::now();
+            let seeded = DwmThumbnail::register(destination.hwnd, HWND(*raw))
+                .and_then(|thumbnail| thumbnail.source_size());
+            let radius = window_corner_radius(HWND(*raw));
+            let seed_elapsed = started.elapsed();
+            let _ = radius;
+            if seeded.is_err() {
+                needs_render += 1;
+            }
+            seed_total += seed_elapsed;
+
             if frozen.is_err() {
                 frozen_failures += 1;
             }
@@ -2950,7 +2969,8 @@ mod tests {
             let frozen_ms = frozen_elapsed.as_secs_f64() * 1000.0;
             let live_ms = live_elapsed.as_secs_f64() * 1000.0;
             println!(
-                "{frozen_ms:>12.2}  {live_ms:>12.2}  {:>12}  0x{raw:X}{}{}",
+                "{frozen_ms:>12.2}  {live_ms:>12.2}  {:>12.2}  {:>12}  0x{raw:X}{}{}",
+                seed_elapsed.as_secs_f64() * 1000.0,
                 if live_ms > 0.0 {
                     format!("{:.0}x", frozen_ms / live_ms)
                 } else {
@@ -2975,9 +2995,20 @@ mod tests {
             live_failures,
         );
         println!(
-            "opening the chooser in live mode currently pays both: {:.1} ms, of which {:.1} ms is the frozen render that the DWM previews draw over",
-            (frozen_total + live_total).as_secs_f64() * 1000.0,
+            "seeding tiles from DWM instead: {:.1} ms, with {needs_render} window(s) still needing a render",
+            seed_total.as_secs_f64() * 1000.0,
+        );
+        println!(
+            "rendering every window costs {:.1} ms; seeding and rendering only what DWM cannot draw costs {:.1} ms",
             frozen_total.as_secs_f64() * 1000.0,
+            seed_total.as_secs_f64() * 1000.0
+                + if needs_render == 0 {
+                    0.0
+                } else {
+                    // Charge the unrenderable windows at the measured average.
+                    frozen_total.as_secs_f64() * 1000.0 / handles.len() as f64
+                        * needs_render as f64
+                },
         );
     }
 
