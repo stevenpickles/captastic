@@ -1284,11 +1284,22 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let shutdown_sent = teardown.shutdown_sent;
     let hotkey_stop_error = teardown.hotkey_stop_error;
     let persistence_failures = teardown.persistence_failures;
-    for failure in teardown.file_output_failures {
-        crate::logging::warn(format_args!(
-            "shutdown retained file-output failure for capture {} in the persistent log: {}",
-            failure.capture_id.0, failure.message
-        ));
+    if let Some(file_output) = teardown.file_output {
+        for failure in file_output.failures {
+            crate::logging::warn(format_args!(
+                "shutdown retained file-output failure for capture {} in the persistent log: {}",
+                failure.capture_id.0, failure.message
+            ));
+        }
+        // Reported apart from the capture-latency lines, and shaped differently, so nobody reads
+        // an encode percentile as though it were part of what a capture cost (ADR 0002).
+        if let Some(summary) = file_output.summary {
+            if args.json {
+                println!("{}", summary.to_json());
+            } else {
+                log::info!("{}", summary.to_line());
+            }
+        }
     }
     for failure in teardown.clipboard_failures {
         crate::logging::warn(format_args!(

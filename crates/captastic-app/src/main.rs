@@ -16,6 +16,8 @@ mod logging;
 #[cfg(windows)]
 mod output;
 #[cfg(windows)]
+mod output_metrics;
+#[cfg(windows)]
 mod selection;
 #[cfg(windows)]
 mod worker_registry;

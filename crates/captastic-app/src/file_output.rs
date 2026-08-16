@@ -29,9 +29,17 @@ pub struct FileOutputWorker {
     /// Announces successful writes so the daemon can enable the history menu entries. Bounded and
     /// lossy on purpose: it carries "there is at least one capture now", not a record of each.
     written_receiver: mpsc::Receiver<()>,
+    /// Carries the run's totals back from the worker thread when it exits.
+    summary_receiver: mpsc::Receiver<crate::output_metrics::OutputMetrics>,
     stop_requested: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
     directory: PathBuf,
+}
+
+/// What the file destination has to say once it has stopped.
+pub struct FileOutputTeardown {
+    pub failures: Vec<FileOutputFailure>,
+    pub summary: Option<crate::output_metrics::OutputSummary>,
 }
 
 /// A capture that did not reach disk.
@@ -72,6 +80,7 @@ impl FileOutputWorker {
         let (sender, receiver) = mpsc::sync_channel::<OutputJob>(queue_capacity);
         let (failure_sender, failure_receiver) = mpsc::sync_channel(queue_capacity);
         let (written_sender, written_receiver) = mpsc::sync_channel(1);
+        let (summary_sender, summary_receiver) = mpsc::sync_channel(1);
         let stop_requested = Arc::new(AtomicBool::new(false));
         let worker_stop_requested = stop_requested.clone();
         let worker_directory = directory.clone();
@@ -79,54 +88,70 @@ impl FileOutputWorker {
         let worker_history = history;
         let join = thread::Builder::new()
             .name("captastic-file-output".to_owned())
-            .spawn(move || loop {
-                if worker_stop_requested.load(Ordering::Acquire) {
-                    break;
-                }
-                let mut job = match receiver.recv_timeout(WORKER_RECEIVE_POLL) {
-                    Ok(job) => job,
-                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                };
-                match write_capture(&worker_directory, &worker_template, &mut job) {
-                    Ok(report) => {
-                        report_written(&job, &report, json_output);
-                        worker_history.record(&job, &report);
-                        // A full channel means the daemon has not drained the previous signal
-                        // yet, which already says what this one would.
-                        let _ = written_sender.try_send(());
+            .spawn(move || {
+                // Owned by the worker thread so recording costs no synchronization, and handed
+                // back once at teardown rather than being polled.
+                let mut metrics = crate::output_metrics::OutputMetrics::new("file");
+                loop {
+                    if worker_stop_requested.load(Ordering::Acquire) {
+                        break;
                     }
-                    Err(error) => {
-                        crate::logging::error(format_args!(
-                            "file output {} failed without invalidating capture: {error}",
-                            job.capture_id.0
-                        ));
-                        let _ = failure_sender.try_send(FileOutputFailure {
-                            capture_id: job.capture_id,
-                            message: error.clone(),
-                        });
-                        if json_output {
-                            println!(
-                                "{}",
-                                json!({
-                                    "schema_version": 1,
-                                    "event": "file_output_failed",
-                                    "capture_id": job.capture_id,
-                                    "source": job.source,
-                                    "action": job.action,
-                                    "error": error,
-                                })
+                    let mut job = match receiver.recv_timeout(WORKER_RECEIVE_POLL) {
+                        Ok(job) => job,
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
+                    match write_capture(&worker_directory, &worker_template, &mut job) {
+                        Ok(report) => {
+                            metrics.record_write(
+                                report.bytes,
+                                report.encode_ns,
+                                report.write_ns,
+                                report.collisions,
                             );
+                            report_written(&job, &report, json_output);
+                            worker_history.record(&job, &report);
+                            // A full channel means the daemon has not drained the previous signal
+                            // yet, which already says what this one would.
+                            let _ = written_sender.try_send(());
+                        }
+                        Err(error) => {
+                            metrics.record_failure();
+                            crate::logging::error(format_args!(
+                                "file output {} failed without invalidating capture: {error}",
+                                job.capture_id.0
+                            ));
+                            let _ = failure_sender.try_send(FileOutputFailure {
+                                capture_id: job.capture_id,
+                                message: error.clone(),
+                            });
+                            if json_output {
+                                println!(
+                                    "{}",
+                                    json!({
+                                        "schema_version": 1,
+                                        "event": "file_output_failed",
+                                        "capture_id": job.capture_id,
+                                        "source": job.source,
+                                        "action": job.action,
+                                        "error": error,
+                                    })
+                                );
+                            }
                         }
                     }
+                    finish_attempt(&mut job);
                 }
-                finish_attempt(&mut job);
+                // Reported once, on the way out: a per-capture line already says what each
+                // capture cost, and this is the shape of the whole run.
+                let _ = summary_sender.try_send(metrics);
             })
             .map_err(|error| AppError::BackendUnavailable(error.to_string()))?;
         Ok(Self {
             sender: Some(sender),
             failure_receiver,
             written_receiver,
+            summary_receiver,
             stop_requested,
             join: Some(join),
             directory,
@@ -157,10 +182,20 @@ impl FileOutputWorker {
         self.written_receiver.try_recv().is_ok()
     }
 
-    pub fn stop_before(mut self, deadline: Instant) -> Vec<FileOutputFailure> {
+    pub fn stop_before(mut self, deadline: Instant) -> FileOutputTeardown {
         self.request_stop();
         self.stop_inner(deadline);
-        self.failure_receiver.try_iter().collect()
+        FileOutputTeardown {
+            failures: self.failure_receiver.try_iter().collect(),
+            // Absent when the worker was detached at its deadline rather than exiting, in which
+            // case there are no totals to report because nothing finished counting them.
+            summary: self
+                .summary_receiver
+                .try_recv()
+                .ok()
+                .filter(|metrics| !metrics.is_empty())
+                .map(|metrics| metrics.summary()),
+        }
     }
 
     pub fn request_stop(&mut self) {

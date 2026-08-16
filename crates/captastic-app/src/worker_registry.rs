@@ -44,7 +44,8 @@ pub(crate) fn guaranteed_deadline(now: Instant, deadline: Instant, minimum: Dura
 /// What a completed teardown has to report back to the daemon.
 pub(crate) struct TeardownReport {
     pub clipboard_failures: Vec<crate::clipboard::ClipboardFailure>,
-    pub file_output_failures: Vec<crate::file_output::FileOutputFailure>,
+    /// Absent when file output was not configured.
+    pub file_output: Option<crate::file_output::FileOutputTeardown>,
     pub persistence_failures: Vec<String>,
     pub hotkey_stop_error: Option<captastic_core::CaptureError>,
     /// Whether the capture worker was ever told to shut down through its command channel, which
@@ -237,13 +238,13 @@ impl WorkerRegistry {
             .map_or_else(Vec::new, |worker| worker.stop_before(deadline));
         // Last, and against the full deadline: a capture that has been encoded but not yet
         // written is the one piece of work whose loss the user would actually see.
-        let file_output_failures = self
+        let file_output = self
             .file_output
             .take()
-            .map_or_else(Vec::new, |worker| worker.stop_before(deadline));
+            .map(|worker| worker.stop_before(deadline));
         TeardownReport {
             clipboard_failures,
-            file_output_failures,
+            file_output,
             persistence_failures,
             hotkey_stop_error,
             shutdown_sent: self.capture.shutdown_sent,
