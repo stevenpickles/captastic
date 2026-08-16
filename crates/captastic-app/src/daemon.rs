@@ -66,6 +66,9 @@ struct ResolvedDaemonArgs {
     mode: CaptureMode,
     cpu_frame: bool,
     clipboard: bool,
+    file_output: bool,
+    output_directory: std::path::PathBuf,
+    output_queue_capacity: usize,
     selection: bool,
     selection_preview: PreviewMode,
     trigger_queue_capacity: usize,
@@ -153,6 +156,17 @@ fn resolve_daemon_args_with_default(
         mode,
         cpu_frame: args.cpu_frame.unwrap_or(config.capture.cpu_frame),
         clipboard: args.clipboard.unwrap_or(config.clipboard.enabled),
+        file_output: config.output.enabled,
+        output_directory: config
+            .output
+            .directory
+            .clone()
+            .or_else(captastic_config::default_output_directory)
+            .ok_or(AppError::BackendUnavailable(
+                "unable to determine a default output directory from USERPROFILE or HOME"
+                    .to_owned(),
+            ))?,
+        output_queue_capacity: config.output.queue_capacity,
         selection: args.selection.unwrap_or(config.selection.enabled),
         selection_preview: config.selection.preview,
         trigger_queue_capacity: config.daemon.trigger_queue_capacity,
@@ -192,7 +206,8 @@ struct CaptureWorkerContext {
     done: mpsc::SyncSender<Result<(), AppError>>,
     commands: mpsc::Receiver<CaptureCommand>,
     selection_sender: Option<mpsc::SyncSender<crate::selection::SelectionJob>>,
-    clipboard_sink: Option<crate::output::ChannelSink>,
+    /// Every destination a finished capture is offered to, in the order they were configured.
+    destinations: Vec<crate::output::ChannelSink>,
 }
 
 #[cfg(windows)]
@@ -214,8 +229,14 @@ fn run_capture_worker(context: CaptureWorkerContext) {
         done: done_sender,
         commands: command_receiver,
         selection_sender,
-        clipboard_sink,
+        destinations,
     } = context;
+    // Resolved once: the loop offers every capture to the same set, and building the trait-object
+    // view per capture would allocate on the path this worker exists to keep clear.
+    let destination_refs: Vec<&dyn crate::output::OutputSink> = destinations
+        .iter()
+        .map(|sink| sink as &dyn crate::output::OutputSink)
+        .collect();
     let backend = match super::create_backend(&backend_name, &display_policy) {
         Ok(backend) => backend,
         Err(error) => {
@@ -465,9 +486,7 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                             capture_id,
                             dispatch_output(
                                 selection_sender.as_ref(),
-                                clipboard_sink
-                                    .as_ref()
-                                    .map(|sink| sink as &dyn crate::output::OutputSink),
+                                &destination_refs,
                                 capture_id,
                                 trigger.received_at,
                                 trigger.source,
@@ -785,14 +804,19 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             "max-captures must be greater than zero".to_owned(),
         ));
     }
-    if args.clipboard && !args.cpu_frame {
+    // Both rules used to name the clipboard, because it was the only destination there was.
+    // Neither was ever about the clipboard specifically: one is that a destination needs pixels,
+    // and the other is that selecting a region is pointless if nothing receives the result.
+    let any_destination = args.clipboard || args.file_output;
+    if any_destination && !args.cpu_frame {
         return Err(AppError::InvalidArgument(
-            "clipboard output requires --cpu-frame true".to_owned(),
+            "output destinations require --cpu-frame true".to_owned(),
         ));
     }
-    if args.selection && !args.clipboard {
+    if args.selection && !any_destination {
         return Err(AppError::InvalidArgument(
-            "native selection currently requires --clipboard true".to_owned(),
+            "native selection requires at least one output destination (clipboard or file)"
+                .to_owned(),
         ));
     }
     if !args.selection {
@@ -807,6 +831,16 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             )));
         }
     }
+    let mut file_output_worker = args
+        .file_output
+        .then(|| {
+            crate::file_output::FileOutputWorker::start(
+                args.output_directory.clone(),
+                args.json,
+                args.output_queue_capacity,
+            )
+        })
+        .transpose()?;
     let mut clipboard_worker = args
         .clipboard
         .then(|| crate::clipboard::ClipboardWorker::start(args.json, args.clipboard_queue_capacity))
@@ -840,9 +874,17 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let selection_sender = selection_worker
         .as_ref()
         .map(crate::selection::SelectionWorker::submitter);
-    let clipboard_sink = clipboard_worker
+    // Clipboard first so it keeps its place in the logs when file output joins it.
+    let destinations: Vec<crate::output::ChannelSink> = clipboard_worker
         .as_ref()
-        .map(crate::clipboard::ClipboardWorker::sink);
+        .map(crate::clipboard::ClipboardWorker::sink)
+        .into_iter()
+        .chain(
+            file_output_worker
+                .as_ref()
+                .map(crate::file_output::FileOutputWorker::sink),
+        )
+        .collect();
     let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
     let (done_sender, done_receiver) = mpsc::sync_channel::<Result<(), AppError>>(1);
     let capture_stop_requested = Arc::new(AtomicBool::new(false));
@@ -864,7 +906,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         done: done_sender,
         commands: command_receiver,
         selection_sender,
-        clipboard_sink,
+        destinations,
     };
     let capture_join = thread::Builder::new()
         .name("captastic-capture".to_owned())
@@ -930,6 +972,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     workers
         .register_selection(selection_worker.take())
         .register_clipboard(clipboard_worker.take())
+        .register_file_output(file_output_worker.take())
         .register_hotkey(hotkey);
     let startup_enabled = match captastic_windows::startup_command() {
         Ok(command) => command.is_some(),
@@ -983,6 +1026,11 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         "clipboard_queue_capacity": args.clipboard.then_some(args.clipboard_queue_capacity),
         "selection": args.selection,
         "selection_queue_capacity": args.selection.then_some(args.selection_queue_capacity),
+        "file_output": args.file_output,
+        "output_directory": workers
+            .file_output()
+            .map(|worker| worker.directory().display().to_string()),
+        "output_queue_capacity": args.file_output.then_some(args.output_queue_capacity),
         "tray": tray.is_some(),
         "log_file": crate::logging::path().map(|path| path.display().to_string()),
     });
@@ -1006,6 +1054,9 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         );
         if let Some(path) = crate::logging::path() {
             log::info!("Persistent log: {}", path.display());
+        }
+        if let Some(worker) = workers.file_output() {
+            log::info!("Saving captures to {}", worker.directory().display());
         }
     }
 
@@ -1071,6 +1122,21 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                             if let Err(error) = tray.show_error(message) {
                                 crate::logging::warn(format_args!(
                                     "failed to surface clipboard error in the notification area: {error}"
+                                ));
+                            }
+                        }
+                    }
+                }
+                if let Some(worker) = workers.file_output() {
+                    while let Some(failure) = worker.try_recv_failure() {
+                        if let Some(tray) = tray.as_ref() {
+                            let message = format!(
+                                "Capture {} was not saved to disk. {}",
+                                failure.capture_id.0, failure.message
+                            );
+                            if let Err(error) = tray.show_error(message) {
+                                crate::logging::warn(format_args!(
+                                    "failed to surface file-output error in the notification area: {error}"
                                 ));
                             }
                         }
@@ -1183,6 +1249,12 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let shutdown_sent = teardown.shutdown_sent;
     let hotkey_stop_error = teardown.hotkey_stop_error;
     let persistence_failures = teardown.persistence_failures;
+    for failure in teardown.file_output_failures {
+        crate::logging::warn(format_args!(
+            "shutdown retained file-output failure for capture {} in the persistent log: {}",
+            failure.capture_id.0, failure.message
+        ));
+    }
     for failure in teardown.clipboard_failures {
         crate::logging::warn(format_args!(
             "shutdown retained clipboard failure for capture {} in the persistent log: {}{}",
@@ -1607,7 +1679,7 @@ fn dispatch_live_selection(
 #[allow(clippy::too_many_arguments)]
 fn dispatch_output(
     selection_sender: Option<&mpsc::SyncSender<crate::selection::SelectionJob>>,
-    clipboard_sink: Option<&dyn crate::output::OutputSink>,
+    destinations: &[&dyn crate::output::OutputSink],
     capture_id: CaptureId,
     triggered_at: Instant,
     source: &'static str,
@@ -1661,7 +1733,7 @@ fn dispatch_output(
         match repeat_region_rect(confirmed, metadata) {
             Ok(rect) => {
                 return dispatch_repeat_region(
-                    clipboard_sink,
+                    destinations,
                     capture_id,
                     triggered_at,
                     source,
@@ -1724,8 +1796,8 @@ fn dispatch_output(
         }
     }
 
-    dispatch_clipboard(
-        clipboard_sink,
+    dispatch_destinations(
+        destinations,
         capture_id,
         triggered_at,
         source,
@@ -1808,7 +1880,7 @@ fn dispatch_selection(
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 fn dispatch_repeat_region(
-    clipboard_sink: Option<&dyn crate::output::OutputSink>,
+    destinations: &[&dyn crate::output::OutputSink],
     capture_id: CaptureId,
     triggered_at: Instant,
     source: &'static str,
@@ -1881,8 +1953,8 @@ fn dispatch_repeat_region(
             })
         );
     }
-    dispatch_clipboard(
-        clipboard_sink,
+    dispatch_destinations(
+        destinations,
         capture_id,
         triggered_at,
         source,
@@ -1933,9 +2005,15 @@ fn repeat_region_rect(
 }
 
 #[cfg(windows)]
+/// Hands a finished capture to every configured destination.
+///
+/// Each destination gets its own fork of the trace, because they run concurrently and their
+/// events cannot be ordered against one another (ADR 0002). The returned status describes the
+/// attempt as a whole: delivered if any destination took it, and otherwise the reason the last
+/// one gave — a capture nobody accepted is still a valid capture, just an undelivered one.
 #[allow(clippy::too_many_arguments)]
-fn dispatch_clipboard(
-    sink: Option<&dyn crate::output::OutputSink>,
+fn dispatch_destinations(
+    sinks: &[&dyn crate::output::OutputSink],
     capture_id: CaptureId,
     triggered_at: Instant,
     source: &'static str,
@@ -1945,7 +2023,7 @@ fn dispatch_clipboard(
     frame: Option<CpuFrame>,
     mut recorder: EventRecorder,
 ) -> Result<&'static str, AppError> {
-    let Some(sink) = sink else {
+    if sinks.is_empty() {
         recorder.record(
             capture_id,
             PerfEventKind::AttemptFinished,
@@ -1953,7 +2031,7 @@ fn dispatch_clipboard(
         );
         validate_event_order(recorder.events())?;
         return Ok("disabled");
-    };
+    }
     let frame = frame.ok_or_else(|| {
         AppError::BackendUnavailable(
             "clipboard was enabled but the capture backend returned no CPU frame".to_owned(),
@@ -1964,31 +2042,50 @@ fn dispatch_clipboard(
             "clipboard was enabled but CPU readiness was not measured".to_owned(),
         )
     })?;
-    let job = crate::clipboard::ClipboardJob {
-        capture_id,
-        triggered_at,
-        action,
-        chord,
-        cpu_ready_offset_ns,
-        source,
-        frame,
-        recorder,
-    };
-    match sink.submit(job) {
-        Ok(()) => Ok("queued"),
-        Err(rejection) => {
-            // A destination that is behind or gone is not a failed capture, which is why the
-            // status is reported rather than returned as an error.
-            let status = rejection.status();
-            let destination = sink.name();
-            let capture_id = crate::clipboard::finish_rejected(*rejection.into_job())?;
-            crate::logging::warn(format_args!(
-                "{destination} {} skipped ({status}); capture remains valid",
-                capture_id.0
-            ));
-            Ok(status)
+    let mut delivered = 0_usize;
+    let mut last_rejection = None;
+    for sink in sinks {
+        let job = crate::output::OutputJob {
+            capture_id,
+            triggered_at,
+            action,
+            chord,
+            cpu_ready_offset_ns,
+            source,
+            // Cloned per destination: the frame is reference-counted, and the recorder forks so
+            // each destination writes its own trace of the same capture.
+            frame: frame.clone(),
+            recorder: recorder.clone(),
+        };
+        match sink.submit(job) {
+            Ok(()) => delivered += 1,
+            Err(rejection) => {
+                // A destination that is behind or gone is not a failed capture, which is why the
+                // status is reported rather than returned as an error — and why one destination
+                // rejecting does not stop the others being offered the same capture.
+                let status = rejection.status();
+                let destination = sink.name();
+                crate::clipboard::finish_rejected(*rejection.into_job())?;
+                crate::logging::warn(format_args!(
+                    "{destination} {} skipped ({status}); capture remains valid",
+                    capture_id.0
+                ));
+                last_rejection = Some(status);
+            }
         }
     }
+    if delivered > 0 {
+        return Ok("queued");
+    }
+    // Nothing took it. The recorder that was never handed to a destination still owes this
+    // attempt its ending.
+    recorder.record(
+        capture_id,
+        PerfEventKind::AttemptFinished,
+        duration_ns(triggered_at, Instant::now()),
+    );
+    validate_event_order(recorder.events())?;
+    Ok(last_rejection.unwrap_or("disabled"))
 }
 
 #[cfg(not(windows))]
@@ -2607,8 +2704,8 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel::<crate::clipboard::ClipboardJob>(1);
         drop(receiver);
         let sink = crate::output::ChannelSink::new("clipboard", sender);
-        let status = dispatch_clipboard(
-            Some(&sink),
+        let status = dispatch_destinations(
+            &[&sink],
             capture_id,
             triggered_at,
             "test",

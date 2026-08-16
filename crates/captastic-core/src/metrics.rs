@@ -40,12 +40,15 @@ impl PerfEventKind {
             (CaptureOrder::SelectionFirst, Self::ReadbackStarted) => 7,
             (CaptureOrder::SelectionFirst, Self::CpuFrameReady) => 8,
             (CaptureOrder::SelectionFirst, Self::CropFinished) => 9,
+            // Destinations are parallel tracks, not successive stages, so clipboard and file
+            // events share ranks rather than being ordered against each other. Ordering still
+            // holds inside a track, and every destination has its own trace (ADR 0002).
             (CaptureOrder::SelectionFirst, Self::ClipboardStarted) => 10,
             (CaptureOrder::SelectionFirst, Self::ClipboardCommitted) => 11,
-            (CaptureOrder::SelectionFirst, Self::EncodeStarted) => 12,
-            (CaptureOrder::SelectionFirst, Self::EncodeFinished) => 13,
-            (CaptureOrder::SelectionFirst, Self::FileWriteStarted) => 14,
-            (CaptureOrder::SelectionFirst, Self::FileWriteFinished) => 15,
+            (CaptureOrder::SelectionFirst, Self::EncodeStarted) => 10,
+            (CaptureOrder::SelectionFirst, Self::EncodeFinished) => 11,
+            (CaptureOrder::SelectionFirst, Self::FileWriteStarted) => 12,
+            (CaptureOrder::SelectionFirst, Self::FileWriteFinished) => 13,
             (CaptureOrder::SelectionFirst, Self::AttemptFinished) => 16,
             (CaptureOrder::CaptureFirst, Self::HotkeyReceived) => 0,
             (CaptureOrder::CaptureFirst, Self::TriggerEnqueued) => 1,
@@ -59,10 +62,10 @@ impl PerfEventKind {
             (CaptureOrder::CaptureFirst, Self::CropFinished) => 9,
             (CaptureOrder::CaptureFirst, Self::ClipboardStarted) => 10,
             (CaptureOrder::CaptureFirst, Self::ClipboardCommitted) => 11,
-            (CaptureOrder::CaptureFirst, Self::EncodeStarted) => 12,
-            (CaptureOrder::CaptureFirst, Self::EncodeFinished) => 13,
-            (CaptureOrder::CaptureFirst, Self::FileWriteStarted) => 14,
-            (CaptureOrder::CaptureFirst, Self::FileWriteFinished) => 15,
+            (CaptureOrder::CaptureFirst, Self::EncodeStarted) => 10,
+            (CaptureOrder::CaptureFirst, Self::EncodeFinished) => 11,
+            (CaptureOrder::CaptureFirst, Self::FileWriteStarted) => 12,
+            (CaptureOrder::CaptureFirst, Self::FileWriteFinished) => 13,
             (CaptureOrder::CaptureFirst, Self::AttemptFinished) => 16,
         }
     }
@@ -124,7 +127,13 @@ pub struct PerfEvent {
     pub value: u64,
 }
 
-#[derive(Debug)]
+/// Cloning forks a trace rather than copying a log.
+///
+/// A capture delivered to several destinations gives each one its own recorder, so their events
+/// cannot interleave into an order no single destination actually observed. The clone keeps the
+/// original's time origin, which is what lets the resulting traces be compared or interleaved by
+/// anything that wants the whole picture (see ADR 0002).
+#[derive(Clone, Debug)]
 pub struct EventRecorder {
     origin: Instant,
     events: Vec<PerfEvent>,
@@ -248,6 +257,81 @@ pub(crate) fn nanos_u64(value: u128) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_forked_recorder_keeps_the_prefix_and_the_time_origin() {
+        // Each destination gets its own trace of the same capture, so the shared prefix has to
+        // come with the fork and the two traces have to stay comparable afterwards.
+        let mut recorder = EventRecorder::with_capacity(16);
+        recorder.record(CaptureId(1), PerfEventKind::CaptureRequested, 1);
+        recorder.record(CaptureId(1), PerfEventKind::CpuFrameReady, 2);
+
+        let mut clipboard = recorder.clone();
+        let mut file = recorder;
+        clipboard.record(CaptureId(1), PerfEventKind::ClipboardStarted, 3);
+        clipboard.record(CaptureId(1), PerfEventKind::ClipboardCommitted, 4);
+        clipboard.record(CaptureId(1), PerfEventKind::AttemptFinished, 5);
+        file.record(CaptureId(1), PerfEventKind::EncodeStarted, 3);
+        file.record(CaptureId(1), PerfEventKind::EncodeFinished, 4);
+        file.record(CaptureId(1), PerfEventKind::FileWriteStarted, 5);
+        file.record(CaptureId(1), PerfEventKind::FileWriteFinished, 6);
+        file.record(CaptureId(1), PerfEventKind::AttemptFinished, 7);
+
+        validate_event_order(clipboard.events()).expect("clipboard track is ordered");
+        validate_event_order(file.events()).expect("file track is ordered");
+        // Both carry the capture prefix, so either can be read on its own.
+        for events in [clipboard.events(), file.events()] {
+            assert!(events
+                .iter()
+                .any(|event| event.kind == PerfEventKind::CpuFrameReady));
+        }
+        // Same origin, so the two tracks can be interleaved by ticks without correction.
+        assert_eq!(clipboard.events()[0].ticks_ns, file.events()[0].ticks_ns);
+    }
+
+    #[test]
+    fn destination_events_are_not_ordered_against_each_other() {
+        // The regression this guards: with clipboard ranked before file output, a capture sent to
+        // both destinations would fail validation the moment the file worker got there first.
+        // Ordering still has to hold *inside* each track.
+        let mut file_first = EventRecorder::with_capacity(8);
+        file_first.record(CaptureId(1), PerfEventKind::CaptureRequested, 1);
+        file_first.record(CaptureId(1), PerfEventKind::CpuFrameReady, 2);
+        file_first.record(CaptureId(1), PerfEventKind::FileWriteStarted, 3);
+        file_first.record(CaptureId(1), PerfEventKind::FileWriteFinished, 4);
+        validate_event_order(file_first.events())
+            .expect("a file-only track never mentions the clipboard");
+
+        let mut regressed = EventRecorder::with_capacity(8);
+        regressed.record(CaptureId(1), PerfEventKind::CaptureRequested, 1);
+        regressed.record(CaptureId(1), PerfEventKind::CpuFrameReady, 2);
+        regressed.record(CaptureId(1), PerfEventKind::FileWriteFinished, 3);
+        regressed.record(CaptureId(1), PerfEventKind::FileWriteStarted, 4);
+        validate_event_order(regressed.events())
+            .expect_err("a write that finishes before it starts is still a regression");
+    }
+
+    #[test]
+    fn output_before_cpu_readiness_is_still_rejected_on_every_track() {
+        // The boundary ADR 0002 exists to defend: no destination may touch disk or compression
+        // before the frame is ready, and fanning out must not have opened a hole in that.
+        for kind in [
+            PerfEventKind::ClipboardStarted,
+            PerfEventKind::EncodeStarted,
+            PerfEventKind::FileWriteStarted,
+        ] {
+            let mut recorder = EventRecorder::with_capacity(4);
+            recorder.record(CaptureId(1), PerfEventKind::CaptureRequested, 1);
+            recorder.record(CaptureId(1), kind, 2);
+            assert!(
+                matches!(
+                    validate_event_order(recorder.events()),
+                    Err(MetricsError::OutputBeforeCpuFrame { .. })
+                ),
+                "{kind:?} was allowed before CPU-frame readiness"
+            );
+        }
+    }
 
     fn event(id: u64, kind: PerfEventKind, ticks_ns: u64) -> PerfEvent {
         PerfEvent {

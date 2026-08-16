@@ -17,7 +17,7 @@ mod ui_state;
 
 use fsio::{maintain_config_artifacts, quarantine_config};
 
-pub use fsio::{atomic_write, replace_file};
+pub use fsio::{atomic_write, finalize_new, replace_file};
 pub use ui_state::{
     resolve_display_ui_state, UiState, UiStateStore, STATE_FILE_NAME, STATE_SCHEMA_VERSION,
 };
@@ -278,7 +278,16 @@ pub fn ensure_default_config() -> Result<PathBuf, ConfigError> {
     Ok(path)
 }
 
-fn storage_directory_from(
+/// The user's home directory, by the same rules `storage_directory` uses.
+fn home_directory() -> Option<PathBuf> {
+    home_directory_from(
+        env::var_os("USERPROFILE").map(PathBuf::from),
+        env::var_os("HOME").map(PathBuf::from),
+        cfg!(windows),
+    )
+}
+
+fn home_directory_from(
     user_profile: Option<PathBuf>,
     home: Option<PathBuf>,
     windows: bool,
@@ -291,7 +300,14 @@ fn storage_directory_from(
     primary
         .filter(|path| !path.as_os_str().is_empty())
         .or_else(|| fallback.filter(|path| !path.as_os_str().is_empty()))
-        .map(|path| path.join(".captastic"))
+}
+
+fn storage_directory_from(
+    user_profile: Option<PathBuf>,
+    home: Option<PathBuf>,
+    windows: bool,
+) -> Option<PathBuf> {
+    home_directory_from(user_profile, home, windows).map(|path| path.join(".captastic"))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -514,10 +530,20 @@ impl AppConfig {
         validate_capacity("selection.queue_capacity", self.selection.queue_capacity)?;
         validate_capacity("clipboard.queue_capacity", self.clipboard.queue_capacity)?;
         validate_capacity("output.queue_capacity", self.output.queue_capacity)?;
-        if self.output.enabled {
-            return Err(ConfigError::InvalidValue(
-                "output.enabled: file output is not implemented yet (roadmap milestone 4); remove the override".to_owned(),
-            ));
+        if let Some(directory) = self.output.directory.as_deref() {
+            if directory.as_os_str().is_empty() {
+                return Err(ConfigError::InvalidValue(
+                    "output.directory must not be empty".to_owned(),
+                ));
+            }
+            // A daemon's working directory is whatever launched it, so a relative path would put
+            // captures somewhere the user cannot predict and would move between launches.
+            if !directory.is_absolute() {
+                return Err(ConfigError::InvalidValue(format!(
+                    "output.directory must be an absolute path, got {}",
+                    directory.display()
+                )));
+            }
         }
         if !matches!(self.output.format.as_str(), "png") {
             return Err(ConfigError::InvalidValue(
@@ -958,6 +984,9 @@ pub struct OutputConfig {
     pub enabled: bool,
     pub format: String,
     pub queue_capacity: usize,
+    /// Where captures are written. `None` selects [`default_output_directory`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub directory: Option<PathBuf>,
 }
 
 impl Default for OutputConfig {
@@ -966,8 +995,17 @@ impl Default for OutputConfig {
             enabled: false,
             format: "png".to_owned(),
             queue_capacity: 2,
+            directory: None,
         }
     }
+}
+
+/// Where captures land when the user has not said otherwise.
+///
+/// Beside the pictures a person already has, rather than in `.captastic` beside Captastic's own
+/// files: a screenshot is the user's document, not application state.
+pub fn default_output_directory() -> Option<PathBuf> {
+    home_directory().map(|home| home.join("Pictures").join("Captastic"))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1600,12 +1638,47 @@ mod tests {
     }
 
     #[test]
-    fn rejects_output_enabled_as_not_implemented() {
+    fn output_can_now_be_enabled() {
+        // `output.enabled` was rejected outright until Milestone 4 implemented the file worker.
         let mut config = AppConfig::default();
         config.output.enabled = true;
-        let error = config.validate().expect_err("output.enabled is dormant");
-        assert!(matches!(error, ConfigError::InvalidValue(_)));
-        assert!(error.to_string().contains("output.enabled"));
+        config.validate().expect("file output is implemented");
+    }
+
+    #[test]
+    fn an_output_directory_must_be_absolute() {
+        // A daemon's working directory is whatever launched it, so a relative path would put
+        // captures somewhere the user cannot predict and would move between launches.
+        let mut config = AppConfig::default();
+        config.output.enabled = true;
+        config.output.directory = Some(PathBuf::from("captures"));
+        let error = config.validate().expect_err("a relative path is rejected");
+        assert!(error.to_string().contains("absolute"), "{error}");
+
+        config.output.directory = Some(PathBuf::new());
+        let error = config.validate().expect_err("an empty path is rejected");
+        assert!(error.to_string().contains("must not be empty"), "{error}");
+
+        config.output.directory = Some(if cfg!(windows) {
+            PathBuf::from(r"C:\Users\someone\Pictures\Captastic")
+        } else {
+            PathBuf::from("/home/someone/Pictures/Captastic")
+        });
+        config.validate().expect("an absolute path is accepted");
+    }
+
+    #[test]
+    fn the_default_output_directory_sits_with_the_users_pictures() {
+        // A screenshot is the user's document, not application state, so it does not belong in
+        // `.captastic` beside Captastic's own files.
+        let directory = default_output_directory().expect("a home directory exists in this test");
+        // `Path::ends_with` compares components, so one form covers both separators.
+        assert!(
+            directory.ends_with("Pictures/Captastic"),
+            "{}",
+            directory.display()
+        );
+        assert!(!directory.to_string_lossy().contains(".captastic"));
     }
 
     #[test]
