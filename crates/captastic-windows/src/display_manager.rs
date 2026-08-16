@@ -3,7 +3,8 @@ use std::sync::Arc;
 use captastic_core::{
     BackendCapabilities, CaptureBackend, CaptureError, CaptureErrorKind, CaptureOutcome,
     CaptureRequest, CaptureSource, ColorSpace, CpuFrame, DisplayId, DisplayInfo, DisplayTopology,
-    EventRecorder, FrameMetadata, FrameOrigin, PerfEventKind, PixelFormat, Rect, TimingProvenance,
+    EventRecorder, FrameMetadata, FrameOrigin, PerfEventKind, PixelEncoding, PixelFormat, Rect,
+    TimingProvenance,
 };
 use windows::Win32::Foundation::POINT;
 use windows::Win32::UI::WindowsAndMessaging::GetPhysicalCursorPos;
@@ -382,8 +383,15 @@ fn copy_frame_into(
     destination: &mut [u8],
     destination_stride: usize,
 ) -> Result<(), CaptureError> {
-    if frame.format() != PixelFormat::Bgra8Unorm
-        || frame.origin != FrameOrigin::TopLeft
+    let PixelEncoding::EightBitRgba { blue_first: true } = frame.format().encoding() else {
+        return Err(manager_error(
+            CaptureErrorKind::InvalidFrame,
+            "compose_virtual_desktop",
+            "virtual-desktop composition requires 8-bit BGRA pixels",
+            false,
+        ));
+    };
+    if frame.origin != FrameOrigin::TopLeft
         || frame.width() != frame.metadata.source_rect.width
         || frame.height() != frame.metadata.source_rect.height
     {

@@ -49,7 +49,7 @@ use machine::{
 use crate::dwm_thumbnail::{fit_source_in_bounds, DwmThumbnail};
 use captastic_core::{
     CaptureError, CaptureErrorKind, CpuFrame, DisplayId, DisplayInfo, FrameMetadata, FrameOrigin,
-    PixelFormat, Rect,
+    PixelEncoding, Rect,
 };
 #[cfg(test)]
 use captastic_core::{CaptureId, CaptureMode, ColorSpace, TimingProvenance};
@@ -3192,7 +3192,11 @@ fn tight_pixels(frame: &CpuFrame) -> Result<Arc<[u8]>, CaptureError> {
 }
 
 fn validate_frame(frame: &CpuFrame) -> Result<(), CaptureError> {
-    if frame.format() != PixelFormat::Bgra8Unorm || frame.origin != FrameOrigin::TopLeft {
+    let is_bgra8 = matches!(
+        frame.format().encoding(),
+        PixelEncoding::EightBitRgba { blue_first: true }
+    );
+    if !is_bgra8 || frame.origin != FrameOrigin::TopLeft {
         return Err(CaptureError {
             kind: CaptureErrorKind::Unsupported,
             backend: "windows-overlay",
@@ -3214,6 +3218,8 @@ fn validate_frame(frame: &CpuFrame) -> Result<(), CaptureError> {
 
 #[cfg(test)]
 mod tests {
+    use captastic_core::PixelFormat;
+
     use super::*;
 
     #[test]

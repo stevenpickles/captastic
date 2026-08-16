@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use captastic_core::{
-    encode_frame, CaptureError, CaptureErrorKind, CpuFrame, FrameAlpha, FrameOrigin, PixelFormat,
+    encode_frame, CaptureError, CaptureErrorKind, CpuFrame, FrameAlpha, FrameOrigin, PixelEncoding,
     PngEffort,
 };
 use windows::core::w;
@@ -379,8 +379,16 @@ struct DibV5Layout {
 
 impl DibV5Layout {
     fn new(frame: &CpuFrame) -> Result<Self, CaptureError> {
-        if frame.format() != PixelFormat::Bgra8Unorm {
-            return Err(unsupported("DIBV5 publication requires BGRA8 pixels"));
+        // A DIBV5 payload is 8-bit BGRA and nothing else. Matched on the encoding rather than
+        // tested for inequality so that a pixel of another width cannot reach the row copy below
+        // by simply not being the one format this happened to name.
+        match frame.format().encoding() {
+            PixelEncoding::EightBitRgba { blue_first: true } => {}
+            PixelEncoding::EightBitRgba { blue_first: false } => {
+                return Err(unsupported(
+                    "DIBV5 publication requires BGRA8 pixels, and this frame is RGBA8",
+                ))
+            }
         }
         if frame.origin != FrameOrigin::TopLeft {
             return Err(unsupported("DIBV5 publication requires top-left pixels"));
@@ -563,7 +571,8 @@ fn read_current_dibv5(owner: HWND) -> Result<Vec<u8>, CaptureError> {
 #[cfg(test)]
 mod tests {
     use captastic_core::{
-        CaptureId, CaptureMode, ColorSpace, DisplayId, FrameMetadata, Rect, TimingProvenance,
+        CaptureId, CaptureMode, ColorSpace, DisplayId, FrameMetadata, PixelFormat, Rect,
+        TimingProvenance,
     };
     use std::sync::Arc;
 

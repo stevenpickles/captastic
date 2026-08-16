@@ -9,7 +9,7 @@ use std::io::Write;
 
 use thiserror::Error;
 
-use crate::frame::{CpuFrame, FrameAlpha, FrameOrigin, PixelFormat};
+use crate::frame::{CpuFrame, FrameAlpha, FrameOrigin, PixelEncoding, PixelFormat};
 
 /// How hard the DEFLATE backend works on a frame.
 ///
@@ -39,6 +39,12 @@ impl PngEffort {
 pub enum PngError {
     #[error("PNG encoding requires top-left pixels, not {origin:?}")]
     UnsupportedOrigin { origin: FrameOrigin },
+    /// Rejected rather than converted. Narrowing a wide-gamut or high-dynamic-range pixel to eight
+    /// bits is tone mapping, not a cast: done naively it clips every highlight the format existed
+    /// to carry, and silently. Until Captastic has a tone-mapping stage worth naming, refusing is
+    /// the honest answer.
+    #[error("PNG encoding requires 8-bit pixels, and {format:?} is not")]
+    UnsupportedFormat { format: PixelFormat },
     #[error("frame dimensions must be non-zero")]
     EmptyDimensions,
     #[error("stride {stride} is smaller than the minimum row size {minimum}")]
@@ -120,6 +126,11 @@ impl FrameLayout {
         if frame.width() == 0 || frame.height() == 0 {
             return Err(PngError::EmptyDimensions);
         }
+        // Every path below reads four bytes per pixel and writes eight bits per channel, so the
+        // encoding is settled before any of the arithmetic that assumes it.
+        let swizzle = match frame.format().encoding() {
+            PixelEncoding::EightBitRgba { blue_first } => blue_first,
+        };
         let source_row_bytes = usize::try_from(frame.width())
             .ok()
             .and_then(|width| width.checked_mul(4))
@@ -157,7 +168,7 @@ impl FrameLayout {
             source_row_bytes,
             output_row_bytes,
             height: frame.height() as usize,
-            swizzle: frame.format() == PixelFormat::Bgra8Unorm,
+            swizzle,
             keep_alpha,
         })
     }

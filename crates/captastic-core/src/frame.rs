@@ -17,6 +17,30 @@ impl PixelFormat {
             Self::Bgra8Unorm | Self::Rgba8Unorm => 4,
         }
     }
+
+    /// How one pixel is actually laid out in memory.
+    ///
+    /// Consumers branch on this rather than on the format, and the difference matters at the point
+    /// a new format is added. A second name for a four-byte 8-bit pixel needs no decision from a
+    /// sink that already handles one; a pixel of a different width or a different numeric type
+    /// needs a decision from every sink there is. Matching on the encoding is what makes the
+    /// compiler ask only the second question.
+    pub const fn encoding(self) -> PixelEncoding {
+        match self {
+            Self::Bgra8Unorm => PixelEncoding::EightBitRgba { blue_first: true },
+            Self::Rgba8Unorm => PixelEncoding::EightBitRgba { blue_first: false },
+        }
+    }
+}
+
+/// The memory layout of a single pixel, as distinct from the name of its format.
+///
+/// Deliberately not `#[non_exhaustive]`: adding a variant should stop every sink in the workspace
+/// from compiling, which is the entire reason this type exists.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PixelEncoding {
+    /// Four bytes: three 8-bit unsigned channels then 8 bits of alpha.
+    EightBitRgba { blue_first: bool },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
