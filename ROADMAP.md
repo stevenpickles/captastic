@@ -171,13 +171,17 @@ through `PrintWindow`.
 
 ## Milestone 4 — Asynchronous file output and capture history
 
-**Status:** Not started. Prerequisites identified during the 2026-08 architecture review: adopt a
-real PNG compressor for file output (the clipboard encoder emits stored, uncompressed DEFLATE —
-acceptable as a clipboard latency trade, unacceptable on disk); move app-owned state (UI state,
-history) out of the user's `captastic.toml` into separate app-owned storage before per-capture
-history writes exist; introduce a shared output-sink seam so clipboard and file destinations fail
-independently; and extract a worker-registry/shutdown coordinator from the daemon loop before
-wiring in a third worker.
+**Status:** Complete. The pre-work landed first: `png` replaced the hand-rolled stored-DEFLATE
+encoder, app-owned state moved out of `captastic.toml` into `state.toml`, an output-sink seam made
+destinations independent, and a worker registry took over shutdown before a third worker existed.
+The milestone itself then added the file worker, filename templates, capture history, and the
+history commands. Every exit criterion below is met — three by test, and the latency criterion by
+measurement (CPU-frame p50 1.065 ms with file output off against 1.060 ms with it on).
+
+ADR 0002 was amended during this work: destinations are parallel tracks after CPU-frame readiness
+rather than later stages of one pipeline, so each records its own trace. Two product decisions
+remain open and are not blockers for anything shipped: whether captures should opt out of clipboard
+history and cloud clipboard, and whether window titles belong in the default filename template.
 
 **Outcome:** Captastic can save and revisit captures without adding disk or compression work to the
 capture critical path.
@@ -238,10 +242,9 @@ explicit, tested behavior.
 
 ## Milestone 6 — Annotation and pinning
 
-**Status:** Not started. Gated on the overlay/tray message-state-machine extraction in the
-architecture hardening backlog: annotation needs a compose/render layer and window-shell utilities
-that the current single-file overlay cannot expose, and building on it as-is would compound the
-existing defect pattern.
+**Status:** Not started, and no longer gated. The overlay/tray message-state-machine extraction it
+waited on is complete, so the compose/render layer and window-shell utilities annotation needs now
+exist as separable modules. Remains behind Milestones 1 and 5 by priority, not by dependency.
 
 **Outcome:** Optional post-capture tools add communication value without changing Captastic's
 capture-engine identity.
@@ -302,9 +305,14 @@ branches before the affected subsystem grows further.
 
 ### Extract overlay and tray message state machines
 
+**Status:** Complete. Overlay and tray transitions are pure functions with table-driven coverage,
+`overlay.rs` is decomposed along tested ownership boundaries into window enumeration, the software
+rasterizer, and the win32 window shell, and native procedures now translate messages and apply
+declared effects rather than owning product state.
+
 **Why:** Recent defects arose from reentrant Win32 messages mutating state that was also being
-consumed by the originating handler. The current large message procedures make transition coverage
-and teardown reasoning unnecessarily difficult.
+consumed by the originating handler. The large message procedures made transition coverage and
+teardown reasoning unnecessarily difficult.
 
 - Extract drag ownership, capture loss, button release, and toolbar persistence decisions into a
   pure overlay transition function.
@@ -327,8 +335,9 @@ state required by their caller.
 `[output]`, `hotkey.repeat = "coalesce"`, `capture.cursor = "include"`, and non-default
 `capture.buffer_slots` with actionable not-implemented-yet errors, covered by unit tests, and the
 write-only `backend_duration` field was removed from the capture outcome. Each rejection lifts when
-its milestone implements the feature. Remaining: inventory and remove legacy UI-state save/load
-entry points superseded by `UiStateStore`.
+its milestone implements the feature — `[output]` accordingly became live in Milestone 4. The legacy
+UI-state save/load entry points superseded by `UiStateStore` were removed rather than inventoried,
+since they wrote UI state into the user's configuration file, which that work stopped doing.
 
 **Why:** Accepted-but-unused settings create false product contracts and make cross-platform
 backends inherit behavior that does not exist. Write-only telemetry has the same maintenance cost
@@ -374,26 +383,33 @@ Authenticode is deliberately not on the near-term critical path. Until signing i
 ## Recommended implementation order
 
 Rotated-output normalization and same-adapter virtual-desktop composition shipped in PRs #8–#9.
-The verified findings from the 2026-08 code, architecture, and roadmap review — the three confirmed
-High defects, the silent-drop and sticky-failure paths, the config write guards, and the dormant
-configuration/telemetry surfaces — were remediated on the review branch itself. The order below
-reflects what remains.
+The 2026-08 code, architecture, and roadmap review is fully remediated: the three confirmed High
+defects and the silent-drop, sticky-failure, config-write and dormant-surface findings were fixed on
+the review branch, and the Medium findings that were deferred into batched issues — window-capture
+alpha and geometry parity, timeout budgets, worker exhaustion, log-rotation coexistence, the
+clipboard's stored-DEFLATE encoder, unlocked state writes, and the unreachable schema error — closed
+alongside the overlay extraction and Milestone 4. The order below reflects what remains.
 
-1. Extract the overlay and tray message state machines (the backlog above) — the prerequisite for
-   Milestone 6 and the highest-leverage reduction of the current defect stream.
-2. Add asynchronous file output and capture history (Milestone 4), starting with its listed
-   prerequisites.
-3. Complete Milestone 1 (multi-adapter composition and the hardware validation matrix) — this can
-   proceed in parallel with item 1.
-4. Build capture-quality completeness and performance evidence (Milestone 5).
-5. Add annotation/pinning or cross-platform work, based on audience demand (existing decision gate).
+1. Complete Milestone 1 (multi-adapter composition and the hardware validation matrix). The only
+   milestone in progress, and the one whose remaining work needs hardware rather than design.
+2. Build capture-quality completeness and performance evidence (Milestone 5), starting with its
+   pre-work: a documented detach budget, FakeBackend contract fidelity, and the pixel-format
+   extension.
+3. Settle the outstanding design decisions — latest-mode currency on an idle desktop,
+   `fresh` + `virtual_desktop`, control-event hardening, the mouse-capture/software-KVM contract,
+   and Milestone 4's two product questions.
+4. Add annotation/pinning (Milestone 6, now ungated) or cross-platform work (Milestone 7), based on
+   audience demand (existing decision gate).
 
 ## Recommended next branch
 
-Extract the overlay and tray message state machines (the architecture hardening backlog above).
-The 2026-08 review independently confirmed it as the highest-leverage investment: the defect
-stream, the largest unsafe surface, and every Milestone 6 feature converge on the overlay module,
-and the extraction pays for itself in table-driven transition tests that today's shape cannot
-support. Remaining Medium findings from the review (window-capture alpha and geometry parity,
-timeout budgets, log-rotation coexistence, shutdown-budget reservation, live-mode chrome
-visibility) are candidates to batch alongside or after it.
+Milestone 5's pre-work. FakeBackend contract fidelity is the piece with leverage beyond its own
+milestone: much of Milestone 4 shipped with daemon-side behaviour verified only by unit tests,
+because a second daemon cannot start while one holds the session control event, and a fake backend
+that honestly reproduces the real contract is what would close that gap for everything after it.
+The detach-budget ADR is owed regardless — capture and window-render workers are already detached at
+their deadlines, and the accounting for that is currently implicit.
+
+Milestone 1's remaining work is the higher priority by roadmap order, but it is gated on hardware
+rather than effort: multi-adapter composition cannot be honestly validated on a single-adapter,
+single-monitor machine. Schedule it when the hardware matrix is available.
