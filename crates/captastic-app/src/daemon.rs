@@ -2846,6 +2846,12 @@ mod tests {
         assert!(!requires_backend_recovery(&error(
             CaptureErrorKind::Timeout
         )));
+        // The condition this kind exists to separate out. Reported as TopologyChanged it meant
+        // three capture-engine teardowns and rebuilds, 350 ms of back-off, and a failed capture -
+        // for a mouse that was simply not over a monitor. Rebuilding cannot move the mouse.
+        assert!(!requires_backend_recovery(&error(
+            CaptureErrorKind::PointerOutsideDisplays
+        )));
         assert_eq!(recovery_delay(1), Duration::from_millis(50));
         assert_eq!(recovery_delay(99), Duration::from_millis(1_600));
     }

@@ -17,6 +17,16 @@ pub enum CaptureErrorKind {
     /// inside an unresponsive foreign process may never exit, so an immediate retry cannot succeed
     /// and the condition is worth explaining rather than silently retrying.
     WorkersExhausted,
+    /// The mouse pointer is not on any known display, so the `pointer` policy names no source.
+    ///
+    /// Distinct from [`Self::TopologyChanged`], which it used to be reported as. That kind means
+    /// the display arrangement moved underneath a cached view of it, and the response is to
+    /// rebuild and re-enumerate. This means the arrangement is understood perfectly well and the
+    /// pointer is simply not on it — every non-rectangular multi-monitor layout has coordinates
+    /// inside its bounding box that belong to no display, and the pointer can rest in one. No
+    /// amount of rebuilding changes where the mouse is, so this is not retryable and callers are
+    /// expected to choose another display rather than fail.
+    PointerOutsideDisplays,
     InvalidFrame,
     NativeFailure,
     ShuttingDown,

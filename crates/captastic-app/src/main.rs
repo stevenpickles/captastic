@@ -975,11 +975,40 @@ fn resolve_capture_source(
 ) -> Result<CaptureSource, captastic_core::CaptureError> {
     match policy {
         DisplayPolicy::Pointer => {
-            captastic_windows::display_containing_pointer(displays).map(CaptureSource::Display)
+            pointer_source_or_primary(captastic_windows::display_containing_pointer(displays))
         }
         DisplayPolicy::Primary => Ok(CaptureSource::Display(DisplayId::primary())),
         DisplayPolicy::Fixed(id) => Ok(CaptureSource::Display(id.clone())),
         DisplayPolicy::VirtualDesktop => Ok(CaptureSource::VirtualDesktop),
+    }
+}
+
+/// Turns a resolved pointer display into a capture source, falling back to the primary display
+/// when the pointer is on no display at all.
+///
+/// A capture is worth more than the policy that chose its display. Every non-rectangular monitor
+/// arrangement — two screens of different heights, an L of three — has coordinates inside its
+/// bounding box that belong to no display, and the pointer can be resting in one when the hotkey
+/// is pressed. Failing there would mean a screenshot tool that declines to take a screenshot
+/// because of where the mouse is, which is a worse answer than a screenshot of the primary
+/// display. The choice is logged rather than made silently, because the resulting capture is of a
+/// display the user did not point at.
+///
+/// Every other failure still fails: a denied cursor query is a permissions problem the user needs
+/// to see, not a reason to quietly photograph a different screen.
+#[cfg(windows)]
+fn pointer_source_or_primary(
+    resolved: Result<DisplayId, captastic_core::CaptureError>,
+) -> Result<CaptureSource, captastic_core::CaptureError> {
+    match resolved {
+        Ok(display) => Ok(CaptureSource::Display(display)),
+        Err(error) if error.kind == captastic_core::CaptureErrorKind::PointerOutsideDisplays => {
+            crate::logging::warn(format_args!(
+                "{error}; capturing the primary display instead"
+            ));
+            Ok(CaptureSource::Display(DisplayId::primary()))
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -1141,6 +1170,61 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    #[cfg(windows)]
+    fn pointer_error(kind: captastic_core::CaptureErrorKind) -> captastic_core::CaptureError {
+        captastic_core::CaptureError {
+            kind,
+            backend: "dxgi-manager",
+            operation: "resolve_pointer_display",
+            message: "pointer position (0, 1646) is on no attached display".to_owned(),
+            retryable: false,
+            native_code: None,
+        }
+    }
+
+    /// The pointer resting in the gap of an L-shaped desktop must not cost the user a screenshot.
+    #[cfg(windows)]
+    #[test]
+    fn a_pointer_on_no_display_captures_the_primary_display() {
+        let resolved = pointer_source_or_primary(Err(pointer_error(
+            captastic_core::CaptureErrorKind::PointerOutsideDisplays,
+        )))
+        .expect("a pointer on no display still yields a capture source");
+
+        assert_eq!(
+            resolved,
+            CaptureSource::Display(DisplayId::primary()),
+            "the fallback must name the primary display"
+        );
+    }
+
+    /// The fallback is for one condition only. A cursor query that was denied is a permissions
+    /// problem the user has to see; quietly photographing a different screen would hide it.
+    #[cfg(windows)]
+    #[test]
+    fn other_pointer_failures_are_not_swallowed_by_the_fallback() {
+        for kind in [
+            captastic_core::CaptureErrorKind::PermissionDenied,
+            captastic_core::CaptureErrorKind::NativeFailure,
+        ] {
+            let resolved = pointer_source_or_primary(Err(pointer_error(kind)));
+            assert!(
+                matches!(resolved, Err(error) if error.kind == kind),
+                "{kind:?} should still fail"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_resolved_pointer_display_is_used_as_it_is() {
+        let display = DisplayId("windows-monitor-abc".to_owned());
+        assert_eq!(
+            pointer_source_or_primary(Ok(display.clone())).expect("a resolved display"),
+            CaptureSource::Display(display)
+        );
+    }
 
     fn cli(command: Option<Command>) -> Cli {
         Cli {
