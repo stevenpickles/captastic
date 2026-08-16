@@ -153,6 +153,10 @@ pub struct BenchmarkArgs {
     pub readback_delay_us: u64,
     #[arg(long, default_value_t = 1000)]
     pub frame_age_us: u64,
+    /// Reject retained frames older than this, in milliseconds. Zero accepts any age, which is the
+    /// default and matches `latest` mode's documented behaviour.
+    #[arg(long, default_value_t = 0)]
+    pub max_frame_age_ms: u64,
     #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
     pub cpu_frame: bool,
     #[arg(long)]

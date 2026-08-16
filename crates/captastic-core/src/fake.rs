@@ -124,6 +124,60 @@ impl FakeBackend {
         })
     }
 
+    /// Applies the capture mode's timing contract, mirroring what the DXGI backend enforces.
+    ///
+    /// `Fresh` promises a frame presented after the trigger, within `timeout_ms`. The fake's
+    /// `native_delay` is how long acquisition takes, so a delay past the deadline is the same
+    /// situation the real backend reports when no frame arrives in time.
+    ///
+    /// `Latest` promises a retained frame no older than `max_age_ms`. The fake's `frame_age` is
+    /// that age directly.
+    ///
+    /// Both failures are retryable and carry the real backend's operation names, because callers
+    /// branch on those: the daemon's recovery path distinguishes a timeout from an outage.
+    fn enforce_capture_mode(&self, request: &CaptureRequest) -> Result<(), CaptureError> {
+        match request.mode {
+            CaptureMode::Fresh { timeout_ms } => {
+                let deadline = Duration::from_millis(timeout_ms);
+                // Zero means "no waiting is acceptable", which only a zero-cost acquisition meets.
+                if self.config.native_delay > deadline {
+                    return Err(CaptureError {
+                        kind: CaptureErrorKind::Timeout,
+                        backend: "fake",
+                        operation: "acquire_next_frame",
+                        message: format!(
+                            "no post-trigger frame arrived within {timeout_ms} ms; the configured native delay is {} ms",
+                            self.config.native_delay.as_millis()
+                        ),
+                        retryable: true,
+                        native_code: None,
+                    });
+                }
+            }
+            CaptureMode::Latest { max_age_ms } => {
+                let Some(max_age_ms) = max_age_ms else {
+                    // Age is not a constraint: the documented default, where any retained frame
+                    // is acceptable.
+                    return Ok(());
+                };
+                let age_ms = self.config.frame_age.as_millis();
+                if age_ms > u128::from(max_age_ms) {
+                    return Err(CaptureError {
+                        kind: CaptureErrorKind::Timeout,
+                        backend: "fake",
+                        operation: "capture_latest",
+                        message: format!(
+                            "retained frame age {age_ms} ms exceeds the configured maximum of {max_age_ms} ms"
+                        ),
+                        retryable: true,
+                        native_code: None,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn validate_request_capabilities(&self, request: &CaptureRequest) -> Result<(), CaptureError> {
         let supported = match request.mode {
             CaptureMode::Fresh { .. } => self.capabilities.fresh_mode,
@@ -225,6 +279,13 @@ impl CaptureBackend for FakeBackend {
         {
             return Err(CaptureError::synthetic("configured deterministic failure"));
         }
+
+        // The capture mode's knobs are honored before any frame is produced, because that is what
+        // the real backend does: `Fresh` fails when no new frame arrives inside its timeout, and
+        // `Latest` fails when the retained frame is older than the caller will accept. A fake that
+        // ignored them let the daemon's timeout and staleness handling be "tested" against a
+        // backend incapable of exercising either.
+        self.enforce_capture_mode(request)?;
 
         sleep_if_nonzero(self.config.native_delay);
         let native_ready_ns = nanos_u64(request.triggered_at.elapsed().as_nanos());
@@ -332,6 +393,126 @@ mod tests {
 
     fn request(mode: CaptureMode) -> CaptureRequest {
         request_for(DisplayId::primary(), mode)
+    }
+
+    #[test]
+    fn latest_rejects_a_frame_older_than_the_caller_accepts() {
+        // The DXGI contract: a retained frame past `max_age_ms` is a timeout, not a stale frame
+        // handed over anyway. The daemon's staleness handling was previously "tested" against a
+        // fake that could never produce this.
+        let mut backend = FakeBackend::new(FakeBackendConfig {
+            native_delay: Duration::ZERO,
+            readback_delay: Duration::ZERO,
+            frame_age: Duration::from_millis(50),
+            ..FakeBackendConfig::default()
+        });
+        let mut recorder = EventRecorder::with_capacity(8);
+
+        let error = backend
+            .capture(
+                &request(CaptureMode::Latest {
+                    max_age_ms: Some(10),
+                }),
+                &mut recorder,
+            )
+            .expect_err("a 50 ms frame does not satisfy a 10 ms maximum");
+
+        assert_eq!(error.kind, CaptureErrorKind::Timeout);
+        assert_eq!(error.operation, "capture_latest");
+        assert!(error.retryable, "a fresher frame may arrive");
+        assert!(error.message.contains("50"), "{}", error.message);
+    }
+
+    #[test]
+    fn latest_accepts_a_frame_inside_the_maximum_and_any_frame_without_one() {
+        let mut backend = FakeBackend::new(FakeBackendConfig {
+            native_delay: Duration::ZERO,
+            readback_delay: Duration::ZERO,
+            frame_age: Duration::from_millis(50),
+            ..FakeBackendConfig::default()
+        });
+        let mut recorder = EventRecorder::with_capacity(16);
+
+        // Exactly at the limit is inside it.
+        backend
+            .capture(
+                &request(CaptureMode::Latest {
+                    max_age_ms: Some(50),
+                }),
+                &mut recorder,
+            )
+            .expect("a frame at the limit is acceptable");
+        // `None` is the documented default: age is not a constraint at all.
+        backend
+            .capture(
+                &request(CaptureMode::Latest { max_age_ms: None }),
+                &mut recorder,
+            )
+            .expect("no maximum accepts any retained frame");
+    }
+
+    #[test]
+    fn fresh_rejects_an_acquisition_that_misses_its_deadline() {
+        // `Fresh` promises a frame presented after the trigger, within the timeout. A backend that
+        // cannot produce one in time reports a retryable timeout rather than an older frame.
+        let mut backend = FakeBackend::new(FakeBackendConfig {
+            native_delay: Duration::from_millis(40),
+            readback_delay: Duration::ZERO,
+            ..FakeBackendConfig::default()
+        });
+        let mut recorder = EventRecorder::with_capacity(8);
+
+        let error = backend
+            .capture(
+                &request(CaptureMode::Fresh { timeout_ms: 5 }),
+                &mut recorder,
+            )
+            .expect_err("40 ms of acquisition does not fit in 5 ms");
+
+        assert_eq!(error.kind, CaptureErrorKind::Timeout);
+        assert_eq!(error.operation, "acquire_next_frame");
+        assert!(error.retryable);
+
+        // The same backend succeeds when the caller waits long enough, so the failure is about
+        // the deadline rather than the backend being broken.
+        backend
+            .capture(
+                &request(CaptureMode::Fresh { timeout_ms: 100 }),
+                &mut recorder,
+            )
+            .expect("a deadline the acquisition fits inside");
+    }
+
+    #[test]
+    fn a_mode_timeout_costs_nothing_and_leaves_no_frame_events() {
+        // The real backend fails before producing a frame, so a timeout must not record
+        // NativeFrameReady or pay the configured delay — otherwise a test measuring recovery
+        // latency would measure the fake's own sleep.
+        let mut backend = FakeBackend::new(FakeBackendConfig {
+            native_delay: Duration::from_millis(200),
+            readback_delay: Duration::from_millis(200),
+            ..FakeBackendConfig::default()
+        });
+        let mut recorder = EventRecorder::with_capacity(8);
+
+        let started = Instant::now();
+        let _ = backend
+            .capture(
+                &request(CaptureMode::Fresh { timeout_ms: 1 }),
+                &mut recorder,
+            )
+            .expect_err("the deadline is missed");
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "a timeout waited for the delay it was supposed to reject"
+        );
+        assert!(
+            !recorder
+                .events()
+                .iter()
+                .any(|event| event.kind == PerfEventKind::NativeFrameReady),
+            "a frame that never arrived must not be recorded as ready"
+        );
     }
 
     #[test]
