@@ -70,6 +70,8 @@ struct ResolvedDaemonArgs {
     output_directory: std::path::PathBuf,
     output_queue_capacity: usize,
     output_filename_template: String,
+    history_store: captastic_config::HistoryStore,
+    history_retention: captastic_config::RetentionPolicy,
     selection: bool,
     selection_preview: PreviewMode,
     trigger_queue_capacity: usize,
@@ -169,6 +171,11 @@ fn resolve_daemon_args_with_default(
             ))?,
         output_queue_capacity: config.output.queue_capacity,
         output_filename_template: config.output.filename_template.clone(),
+        history_store: args.config.as_ref().map_or_else(
+            captastic_config::HistoryStore::for_default_storage,
+            captastic_config::HistoryStore::for_config,
+        ),
+        history_retention: config.history.retention(),
         selection: args.selection.unwrap_or(config.selection.enabled),
         selection_preview: config.selection.preview,
         trigger_queue_capacity: config.daemon.trigger_queue_capacity,
@@ -839,6 +846,10 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             crate::file_output::FileOutputWorker::start(
                 args.output_directory.clone(),
                 args.output_filename_template.clone(),
+                crate::file_output::HistoryRecorder::new(
+                    args.history_store.clone(),
+                    args.history_retention,
+                ),
                 args.json,
                 args.output_queue_capacity,
             )

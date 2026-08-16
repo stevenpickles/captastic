@@ -13,14 +13,140 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+
+use crate::ConfigError;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
 /// Distinguishes concurrent temporary files within one process; the process id separates processes.
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// How long an abandoned temporary or quarantined file may linger before it is swept.
 const TEMP_ARTIFACT_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 pub(crate) const CORRUPT_ARTIFACT_RETENTION: usize = 5;
+
+/// How long a writer waits for another process to finish its read-modify-write cycle.
+///
+/// Generous relative to the work being serialized (a few kilobytes and one atomic replace),
+/// because the alternative to waiting is losing the update.
+pub(crate) const LOCK_TIMEOUT: Duration = Duration::from_millis(2_000);
+/// How long a lock file may sit untouched before it is assumed to belong to a process that died
+/// holding it. Well above `LOCK_TIMEOUT`, so a merely slow writer is never robbed of its lock.
+pub(crate) const LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
+const LOCK_RETRY_DELAY: Duration = Duration::from_millis(5);
+
+/// A cross-process advisory lock over one file.
+///
+/// Captastic has three things that read-modify-write a shared file from more than one process —
+/// remembered UI state, capture history, and the log's rotation — and all three lose updates
+/// without exclusion. This is that exclusion: portable (`create_new` is atomic everywhere), with
+/// a staleness window so a process killed mid-write cannot lock its own file out permanently.
+pub struct FileLock {
+    path: PathBuf,
+}
+
+impl FileLock {
+    /// Takes the lock guarding `guarded_path`, waiting for a contended one.
+    pub fn acquire(guarded_path: &Path) -> Result<Self, ConfigError> {
+        let path = lock_path(guarded_path);
+        let deadline = Instant::now() + LOCK_TIMEOUT;
+        loop {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    // Contents are diagnostic only; the file's existence is the lock.
+                    let _ = writeln!(file, "{}", std::process::id());
+                    return Ok(Self { path });
+                }
+                // `AlreadyExists` is the ordinary "somebody has it". `PermissionDenied` means the
+                // same thing on Windows, where a lock file that has been deleted but still has an
+                // open handle sits in a delete-pending state: the name is taken, and creating it
+                // fails with ACCESS_DENIED rather than ALREADY_EXISTS until the last handle
+                // closes. Treating that as a hard error made every release a chance to fail the
+                // next acquire.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::AlreadyExists | ErrorKind::PermissionDenied
+                    ) =>
+                {
+                    if break_stale_lock(&path) {
+                        continue;
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(ConfigError::Write {
+                            path: path.display().to_string(),
+                            // Carries the cause: a genuine permission problem times out exactly
+                            // the way contention does, and the two need telling apart.
+                            source: std::io::Error::new(
+                                ErrorKind::TimedOut,
+                                format!(
+                                    "could not take the lock on {} within {} ms (last attempt: {error})",
+                                    guarded_path.display(),
+                                    LOCK_TIMEOUT.as_millis(),
+                                ),
+                            ),
+                        });
+                    }
+                    thread::sleep(LOCK_RETRY_DELAY);
+                }
+                Err(source) => {
+                    return Err(ConfigError::Write {
+                        path: path.display().to_string(),
+                        source,
+                    })
+                }
+            }
+        }
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // A failure here leaves a lock that the staleness check will clear.
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+pub(crate) fn lock_path(guarded_path: &Path) -> PathBuf {
+    let mut name = guarded_path
+        .file_name()
+        .map(std::ffi::OsString::from)
+        .unwrap_or_else(|| std::ffi::OsString::from("captastic"));
+    name.push(".lock");
+    guarded_path
+        .parent()
+        .map_or_else(|| PathBuf::from(&name), |parent| parent.join(&name))
+}
+
+/// Removes a lock whose holder has plainly gone away, reporting whether it did.
+///
+/// A process killed mid-write would otherwise lock its own state file out permanently. The window
+/// is deliberately far longer than any legitimate hold, so a slow writer keeps its lock; two
+/// processes both deciding a lock is stale is harmless, because whichever loses the subsequent
+/// `create_new` simply goes back to waiting.
+pub(crate) fn break_stale_lock(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        // Already gone: the holder released it between our open and this check.
+        return true;
+    };
+    let held_for = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.elapsed().ok());
+    if held_for.is_some_and(|elapsed| elapsed > LOCK_STALE_AFTER) {
+        log::warn!(
+            "clearing a lock held for more than {} s at {}; its owner probably exited without releasing it",
+            LOCK_STALE_AFTER.as_secs(),
+            path.display()
+        );
+        return fs::remove_file(path).is_ok();
+    }
+    false
+}
 
 /// Writes `contents` to `path` so that a reader sees either the previous file or the complete new
 /// one, never a partial write.

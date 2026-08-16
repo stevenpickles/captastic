@@ -8,16 +8,22 @@ use std::io::ErrorKind;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod fsio;
+mod history;
 mod ui_state;
 
 use fsio::{maintain_config_artifacts, quarantine_config};
 
 pub use fsio::{atomic_write, finalize_new, replace_file};
+pub use history::{
+    CaptureHistory, HistoryEntry, HistoryStore, RetentionPolicy, HISTORY_FILE_NAME,
+    HISTORY_SCHEMA_VERSION,
+};
 pub use ui_state::{
     resolve_display_ui_state, UiState, UiStateStore, STATE_FILE_NAME, STATE_SCHEMA_VERSION,
 };
@@ -341,12 +347,6 @@ pub struct ConfirmedRegion {
     pub source: CaptureRegionSource,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct CaptureHistory {
-    pub tool: Option<CaptureTool>,
-    pub region: Option<CaptureRegion>,
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DisplayUiState {
     /// Normalized toolbar center within the display work area.
@@ -385,6 +385,7 @@ pub struct AppConfig {
     pub output: OutputConfig,
     pub metrics: MetricsConfig,
     pub logging: LoggingConfig,
+    pub history: HistoryConfig,
     pub ui: UiConfig,
 }
 
@@ -400,6 +401,7 @@ impl Default for AppConfig {
             output: OutputConfig::default(),
             metrics: MetricsConfig::default(),
             logging: LoggingConfig::default(),
+            history: HistoryConfig::default(),
             ui: UiConfig::default(),
         }
     }
@@ -621,6 +623,16 @@ impl AppConfig {
         if !(1_024..=1_073_741_824).contains(&self.logging.max_file_bytes) {
             return Err(ConfigError::InvalidValue(
                 "logging.max_file_bytes must be between 1024 and 1073741824".to_owned(),
+            ));
+        }
+        if self.history.max_items > 10_000 {
+            return Err(ConfigError::InvalidValue(
+                "history.max_items must be 10000 or fewer".to_owned(),
+            ));
+        }
+        if self.history.max_age_days > 3_650 {
+            return Err(ConfigError::InvalidValue(
+                "history.max_age_days must be 3650 or fewer".to_owned(),
             ));
         }
         if !(1..=20).contains(&self.logging.retained_files) {
@@ -993,6 +1005,42 @@ pub struct OutputConfig {
 
 /// The default capture name: sortable, and identical for every capture but the moment it was taken.
 pub const DEFAULT_FILENAME_TEMPLATE: &str = "captastic-{timestamp}";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HistoryConfig {
+    /// How many recent captures to remember. Zero forgets everything, which is how history is
+    /// turned off — the recording path stays live, so nothing has to check a flag first.
+    pub max_items: usize,
+    /// Forget captures older than this. Zero means age is not a reason to forget.
+    pub max_age_days: u32,
+    /// Forget the oldest once the remembered captures exceed this many bytes. Zero means size is
+    /// not a reason to forget.
+    pub max_total_bytes: u64,
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self {
+            // Enough to find something from this week's work; small enough that the file stays
+            // trivial to read and rewrite on every capture.
+            max_items: 50,
+            max_age_days: 30,
+            max_total_bytes: 0,
+        }
+    }
+}
+
+impl HistoryConfig {
+    pub fn retention(&self) -> RetentionPolicy {
+        RetentionPolicy {
+            max_items: self.max_items,
+            max_age: (self.max_age_days > 0)
+                .then(|| Duration::from_secs(u64::from(self.max_age_days) * 24 * 60 * 60)),
+            max_total_bytes: (self.max_total_bytes > 0).then_some(self.max_total_bytes),
+        }
+    }
+}
 
 impl Default for OutputConfig {
     fn default() -> Self {

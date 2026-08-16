@@ -51,6 +51,7 @@ impl FileOutputWorker {
     pub fn start(
         directory: PathBuf,
         filename_template: String,
+        history: HistoryRecorder,
         json_output: bool,
         queue_capacity: usize,
     ) -> Result<Self, AppError> {
@@ -71,6 +72,7 @@ impl FileOutputWorker {
         let worker_stop_requested = stop_requested.clone();
         let worker_directory = directory.clone();
         let worker_template = filename_template;
+        let worker_history = history;
         let join = thread::Builder::new()
             .name("captastic-file-output".to_owned())
             .spawn(move || loop {
@@ -83,7 +85,10 @@ impl FileOutputWorker {
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 };
                 match write_capture(&worker_directory, &worker_template, &mut job) {
-                    Ok(report) => report_written(&job, &report, json_output),
+                    Ok(report) => {
+                        report_written(&job, &report, json_output);
+                        worker_history.record(&job, &report);
+                    }
                     Err(error) => {
                         crate::logging::error(format_args!(
                             "file output {} failed without invalidating capture: {error}",
@@ -170,6 +175,57 @@ impl FileOutputWorker {
 impl Drop for FileOutputWorker {
     fn drop(&mut self) {
         self.stop_inner(Instant::now() + WORKER_STOP_TIMEOUT);
+    }
+}
+
+/// Remembers where captures went, so they can be found again.
+///
+/// A failure to remember is never a failure to capture: the file is already on disk by the time
+/// this runs, and losing the note is a smaller harm than losing the picture. Every path here logs
+/// and continues.
+#[derive(Clone)]
+pub struct HistoryRecorder {
+    store: captastic_config::HistoryStore,
+    policy: captastic_config::RetentionPolicy,
+}
+
+impl HistoryRecorder {
+    pub fn new(
+        store: captastic_config::HistoryStore,
+        policy: captastic_config::RetentionPolicy,
+    ) -> Self {
+        Self { store, policy }
+    }
+
+    fn record(&self, job: &OutputJob, report: &WriteReport) {
+        if self.policy.max_items == 0 {
+            return;
+        }
+        let entry = captastic_config::HistoryEntry {
+            path: report.path.clone(),
+            captured_at_micros: captastic_config::HistoryEntry::micros_since_epoch(
+                SystemTime::now(),
+            ),
+            bytes: report.bytes as u64,
+            width: job.frame.width,
+            height: job.frame.height,
+            display: job.frame.metadata.display_id.0.clone(),
+            mode: job.action.as_str().to_owned(),
+        };
+        match self.store.record(entry, self.policy, SystemTime::now()) {
+            Ok(dropped) if !dropped.is_empty() => {
+                // Only the count: a path is the user's business and belongs in their history file,
+                // not in a log that may be shared.
+                log::debug!("capture history forgot {} older entr(ies)", dropped.len());
+            }
+            Ok(_) => {}
+            Err(error) => {
+                crate::logging::warn(format_args!(
+                    "capture {} was written but could not be recorded in history: {error}",
+                    job.capture_id.0
+                ));
+            }
+        }
     }
 }
 
@@ -385,6 +441,18 @@ fn ns_to_ms(ns: u64) -> f64 {
 mod tests {
     use super::*;
 
+    /// A recorder that remembers nothing, for tests about writing rather than remembering.
+    fn no_history() -> HistoryRecorder {
+        HistoryRecorder::new(
+            captastic_config::HistoryStore::at(std::env::temp_dir().join("unused-history.toml")),
+            captastic_config::RetentionPolicy {
+                max_items: 0,
+                max_age: None,
+                max_total_bytes: None,
+            },
+        )
+    }
+
     fn test_directory(label: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -404,9 +472,13 @@ mod tests {
         // rather than something discovered when a capture lands under a strange name.
         let directory = test_directory("bad-template");
 
-        let Err(error) =
-            FileOutputWorker::start(directory.clone(), "captastic-{tilte}".to_owned(), false, 1)
-        else {
+        let Err(error) = FileOutputWorker::start(
+            directory.clone(),
+            "captastic-{tilte}".to_owned(),
+            no_history(),
+            false,
+            1,
+        ) else {
             panic!("an unknown token must be rejected");
         };
         assert!(error.to_string().contains("unknown token"), "{error}");
@@ -494,6 +566,7 @@ mod tests {
         let worker = FileOutputWorker::start(
             nested.clone(),
             captastic_config::DEFAULT_FILENAME_TEMPLATE.to_owned(),
+            no_history(),
             false,
             1,
         )
@@ -515,6 +588,7 @@ mod tests {
         let Err(error) = FileOutputWorker::start(
             blocked.join("captures"),
             captastic_config::DEFAULT_FILENAME_TEMPLATE.to_owned(),
+            no_history(),
             false,
             1,
         ) else {
