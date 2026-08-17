@@ -25,6 +25,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 const CF_DIBV5_FORMAT: u32 = 17;
 const LCS_SRGB: u32 = 0x7352_4742;
+/// The value both retention formats carry to decline. Windows reads a `DWORD`, and zero is the
+/// documented "no": omitting the format entirely is how a publisher consents.
+const RETENTION_DENIED: u32 = 0;
 const OPEN_TIMEOUT: Duration = Duration::from_millis(50);
 const MAX_RETRY_DELAY: Duration = Duration::from_millis(5);
 const HRESULT_ACCESS_DENIED: i32 = 0x8007_0005_u32 as i32;
@@ -38,26 +41,90 @@ pub struct ClipboardPublishReport {
     pub open_wait_ns: u64,
     pub open_retries: u32,
     pub publish_ns: u64,
+    /// Whether this publish told Windows to keep the capture out of the Win+V history.
+    pub history_excluded: bool,
+    /// Whether this publish told Windows not to sync the capture to the signed-in account.
+    pub cloud_sync_excluded: bool,
+}
+
+/// What Windows may keep of a capture beyond the paste it was taken for.
+///
+/// Both fields default to `false`, which is to say both retention paths are declined, and that is
+/// the point of having a type here rather than two bare arguments: the value a caller gets by
+/// making no decision is the conservative one. The two mistakes are not symmetrical. A user who
+/// wanted Win+V history and does not get it loses a convenience they can switch back on; a user
+/// whose screenshot reaches a Microsoft account cannot un-send it, and nothing told them it went.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ClipboardRetention {
+    /// Whether the capture may be kept in the Win+V clipboard history.
+    pub history: bool,
+    /// Whether the capture may be synced to the signed-in Microsoft account, and from there to
+    /// that account's other machines.
+    pub cloud_sync: bool,
+}
+
+impl ClipboardRetention {
+    /// Declines both retention paths: the capture is for this paste and nothing else.
+    pub const PRIVATE: Self = Self {
+        history: false,
+        cloud_sync: false,
+    };
 }
 
 pub struct ClipboardPublisher {
     window: ClipboardWindow,
     png_format: u32,
+    history_exclusion_format: u32,
+    cloud_exclusion_format: u32,
+    retention: ClipboardRetention,
     _thread_affine: PhantomData<Rc<()>>,
 }
 
 impl ClipboardPublisher {
-    pub fn new() -> Result<Self, CaptureError> {
-        // SAFETY: The registered clipboard-format name is a static null-terminated string.
-        let png_format = unsafe { RegisterClipboardFormatW(w!("PNG")) };
-        if png_format == 0 {
-            return Err(last_error("register_png_clipboard_format", false));
-        }
+    pub fn new(retention: ClipboardRetention) -> Result<Self, CaptureError> {
         Ok(Self {
             window: ClipboardWindow::create()?,
-            png_format,
+            png_format: register_format(w!("PNG"), "register_png_clipboard_format")?,
+            // Both names are registered whether or not this publisher will use them. Registration
+            // is one session-wide atom per name, returned again on every later call, so there is
+            // nothing to save by deciding here — and the decision then lives in exactly one place.
+            history_exclusion_format: register_format(
+                w!("CanIncludeInClipboardHistory"),
+                "register_clipboard_history_format",
+            )?,
+            cloud_exclusion_format: register_format(
+                w!("CanUploadToCloudClipboard"),
+                "register_cloud_clipboard_format",
+            )?,
+            retention,
             _thread_affine: PhantomData,
         })
+    }
+
+    /// Allocates a `DWORD` of zero for each retention path this publisher declines.
+    ///
+    /// Allocated with the payload, before the clipboard is opened, for the same reason everything
+    /// else here is: an allocation that fails must not be able to cost the user their clipboard.
+    fn retention_exclusions(&self) -> Result<Vec<(u32, GlobalMemory)>, CaptureError> {
+        let denied = RETENTION_DENIED.to_ne_bytes();
+        [
+            (
+                self.history_exclusion_format,
+                self.retention.history,
+                "allocate_history_exclusion",
+            ),
+            (
+                self.cloud_exclusion_format,
+                self.retention.cloud_sync,
+                "allocate_cloud_exclusion",
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, permitted, _)| !permitted)
+        .map(|(format, _, operation)| {
+            GlobalMemory::from_bytes(&denied, operation).map(|memory| (format, memory))
+        })
+        .collect()
     }
 
     /// Commits a prepared payload to the clipboard.
@@ -79,6 +146,7 @@ impl ClipboardPublisher {
         // Every allocation happens before the clipboard is opened, let alone emptied, so the
         // failures most likely to occur cannot cost the user what they had copied.
         let dib_memory = GlobalMemory::from_frame(payload.frame, layout).map_err(intact)?;
+        let exclusions = self.retention_exclusions().map_err(intact)?;
         let png_payload_bytes = payload.png.as_ref().map_or(0, Vec::len);
         let png_memory = payload
             .png
@@ -93,6 +161,14 @@ impl ClipboardPublisher {
         unsafe { EmptyClipboard() }
             .map_err(|error| intact(clipboard_error("empty_clipboard", error, true)))?;
         // Past this point the user's previous clipboard contents are gone.
+        //
+        // The retention markers go on before the pixels, so there is no ordering in which the
+        // capture is on the clipboard without them. A marker that cannot be set fails the publish
+        // rather than falling back: publishing anyway would quietly deliver the retention the user
+        // configured against, which is the one outcome this whole mechanism exists to prevent.
+        for (format, memory) in exclusions {
+            memory.transfer_to_clipboard(format).map_err(cleared)?;
+        }
         dib_memory
             .transfer_to_clipboard(CF_DIBV5_FORMAT)
             .map_err(cleared)?;
@@ -121,6 +197,8 @@ impl ClipboardPublisher {
             // This attempt only. A retried publish reports the attempt that succeeded rather than
             // the sum of the ones that did not.
             publish_ns: duration_ns(publish_started.elapsed()),
+            history_excluded: !self.retention.history,
+            cloud_sync_excluded: !self.retention.cloud_sync,
         })
     }
 }
@@ -521,6 +599,19 @@ fn clipboard_error(
     }
 }
 
+/// Registers one clipboard format name, naming the one that failed rather than "a format".
+fn register_format(
+    name: windows::core::PCWSTR,
+    operation: &'static str,
+) -> Result<u32, CaptureError> {
+    // SAFETY: name is a static null-terminated wide string.
+    let format = unsafe { RegisterClipboardFormatW(name) };
+    if format == 0 {
+        return Err(last_error(operation, false));
+    }
+    Ok(format)
+}
+
 fn last_error(operation: &'static str, retryable: bool) -> CaptureError {
     clipboard_error(operation, windows::core::Error::from_win32(), retryable)
 }
@@ -551,11 +642,22 @@ fn duration_ns(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
+/// Reads one clipboard format back, or reports that it is not on the clipboard at all.
+///
+/// `Ok(None)` is the interesting answer for the retention formats: their absence is what consent
+/// looks like, so a test has to be able to tell "not published" from "published as zero".
 #[cfg(test)]
-fn read_current_dibv5(owner: HWND) -> Result<Vec<u8>, CaptureError> {
+fn read_current_format(owner: HWND, format: u32) -> Result<Option<Vec<u8>>, CaptureError> {
     let (clipboard, _, _) = ClipboardSession::open(owner, OPEN_TIMEOUT)?;
+    // SAFETY: The clipboard is open on this thread.
+    let available =
+        unsafe { windows::Win32::System::DataExchange::IsClipboardFormatAvailable(format).is_ok() };
+    if !available {
+        drop(clipboard);
+        return Ok(None);
+    }
     // SAFETY: The clipboard is open on this thread. The returned handle remains clipboard-owned.
-    let handle = unsafe { GetClipboardData(CF_DIBV5_FORMAT) }
+    let handle = unsafe { GetClipboardData(format) }
         .map_err(|error| clipboard_error("get_clipboard_data", error, true))?;
     let global = HGLOBAL(handle.0 as *mut std::ffi::c_void);
     // SAFETY: global refers to the clipboard-owned DIBV5 allocation while the clipboard is open.
@@ -573,7 +675,13 @@ fn read_current_dibv5(owner: HWND) -> Result<Vec<u8>, CaptureError> {
     // SAFETY: Balances the successful GlobalLock without interpreting the ambiguous false result.
     let _ = unsafe { GlobalUnlock(global) };
     drop(clipboard);
-    Ok(payload)
+    Ok(Some(payload))
+}
+
+#[cfg(test)]
+fn read_current_dibv5(owner: HWND) -> Result<Vec<u8>, CaptureError> {
+    read_current_format(owner, CF_DIBV5_FORMAT)?
+        .ok_or_else(|| invalid_frame("no DIBV5 payload is on the clipboard"))
 }
 
 #[cfg(test)]
@@ -725,8 +833,20 @@ mod tests {
             open_wait_ns: 2,
             open_retries: 3,
             publish_ns: 4,
+            history_excluded: true,
+            cloud_sync_excluded: true,
         };
         assert_eq!(report.open_retries, 3);
+    }
+
+    #[test]
+    fn retention_declines_both_paths_unless_a_caller_says_otherwise() {
+        // The default is the whole safety property: a caller that forgets to decide gets the
+        // answer whose consequences can be undone. Asserted rather than assumed, because a later
+        // derive or field addition could flip it silently.
+        assert_eq!(ClipboardRetention::default(), ClipboardRetention::PRIVATE);
+        assert!(!ClipboardRetention::default().history);
+        assert!(!ClipboardRetention::default().cloud_sync);
     }
 
     #[test]
@@ -816,11 +936,83 @@ mod tests {
         let layout = DibV5Layout::new(&frame).expect("layout");
         let mut expected = vec![0_u8; layout.payload_bytes];
         layout.write(&frame, &mut expected).expect("expected DIBV5");
-        let mut publisher = ClipboardPublisher::new().expect("publisher");
+        let mut publisher =
+            ClipboardPublisher::new(ClipboardRetention::PRIVATE).expect("publisher");
         let payload = ClipboardPayload::prepare(&frame).expect("prepare");
         publisher.publish(&payload).expect("publish");
         let actual = read_current_dibv5(publisher.window.hwnd).expect("clipboard readback");
         assert_eq!(actual, expected);
+    }
+
+    /// Confirms the retention markers reach the real clipboard, as the `DWORD` Windows reads.
+    ///
+    /// The unit tests above can only check what this code decided to do. Whether Windows sees a
+    /// four-byte zero under the two registered names is a fact about the clipboard, and the only
+    /// place to learn it is the clipboard.
+    ///
+    /// cargo test --locked -p captastic-windows -- --ignored --nocapture retention
+    #[test]
+    #[ignore = "mutates the interactive Windows clipboard"]
+    fn declined_retention_publishes_a_zero_dword_under_both_names() {
+        let frame = frame(2, 2, 8, vec![7; 16]);
+        let mut publisher =
+            ClipboardPublisher::new(ClipboardRetention::PRIVATE).expect("publisher");
+        let payload = ClipboardPayload::prepare(&frame).expect("prepare");
+        let report = publisher.publish(&payload).expect("publish");
+
+        assert!(report.history_excluded);
+        assert!(report.cloud_sync_excluded);
+        for (name, format) in [
+            (
+                "CanIncludeInClipboardHistory",
+                publisher.history_exclusion_format,
+            ),
+            (
+                "CanUploadToCloudClipboard",
+                publisher.cloud_exclusion_format,
+            ),
+        ] {
+            let value = read_current_format(publisher.window.hwnd, format)
+                .expect("clipboard readback")
+                .unwrap_or_else(|| panic!("{name} was not published"));
+            assert_eq!(value, RETENTION_DENIED.to_ne_bytes(), "{name} value");
+        }
+        // The capture itself still published: declining retention must not cost the paste.
+        assert!(read_current_dibv5(publisher.window.hwnd).is_ok());
+    }
+
+    /// The other half of the contract: consent is the *absence* of the format, not a nonzero value.
+    #[test]
+    #[ignore = "mutates the interactive Windows clipboard"]
+    fn permitted_retention_publishes_neither_name() {
+        let frame = frame(2, 2, 8, vec![7; 16]);
+        let retention = ClipboardRetention {
+            history: true,
+            cloud_sync: true,
+        };
+        let mut publisher = ClipboardPublisher::new(retention).expect("publisher");
+        let payload = ClipboardPayload::prepare(&frame).expect("prepare");
+        let report = publisher.publish(&payload).expect("publish");
+
+        assert!(!report.history_excluded);
+        assert!(!report.cloud_sync_excluded);
+        for (name, format) in [
+            (
+                "CanIncludeInClipboardHistory",
+                publisher.history_exclusion_format,
+            ),
+            (
+                "CanUploadToCloudClipboard",
+                publisher.cloud_exclusion_format,
+            ),
+        ] {
+            assert!(
+                read_current_format(publisher.window.hwnd, format)
+                    .expect("clipboard readback")
+                    .is_none(),
+                "{name} was published even though retention was permitted"
+            );
+        }
     }
 
     /// Reports what each encoder effort costs, and buys, on a real captured frame.

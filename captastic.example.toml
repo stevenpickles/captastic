@@ -46,6 +46,11 @@ preview = "auto"
 [clipboard]
 enabled = true
 queue_capacity = 1
+# A capture is whatever was on screen, so by default Captastic asks Windows to keep it out of the
+# Win+V clipboard history and to leave it off the sync to your Microsoft account. Set either to
+# true to opt back in; an ordinary paste works the same either way.
+allow_history = false
+allow_cloud_sync = false
 
 [output]
 # Write every capture to disk, alongside the clipboard or instead of it.
@@ -59,7 +64,13 @@ queue_capacity = 2
 # Names each capture, without the extension. Tokens: {timestamp} {date} {time} {display} {mode}
 # {width} {height} {application} {title}. Values coming from a window are sanitized, and a name can
 # never place a capture outside the directory above.
-filename_template = "captastic-{timestamp}"
+#
+# The default leads with the timestamp so captures sort chronologically, then says what was
+# captured. Both window tokens expand to nothing for a display or region capture, leaving the
+# timestamp alone. A window title is content — document names, ticket titles, URLs — and a filename
+# shows up in file pickers, backup indexes, and directory listings. Use "{timestamp}" alone, or
+# "{timestamp}-{application}", if that is more than you want a name to say.
+filename_template = "{timestamp}-{application}-{title}"
 
 [history]
 # How many recent captures to remember, so they can be reopened later. Zero turns history off.

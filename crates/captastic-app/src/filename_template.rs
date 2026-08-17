@@ -173,14 +173,29 @@ fn sanitize_field(value: &str) -> String {
 
 /// Applies the rules that are about the name as a whole rather than any one field.
 fn finalize_stem(stem: &str) -> String {
-    let mut finalized: String = stem
-        .trim_matches(|character: char| character == '-' || character.is_whitespace())
-        .chars()
-        .take(MAX_STEM_CHARS)
-        .collect();
+    let trimmed =
+        stem.trim_matches(|character: char| character == '-' || character.is_whitespace());
+    // One separator means one separator, across the whole name rather than only within a field.
+    // A token that expands to nothing — `{application}` on a display capture — leaves the
+    // separators the template put around it, and `20260816-230500-348--` is not a name anyone
+    // wrote. Runs cannot arrive any other way: a sanitized field never emits two in a row, and a
+    // timestamp is single-separated, so the only other source is a user typing one deliberately.
+    let mut finalized = String::with_capacity(trimmed.len());
+    let mut previous_was_separator = false;
+    for character in trimmed.chars() {
+        if character == '-' && previous_was_separator {
+            continue;
+        }
+        previous_was_separator = character == '-';
+        finalized.push(character);
+        if finalized.chars().count() >= MAX_STEM_CHARS {
+            break;
+        }
+    }
     // Windows strips trailing dots and spaces when resolving a name, so a stem ending in one
-    // resolves to a *different* file than the one that was created.
-    while finalized.ends_with('.') || finalized.ends_with(' ') {
+    // resolves to a *different* file than the one that was created. A trailing separator is only
+    // untidy — truncation above can leave one — and is dropped for the same reason.
+    while finalized.ends_with('.') || finalized.ends_with(' ') || finalized.ends_with('-') {
         finalized.pop();
     }
     if finalized.is_empty() {
@@ -241,9 +256,68 @@ mod tests {
     }
 
     #[test]
-    fn the_default_shape_expands_to_something_sortable() {
-        let stem = expand("captastic-{timestamp}", &context());
-        assert_eq!(stem, "captastic-20260816-230500-348");
+    fn the_default_names_a_window_capture_after_its_window() {
+        let mut context = context();
+        context.application = Some("chrome");
+        context.title = Some("Pull Request 43");
+        assert_eq!(
+            expand(captastic_config::DEFAULT_FILENAME_TEMPLATE, &context),
+            "20260816-230500-348-chrome-Pull-Request-43"
+        );
+    }
+
+    #[test]
+    fn the_default_degrades_to_a_timestamp_when_there_is_no_window() {
+        // A display or region capture has no application and no title, and the name it gets must
+        // be the one the old default produced rather than a timestamp trailed by empty fields.
+        assert_eq!(
+            expand(captastic_config::DEFAULT_FILENAME_TEMPLATE, &context()),
+            "20260816-230500-348"
+        );
+        // Half a window is the same story: no dangling separator where the title would have been.
+        let mut partial = context();
+        partial.application = Some("chrome");
+        assert_eq!(
+            expand(captastic_config::DEFAULT_FILENAME_TEMPLATE, &partial),
+            "20260816-230500-348-chrome"
+        );
+        // And an application Windows could not name still leaves one separator, not two.
+        let mut titled = context();
+        titled.title = Some("Pull Request 43");
+        assert_eq!(
+            expand(captastic_config::DEFAULT_FILENAME_TEMPLATE, &titled),
+            "20260816-230500-348-Pull-Request-43"
+        );
+    }
+
+    #[test]
+    fn the_default_still_sorts_chronologically() {
+        // The timestamp leads so a directory listing is in capture order. Two captures a second
+        // apart of differently named windows must still sort by when they were taken.
+        let mut later = context();
+        later.timestamp_micros += 1_000_000;
+        later.application = Some("a-window-named-early");
+        let mut earlier = context();
+        earlier.application = Some("z-window-named-late");
+        let mut names = [
+            expand(captastic_config::DEFAULT_FILENAME_TEMPLATE, &later),
+            expand(captastic_config::DEFAULT_FILENAME_TEMPLATE, &earlier),
+        ];
+        names.sort();
+        assert!(
+            names[0].contains("z-window-named-late"),
+            "the earlier capture must sort first: {names:?}"
+        );
+    }
+
+    #[test]
+    fn separators_never_double_up() {
+        // A run of separators can only come from a token that expanded to nothing, and a name
+        // pocked with empty fields is not one anybody wrote.
+        let mut context = context();
+        context.title = Some("Report - Final");
+        assert_eq!(expand("{title}", &context), "Report-Final");
+        assert_eq!(expand("{application}--{title}", &context), "Report-Final");
     }
 
     #[test]

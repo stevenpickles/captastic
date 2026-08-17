@@ -511,6 +511,80 @@ mod tests {
         path
     }
 
+    /// A job carrying whatever the selection learned about the window it captured.
+    fn window_job(application: Option<&str>, title: Option<&str>) -> OutputJob {
+        let frame = captastic_core::CpuFrame::new(
+            std::sync::Arc::from(vec![0_u8; 16]),
+            2,
+            2,
+            8,
+            captastic_core::PixelFormat::Bgra8Unorm,
+            captastic_core::FrameOrigin::TopLeft,
+            captastic_core::ColorSpace::Srgb,
+            captastic_core::FrameMetadata {
+                capture_id: captastic_core::CaptureId(1),
+                backend: "test".to_owned(),
+                display_id: captastic_core::DisplayId::primary(),
+                source_rect: captastic_core::Rect {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                },
+                rotation_degrees: 0,
+                capture_mode: captastic_core::CaptureMode::Latest { max_age_ms: None },
+                presentation_offset_ns: None,
+                timing_provenance: captastic_core::TimingProvenance::Synthetic,
+                native_ready_offset_ns: 0,
+                cpu_ready_offset_ns: Some(0),
+                frame_age_ns: Some(0),
+                verified_current_offset_ns: None,
+                frame_generation: Some(1),
+                copy_count: 0,
+                pool_slot: None,
+                cursor: None,
+            },
+        )
+        .expect("test frame");
+        OutputJob {
+            capture_id: captastic_core::CaptureId(1),
+            triggered_at: Instant::now(),
+            action: captastic_config::HotkeyAction::Window,
+            chord: None,
+            cpu_ready_offset_ns: 0,
+            source: "test",
+            frame,
+            recorder: captastic_core::EventRecorder::with_capacity(4),
+            window_title: title.map(str::to_owned),
+            window_application: application.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn the_default_template_names_a_capture_from_the_job_it_is_given() {
+        // The seam between what a capture knows about itself and what the default asks for. The
+        // template's own tests cover the expansion; this covers the wiring, which is the half that
+        // would silently produce timestamp-only names if a field stopped being carried.
+        let template = captastic_config::DEFAULT_FILENAME_TEMPLATE;
+
+        let named = capture_stem(
+            template,
+            &window_job(Some("chrome"), Some("Pull Request 43")),
+        );
+        assert!(
+            named.ends_with("-chrome-Pull-Request-43"),
+            "a window capture should be named after its window: {named}"
+        );
+
+        // A display capture carries neither, and must not be named with the gaps where they went.
+        let bare = capture_stem(template, &window_job(None, None));
+        assert!(
+            !bare.contains("--") && !bare.ends_with('-'),
+            "a capture with no window left separators behind: {bare}"
+        );
+        assert_eq!(bare.len(), "20260816-230500-348".len(), "{bare}");
+    }
+
     #[test]
     fn a_rejected_template_stops_the_worker_starting() {
         // The template comes from the user's configuration, so a typo should be a startup error
