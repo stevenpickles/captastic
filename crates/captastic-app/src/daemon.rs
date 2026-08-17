@@ -37,8 +37,8 @@ use captastic_config::{
 #[cfg(windows)]
 use captastic_core::{
     validate_event_order, CaptureBackend, CaptureError, CaptureErrorKind, CaptureId, CaptureMode,
-    CaptureRequest, CaptureSource, CpuFrame, CursorMode, DisplayId, DisplayInfo, EventRecorder,
-    FrameMetadata, NativeFrame, PerfEventKind, Rect, TimingProvenance,
+    CaptureRequest, CaptureSource, CpuFrame, CursorAbsence, CursorCapture, CursorMode, DisplayId,
+    DisplayInfo, EventRecorder, FrameMetadata, NativeFrame, PerfEventKind, Rect, TimingProvenance,
 };
 #[cfg(windows)]
 use serde_json::json;
@@ -71,6 +71,7 @@ struct ResolvedDaemonArgs {
     backend: String,
     display_policy: DisplayPolicy,
     mode: CaptureMode,
+    cursor: CursorMode,
     cpu_frame: bool,
     clipboard: bool,
     file_output: bool,
@@ -165,6 +166,11 @@ fn resolve_daemon_args_with_default(
             args.display.as_deref().unwrap_or(&config.daemon.display),
         )?,
         mode,
+        cursor: if config.capture.cursor == "include" {
+            CursorMode::Include
+        } else {
+            CursorMode::Exclude
+        },
         cpu_frame: args.cpu_frame.unwrap_or(config.capture.cpu_frame),
         clipboard: args.clipboard.unwrap_or(config.clipboard.enabled),
         file_output: config.output.enabled,
@@ -211,6 +217,7 @@ struct CaptureWorkerContext {
     backend_name: String,
     display_policy: crate::DisplayPolicy,
     mode: CaptureMode,
+    cursor: CursorMode,
     cpu_frame: bool,
     selection_enabled: bool,
     selection_preview: PreviewMode,
@@ -234,6 +241,7 @@ fn run_capture_worker(context: CaptureWorkerContext) {
         backend_name,
         display_policy,
         mode,
+        cursor,
         cpu_frame,
         selection_enabled,
         selection_preview,
@@ -458,7 +466,7 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                                     cpu_frame,
                                     retain_native_frame: selection_enabled
                                         && trigger.action != HotkeyAction::FullDisplay,
-                                    cursor: CursorMode::Exclude,
+                                    cursor,
                                 };
                                 active_backend.capture(&request, &mut recorder)
                             });
@@ -617,6 +625,9 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                     cpu_frame: true,
                     retain_native_frame: request.selection.kind
                         == captastic_windows::SelectionKind::Region,
+                    // Never the configured policy. This capture is taken the instant the user
+                    // confirms, so the pointer is on the selection edge or the overlay's own
+                    // toolbar - an arrow pointing at a thing the screenshot does not contain.
                     cursor: CursorMode::Exclude,
                 };
                 let (capture_result, (), recovery_attempts, reinitialize_error) =
@@ -654,6 +665,13 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                         request.job.cpu_ready_offset_ns =
                             Some(duration_ns(request.job.triggered_at, Instant::now()));
                         request.job.metadata = outcome.metadata;
+                        // Distinguished from a user who never asked: the request was refused by
+                        // this path rather than never made.
+                        if matches!(cursor, CursorMode::Include) {
+                            request.job.metadata.cursor = Some(CursorCapture::Absent {
+                                reason: CursorAbsence::SuppressedForSelection,
+                            });
+                        }
                         request.job.frame = outcome.frame;
                         request.job.native_frame = outcome.native_frame;
                         request.job.confirmed_selection = Some(request.selection);
@@ -722,7 +740,9 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                     mode: mode.clone(),
                     cpu_frame: true,
                     retain_native_frame: true,
-                    cursor: CursorMode::Exclude,
+                    // A frozen preview is captured before the overlay exists, so its pointer is
+                    // the user's own and the configured policy applies unchanged.
+                    cursor,
                 };
                 let (capture_result, (), recovery_attempts, reinitialize_error) =
                     capture_with_backend_recovery(
@@ -936,6 +956,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         backend_name: args.backend.clone(),
         display_policy: args.display_policy.clone(),
         mode: args.mode.clone(),
+        cursor: args.cursor,
         cpu_frame: args.cpu_frame,
         selection_enabled: args.selection,
         selection_preview: args.selection_preview,

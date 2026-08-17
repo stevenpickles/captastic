@@ -581,11 +581,6 @@ impl AppConfig {
                 "capture.cursor must be include or exclude".to_owned(),
             ));
         }
-        if self.capture.cursor == "include" {
-            return Err(ConfigError::InvalidValue(
-                "capture.cursor: include is not implemented yet (roadmap milestone 4); capture.cursor must be include or exclude, but only exclude is currently supported".to_owned(),
-            ));
-        }
         if !matches!(self.hotkey.repeat.as_str(), "ignore" | "coalesce") {
             return Err(ConfigError::InvalidValue(
                 "hotkey.repeat must be ignore or coalesce".to_owned(),
@@ -1769,10 +1764,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_capture_cursor_include_as_not_implemented() {
+    fn accepts_capture_cursor_include_now_that_it_is_implemented() {
         let mut config = AppConfig::default();
         config.capture.cursor = "include".to_owned();
-        let error = config.validate().expect_err("cursor include is dormant");
+        config.validate().expect("cursor include is implemented");
+
+        // The value is still checked; only the "not implemented" refusal is gone.
+        config.capture.cursor = "sometimes".to_owned();
+        let error = config.validate().expect_err("an unknown cursor policy");
         assert!(matches!(error, ConfigError::InvalidValue(_)));
         assert!(error.to_string().contains("capture.cursor"));
     }

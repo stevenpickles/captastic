@@ -2577,6 +2577,97 @@ mod tests {
         pixels.chunks_exact(4).map(|pixel| pixel[0]).collect()
     }
 
+    /// Milestone 5's exit criterion, measured rather than asserted: a cursor-on capture and a
+    /// cursor-off capture of the same desktop must be identical everywhere except where the
+    /// pointer is, and must actually differ there.
+    ///
+    /// Needs a desktop that is actually changing, and moving the mouse is not enough: a pointer
+    /// move is a hardware-cursor update and does not dirty the desktop image, which is the same
+    /// reason DXGI reports pointer position separately from frame content. Drag a window, scroll
+    /// something, or play a video while this runs.
+    ///
+    /// cargo test --locked -p captastic-windows --release
+    ///     -- --ignored --nocapture cursor_composition_changes_only_the_pointer_rectangle
+    #[test]
+    #[ignore = "requires an interactive desktop with a visible pointer"]
+    fn cursor_composition_changes_only_the_pointer_rectangle() {
+        use std::time::Instant;
+
+        let mut backend = DxgiBackend::new_primary().expect("dxgi backend");
+        let mut recorder = EventRecorder::with_capacity(16);
+        let request = |cursor| CaptureRequest {
+            id: CaptureId(1),
+            triggered_at: Instant::now(),
+            source: CaptureSource::Display(DisplayId::primary()),
+            // Generous, because the frame has to arrive from whatever the tester is doing to the
+            // desktop rather than from anything this test can cause.
+            mode: CaptureMode::Fresh { timeout_ms: 10_000 },
+            cpu_frame: true,
+            retain_native_frame: false,
+            cursor,
+        };
+
+        let without = backend
+            .capture(&request(CursorMode::Exclude), &mut recorder)
+            .expect("capture without a cursor")
+            .frame
+            .expect("cpu frame");
+        let with = backend
+            .capture(&request(CursorMode::Include), &mut recorder)
+            .expect("capture with a cursor")
+            .frame
+            .expect("cpu frame");
+
+        let Some(CursorCapture::Composited {
+            x,
+            y,
+            width,
+            height,
+        }) = with.metadata.cursor
+        else {
+            panic!(
+                "expected a composited cursor, got {:?} - is the pointer on the primary display?",
+                with.metadata.cursor
+            );
+        };
+        assert_eq!(without.metadata.cursor, Some(CursorCapture::Excluded));
+        println!("pointer reported at ({x},{y}) sized {width}x{height}");
+
+        // The two captures are of different moments, so anything that repainted between them
+        // differs too. What must hold is the containment: every difference outside the pointer
+        // rectangle has to be explained by the desktop changing, and inside it there must be at
+        // least one difference, or nothing was drawn.
+        let stride = with.stride_bytes() as usize;
+        let mut differing_inside = 0_u64;
+        let mut differing_outside = 0_u64;
+        for row in 0..with.height() as usize {
+            for column in 0..with.width() as usize {
+                let start = row * stride + column * 4;
+                if with.pixels()[start..start + 4] == without.pixels()[start..start + 4] {
+                    continue;
+                }
+                let inside = (column as i64) >= i64::from(x)
+                    && (column as i64) < i64::from(x) + i64::from(width)
+                    && (row as i64) >= i64::from(y)
+                    && (row as i64) < i64::from(y) + i64::from(height);
+                if inside {
+                    differing_inside += 1;
+                } else {
+                    differing_outside += 1;
+                }
+            }
+        }
+
+        let pointer_area = u64::from(width) * u64::from(height);
+        println!(
+            "{differing_inside}/{pointer_area} pixels differ inside the pointer rectangle,              {differing_outside} outside it (desktop repaints)"
+        );
+        assert!(
+            differing_inside > 0,
+            "the cursor-on capture is identical inside the pointer rectangle: nothing was drawn"
+        );
+    }
+
     #[test]
     fn rotation_normalization_orients_pixels_and_removes_row_padding() {
         let raw = labeled_bgra(3, 2, 16);

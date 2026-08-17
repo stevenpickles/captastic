@@ -5,8 +5,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use captastic_core::{
-    process_detach_ledger, CaptureError, CaptureErrorKind, CpuFrame, DetachCount, DetachKind,
-    DetachLedger, FrameAlpha, FrameMetadata, Rect,
+    process_detach_ledger, CaptureError, CaptureErrorKind, CpuFrame, CursorAbsence, CursorCapture,
+    DetachCount, DetachKind, DetachLedger, FrameAlpha, FrameMetadata, Rect,
 };
 use windows::core::Error as WindowsError;
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
@@ -106,6 +106,22 @@ pub(crate) fn capture_window_visual(
     reference_metadata: &FrameMetadata,
 ) -> Result<CapturedWindow, CaptureError> {
     capture_window_bounded(handle, reference_metadata, None)
+}
+
+/// What a window capture can say about the cursor, which is only ever that it has none.
+///
+/// `PrintWindow` renders a window's own drawing, with no compositor and no pointer; Windows
+/// Graphics Capture can draw one, but the compositor positions it and we could neither clip it to
+/// the window nor compare a cursor-on capture against a cursor-off one. Reported rather than
+/// silently dropped, so a user whose configuration asks for a cursor can see which captures could
+/// not have one.
+fn window_cursor_outcome(metadata: &FrameMetadata) -> CursorCapture {
+    match metadata.cursor {
+        Some(CursorCapture::Excluded) | None => CursorCapture::Excluded,
+        _ => CursorCapture::Absent {
+            reason: CursorAbsence::SourceCannotCompose,
+        },
+    }
 }
 
 pub(crate) fn capture_window_thumbnail(
@@ -478,6 +494,7 @@ fn capture_window_inner(
     };
     metadata.copy_count = metadata.copy_count.saturating_add(1);
     metadata.pool_slot = None;
+    metadata.cursor = Some(window_cursor_outcome(&metadata));
     let frame = CpuFrame::new(
         Arc::from(pixels),
         output_width,
@@ -642,6 +659,7 @@ fn capture_window_with_wgc(
     };
     metadata.copy_count = metadata.copy_count.saturating_add(2);
     metadata.pool_slot = None;
+    metadata.cursor = Some(window_cursor_outcome(&metadata));
     let frame = CpuFrame::new(
         Arc::from(pixels),
         output_width,
