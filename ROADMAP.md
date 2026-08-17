@@ -230,7 +230,11 @@ explicit, tested behavior.
 - Add optional cursor composition, including DXGI pointer shapes, hotspots, visibility, clipping, and
   WGC-equivalent semantics.
 - Complete rotation coverage discovered during the multi-monitor milestone.
-- Detect HDR/scRGB sources and implement a documented SDR clipboard/file tone-mapping policy.
+- ~~Detect HDR/scRGB sources and implement a documented SDR clipboard/file tone-mapping policy.~~
+  **Done** (ADR 0006): the compositor is asked for 8-bit BGRA and performs the conversion, so an HDR
+  desktop is capturable and its screenshot matches what other tools produce. Captastic implements no
+  curve of its own. Preserving high dynamic range end to end is deliberately not addressed and needs
+  an output format that can carry it.
 - Investigate ICC/color-profile awareness and preserve color metadata where output formats support it.
 - Add recovery tests for display hot-plugging, sleep/wake, lock/unlock, GPU reset, Remote Desktop, and
   rapid session changes.
@@ -243,7 +247,11 @@ explicit, tested behavior.
 ### Exit criteria
 
 - Cursor-on and cursor-off output are pixel-correct and separately measured.
-- HDR input never produces silently clipped or incorrectly tagged SDR output.
+- HDR input never produces silently clipped or incorrectly tagged SDR output. **Met:** the sinks
+  refuse what they cannot describe (#41) and the capture path no longer produces it (ADR 0006), so
+  there is no path by which wide-gamut samples reach an 8-bit destination unconverted. Unverified on
+  an HDR display, which is what would be needed to judge the compositor's conversion rather than
+  merely confirm one happened.
 - A 1,000-capture acceptance soak and 10,000-capture endurance soak show no unbounded handle or
   memory growth. **Acceptance soak met** (2026-08-16, fake backend, clipboard and file output both
   enabled): kernel handles, GDI objects and USER objects were exactly flat at 186/10/9 across all
