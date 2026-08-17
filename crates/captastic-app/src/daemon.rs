@@ -1910,6 +1910,7 @@ pub(crate) fn preview_metadata(
         frame_generation: None,
         copy_count: 0,
         pool_slot: None,
+        cursor: None,
     })
 }
 
@@ -3124,6 +3125,7 @@ mod tests {
             frame_generation: Some(1),
             copy_count: 1,
             pool_slot: Some(0),
+            cursor: None,
         };
         let frame = CpuFrame::new(
             Arc::from([1_u8, 2, 3, 4]),
@@ -3198,6 +3200,7 @@ mod tests {
             frame_generation: Some(1),
             copy_count: 1,
             pool_slot: Some(0),
+            cursor: None,
         }
     }
 

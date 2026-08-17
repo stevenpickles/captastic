@@ -3079,6 +3079,7 @@ mod tests {
             frame_generation: Some(1),
             copy_count: 0,
             pool_slot: None,
+            cursor: None,
         };
         CpuFrame::new(
             Arc::from(vec![255_u8; 16]),

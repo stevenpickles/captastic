@@ -356,6 +356,7 @@ fn compose_virtual_desktop(
         frame_generation: None,
         copy_count,
         pool_slot: Some(slot as u16),
+        cursor: None,
     };
     CpuFrame::new(
         pixels,
@@ -689,6 +690,7 @@ mod tests {
             frame_generation: Some(1),
             copy_count: 2,
             pool_slot: Some(0),
+            cursor: None,
         };
         CpuFrame::new(
             pixels.into(),

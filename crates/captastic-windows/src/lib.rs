@@ -3,6 +3,8 @@ mod clipboard;
 #[cfg(windows)]
 mod console;
 #[cfg(windows)]
+mod cursor;
+#[cfg(windows)]
 mod daemon_control;
 #[cfg(windows)]
 mod display_manager;

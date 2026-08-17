@@ -318,6 +318,7 @@ impl CaptureBackend for FakeBackend {
             frame_generation: Some(self.attempts),
             copy_count: 0,
             pool_slot: Some((self.attempts % 3) as u16),
+            cursor: None,
         };
 
         let frame = if request.cpu_frame {
