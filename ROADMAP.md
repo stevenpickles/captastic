@@ -252,12 +252,19 @@ explicit, tested behavior.
   there is no path by which wide-gamut samples reach an 8-bit destination unconverted. Unverified on
   an HDR display, which is what would be needed to judge the compositor's conversion rather than
   merely confirm one happened.
-- A 1,000-capture acceptance soak and 10,000-capture endurance soak show no unbounded handle or
-  memory growth. **Acceptance soak met** (2026-08-16, fake backend, clipboard and file output both
-  enabled): kernel handles, GDI objects and USER objects were exactly flat at 186/10/9 across all
-  1,000 captures, and private bytes plateaued at 4.77 MB for the final 440. The endurance soak is
-  still owed, as is a long run on the DXGI backend — desktop duplication only yields on change, so
-  a soak there has to synthesise desktop activity for its whole duration.
+- ~~A 1,000-capture acceptance soak and 10,000-capture endurance soak show no unbounded handle or
+  memory growth.~~ **Met** for both, on the fake backend with clipboard and file output enabled.
+  Acceptance (2026-08-16, 1,000 captures): handles, GDI and USER objects exactly flat at 186/10/9,
+  private bytes plateauing at 4.77 MB for the final 440 captures. Endurance (2026-08-17, 10,000
+  captures over 20 minutes, 83 samples): GDI exactly 10 and USER exactly 9 at every sample, kernel
+  handles in a 186–188 band with no trend, private bytes flat from the first quarter onward
+  (Q1 mean 4.83 MB, Q4 mean 5.40 MB).
+
+  Still owed: an equivalent run on the DXGI backend, which is the only thing that exercises D3D
+  resources. It is now possible on an idle desktop — ADR 0003's verified-currency amendment removed
+  the need to synthesise desktop activity — but the attempt on 2026-08-17 could not start, because
+  the workstation locked partway through the session and a locked session enumerates no displays
+  (issue #51).
 - Three compatible repeat runs support every published performance claim.
 
 ## Milestone 6 — Annotation and pinning
