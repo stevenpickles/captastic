@@ -50,6 +50,13 @@ use crate::error::AppError;
 #[cfg(windows)]
 use crate::DisplayPolicy;
 
+/// How long the daemon's event loop waits before looking at its shutdown sources again.
+///
+/// Also the resolution of everything that loop polls, which is why a soak interval shorter than
+/// this shortens the wait rather than being silently rounded up to it.
+#[cfg(windows)]
+const DAEMON_TICK: Duration = Duration::from_millis(50);
+
 #[cfg(windows)]
 const CAPTURE_RECOVERY_RETRIES: u32 = 3;
 
@@ -83,6 +90,7 @@ struct ResolvedDaemonArgs {
     selection_queue_capacity: usize,
     max_captures: Option<usize>,
     self_trigger: bool,
+    self_trigger_interval_ms: Option<u64>,
     json: bool,
     startup_warnings: Vec<String>,
 }
@@ -187,6 +195,7 @@ fn resolve_daemon_args_with_default(
         selection_queue_capacity: config.selection.queue_capacity,
         max_captures: args.max_captures,
         self_trigger: args.self_trigger,
+        self_trigger_interval_ms: args.self_trigger_interval_ms,
         json: args.json,
         startup_warnings,
     })
@@ -1107,6 +1116,17 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             .map_err(|error| AppError::InvalidArgument(error.to_string()))?;
     }
 
+    // A soak drives thousands of captures through the real process rather than through the
+    // workers alone, which is the only way the exit criterion - no unbounded handle or memory
+    // growth - means anything. Driven from the event loop below rather than from a thread of its
+    // own: a soak that needed its own shutdown path would be testing a daemon nobody ships.
+    let self_trigger_interval = args
+        .self_trigger_interval_ms
+        .filter(|interval| *interval > 0)
+        .map(Duration::from_millis);
+    let mut next_self_trigger = self_trigger_interval.map(|interval| Instant::now() + interval);
+    let mut self_triggers_sent = 0_u64;
+    let mut self_triggers_dropped = 0_u64;
     let mut tray_shutdown_requested = false;
     let mut last_persistence_notification: Option<String> = None;
     let mut last_notice_message: Option<String> = None;
@@ -1132,7 +1152,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             ));
             break;
         }
-        match done_receiver.recv_timeout(Duration::from_millis(50)) {
+        match done_receiver.recv_timeout(event_loop_tick(self_trigger_interval)) {
             Ok(result) => {
                 daemon_result = result;
                 break;
@@ -1281,6 +1301,28 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                         }
                     }
                 }
+                if let (Some(interval), Some(due)) = (self_trigger_interval, next_self_trigger) {
+                    // Stops as soon as a shutdown begins: a soak that kept enqueueing work into
+                    // the teardown would be measuring its own interference.
+                    if !workers.is_shutting_down() && Instant::now() >= due {
+                        match command_sender.try_send(CaptureCommand::Trigger(TriggerEvent {
+                            received_at: Instant::now(),
+                            enqueued_at: Instant::now(),
+                            source: "self_test",
+                            action: HotkeyAction::LastWorkflow,
+                            chord: None,
+                        })) {
+                            Ok(()) => self_triggers_sent = self_triggers_sent.saturating_add(1),
+                            // Counted rather than retried or ignored. A soak that quietly lost
+                            // triggers would report a capture rate the daemon never sustained.
+                            Err(mpsc::TrySendError::Full(_)) => {
+                                self_triggers_dropped = self_triggers_dropped.saturating_add(1)
+                            }
+                            Err(mpsc::TrySendError::Disconnected(_)) => {}
+                        }
+                        next_self_trigger = Some(Instant::now() + interval);
+                    }
+                }
                 if console_shutdown.requested() {
                     workers.begin_shutdown("console shutdown requested");
                 } else if daemon_control.requested() {
@@ -1343,6 +1385,14 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             "shutdown retained a daemon notice in the persistent log: {}",
             notice.message()
         ));
+    }
+    // Reported whenever a soak drove the run, because the number of captures attempted and the
+    // number of triggers the queue accepted are different numbers, and a soak that reported only
+    // the first would describe a throughput the daemon never sustained.
+    if self_triggers_sent > 0 || self_triggers_dropped > 0 {
+        log::info!(
+            "self-trigger soak enqueued {self_triggers_sent} trigger(s); {self_triggers_dropped} were refused by a full trigger queue"
+        );
     }
     // Silent on a run that detached nothing, which is nearly all of them. A line that only appears
     // when something was abandoned is one worth reading; a line reporting zero every time is not.
@@ -1610,6 +1660,19 @@ fn wait_for_backoff(delay: Duration, stop_requested: &AtomicBool) -> BackoffOutc
         }
         thread::sleep(remaining.min(RECOVERY_BACKOFF_POLL));
     }
+}
+
+/// How long the event loop may wait, given whatever a soak asked for.
+///
+/// The loop's wait is also the resolution of everything it polls, so an interval shorter than the
+/// default tick has to shorten the wait or it would be silently rounded up to it - a soak asking
+/// for 10 ms and quietly getting 50 would report a rate it never ran at. A longer interval leaves
+/// the tick alone, because the loop still has shutdown sources to watch on its own schedule.
+#[cfg(windows)]
+fn event_loop_tick(self_trigger_interval: Option<Duration>) -> Duration {
+    self_trigger_interval
+        .map_or(DAEMON_TICK, |interval| interval.min(DAEMON_TICK))
+        .max(Duration::from_millis(1))
 }
 
 #[cfg(windows)]
@@ -2901,6 +2964,29 @@ mod tests {
         assert_eq!(waits, vec![Duration::from_millis(50)]);
         assert_eq!(retry_kinds, vec![CaptureErrorKind::AccessLost]);
         assert!(rebuild_error.is_none());
+    }
+
+    #[test]
+    fn a_soak_interval_sets_the_loop_tick_without_lengthening_it() {
+        // No soak: unchanged.
+        assert_eq!(event_loop_tick(None), DAEMON_TICK);
+        // Longer than the tick: the loop still watches its shutdown sources on its own schedule,
+        // and the soak's own deadline arithmetic spaces the triggers out.
+        assert_eq!(
+            event_loop_tick(Some(Duration::from_millis(250))),
+            DAEMON_TICK
+        );
+        // Shorter: the wait has to shorten, or a soak asking for 10 ms silently runs at 50 and
+        // reports a capture rate the daemon never sustained.
+        assert_eq!(
+            event_loop_tick(Some(Duration::from_millis(10))),
+            Duration::from_millis(10)
+        );
+        // Never zero, which would turn the event loop into a spin.
+        assert_eq!(
+            event_loop_tick(Some(Duration::ZERO)),
+            Duration::from_millis(1)
+        );
     }
 
     #[test]
