@@ -260,11 +260,17 @@ explicit, tested behavior.
   handles in a 186–188 band with no trend, private bytes flat from the first quarter onward
   (Q1 mean 4.83 MB, Q4 mean 5.40 MB).
 
-  Still owed: an equivalent run on the DXGI backend, which is the only thing that exercises D3D
-  resources. It is now possible on an idle desktop — ADR 0003's verified-currency amendment removed
-  the need to synthesise desktop activity — but the attempt on 2026-08-17 could not start, because
-  the workstation locked partway through the session and a locked session enumerates no displays
-  (issue #51).
+  A DXGI leg followed (2026-08-17, 2,000 attempts at 3840×2160 to both destinations, 9 minutes):
+  memory flat throughout at ~248 MB private, and the counters flat for the final six minutes — but
+  with one unexplained step of +22 GDI, +21 USER and +65 handles at the three-minute mark, tracked as
+  #53. Nine minutes is not long enough to know whether that step recurs, so the DXGI side of this
+  criterion is **not** claimed as met.
+
+  That run also measured the sustainable rate for large frames, which nothing had: at 250 ms with
+  8.3 MP frames going to clipboard and file, 787 of 2,000 attempts were refused with
+  `BufferExhausted` — three CPU frame slots against a ~13 ms readback plus a 33 MB clipboard payload
+  and a 3 MB PNG per capture. The bound behaves as designed and reports every refusal; the number is
+  worth knowing before promising a capture rate.
 - Three compatible repeat runs support every published performance claim.
 
 ## Milestone 6 — Annotation and pinning
