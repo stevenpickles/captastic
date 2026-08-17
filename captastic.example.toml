@@ -46,6 +46,11 @@ preview = "auto"
 [clipboard]
 enabled = true
 queue_capacity = 1
+# A capture is whatever was on screen, so by default Captastic asks Windows to keep it out of the
+# Win+V clipboard history and to leave it off the sync to your Microsoft account. Set either to
+# true to opt back in; an ordinary paste works the same either way.
+allow_history = false
+allow_cloud_sync = false
 
 [output]
 # Write every capture to disk, alongside the clipboard or instead of it.

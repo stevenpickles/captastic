@@ -88,6 +88,7 @@ struct ResolvedDaemonArgs {
     ui: UiState,
     ui_state_store: captastic_config::UiStateStore,
     clipboard_queue_capacity: usize,
+    clipboard_retention: captastic_windows::ClipboardRetention,
     selection_queue_capacity: usize,
     max_captures: Option<usize>,
     self_trigger: bool,
@@ -194,6 +195,10 @@ fn resolve_daemon_args_with_default(
         selection_preview: config.selection.preview,
         trigger_queue_capacity: config.daemon.trigger_queue_capacity,
         clipboard_queue_capacity: config.clipboard.queue_capacity,
+        clipboard_retention: captastic_windows::ClipboardRetention {
+            history: config.clipboard.allow_history,
+            cloud_sync: config.clipboard.allow_cloud_sync,
+        },
         hotkey_bindings,
         confirmed_regions,
         ui,
@@ -904,7 +909,13 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         .transpose()?;
     let mut clipboard_worker = args
         .clipboard
-        .then(|| crate::clipboard::ClipboardWorker::start(args.json, args.clipboard_queue_capacity))
+        .then(|| {
+            crate::clipboard::ClipboardWorker::start(
+                args.json,
+                args.clipboard_queue_capacity,
+                args.clipboard_retention,
+            )
+        })
         .transpose()?;
     // Clipboard first so it keeps its place in the logs when file output joins it.
     let destinations: Vec<crate::output::ChannelSink> = clipboard_worker
@@ -1089,6 +1100,10 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         "queue_capacity": args.trigger_queue_capacity,
         "clipboard": args.clipboard,
         "clipboard_queue_capacity": args.clipboard.then_some(args.clipboard_queue_capacity),
+        // Stated at startup rather than only per capture, so a user can see what this daemon will
+        // let Windows keep before they take the screenshot they would regret.
+        "clipboard_allow_history": args.clipboard.then_some(args.clipboard_retention.history),
+        "clipboard_allow_cloud_sync": args.clipboard.then_some(args.clipboard_retention.cloud_sync),
         "selection": args.selection,
         "selection_queue_capacity": args.selection.then_some(args.selection_queue_capacity),
         "file_output": args.file_output,

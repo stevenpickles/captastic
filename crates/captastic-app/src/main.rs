@@ -431,7 +431,8 @@ fn capture_with_preview_fallback(
             })?;
             recorder.record(request.id, PerfEventKind::ClipboardStarted, 0);
             let payload = captastic_windows::ClipboardPayload::prepare(clipboard_frame)?;
-            let mut publisher = captastic_windows::ClipboardPublisher::new()?;
+            let mut publisher =
+                captastic_windows::ClipboardPublisher::new(one_shot_clipboard_retention())?;
             let report = publisher.publish(&payload).map_err(report_clipboard_loss)?;
             recorder.record(
                 request.id,
@@ -446,6 +447,8 @@ fn capture_with_preview_fallback(
                 "open_wait_ns": report.open_wait_ns,
                 "open_retries": report.open_retries,
                 "publish_ns": report.publish_ns,
+                "history_excluded": report.history_excluded,
+                "cloud_sync_excluded": report.cloud_sync_excluded,
             }));
         }
         #[cfg(not(windows))]
@@ -483,6 +486,23 @@ fn capture_with_preview_fallback(
     #[cfg(windows)]
     finish_one_shot_ui_state(ui_worker);
     Ok(())
+}
+
+/// What a one-shot capture lets Windows keep of the clipboard it publishes.
+///
+/// Read from the same `[clipboard]` configuration the daemon uses, so `captastic capture
+/// --clipboard` cannot be a quieter way around a decision the user made once. Configuration that
+/// fails to load falls back to `Default`, which declines both retention paths — the failure mode
+/// of a missing config file should not be the permissive one.
+#[cfg(windows)]
+fn one_shot_clipboard_retention() -> captastic_windows::ClipboardRetention {
+    captastic_config::AppConfig::load_default().map_or_else(
+        |_| captastic_windows::ClipboardRetention::default(),
+        |config| captastic_windows::ClipboardRetention {
+            history: config.clipboard.allow_history,
+            cloud_sync: config.clipboard.allow_cloud_sync,
+        },
+    )
 }
 
 /// Writes a one-shot capture to disk when `[output]` is enabled.
@@ -754,7 +774,8 @@ fn capture_with_live_selection(mut args: cli::CaptureArgs) -> Result<(), AppErro
     if args.clipboard {
         recorder.record(capture_id, PerfEventKind::ClipboardStarted, 0);
         let payload = captastic_windows::ClipboardPayload::prepare(&selected_frame)?;
-        let mut publisher = captastic_windows::ClipboardPublisher::new()?;
+        let mut publisher =
+            captastic_windows::ClipboardPublisher::new(one_shot_clipboard_retention())?;
         let report = publisher.publish(&payload).map_err(report_clipboard_loss)?;
         recorder.record(
             capture_id,
@@ -769,6 +790,8 @@ fn capture_with_live_selection(mut args: cli::CaptureArgs) -> Result<(), AppErro
             "open_wait_ns": report.open_wait_ns,
             "open_retries": report.open_retries,
             "publish_ns": report.publish_ns,
+            "history_excluded": report.history_excluded,
+            "cloud_sync_excluded": report.cloud_sync_excluded,
         }));
     }
     recorder.record(capture_id, PerfEventKind::AttemptFinished, 0);

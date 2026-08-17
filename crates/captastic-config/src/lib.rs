@@ -381,7 +381,7 @@ pub struct AppConfig {
     pub hotkey: HotkeyConfig,
     pub capture: CaptureConfig,
     pub selection: SelectionConfig,
-    pub clipboard: QueueFeatureConfig,
+    pub clipboard: ClipboardConfig,
     pub output: OutputConfig,
     pub metrics: MetricsConfig,
     pub logging: LoggingConfig,
@@ -397,7 +397,7 @@ impl Default for AppConfig {
             hotkey: HotkeyConfig::default(),
             capture: CaptureConfig::default(),
             selection: SelectionConfig::default(),
-            clipboard: QueueFeatureConfig::default(),
+            clipboard: ClipboardConfig::default(),
             output: OutputConfig::default(),
             metrics: MetricsConfig::default(),
             logging: LoggingConfig::default(),
@@ -944,9 +944,20 @@ impl Default for CaptureConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct QueueFeatureConfig {
+pub struct ClipboardConfig {
     pub enabled: bool,
     pub queue_capacity: usize,
+    /// Whether a capture may be kept in the Win+V clipboard history.
+    ///
+    /// Off by default. A screenshot is whatever happened to be on screen, and history keeps it
+    /// reachable long after the paste it was taken for.
+    pub allow_history: bool,
+    /// Whether a capture may be synced to the signed-in Microsoft account, and from there to that
+    /// account's other machines.
+    ///
+    /// Off by default, and the more consequential of the two: local history is a convenience a
+    /// user can restore, while a capture that has left the machine cannot be recalled.
+    pub allow_cloud_sync: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -976,11 +987,15 @@ impl Default for SelectionConfig {
     }
 }
 
-impl Default for QueueFeatureConfig {
+impl Default for ClipboardConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             queue_capacity: 1,
+            // Both retention paths are declined by default. See ADR 0008: the two mistakes are not
+            // symmetrical, so the default is the one whose consequences a user can undo.
+            allow_history: false,
+            allow_cloud_sync: false,
         }
     }
 }

@@ -103,6 +103,8 @@ allocations.
 
 The daemon enables clipboard publication by default. A configurable bounded queue connects the capture thread to a serialized clipboard worker. The worker creates a hidden message-only owner window, prepares top-down CF_DIBV5 and registered PNG representations, retries `OpenClipboard` for at most 50 ms, empties the clipboard, and transfers both movable allocations to Windows. Opaque DXGI frames omit the DIB alpha mask; deliberate native-window alpha advertises it. PNG improves transparent-corner interoperability.
 
+Every publish also declines what Windows would otherwise keep of the capture. `CanIncludeInClipboardHistory` and `CanUploadToCloudClipboard` are set to a `DWORD` of zero, which keeps the capture out of the Win+V history and off the sync to the signed-in Microsoft account. `clipboard.allow_history` and `clipboard.allow_cloud_sync` opt back in, one path at a time. The markers are transferred before the pixels, so no ordering exists in which the capture is on the clipboard without them, and a marker that cannot be set fails the publish rather than falling back to retention the user configured against.
+
 `cpu_frame_ready`, `clipboard_started`, and `clipboard_committed` are distinct event boundaries. Allocation, DIB copying, contention waits, and clipboard API work do not change native-frame or CPU-frame latency. Use `--clipboard false` to disable the worker.
 
 ## Native selection overlay

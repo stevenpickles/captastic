@@ -25,7 +25,11 @@ pub struct ClipboardWorker {
 }
 
 impl ClipboardWorker {
-    pub fn start(json_output: bool, queue_capacity: usize) -> Result<Self, AppError> {
+    pub fn start(
+        json_output: bool,
+        queue_capacity: usize,
+        retention: captastic_windows::ClipboardRetention,
+    ) -> Result<Self, AppError> {
         let (sender, receiver) = mpsc::sync_channel::<ClipboardJob>(queue_capacity);
         let (failure_sender, failure_receiver) = mpsc::sync_channel(queue_capacity);
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
@@ -34,7 +38,7 @@ impl ClipboardWorker {
         let join = thread::Builder::new()
             .name("captastic-clipboard".to_owned())
             .spawn(move || {
-                let mut publisher = match captastic_windows::ClipboardPublisher::new() {
+                let mut publisher = match captastic_windows::ClipboardPublisher::new(retention) {
                     Ok(publisher) => publisher,
                     Err(error) => {
                         let _ = ready_sender.send(Err(error));
@@ -133,6 +137,8 @@ impl ClipboardWorker {
                                         "open_retries": report.open_retries,
                                         "publish_retries": publish_retries,
                                         "publish_ns": report.publish_ns,
+                                        "history_excluded": report.history_excluded,
+                                        "cloud_sync_excluded": report.cloud_sync_excluded,
                                     })
                                 );
                             }
