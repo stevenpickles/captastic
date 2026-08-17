@@ -3221,6 +3221,149 @@ mod tests {
         );
     }
 
+    /// A display record, for topology tests that care about which screens exist.
+    fn lifecycle_display(id: &str, primary: bool, width: u32, height: u32) -> DisplayInfo {
+        DisplayInfo {
+            id: DisplayId(id.to_owned()),
+            name: format!("{id} panel"),
+            bounds: Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+            scale_factor: 1.0,
+            rotation_degrees: 0,
+            is_primary: primary,
+        }
+    }
+
+    /// Drives one capture through the recovery seam with a rebuild that changes the world.
+    ///
+    /// The daemon's hot-plug behaviour is entirely a question of what the *replacement* backend
+    /// enumerates, and the existing recovery test rebuilds an identical one — so it proves the
+    /// retry happens and nothing about whether the retry sees the new topology.
+    fn capture_across_rebuild(
+        source: CaptureSource,
+        before: Vec<DisplayInfo>,
+        after: Vec<DisplayInfo>,
+    ) -> (Result<captastic_core::CaptureOutcome, CaptureError>, u32) {
+        let instant = FakeBackendConfig {
+            native_delay: Duration::ZERO,
+            readback_delay: Duration::ZERO,
+            ..FakeBackendConfig::default()
+        };
+        let mut backend: Option<Box<dyn CaptureBackend>> =
+            Some(Box::new(FakeBackend::with_displays(
+                FakeBackendConfig {
+                    // What a real hot-plug produces: the arrangement moved underneath a cached
+                    // view of it, so the backend is rebuilt rather than merely retried.
+                    failure_script: vec![FakeFailure::new(
+                        1,
+                        CaptureErrorKind::TopologyChanged,
+                        true,
+                    )],
+                    ..instant.clone()
+                },
+                before,
+            )));
+        let request = CaptureRequest {
+            id: CaptureId(1),
+            triggered_at: Instant::now(),
+            source,
+            mode: CaptureMode::Latest { max_age_ms: None },
+            cpu_frame: true,
+            retain_native_frame: false,
+            cursor: CursorMode::Exclude,
+        };
+        let mut rebuilds = 0_u32;
+        let (result, _recorder, _attempts, _rebuild_error) = capture_with_backend_recovery(
+            &mut backend,
+            |active_backend| {
+                let mut recorder = EventRecorder::with_capacity(8);
+                let result = active_backend.capture(&request, &mut recorder);
+                (result, recorder)
+            },
+            || {
+                rebuilds = rebuilds.saturating_add(1);
+                Ok(Box::new(FakeBackend::with_displays(
+                    instant.clone(),
+                    after.clone(),
+                )))
+            },
+            |_| BackoffOutcome::Elapsed,
+            |_, _, _| {},
+        );
+        (result, rebuilds)
+    }
+
+    #[test]
+    fn a_display_plugged_in_during_recovery_is_captured_after_the_rebuild() {
+        // Hot-plug, from the daemon's side: the configured display does not exist when the capture
+        // is requested, and does by the time the engine has been rebuilt.
+        let (result, rebuilds) = capture_across_rebuild(
+            CaptureSource::Display(DisplayId("arriving".to_owned())),
+            vec![lifecycle_display("built-in", true, 1920, 1080)],
+            vec![
+                lifecycle_display("built-in", true, 1920, 1080),
+                lifecycle_display("arriving", false, 3840, 2160),
+            ],
+        );
+
+        assert_eq!(rebuilds, 1);
+        let outcome = result.expect("the arriving display is capturable after the rebuild");
+        assert_eq!(outcome.metadata.display_id.0, "arriving");
+        // Its own dimensions, not the display it replaced: a rebuild that kept the previous
+        // display's geometry would produce a correctly named capture of the wrong size.
+        let frame = outcome.frame.expect("CPU frame");
+        assert_eq!((frame.width(), frame.height()), (3840, 2160));
+    }
+
+    #[test]
+    fn a_display_unplugged_during_recovery_is_reported_rather_than_substituted() {
+        // The property worth more than the capture: a screenshot tool must never quietly
+        // photograph a different screen than the one it was asked for. Failing is the right
+        // answer; silently falling back to the remaining display is not.
+        let (result, rebuilds) = capture_across_rebuild(
+            CaptureSource::Display(DisplayId("departing".to_owned())),
+            vec![
+                lifecycle_display("built-in", true, 1920, 1080),
+                lifecycle_display("departing", false, 3840, 2160),
+            ],
+            vec![lifecycle_display("built-in", true, 1920, 1080)],
+        );
+
+        assert_eq!(rebuilds, 1);
+        let error = result.expect_err("a display that has gone cannot be captured");
+        assert_eq!(error.kind, CaptureErrorKind::SourceUnavailable);
+        assert!(
+            error.message.contains("departing"),
+            "the refusal should name the display that went: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn the_primary_alias_follows_the_primary_across_a_rebuild() {
+        // Promoting a different display to primary — closing a laptop lid, or undocking — leaves
+        // `display = "primary"` meaning a different screen. The alias has to resolve against the
+        // topology that exists now, not the one the daemon started with.
+        let (result, _) = capture_across_rebuild(
+            CaptureSource::Display(DisplayId::primary()),
+            vec![
+                lifecycle_display("built-in", true, 1920, 1080),
+                lifecycle_display("external", false, 3840, 2160),
+            ],
+            vec![
+                lifecycle_display("built-in", false, 1920, 1080),
+                lifecycle_display("external", true, 3840, 2160),
+            ],
+        );
+
+        let outcome = result.expect("the primary alias resolves after the rebuild");
+        assert_eq!(outcome.metadata.display_id.0, "external");
+    }
+
     #[test]
     fn scripted_access_loss_rebuilds_backend_and_retries_capture() {
         let mut backend: Option<Box<dyn CaptureBackend>> =
