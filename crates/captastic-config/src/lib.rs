@@ -1013,8 +1013,16 @@ pub struct OutputConfig {
     pub filename_template: String,
 }
 
-/// The default capture name: sortable, and identical for every capture but the moment it was taken.
-pub const DEFAULT_FILENAME_TEMPLATE: &str = "captastic-{timestamp}";
+/// The default capture name: sortable first, then findable.
+///
+/// The timestamp leads so a directory listing sorts chronologically. What follows says what was
+/// captured, because `20260816-142233-104.png` tells you nothing a week later and
+/// `20260816-142233-104-chrome-Pull-Request-43.png` tells you everything. Both window tokens
+/// expand to nothing for a display or region capture, leaving the timestamp alone.
+///
+/// A window title is content, and a filename is visible in places the image is not. See ADR 0008
+/// for why that cost is accepted here and refused for the clipboard.
+pub const DEFAULT_FILENAME_TEMPLATE: &str = "{timestamp}-{application}-{title}";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]

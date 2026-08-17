@@ -64,7 +64,13 @@ queue_capacity = 2
 # Names each capture, without the extension. Tokens: {timestamp} {date} {time} {display} {mode}
 # {width} {height} {application} {title}. Values coming from a window are sanitized, and a name can
 # never place a capture outside the directory above.
-filename_template = "captastic-{timestamp}"
+#
+# The default leads with the timestamp so captures sort chronologically, then says what was
+# captured. Both window tokens expand to nothing for a display or region capture, leaving the
+# timestamp alone. A window title is content — document names, ticket titles, URLs — and a filename
+# shows up in file pickers, backup indexes, and directory listings. Use "{timestamp}" alone, or
+# "{timestamp}-{application}", if that is more than you want a name to say.
+filename_template = "{timestamp}-{application}-{title}"
 
 [history]
 # How many recent captures to remember, so they can be reopened later. Zero turns history off.
