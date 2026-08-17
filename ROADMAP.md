@@ -179,9 +179,11 @@ history commands. Every exit criterion below is met — three by test, and the l
 measurement (CPU-frame p50 1.065 ms with file output off against 1.060 ms with it on).
 
 ADR 0002 was amended during this work: destinations are parallel tracks after CPU-frame readiness
-rather than later stages of one pipeline, so each records its own trace. Two product decisions
-remain open and are not blockers for anything shipped: whether captures should opt out of clipboard
-history and cloud clipboard, and whether window titles belong in the default filename template.
+rather than later stages of one pipeline, so each records its own trace. The two product decisions
+this milestone deliberately left open (issue #44) were settled afterwards and are recorded in
+ADR 0008: captures now decline both Windows clipboard-retention paths by default, and the default
+filename names the window a capture came from. They point in opposite directions on purpose — the
+question each time was what the user can undo, and clipboard retention is the one that cannot be.
 
 **Outcome:** Captastic can save and revisit captures without adding disk or compression work to the
 capture critical path.
@@ -429,8 +431,8 @@ alongside the overlay extraction and Milestone 4. The order below reflects what 
    pre-work: a documented detach budget, FakeBackend contract fidelity, and the pixel-format
    extension.
 3. Settle the outstanding design decisions — latest-mode currency on an idle desktop,
-   `fresh` + `virtual_desktop`, control-event hardening, the mouse-capture/software-KVM contract,
-   and Milestone 4's two product questions.
+   `fresh` + `virtual_desktop`, control-event hardening, and the mouse-capture/software-KVM
+   contract. Milestone 4's two product questions are now answered (ADR 0008).
 4. Add annotation/pinning (Milestone 6, now ungated) or cross-platform work (Milestone 7), based on
    audience demand (existing decision gate).
 
