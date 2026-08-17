@@ -21,6 +21,11 @@
 [CmdletBinding()]
 param(
     [string] $ProcessName = 'captastic',
+    # Pin the sample to one process. Without this the newest process of that name is sampled, and a
+    # second short-lived instance - a `captastic status`, a daemon that failed to start - silently
+    # substitutes its own counters into the series. That happened during the 2026-08-17 soak and
+    # produced four samples that looked like a 60% drop in handles.
+    [int] $ProcessId = 0,
     [int] $IntervalSeconds = 10,
     [Parameter(Mandatory)] [string] $OutputPath,
     [int] $MaxMinutes = 60
@@ -35,16 +40,20 @@ public static extern uint GetGuiResources(System.IntPtr hProcess, uint uiFlags);
 '@
 }
 
-'Timestamp,ElapsedSeconds,Handles,GdiObjects,UserObjects,WorkingSetMB,PrivateMB' |
+'Timestamp,ElapsedSeconds,ProcessId,Handles,GdiObjects,UserObjects,WorkingSetMB,PrivateMB' |
     Set-Content -Path $OutputPath -Encoding UTF8
 
 $started = Get-Date
 $deadline = $started.AddMinutes($MaxMinutes)
 
 while ((Get-Date) -lt $deadline) {
-    $process = Get-Process -Name $ProcessName -ErrorAction SilentlyContinue |
-        Sort-Object StartTime -Descending |
-        Select-Object -First 1
+    $process = if ($ProcessId -ne 0) {
+        Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    } else {
+        Get-Process -Name $ProcessName -ErrorAction SilentlyContinue |
+            Sort-Object StartTime -Descending |
+            Select-Object -First 1
+    }
     if (-not $process) {
         # The daemon exiting is the normal end of a soak, not an error.
         break
@@ -54,8 +63,11 @@ while ((Get-Date) -lt $deadline) {
     $user = [Captastic.GuiResources]::GetGuiResources($process.Handle, 1)
     $elapsed = [int]((Get-Date) - $started).TotalSeconds
 
-    $row = '{0},{1},{2},{3},{4},{5:N2},{6:N2}' -f (Get-Date -Format 'HH:mm:ss'),
+    # The PID is recorded per row so a substituted process is visible in the data rather than
+    # having to be inferred from an implausible step.
+    $row = '{0},{1},{2},{3},{4},{5},{6:N2},{7:N2}' -f (Get-Date -Format 'HH:mm:ss'),
         $elapsed,
+        $process.Id,
         $process.HandleCount,
         $gdi,
         $user,

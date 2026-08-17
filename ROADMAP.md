@@ -252,12 +252,25 @@ explicit, tested behavior.
   there is no path by which wide-gamut samples reach an 8-bit destination unconverted. Unverified on
   an HDR display, which is what would be needed to judge the compositor's conversion rather than
   merely confirm one happened.
-- A 1,000-capture acceptance soak and 10,000-capture endurance soak show no unbounded handle or
-  memory growth. **Acceptance soak met** (2026-08-16, fake backend, clipboard and file output both
-  enabled): kernel handles, GDI objects and USER objects were exactly flat at 186/10/9 across all
-  1,000 captures, and private bytes plateaued at 4.77 MB for the final 440. The endurance soak is
-  still owed, as is a long run on the DXGI backend — desktop duplication only yields on change, so
-  a soak there has to synthesise desktop activity for its whole duration.
+- ~~A 1,000-capture acceptance soak and 10,000-capture endurance soak show no unbounded handle or
+  memory growth.~~ **Met** for both, on the fake backend with clipboard and file output enabled.
+  Acceptance (2026-08-16, 1,000 captures): handles, GDI and USER objects exactly flat at 186/10/9,
+  private bytes plateauing at 4.77 MB for the final 440 captures. Endurance (2026-08-17, 10,000
+  captures over 20 minutes, 83 samples): GDI exactly 10 and USER exactly 9 at every sample, kernel
+  handles in a 186–188 band with no trend, private bytes flat from the first quarter onward
+  (Q1 mean 4.83 MB, Q4 mean 5.40 MB).
+
+  A DXGI leg followed (2026-08-17, 2,000 attempts at 3840×2160 to both destinations, 9 minutes):
+  memory flat throughout at ~248 MB private, and the counters flat for the final six minutes — but
+  with one unexplained step of +22 GDI, +21 USER and +65 handles at the three-minute mark, tracked as
+  #53. Nine minutes is not long enough to know whether that step recurs, so the DXGI side of this
+  criterion is **not** claimed as met.
+
+  That run also measured the sustainable rate for large frames, which nothing had: at 250 ms with
+  8.3 MP frames going to clipboard and file, 787 of 2,000 attempts were refused with
+  `BufferExhausted` — three CPU frame slots against a ~13 ms readback plus a 33 MB clipboard payload
+  and a 3 MB PNG per capture. The bound behaves as designed and reports every refusal; the number is
+  worth knowing before promising a capture rate.
 - Three compatible repeat runs support every published performance claim.
 
 ## Milestone 6 — Annotation and pinning
