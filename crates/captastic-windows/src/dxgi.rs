@@ -26,17 +26,18 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION, DXGI_MODE_ROTATION_ROTATE180,
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM,
+    DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_MODE_ROTATION, DXGI_MODE_ROTATION_ROTATE180,
     DXGI_MODE_ROTATION_ROTATE270, DXGI_MODE_ROTATION_ROTATE90, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
-    IDXGIOutputDuplication, IDXGIResource, DXGI_ADAPTER_DESC1, DXGI_ERROR_ACCESS_LOST,
-    DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET, DXGI_ERROR_NOT_FOUND,
-    DXGI_ERROR_WAIT_TIMEOUT, DXGI_ERROR_WAS_STILL_DRAWING, DXGI_OUTDUPL_FRAME_INFO,
-    DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR,
-    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME,
-    DXGI_OUTPUT_DESC,
+    IDXGIOutput5, IDXGIOutputDuplication, IDXGIResource, DXGI_ADAPTER_DESC1,
+    DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET,
+    DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT, DXGI_ERROR_WAS_STILL_DRAWING,
+    DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR,
+    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME, DXGI_OUTPUT_DESC,
 };
 use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
@@ -169,9 +170,7 @@ impl DxgiBackend {
                 None,
             )
         })?;
-        // SAFETY: The output and device belong to the same enumerated adapter and remain alive.
-        let duplication = unsafe { selected_record.output.DuplicateOutput(&device) }
-            .map_err(|error| map_windows_error("duplicate_output", error))?;
+        let duplication = duplicate_output_as_bgra8(&selected_record.output, &device)?;
         let qpc_frequency = query_performance_frequency()?;
         let staging = None;
         let (retained_width, retained_height) = dimensions_after_rotation(
@@ -787,7 +786,7 @@ impl DxgiBackend {
             return Err(capture_error(
                 CaptureErrorKind::Unsupported,
                 "readback",
-                format!("unsupported DXGI desktop format {}", source_desc.Format.0),
+                describe_unsupported_format(source_desc.Format),
                 false,
                 None,
             ));
@@ -1052,7 +1051,7 @@ impl DxgiGpuFrame {
             return Err(capture_error(
                 CaptureErrorKind::Unsupported,
                 "gpu_region_readback",
-                format!("unsupported DXGI desktop format {}", self.desc.Format.0),
+                describe_unsupported_format(self.desc.Format),
                 false,
                 None,
             ));
@@ -1998,6 +1997,77 @@ fn persistent_display_id(identity: &str) -> DisplayId {
     DisplayId(format!("windows-monitor-{hash:016x}"))
 }
 
+/// Explains a desktop format this backend cannot read, rather than naming its number.
+///
+/// The number alone was the whole message until 2026-08, and format 10 is the one a user actually
+/// meets: it is what the compositor produces once HDR is switched on for any display, so a setting
+/// change in Windows made every capture fail with an integer and no way to connect the two.
+fn describe_unsupported_format(format: DXGI_FORMAT) -> String {
+    let explanation = if format == DXGI_FORMAT_R16G16B16A16_FLOAT {
+        ". This is the format the compositor uses while HDR is enabled, and Captastic asked it for          8-bit BGRA and was refused. Turning HDR off for this display, or updating the display          driver, restores capture"
+    } else {
+        ""
+    };
+    format!(
+        "the desktop is composed in DXGI format {} ({}), which Captastic cannot read{explanation}",
+        format.0,
+        format_name(format)
+    )
+}
+
+/// A name for the handful of desktop formats worth naming; the number otherwise.
+fn format_name(format: DXGI_FORMAT) -> &'static str {
+    if format == DXGI_FORMAT_B8G8R8A8_UNORM {
+        "B8G8R8A8_UNORM"
+    } else if format == DXGI_FORMAT_R16G16B16A16_FLOAT {
+        "R16G16B16A16_FLOAT"
+    } else if format == DXGI_FORMAT_R10G10B10A2_UNORM {
+        "R10G10B10A2_UNORM"
+    } else {
+        "unrecognized"
+    }
+}
+
+/// Duplicates an output, asking the compositor for 8-bit BGRA even when the desktop is not.
+///
+/// On an HDR desktop the composition surface is `R16G16B16A16_FLOAT` in scRGB, and plain
+/// `DuplicateOutput` hands that back — a format nothing downstream can carry, since a PNG has no
+/// way to say "these samples are linear and 1.0 is not the maximum" and the clipboard's DIBV5 has
+/// no encoding for half-floats. Before this, every capture on an HDR desktop failed with an
+/// unexplained format number.
+///
+/// `DuplicateOutput1` takes the formats the caller can accept, in order of preference, and the
+/// compositor converts. Only BGRA8 is listed, deliberately: listing the float format as a fallback
+/// would let the OS hand back pixels this backend has decided not to interpret, and the decision to
+/// let Windows own the tone mapping is only coherent if there is no second path (ADR 0006).
+///
+/// The conversion is the compositor's own, the same one it performs for anything that reads the
+/// desktop as SDR, which is what makes a Captastic screenshot of an HDR desktop look like every
+/// other tool's screenshot of it rather than like Captastic's opinion of it.
+fn duplicate_output_as_bgra8(
+    output: &IDXGIOutput1,
+    device: &ID3D11Device,
+) -> Result<IDXGIOutputDuplication, CaptureError> {
+    if let Ok(output5) = output.cast::<IDXGIOutput5>() {
+        // SAFETY: The output and device belong to the same enumerated adapter and remain alive for
+        // the call; the format slice is valid for its stated length and the flags must be zero.
+        match unsafe { output5.DuplicateOutput1(device, 0, &[DXGI_FORMAT_B8G8R8A8_UNORM]) } {
+            Ok(duplication) => return Ok(duplication),
+            Err(error) => {
+                // Falls through rather than failing. An output that cannot deliver BGRA8 is still
+                // capturable when the desktop is SDR, and the readback below reports precisely
+                // what arrived if it is not.
+                log::debug!(
+                    "DuplicateOutput1 with BGRA8 was refused ({error}); falling back to the                      compositor's own format"
+                );
+            }
+        }
+    }
+    // SAFETY: The output and device belong to the same enumerated adapter and remain alive.
+    unsafe { output.DuplicateOutput(device) }
+        .map_err(|error| map_windows_error("duplicate_output", error))
+}
+
 struct AcquiredFrame {
     duplication: IDXGIOutputDuplication,
     resource: IDXGIResource,
@@ -2666,6 +2736,30 @@ mod tests {
             differing_inside > 0,
             "the cursor-on capture is identical inside the pointer rectangle: nothing was drawn"
         );
+    }
+
+    #[test]
+    fn an_hdr_desktop_format_explains_itself_rather_than_reporting_a_number() {
+        let message = describe_unsupported_format(DXGI_FORMAT_R16G16B16A16_FLOAT);
+
+        // The number stays, because a bug report needs it; what changes is that it is no longer
+        // the entire message. A user who switched HDR on in Settings can connect the two now.
+        assert!(message.contains("10"), "{message}");
+        assert!(message.contains("R16G16B16A16_FLOAT"), "{message}");
+        assert!(message.contains("HDR"), "{message}");
+        assert!(
+            message.contains("Turning HDR off"),
+            "the message should say what would fix it: {message}"
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_desktop_format_still_names_its_number() {
+        // No HDR explanation attached to a format that has nothing to do with HDR, which would be
+        // a confident answer to a question nobody asked.
+        let message = describe_unsupported_format(DXGI_FORMAT_R10G10B10A2_UNORM);
+        assert!(message.contains("R10G10B10A2_UNORM"), "{message}");
+        assert!(!message.contains("HDR"), "{message}");
     }
 
     #[test]
