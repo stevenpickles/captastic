@@ -66,6 +66,34 @@ pub fn enumerate_displays() -> Result<Vec<DisplayInfo>, CaptureError> {
     enumerate_outputs().map(|outputs| outputs.into_iter().map(|output| output.info).collect())
 }
 
+/// Explains an empty display list, or a denied desktop, by asking whose desktop it is.
+///
+/// DXGI cannot tell "every monitor is unplugged" from "the workstation is locked": both enumerate
+/// no attached outputs and both refuse duplication. Only the session can say which, and the answer
+/// decides whether a caller should give up or wait (issue #51).
+///
+/// Returns `None` when the session does own its desktop, because then the original diagnosis was
+/// right and replacing it would trade one wrong explanation for another.
+pub(crate) fn desktop_obstacle(operation: &'static str) -> Option<CaptureError> {
+    let state = crate::session::desktop_state();
+    if state.is_interactive() {
+        return None;
+    }
+    Some(capture_error(
+        if state.is_temporary() {
+            CaptureErrorKind::DesktopUnavailable
+        } else {
+            // An unanswered probe is not evidence of a lock. Reporting one as `DesktopUnavailable`
+            // would send the daemon into an unbounded wait on a condition nobody confirmed.
+            CaptureErrorKind::SourceUnavailable
+        },
+        operation,
+        format!("{state}"),
+        state.is_temporary(),
+        None,
+    ))
+}
+
 pub(crate) fn enumerate_display_adapters() -> Result<Vec<(DisplayInfo, i64)>, CaptureError> {
     enumerate_outputs().map(|outputs| {
         outputs
@@ -111,6 +139,14 @@ impl DxgiBackend {
         let outputs = enumerate_outputs()?;
         let displays: Vec<_> = outputs.iter().map(|output| output.info.clone()).collect();
         let selected_output = select_display_index(&displays, display_id).ok_or_else(|| {
+            // No displays at all is the shape a locked or disconnected session takes, so it is
+            // asked about before the hardware is blamed. A list with displays in it that simply
+            // does not contain the configured one is a real configuration problem either way.
+            if displays.is_empty() {
+                if let Some(obstacle) = desktop_obstacle("enumerate_outputs") {
+                    return obstacle;
+                }
+            }
             let available = displays
                 .iter()
                 .map(|display| display.id.0.as_str())
@@ -2106,8 +2142,13 @@ fn duplicate_output_as_bgra8(
         }
     }
     // SAFETY: The output and device belong to the same enumerated adapter and remain alive.
-    unsafe { output.DuplicateOutput(device) }
-        .map_err(|error| map_windows_error("duplicate_output", error))
+    unsafe { output.DuplicateOutput(device) }.map_err(|error| {
+        // "Access is denied" here is what a locked workstation looks like from DXGI, and it is
+        // the message that sent this project looking for a permissions problem more than once.
+        // The session is asked before the error is handed on, so it explains itself (issue #51).
+        desktop_obstacle("duplicate_output")
+            .unwrap_or_else(|| map_windows_error("duplicate_output", error))
+    })
 }
 
 struct AcquiredFrame {
