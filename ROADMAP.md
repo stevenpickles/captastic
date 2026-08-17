@@ -239,7 +239,9 @@ explicit, tested behavior.
   an output format that can carry it.
 - Investigate ICC/color-profile awareness and preserve color metadata where output formats support it.
 - Add recovery tests for display hot-plugging, sleep/wake, lock/unlock, GPU reset, Remote Desktop, and
-  rapid session changes.
+  rapid session changes. Hot-plug, unplug and primary-promotion are covered deterministically
+  through the daemon's rebuild seam; the no-source path is covered end to end (#56). Sleep/wake,
+  GPU reset and Remote Desktop still need a machine rather than a fake.
 - Build the controlled sequence-marker workload for freshness, orientation, crop, and cursor tests.
 - Collect environment fingerprints and automate warm-up, raw artifacts, repeat runs, and compatible
   baseline comparison.
