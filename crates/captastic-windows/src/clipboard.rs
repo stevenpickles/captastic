@@ -612,6 +612,7 @@ mod tests {
                 native_ready_offset_ns: 1,
                 cpu_ready_offset_ns: Some(2),
                 frame_age_ns: Some(0),
+                verified_current_offset_ns: None,
                 frame_generation: Some(1),
                 copy_count: 1,
                 pool_slot: None,

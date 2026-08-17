@@ -331,6 +331,16 @@ fn compose_virtual_desktop(
         .iter()
         .filter_map(|frame| frame.metadata.frame_age_ns)
         .max();
+    // A composite is only as verified as its least-recently-verified output, and not verified at
+    // all unless every output is: claiming otherwise would let one freshly-checked display vouch
+    // for a stale neighbour it knows nothing about.
+    let verified_current_offset_ns = frames
+        .iter()
+        .map(|frame| frame.metadata.verified_current_offset_ns)
+        .try_fold(None::<u64>, |oldest, verified| {
+            verified.map(|offset| Some(oldest.map_or(offset, |previous: u64| previous.min(offset))))
+        })
+        .flatten();
     let copy_count = frames.iter().fold(1_u32, |count, frame| {
         count.saturating_add(frame.metadata.copy_count)
     });
@@ -342,6 +352,7 @@ fn compose_virtual_desktop(
         rotation_degrees: 0,
         capture_mode: request.mode.clone(),
         presentation_offset_ns,
+        verified_current_offset_ns,
         timing_provenance: if frames
             .iter()
             .all(|frame| frame.metadata.timing_provenance == TimingProvenance::OsPresentationTime)
@@ -687,6 +698,7 @@ mod tests {
             native_ready_offset_ns: 1,
             cpu_ready_offset_ns: Some(2),
             frame_age_ns: Some(1),
+            verified_current_offset_ns: None,
             frame_generation: Some(1),
             copy_count: 2,
             pool_slot: Some(0),

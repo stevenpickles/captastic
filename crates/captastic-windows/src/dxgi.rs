@@ -311,10 +311,19 @@ impl CaptureBackend for DxgiBackend {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                // Nothing was presented in the window - which, on a static desktop, is because
+                // there was nothing to present. A retained frame that a probe proves identical to
+                // the screen satisfies what `fresh` asks for in every way the caller can observe,
+                // so it is used rather than refused (ADR 0003, amended 2026-08-17). Without this,
+                // `fresh` fails on any idle desktop, and `fresh` + `virtual_desktop` fails whenever
+                // *any* display is idle - which is most of the time on a real multi-monitor desk.
+                if self.refresh_latest_on_demand().unwrap_or(false) {
+                    return self.capture_latest(request, None, recorder);
+                }
                 return Err(capture_error(
                     CaptureErrorKind::Timeout,
                     "acquire_next_frame",
-                    "no post-trigger desktop frame arrived before the timeout",
+                    "no post-trigger desktop frame arrived before the timeout, and no retained                      frame could be proven current",
                     true,
                     Some(i64::from(DXGI_ERROR_WAIT_TIMEOUT.0)),
                 ));
@@ -374,6 +383,7 @@ impl CaptureBackend for DxgiBackend {
                 native_ready_offset_ns: native_ready_ns,
                 cpu_ready_offset_ns: None,
                 frame_age_ns: Some(0),
+                verified_current_offset_ns: None,
                 frame_generation,
                 copy_count: 1,
                 pool_slot: None,
@@ -436,7 +446,7 @@ impl DxgiBackend {
         max_age_ms: Option<u64>,
         recorder: &mut EventRecorder,
     ) -> Result<CaptureOutcome, CaptureError> {
-        self.refresh_latest_on_demand()?;
+        let verified_current = self.refresh_latest_on_demand()?;
         let latest = self.latest.ok_or_else(|| {
             capture_error(
                 CaptureErrorKind::SourceUnavailable,
@@ -457,7 +467,11 @@ impl DxgiBackend {
         } else {
             0
         };
-        if max_age_ms.is_some_and(|maximum| frame_age_ns > maximum.saturating_mul(1_000_000)) {
+        // The verification happened during the probe above, a few microseconds ago; recording the
+        // elapsed time now overstates its age slightly, which is the safe direction.
+        let verified_current_offset_ns =
+            verified_current.then(|| duration_ns_u64(request.triggered_at.elapsed()));
+        if frame_is_too_stale(max_age_ms, frame_age_ns, verified_current) {
             return Err(capture_error(
                 CaptureErrorKind::Timeout,
                 "capture_latest",
@@ -484,6 +498,7 @@ impl DxgiBackend {
             native_ready_offset_ns: native_ready_ns,
             cpu_ready_offset_ns: None,
             frame_age_ns: Some(frame_age_ns),
+            verified_current_offset_ns,
             frame_generation: Some(latest.generation),
             copy_count: 1,
             pool_slot: None,
@@ -528,15 +543,25 @@ impl DxgiBackend {
         })
     }
 
-    fn refresh_latest_on_demand(&mut self) -> Result<(), CaptureError> {
+    /// Brings the retained frame up to date, reporting whether it was *proven* up to date.
+    ///
+    /// `Ok(true)` means a zero-timeout acquisition found nothing pending, which is not a failure to
+    /// find a frame - it is positive evidence that nothing has been presented since the retained
+    /// one, because duplication yields only on change. That evidence used to be discarded here.
+    fn refresh_latest_on_demand(&mut self) -> Result<bool, CaptureError> {
         match self.refresh_latest(0) {
-            Ok(true) => return Ok(()),
+            // A new frame: current by construction, with nothing to verify.
+            Ok(true) => return Ok(false),
             Ok(false) => {}
-            Err(error) if error.kind == CaptureErrorKind::Timeout => {}
+            Err(error) if error.kind == CaptureErrorKind::Timeout => {
+                if self.latest.is_some() {
+                    return Ok(true);
+                }
+            }
             Err(error) => return Err(error),
         }
         if self.latest.is_some() {
-            return Ok(());
+            return Ok(false);
         }
 
         let deadline = Instant::now() + INITIAL_LATEST_FRAME_TIMEOUT;
@@ -546,13 +571,17 @@ impl DxgiBackend {
                 return Err(capture_error(
                     CaptureErrorKind::Timeout,
                     "capture_latest",
-                    "no desktop frame was available before the initial capture timeout",
-                    true,
+                    "the desktop has not changed since Captastic started, so no frame has ever                      been available to retain",
+                    // Not retryable. Duplication produces a frame only when the desktop image
+                    // changes, so retrying cannot succeed until something repaints - and a caller
+                    // that retries in a tight loop learns nothing while burning the deadline.
+                    false,
                     Some(i64::from(DXGI_ERROR_WAIT_TIMEOUT.0)),
                 ));
             }
             match self.refresh_latest(duration_to_timeout_ms(remaining)) {
-                Ok(true) => return Ok(()),
+                // Freshly presented, so there is nothing to have verified.
+                Ok(true) => return Ok(false),
                 Ok(false) => {}
                 Err(error) => return Err(error),
             }
@@ -2044,6 +2073,19 @@ fn format_name(format: DXGI_FORMAT) -> &'static str {
 /// The conversion is the compositor's own, the same one it performs for anything that reads the
 /// desktop as SDR, which is what makes a Captastic screenshot of an HDR desktop look like every
 /// other tool's screenshot of it rather than like Captastic's opinion of it.
+/// Whether a retained frame fails the caller's staleness limit.
+///
+/// Currency, not age, is what a maximum age is asking about. A frame presented thirty seconds ago
+/// that has just been proven pixel-identical to the screen is more current than one presented a
+/// moment ago and never checked since; rejecting the first would refuse a frame on the strength of a
+/// number describing something else (ADR 0003, amended 2026-08-17).
+fn frame_is_too_stale(max_age_ms: Option<u64>, frame_age_ns: u64, verified_current: bool) -> bool {
+    if verified_current {
+        return false;
+    }
+    max_age_ms.is_some_and(|maximum| frame_age_ns > maximum.saturating_mul(1_000_000))
+}
+
 fn duplicate_output_as_bgra8(
     output: &IDXGIOutput1,
     device: &ID3D11Device,
@@ -2736,6 +2778,82 @@ mod tests {
             differing_inside > 0,
             "the cursor-on capture is identical inside the pointer rectangle: nothing was drawn"
         );
+    }
+
+    /// The acceptance test for ADR 0003's amendment: `fresh` succeeds on a desktop that has not
+    /// changed, by proving the retained frame is what the screen shows.
+    ///
+    /// A zero millisecond budget expires before the loop runs, so the fallback is reached on every
+    /// attempt. Whether it can *verify* depends on nothing being presented in the microseconds
+    /// between attempts, which is why this retries: a busy desktop simply needs a few tries to have
+    /// a quiet gap, and an idle one succeeds first time.
+    ///
+    /// cargo test --locked -p captastic-windows --release
+    ///     -- --ignored --nocapture fresh_falls_back_to_a_frame_proven_current
+    #[test]
+    #[ignore = "requires a real desktop and a working duplication"]
+    fn fresh_falls_back_to_a_frame_proven_current() {
+        use std::time::Instant;
+
+        let mut backend = DxgiBackend::new_primary().expect("dxgi backend");
+        let mut recorder = EventRecorder::with_capacity(16);
+        let request = |timeout_ms| CaptureRequest {
+            id: CaptureId(1),
+            triggered_at: Instant::now(),
+            source: CaptureSource::Display(DisplayId::primary()),
+            mode: CaptureMode::Fresh { timeout_ms },
+            cpu_frame: true,
+            retain_native_frame: false,
+            cursor: CursorMode::Exclude,
+        };
+
+        // Prime the retained frame, with a budget long enough to find one.
+        backend
+            .capture(&request(2_000), &mut recorder)
+            .expect("an initial frame");
+
+        for attempt in 1..=20 {
+            let outcome = match backend.capture(&request(0), &mut recorder) {
+                Ok(outcome) => outcome,
+                // A frame was pending, so the desktop is not static and a zero budget genuinely
+                // failed. Correct, and worth another attempt.
+                Err(error) if error.kind == CaptureErrorKind::Timeout => continue,
+                Err(error) => panic!("unexpected failure: {error}"),
+            };
+            let metadata = outcome.metadata;
+            let Some(verified) = metadata.verified_current_offset_ns else {
+                continue;
+            };
+            println!(
+                "attempt {attempt}: fresh with a 0 ms budget returned a frame presented {:.1} ms before the trigger, verified current {:.3} ms after it",
+                metadata.frame_age_ns.unwrap_or(0) as f64 / 1_000_000.0,
+                verified as f64 / 1_000_000.0
+            );
+            assert!(
+                outcome.frame.is_some(),
+                "the fallback must return the retained frame, not merely describe it"
+            );
+            return;
+        }
+        panic!("no attempt could prove the retained frame current; is the desktop repainting continuously?");
+    }
+
+    #[test]
+    fn a_verified_current_frame_is_never_too_stale() {
+        let thirty_seconds = 30_000_000_000;
+
+        // The case that motivated the change: an opt-in staleness limit refusing a frame that a
+        // probe had just proven identical to the screen.
+        assert!(!frame_is_too_stale(Some(100), thirty_seconds, true));
+        // The same frame without that proof is exactly as stale as it looks.
+        assert!(frame_is_too_stale(Some(100), thirty_seconds, false));
+        // No limit asked for, nothing to fail.
+        assert!(!frame_is_too_stale(None, thirty_seconds, false));
+        // A limit that the age satisfies on its own needs no verification to pass.
+        assert!(!frame_is_too_stale(Some(100), 50_000_000, false));
+        // Exactly at the limit is inside it.
+        assert!(!frame_is_too_stale(Some(100), 100_000_000, false));
+        assert!(frame_is_too_stale(Some(100), 100_000_001, false));
     }
 
     #[test]
