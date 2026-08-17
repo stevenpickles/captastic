@@ -17,6 +17,8 @@ mod hotkey;
 #[cfg(windows)]
 mod overlay;
 #[cfg(windows)]
+mod session;
+#[cfg(windows)]
 mod startup;
 #[cfg(windows)]
 mod tray;
@@ -48,6 +50,8 @@ pub use overlay::{
     OverlayController, OverlayResources, OverlaySelection, OverlayUiUpdate, SelectionKind,
     SelectionPreviewSource,
 };
+#[cfg(windows)]
+pub use session::{desktop_state, DesktopState};
 #[cfg(windows)]
 pub use startup::{disable_startup, enable_startup, startup_command};
 #[cfg(windows)]

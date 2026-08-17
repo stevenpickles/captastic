@@ -157,6 +157,16 @@ Use `--mode fresh` for controlled tests where the desktop is known to present af
 
 Desktop Duplication access can be denied from an isolated sandbox even when the same executable succeeds in the user's interactive session. `captastic doctor` preserves the native HRESULT/message so the two cases are distinguishable.
 
+### A session without a desktop
+
+Displays asleep, unplugged mid-session, a disconnected RDP session, or a desktop owned by the lock screen all present to DXGI the same way: no attached outputs. Enumerating nothing is therefore `CaptureErrorKind::DesktopUnavailable` whatever the cause — it means "not now", where `SourceUnavailable` keeps its narrower meaning of "displays exist, but not the one configured", which stays fatal because waiting cannot fix a `display =` naming absent hardware.
+
+Captastic asks the session to *explain* the condition rather than to decide it, using `OpenInputDesktop` and the WTS connect state; neither call answers alone, because a locked session stays `WTSActive` and a disconnected one may still have an openable desktop. Measured on the development host, a plain `Win+L` lock does not stop enumeration or duplication at all, so a fix keyed on the lock would not have addressed the failure that prompted this work (issue #51).
+
+The daemon treats the condition as a wait: it starts, registers hotkeys, reports `capture_engine: "waiting_for_desktop"` in its ready event, and builds the capture engine once there is something to capture. Each wait is polled at the cost of asking — 500 ms for the two-syscall session probe, 2 s for an enumeration, and never by rebuilding DXGI on the engine-recovery schedule, which would be roughly 1,800 device initializations an hour for the length of a lock screen.
+
+`CAPTASTIC_TEST_NO_DISPLAYS_MS` reports no attached outputs for that many milliseconds from process start, so the wait-and-recover path can be exercised without detaching a display. Debug builds only; `scripts/verify-no-display-recovery.ps1` drives it.
+
 ## Safety invariants
 
 - COM initialization is balanced on the creating thread.

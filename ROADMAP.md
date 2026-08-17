@@ -436,6 +436,22 @@ alongside the overlay extraction and Milestone 4. The order below reflects what 
 4. Add annotation/pinning (Milestone 6, now ungated) or cross-platform work (Milestone 7), based on
    audience demand (existing decision gate).
 
+### Lifecycle recovery: a daemon with nothing to capture
+
+The daemon no longer exits when enumeration finds no displays. Locked, disconnected, asleep or
+unplugged all reach DXGI as an empty output list, so they share one kind — `DesktopUnavailable`,
+"not now" — and the daemon waits, registers its hotkeys, and builds the capture engine when a
+display appears. Verified end to end on 2026-08-17 with an injected blackout
+(`CAPTASTIC_TEST_NO_DISPLAYS_MS`, debug builds only): start with nothing attached, seven triggers
+refused with an accurate reason, engine built unattended, 4K captures following.
+
+The measurement that shaped it is worth keeping: **a plain `Win+L` lock does not break DXGI at
+all** on the development host. With `OpenInputDesktop` refused for 6.3 continuous seconds,
+enumeration and duplication both worked and a fresh daemon reported ready. Issue #51's stated
+mechanism was therefore wrong, and a fix keyed on the lock would have missed the failure it was
+filed about. The original condition — an empty list *and* a denied `QueryDisplayConfig` — has still
+not been reproduced on demand.
+
 ## Recommended next branch
 
 Milestone 5's lifecycle-recovery and soak work, now that its pre-work (issue #19) is complete.

@@ -66,6 +66,53 @@ pub fn enumerate_displays() -> Result<Vec<DisplayInfo>, CaptureError> {
     enumerate_outputs().map(|outputs| outputs.into_iter().map(|output| output.info).collect())
 }
 
+/// Reports that there is no desktop to capture, naming the cause where the session can name it.
+///
+/// Every display being absent is one condition with several causes: the workstation is locked or a
+/// secure prompt owns the desktop, the session is disconnected, the monitors are asleep, or they
+/// are genuinely unplugged. DXGI presents all of them identically — no attached outputs — and the
+/// session probe can distinguish only some of them.
+///
+/// They share a kind anyway, because they share the only answer that matters to a caller: there is
+/// nothing to capture *right now*. Measured, not assumed: a locked session on the development host
+/// enumerates and duplicates perfectly well, so keying this on the lock alone would have missed the
+/// very failure issue #51 was filed about. The session state is reported when it explains
+/// something, and its absence is not treated as evidence either way.
+pub(crate) fn no_desktop_to_capture(operation: &'static str) -> CaptureError {
+    let state = crate::session::desktop_state();
+    let message = if state.is_interactive() {
+        "no attached desktop displays were found".to_owned()
+    } else {
+        format!("no attached desktop displays were found: {state}")
+    };
+    capture_error(
+        CaptureErrorKind::DesktopUnavailable,
+        operation,
+        message,
+        true,
+        None,
+    )
+}
+
+/// Explains a *denied* desktop operation, when the session is what denied it.
+///
+/// Narrower than [`no_desktop_to_capture`] on purpose. An enumeration that comes back empty is
+/// self-evidently "nothing to capture"; a denial is only a session problem if the session says so,
+/// and swallowing an unexplained denial would hide a real fault behind a comfortable message.
+pub(crate) fn desktop_obstacle(operation: &'static str) -> Option<CaptureError> {
+    let state = crate::session::desktop_state();
+    if !state.is_temporary() {
+        return None;
+    }
+    Some(capture_error(
+        CaptureErrorKind::DesktopUnavailable,
+        operation,
+        format!("{state}"),
+        true,
+        None,
+    ))
+}
+
 pub(crate) fn enumerate_display_adapters() -> Result<Vec<(DisplayInfo, i64)>, CaptureError> {
     enumerate_outputs().map(|outputs| {
         outputs
@@ -111,6 +158,13 @@ impl DxgiBackend {
         let outputs = enumerate_outputs()?;
         let displays: Vec<_> = outputs.iter().map(|output| output.info.clone()).collect();
         let selected_output = select_display_index(&displays, display_id).ok_or_else(|| {
+            // No displays at all is a different condition from the configured display being
+            // missing, and only the second is about the configuration. The first says the desktop
+            // is not there to capture — asleep, unplugged, or owned by a lock screen — and it is
+            // the one worth waiting out rather than exiting over (issue #51).
+            if displays.is_empty() {
+                return no_desktop_to_capture("enumerate_outputs");
+            }
             let available = displays
                 .iter()
                 .map(|display| display.id.0.as_str())
@@ -1808,7 +1862,41 @@ struct DisplayConfigIdentity {
     friendly_name: String,
 }
 
+/// Test-only: reports no attached outputs for the first N milliseconds of the process.
+///
+/// `CAPTASTIC_TEST_NO_DISPLAYS_MS` exists because the condition the daemon's wait-and-recover path
+/// is built around — a machine with nothing attached — cannot be produced on a working desk
+/// without unplugging the monitor someone is reading. Expressed as a duration rather than a flag
+/// so one run proves both halves: the daemon waits while it is set, and picks the displays up by
+/// itself when it lapses.
+///
+/// Absent from release builds entirely, so a shipped binary has no such switch to find.
+#[cfg(debug_assertions)]
+fn displays_are_hidden_for_testing() -> bool {
+    use std::sync::OnceLock;
+    static BLACKOUT: OnceLock<Option<(Instant, Duration)>> = OnceLock::new();
+    let configured = BLACKOUT.get_or_init(|| {
+        let milliseconds = std::env::var("CAPTASTIC_TEST_NO_DISPLAYS_MS")
+            .ok()?
+            .parse::<u64>()
+            .ok()?;
+        log::warn!(
+            "CAPTASTIC_TEST_NO_DISPLAYS_MS is set: reporting no attached displays for {milliseconds} ms"
+        );
+        Some((Instant::now(), Duration::from_millis(milliseconds)))
+    });
+    configured.is_some_and(|(started, window)| started.elapsed() < window)
+}
+
+#[cfg(not(debug_assertions))]
+const fn displays_are_hidden_for_testing() -> bool {
+    false
+}
+
 fn enumerate_outputs() -> Result<Vec<OutputRecord>, CaptureError> {
+    if displays_are_hidden_for_testing() {
+        return Ok(Vec::new());
+    }
     // SAFETY: The generic result is a supported DXGI factory interface and Windows initializes it.
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }
         .map_err(|error| map_windows_error("create_dxgi_factory", error))?;
@@ -2106,8 +2194,13 @@ fn duplicate_output_as_bgra8(
         }
     }
     // SAFETY: The output and device belong to the same enumerated adapter and remain alive.
-    unsafe { output.DuplicateOutput(device) }
-        .map_err(|error| map_windows_error("duplicate_output", error))
+    unsafe { output.DuplicateOutput(device) }.map_err(|error| {
+        // "Access is denied" here is what a locked workstation looks like from DXGI, and it is
+        // the message that sent this project looking for a permissions problem more than once.
+        // The session is asked before the error is handed on, so it explains itself (issue #51).
+        desktop_obstacle("duplicate_output")
+            .unwrap_or_else(|| map_windows_error("duplicate_output", error))
+    })
 }
 
 struct AcquiredFrame {

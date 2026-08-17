@@ -39,12 +39,7 @@ impl DxgiDisplayManager {
             .map(|(display, _)| display.clone())
             .collect();
         if displays.is_empty() {
-            return Err(manager_error(
-                CaptureErrorKind::SourceUnavailable,
-                "initialize",
-                "no attached desktop displays were found",
-                false,
-            ));
+            return Err(crate::dxgi::no_desktop_to_capture("initialize"));
         }
         let virtual_bounds = DisplayTopology::new(0, displays.clone())
             .map_err(|error| {
@@ -98,6 +93,12 @@ impl DxgiDisplayManager {
             .first()
             .map(|session| session.backend.capabilities().clone())
             .ok_or_else(|| {
+                // Displays enumerated but not one of them would duplicate. A session that locked
+                // between the two steps produces exactly that, and per-display errors listing
+                // "Access is denied" for each is a long way of not saying so.
+                if let Some(obstacle) = crate::dxgi::desktop_obstacle("initialize") {
+                    return obstacle;
+                }
                 manager_error(
                     CaptureErrorKind::SourceUnavailable,
                     "initialize",

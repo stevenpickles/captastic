@@ -237,6 +237,7 @@ fn capture_error_kind_label(kind: CaptureErrorKind) -> &'static str {
         CaptureErrorKind::Unsupported => "unsupported",
         CaptureErrorKind::PermissionDenied => "permission_denied",
         CaptureErrorKind::SourceUnavailable => "source_unavailable",
+        CaptureErrorKind::DesktopUnavailable => "desktop_unavailable",
         CaptureErrorKind::Timeout => "timeout",
         CaptureErrorKind::AccessLost => "access_lost",
         CaptureErrorKind::DeviceRemoved => "device_removed",

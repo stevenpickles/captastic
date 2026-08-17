@@ -5,6 +5,17 @@ pub enum CaptureErrorKind {
     Unsupported,
     PermissionDenied,
     SourceUnavailable,
+    /// The session does not currently own a desktop to capture.
+    ///
+    /// Distinct from [`Self::SourceUnavailable`], which it used to be reported as. That kind means
+    /// the display a caller asked for is not there — a monitor unplugged, a `display =` naming
+    /// hardware that has gone. This means every display is missing for the same reason and it is
+    /// not about the hardware at all: the workstation is locked, a secure prompt owns the desktop,
+    /// or the session is disconnected. The two look identical from inside DXGI (no attached
+    /// outputs, duplication denied) and could not be less alike in what a caller should do —
+    /// this one fixes itself when the user signs back in, so it is worth waiting for rather than
+    /// exiting over.
+    DesktopUnavailable,
     Timeout,
     AccessLost,
     DeviceRemoved,
