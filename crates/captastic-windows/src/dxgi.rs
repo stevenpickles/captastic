@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 
 use captastic_core::{
     BackendCapabilities, CaptureBackend, CaptureError, CaptureErrorKind, CaptureMode,
-    CaptureOutcome, CaptureRequest, CaptureSource, ColorSpace, CpuFrame, CursorMode, DisplayId,
-    DisplayInfo, EventRecorder, FrameMetadata, FrameOrigin, NativeFrame, PerfEventKind,
-    PixelFormat, Rect, TimingProvenance,
+    CaptureOutcome, CaptureRequest, CaptureSource, ColorSpace, CpuFrame, CursorAbsence,
+    CursorCapture, CursorMode, DisplayId, DisplayInfo, EventRecorder, FrameMetadata, FrameOrigin,
+    NativeFrame, PerfEventKind, PixelFormat, Rect, TimingProvenance,
 };
 use windows::core::{ComInterface, Error as WindowsError};
 use windows::Win32::Devices::Display::{
@@ -34,6 +34,8 @@ use windows::Win32::Graphics::Dxgi::{
     IDXGIOutputDuplication, IDXGIResource, DXGI_ADAPTER_DESC1, DXGI_ERROR_ACCESS_LOST,
     DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET, DXGI_ERROR_NOT_FOUND,
     DXGI_ERROR_WAIT_TIMEOUT, DXGI_ERROR_WAS_STILL_DRAWING, DXGI_OUTDUPL_FRAME_INFO,
+    DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR,
+    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME,
     DXGI_OUTPUT_DESC,
 };
 use windows::Win32::Graphics::Gdi::HMONITOR;
@@ -77,6 +79,11 @@ pub struct DxgiBackend {
     device: ID3D11Device,
     context: Arc<Mutex<ID3D11DeviceContext>>,
     duplication: IDXGIOutputDuplication,
+    /// The last pointer shape this duplication sent. Owned by the backend rather than by a frame
+    /// because the compositor sends a shape only when it changes; a rebuild after AccessLost
+    /// creates a new backend and so discards it, which is correct - the new duplication will send
+    /// a fresh shape before it reports a position that needs one.
+    pointer: crate::cursor::PointerCache,
     retained: RetainedTexture,
     latest: Option<RetainedFrame>,
     staging: Option<StagingTexture>,
@@ -191,6 +198,7 @@ impl DxgiBackend {
             device,
             context: Arc::new(Mutex::new(context)),
             duplication,
+            pointer: crate::cursor::PointerCache::default(),
             retained,
             latest: None,
             staging,
@@ -345,8 +353,16 @@ impl CaptureBackend for DxgiBackend {
 
             let native_ready_ns = duration_ns_u64(request.triggered_at.elapsed());
             recorder.record(request.id, PerfEventKind::NativeFrameReady, native_ready_ns);
-            let frame_generation =
-                self.retain_frame(&texture, texture_desc, acquired.info.LastPresentTime)?;
+            let retained_pointer_at = acquired.info.PointerPosition.Visible.as_bool().then_some((
+                acquired.info.PointerPosition.Position.x,
+                acquired.info.PointerPosition.Position.y,
+            ));
+            let frame_generation = self.retain_frame(
+                &texture,
+                texture_desc,
+                acquired.info.LastPresentTime,
+                retained_pointer_at,
+            )?;
             let mut metadata = FrameMetadata {
                 capture_id: request.id,
                 backend: self.name().to_owned(),
@@ -362,6 +378,7 @@ impl CaptureBackend for DxgiBackend {
                 frame_generation,
                 copy_count: 1,
                 pool_slot: None,
+                cursor: None,
             };
             let native_texture = if request.retain_native_frame {
                 metadata.copy_count = metadata.copy_count.saturating_add(1);
@@ -370,11 +387,13 @@ impl CaptureBackend for DxgiBackend {
                 None
             };
             let cpu_frame = if request.cpu_frame {
+                let pointer_at = self.pointer_for(&acquired, &request.cursor, &mut metadata)?;
                 Some(self.readback(
                     &texture,
                     texture_desc,
                     request.triggered_at,
                     &mut metadata,
+                    pointer_at,
                     recorder,
                 )?)
             } else {
@@ -469,6 +488,7 @@ impl DxgiBackend {
             frame_generation: Some(latest.generation),
             copy_count: 1,
             pool_slot: None,
+            cursor: None,
         };
         let retained_texture = self.retained.texture.clone();
         let retained_desc = self.retained.desc;
@@ -479,11 +499,14 @@ impl DxgiBackend {
             None
         };
         let cpu_frame = if request.cpu_frame {
+            let pointer_at =
+                self.retained_pointer(latest.pointer_at, &request.cursor, &mut metadata);
             Some(self.readback(
                 &retained_texture,
                 retained_desc,
                 request.triggered_at,
                 &mut metadata,
+                pointer_at,
                 recorder,
             )?)
         } else {
@@ -559,7 +582,14 @@ impl DxgiBackend {
                 None,
             ));
         }
-        self.retain_frame(&texture, desc, acquired.info.LastPresentTime)?;
+        // Cached before the frame is retained, so a shape delivered alongside this frame is
+        // available when the frame is materialized later.
+        self.refresh_pointer_shape(&acquired)?;
+        let pointer_at = acquired.info.PointerPosition.Visible.as_bool().then_some((
+            acquired.info.PointerPosition.Position.x,
+            acquired.info.PointerPosition.Position.y,
+        ));
+        self.retain_frame(&texture, desc, acquired.info.LastPresentTime, pointer_at)?;
         acquired.release()?;
         Ok(true)
     }
@@ -569,6 +599,7 @@ impl DxgiBackend {
         source: &ID3D11Texture2D,
         source_desc: D3D11_TEXTURE2D_DESC,
         presentation_qpc: i64,
+        pointer_at: Option<(i32, i32)>,
     ) -> Result<Option<u64>, CaptureError> {
         if presentation_qpc == 0 {
             return Ok(None);
@@ -609,8 +640,138 @@ impl DxgiBackend {
         self.latest = Some(RetainedFrame {
             presentation_qpc,
             generation,
+            pointer_at,
         });
         Ok(Some(generation))
+    }
+
+    /// Takes whatever pointer information this frame carried, and says what to do with it.
+    ///
+    /// Returns `Ok(None)` when there is nothing to draw, with the reason already recorded on the
+    /// metadata - a request that could not be honoured is reported rather than left looking like a
+    /// request never made.
+    fn pointer_for(
+        &mut self,
+        acquired: &AcquiredFrame,
+        mode: &CursorMode,
+        metadata: &mut FrameMetadata,
+    ) -> Result<Option<(i32, i32)>, CaptureError> {
+        if matches!(mode, CursorMode::Exclude) {
+            metadata.cursor = Some(CursorCapture::Excluded);
+            return Ok(None);
+        }
+        // Cached before the visibility test, not after: a shape can arrive on the same frame that
+        // moves the pointer onto another output, and throwing it away would mean drawing nothing
+        // when it comes back.
+        self.refresh_pointer_shape(acquired)?;
+
+        if !acquired.info.PointerPosition.Visible.as_bool() {
+            metadata.cursor = Some(CursorCapture::Absent {
+                reason: CursorAbsence::NotVisible,
+            });
+            return Ok(None);
+        }
+        // Refused rather than guessed. The position arrives in the duplicated surface's own
+        // coordinates and clearly needs the rotation normalization the pixels get, but whether the
+        // *shape* arrives rotated with it is not something the documentation settles, and this
+        // machine has no rotated display to settle it on. Drawing a cursor in the wrong place, or
+        // the right place at the wrong angle, is worse than drawing none and saying so.
+        if metadata.rotation_degrees != 0 {
+            metadata.cursor = Some(CursorCapture::Absent {
+                reason: CursorAbsence::RotatedDisplayUnverified,
+            });
+            return Ok(None);
+        }
+        if self.pointer.current().is_none() {
+            metadata.cursor = Some(CursorCapture::Absent {
+                reason: CursorAbsence::ShapeNotYetKnown,
+            });
+            return Ok(None);
+        }
+        Ok(Some((
+            acquired.info.PointerPosition.Position.x,
+            acquired.info.PointerPosition.Position.y,
+        )))
+    }
+
+    /// The pointer decision for a frame that was captured earlier and is being materialized now.
+    ///
+    /// Shares every rule with the live path except where the position comes from: this one was
+    /// recorded when the frame was captured, because that is the only position consistent with its
+    /// pixels.
+    fn retained_pointer(
+        &self,
+        pointer_at: Option<(i32, i32)>,
+        mode: &CursorMode,
+        metadata: &mut FrameMetadata,
+    ) -> Option<(i32, i32)> {
+        if matches!(mode, CursorMode::Exclude) {
+            metadata.cursor = Some(CursorCapture::Excluded);
+            return None;
+        }
+        let reason = if pointer_at.is_none() {
+            CursorAbsence::NotVisible
+        } else if metadata.rotation_degrees != 0 {
+            CursorAbsence::RotatedDisplayUnverified
+        } else if self.pointer.current().is_none() {
+            CursorAbsence::ShapeNotYetKnown
+        } else {
+            metadata.cursor = None;
+            return pointer_at;
+        };
+        metadata.cursor = Some(CursorCapture::Absent { reason });
+        None
+    }
+
+    /// Stores this frame's pointer shape, if it carried one.
+    fn refresh_pointer_shape(&mut self, acquired: &AcquiredFrame) -> Result<(), CaptureError> {
+        let size = acquired.info.PointerShapeBufferSize;
+        if size == 0 {
+            return Ok(());
+        }
+        let mut buffer = vec![0_u8; size as usize];
+        let mut required = 0_u32;
+        let mut info = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+        // SAFETY: The buffer is `size` bytes, which is the size DXGI just reported for this
+        // frame's shape, and both out-parameters are valid writable storage.
+        unsafe {
+            self.duplication.GetFramePointerShape(
+                size,
+                buffer.as_mut_ptr().cast(),
+                &mut required,
+                &mut info,
+            )
+        }
+        .map_err(|error| map_windows_error("get_frame_pointer_shape", error))?;
+
+        let shape_type = info.Type as i32;
+        let kind = if shape_type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0 {
+            crate::cursor::PointerShapeKind::Color
+        } else if shape_type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 {
+            crate::cursor::PointerShapeKind::Monochrome
+        } else if shape_type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0 {
+            crate::cursor::PointerShapeKind::MaskedColor
+        } else {
+            // Left uncached deliberately: an unknown encoding would otherwise be drawn as
+            // whichever of the three it was mistaken for.
+            log::debug!("ignoring pointer shape of unknown type {shape_type}");
+            return Ok(());
+        };
+        // A monochrome shape's buffer is two masks stacked, so its drawn height is half what DXGI
+        // reports here.
+        let height = if matches!(kind, crate::cursor::PointerShapeKind::Monochrome) {
+            info.Height / 2
+        } else {
+            info.Height
+        };
+        self.pointer.store(crate::cursor::PointerShape {
+            kind,
+            width: info.Width,
+            height,
+            pitch: info.Pitch,
+            pixels: buffer,
+        });
+        Ok(())
     }
 
     fn readback(
@@ -619,6 +780,7 @@ impl DxgiBackend {
         source_desc: D3D11_TEXTURE2D_DESC,
         triggered_at: Instant,
         metadata: &mut FrameMetadata,
+        pointer_at: Option<(i32, i32)>,
         recorder: &mut EventRecorder,
     ) -> Result<CpuFrame, CaptureError> {
         if source_desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
@@ -721,6 +883,24 @@ impl DxgiBackend {
                 metadata.rotation_degrees,
                 pixels,
             )?;
+            // Drawn here, into the full frame, before any crop. A pointer straddling a selection
+            // edge is then clipped by that crop exactly as it was clipped by the edge of the
+            // screen, without a second bounds test that could disagree with the first.
+            if let (Some((x, y)), Some(shape)) = (pointer_at, self.pointer.current()) {
+                let composited = std::time::Instant::now();
+                metadata.cursor = Some(crate::cursor::composite_pointer(
+                    pixels,
+                    layout.width,
+                    layout.height,
+                    layout.stride as usize,
+                    &crate::cursor::PointerSample { x, y, shape },
+                ));
+                log::debug!(
+                    "capture {} composited its cursor in {:.3} ms",
+                    metadata.capture_id.0,
+                    composited.elapsed().as_secs_f64() * 1_000.0
+                );
+            }
         }
         drop(mapped);
         let pixels = self.cpu_pool.slots[slot_index]
@@ -1173,6 +1353,12 @@ fn lock_context(
 struct RetainedFrame {
     presentation_qpc: i64,
     generation: u64,
+    /// Where the pointer was when this frame was captured.
+    ///
+    /// Retained with the frame rather than read fresh at materialization time, because `latest`
+    /// mode may hand back a frame acquired seconds ago and the mouse has moved since. Drawing the
+    /// cursor where it is now would place it over pixels that never had it there.
+    pointer_at: Option<(i32, i32)>,
 }
 
 struct RetainedTexture {
@@ -2389,6 +2575,97 @@ mod tests {
 
     fn blue_channel(pixels: &[u8]) -> Vec<u8> {
         pixels.chunks_exact(4).map(|pixel| pixel[0]).collect()
+    }
+
+    /// Milestone 5's exit criterion, measured rather than asserted: a cursor-on capture and a
+    /// cursor-off capture of the same desktop must be identical everywhere except where the
+    /// pointer is, and must actually differ there.
+    ///
+    /// Needs a desktop that is actually changing, and moving the mouse is not enough: a pointer
+    /// move is a hardware-cursor update and does not dirty the desktop image, which is the same
+    /// reason DXGI reports pointer position separately from frame content. Drag a window, scroll
+    /// something, or play a video while this runs.
+    ///
+    /// cargo test --locked -p captastic-windows --release
+    ///     -- --ignored --nocapture cursor_composition_changes_only_the_pointer_rectangle
+    #[test]
+    #[ignore = "requires an interactive desktop with a visible pointer"]
+    fn cursor_composition_changes_only_the_pointer_rectangle() {
+        use std::time::Instant;
+
+        let mut backend = DxgiBackend::new_primary().expect("dxgi backend");
+        let mut recorder = EventRecorder::with_capacity(16);
+        let request = |cursor| CaptureRequest {
+            id: CaptureId(1),
+            triggered_at: Instant::now(),
+            source: CaptureSource::Display(DisplayId::primary()),
+            // Generous, because the frame has to arrive from whatever the tester is doing to the
+            // desktop rather than from anything this test can cause.
+            mode: CaptureMode::Fresh { timeout_ms: 10_000 },
+            cpu_frame: true,
+            retain_native_frame: false,
+            cursor,
+        };
+
+        let without = backend
+            .capture(&request(CursorMode::Exclude), &mut recorder)
+            .expect("capture without a cursor")
+            .frame
+            .expect("cpu frame");
+        let with = backend
+            .capture(&request(CursorMode::Include), &mut recorder)
+            .expect("capture with a cursor")
+            .frame
+            .expect("cpu frame");
+
+        let Some(CursorCapture::Composited {
+            x,
+            y,
+            width,
+            height,
+        }) = with.metadata.cursor
+        else {
+            panic!(
+                "expected a composited cursor, got {:?} - is the pointer on the primary display?",
+                with.metadata.cursor
+            );
+        };
+        assert_eq!(without.metadata.cursor, Some(CursorCapture::Excluded));
+        println!("pointer reported at ({x},{y}) sized {width}x{height}");
+
+        // The two captures are of different moments, so anything that repainted between them
+        // differs too. What must hold is the containment: every difference outside the pointer
+        // rectangle has to be explained by the desktop changing, and inside it there must be at
+        // least one difference, or nothing was drawn.
+        let stride = with.stride_bytes() as usize;
+        let mut differing_inside = 0_u64;
+        let mut differing_outside = 0_u64;
+        for row in 0..with.height() as usize {
+            for column in 0..with.width() as usize {
+                let start = row * stride + column * 4;
+                if with.pixels()[start..start + 4] == without.pixels()[start..start + 4] {
+                    continue;
+                }
+                let inside = (column as i64) >= i64::from(x)
+                    && (column as i64) < i64::from(x) + i64::from(width)
+                    && (row as i64) >= i64::from(y)
+                    && (row as i64) < i64::from(y) + i64::from(height);
+                if inside {
+                    differing_inside += 1;
+                } else {
+                    differing_outside += 1;
+                }
+            }
+        }
+
+        let pointer_area = u64::from(width) * u64::from(height);
+        println!(
+            "{differing_inside}/{pointer_area} pixels differ inside the pointer rectangle,              {differing_outside} outside it (desktop repaints)"
+        );
+        assert!(
+            differing_inside > 0,
+            "the cursor-on capture is identical inside the pointer rectangle: nothing was drawn"
+        );
     }
 
     #[test]

@@ -615,6 +615,7 @@ mod tests {
                 frame_generation: Some(1),
                 copy_count: 1,
                 pool_slot: None,
+                cursor: None,
             },
         )
         .expect("valid fixture")

@@ -271,7 +271,7 @@ fn capture_with_preview_fallback(
         mode: capture_mode(args.mode),
         cpu_frame: args.cpu_frame,
         retain_native_frame: args.selection,
-        cursor: CursorMode::Exclude,
+        cursor: configured_cursor_mode(),
     };
     recorder.record(request.id, PerfEventKind::HotkeyReceived, 0);
     recorder.record(request.id, PerfEventKind::TriggerEnqueued, 0);
@@ -668,6 +668,8 @@ fn capture_with_live_selection(mut args: cli::CaptureArgs) -> Result<(), AppErro
             mode,
             cpu_frame: true,
             retain_native_frame: selection.kind == captastic_windows::SelectionKind::Region,
+            // Suppressed for the same reason as the daemon's confirmation capture: this frame is
+            // taken the instant the user confirms, with the pointer on Captastic's own overlay.
             cursor: CursorMode::Exclude,
         };
         let outcome = backend.capture(&request, &mut recorder)?;
@@ -936,6 +938,19 @@ fn config(command: ConfigCommand) -> Result<(), AppError> {
             println!("valid: {}", path.display());
             Ok(())
         }
+    }
+}
+
+/// The cursor policy from configuration.
+///
+/// One-shot captures have no `--cursor` flag: the policy is a standing preference rather than a
+/// per-capture choice, and duplicating it on the command line would let the two disagree.
+fn configured_cursor_mode() -> CursorMode {
+    let config = captastic_config::AppConfig::load_default().unwrap_or_default();
+    if config.capture.cursor == "include" {
+        CursorMode::Include
+    } else {
+        CursorMode::Exclude
     }
 }
 

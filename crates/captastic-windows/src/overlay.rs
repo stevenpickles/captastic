@@ -4416,6 +4416,7 @@ mod tests {
             frame_generation: Some(1),
             copy_count: 1,
             pool_slot: Some(0),
+            cursor: None,
         }
     }
 
@@ -4440,6 +4441,7 @@ mod tests {
             frame_generation: Some(1),
             copy_count: 1,
             pool_slot: Some(0),
+            cursor: None,
         };
         let frame = CpuFrame::new(
             Arc::from(vec![0_u8; 4]),

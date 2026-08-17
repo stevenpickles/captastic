@@ -18,8 +18,8 @@ pub use display::{DisplayId, DisplayInfo, DisplayTopology, DisplayTopologyError,
 pub use error::{CaptureError, CaptureErrorKind, FrameError, MetricsError};
 pub use fake::{FakeBackend, FakeBackendConfig, FakeFailure};
 pub use frame::{
-    ColorSpace, CpuFrame, FrameAlpha, FrameMetadata, FrameOrigin, PixelEncoding, PixelFormat,
-    TimingProvenance,
+    ColorSpace, CpuFrame, CursorAbsence, CursorCapture, FrameAlpha, FrameMetadata, FrameOrigin,
+    PixelEncoding, PixelFormat, TimingProvenance,
 };
 pub use metrics::{validate_event_order, EventRecorder, LatencySummary, PerfEvent, PerfEventKind};
 pub use png::{encode_frame, PngEffort, PngError};

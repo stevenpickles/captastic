@@ -97,6 +97,52 @@ pub enum TimingProvenance {
     Unavailable,
 }
 
+/// Why a frame carries no cursor, when one was asked for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CursorAbsence {
+    /// The pointer was not on the captured display, or was hidden.
+    NotVisible,
+    /// The source cannot produce a pointer at all — every window-capture backend.
+    SourceCannotCompose,
+    /// A live selection: the pointer at confirmation time was on Captastic's own overlay.
+    SuppressedForSelection,
+    /// The display is rotated, and where the pointer belongs on it has not been established.
+    ///
+    /// The position plainly needs the rotation normalization the pixels get; whether the shape
+    /// arrives already rotated is not settled by the documentation and needs a rotated display to
+    /// answer. Reported rather than guessed, because a cursor drawn in the wrong place is a worse
+    /// answer than no cursor and a reason.
+    RotatedDisplayUnverified,
+    /// The pointer is visible but no shape has been received for it yet.
+    ///
+    /// A real state rather than an error. The compositor only sends a pointer shape when it
+    /// changes, so a duplication that has just been created knows where the pointer is before it
+    /// knows what it looks like.
+    ShapeNotYetKnown,
+}
+
+/// What became of the cursor for one capture.
+///
+/// Recorded because "no cursor in the image" has several causes and only one of them is the user
+/// not asking for one. A request that could not be honoured should be visible in the result rather
+/// than indistinguishable from a request never made.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum CursorCapture {
+    Excluded,
+    /// Drawn into the frame over this rectangle, in frame coordinates before any crop.
+    Composited {
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+    },
+    Absent {
+        reason: CursorAbsence,
+    },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FrameMetadata {
     pub capture_id: CaptureId,
@@ -113,6 +159,10 @@ pub struct FrameMetadata {
     pub frame_generation: Option<u64>,
     pub copy_count: u32,
     pub pool_slot: Option<u16>,
+    /// Absent in frames produced before cursor composition existed, and in fixtures that do not
+    /// care about it; `Excluded` and a missing field mean the same thing to a reader.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<CursorCapture>,
 }
 
 /// A frame of pixels whose layout has been validated against its buffer.
@@ -361,6 +411,7 @@ mod tests {
                 frame_generation: Some(1),
                 copy_count: 1,
                 pool_slot: Some(0),
+                cursor: None,
             },
         )
         .expect("test frame")

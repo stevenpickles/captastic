@@ -138,6 +138,7 @@ mod tests {
             frame_generation: Some(1),
             copy_count: 0,
             pool_slot: None,
+            cursor: None,
         };
         OutputJob {
             capture_id: CaptureId(1),
