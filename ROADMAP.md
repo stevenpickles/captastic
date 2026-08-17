@@ -245,7 +245,11 @@ explicit, tested behavior.
 - Cursor-on and cursor-off output are pixel-correct and separately measured.
 - HDR input never produces silently clipped or incorrectly tagged SDR output.
 - A 1,000-capture acceptance soak and 10,000-capture endurance soak show no unbounded handle or
-  memory growth.
+  memory growth. **Acceptance soak met** (2026-08-16, fake backend, clipboard and file output both
+  enabled): kernel handles, GDI objects and USER objects were exactly flat at 186/10/9 across all
+  1,000 captures, and private bytes plateaued at 4.77 MB for the final 440. The endurance soak is
+  still owed, as is a long run on the DXGI backend — desktop duplication only yields on change, so
+  a soak there has to synthesise desktop activity for its whole duration.
 - Three compatible repeat runs support every published performance claim.
 
 ## Milestone 6 — Annotation and pinning

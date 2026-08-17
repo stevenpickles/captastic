@@ -95,6 +95,11 @@ pub struct DaemonArgs {
     pub max_captures: Option<usize>,
     #[arg(long)]
     pub self_trigger: bool,
+    /// Repeat the self-trigger every N milliseconds, for soak runs. Pair with --max-captures.
+    ///
+    /// Observed on the daemon's event loop, so the interval is a floor rather than a cadence.
+    #[arg(long, requires = "self_trigger")]
+    pub self_trigger_interval_ms: Option<u64>,
     #[arg(long)]
     pub json: bool,
 }
