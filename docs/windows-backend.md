@@ -157,6 +157,12 @@ Use `--mode fresh` for controlled tests where the desktop is known to present af
 
 Desktop Duplication access can be denied from an isolated sandbox even when the same executable succeeds in the user's interactive session. `captastic doctor` preserves the native HRESULT/message so the two cases are distinguishable.
 
+### A session without a desktop
+
+A locked workstation, a secure prompt (the credential dialog or a UAC elevation), and a disconnected RDP session all present to DXGI as no attached outputs and denied duplication — identical, from inside the API, to every monitor being unplugged. Captastic asks the session which it is, using `OpenInputDesktop` and the session's WTS connect state: neither call answers alone, because a locked session stays `WTSActive` and a disconnected one may still have an openable desktop.
+
+The result is `CaptureErrorKind::DesktopUnavailable`, which means "not now" where `SourceUnavailable` means "not there". The daemon treats it as a wait: it starts, registers hotkeys, reports `capture_engine: "waiting_for_desktop"` in its ready event, and builds the capture engine when the session has a desktop again. While waiting it polls the session probe every 500 ms rather than rebuilding DXGI on the engine-recovery schedule, which would be roughly 1,800 device initializations an hour for the length of a lock screen. A probe that cannot answer stays `SourceUnavailable`, so an unanswered question never starts an unbounded wait.
+
 ## Safety invariants
 
 - COM initialization is balanced on the creating thread.

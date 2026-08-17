@@ -276,8 +276,11 @@ fn run_capture_worker(context: CaptureWorkerContext) {
         // one the user finds missing when they return, having been told their monitors are gone
         // (issue #51). Hotkeys still register, and the engine is built when the desktop arrives.
         Err(error) if waiting_for_desktop(&error) => {
+            // The error says which cause it was; this line must not guess, because guessing
+            // "locked" at a sleeping monitor is the same class of mistake as guessing "unplugged"
+            // at a lock screen.
             log::info!(
-                "waiting for an interactive desktop before initializing the capture engine: {error}"
+                "waiting for a display to capture before initializing the capture engine: {error}"
             );
             recovery = Some(BackendRecovery::after_failure(0, true));
             None
@@ -322,17 +325,19 @@ fn run_capture_worker(context: CaptureWorkerContext) {
             .as_ref()
             .is_some_and(|state| Instant::now() >= state.next_attempt)
         {
-            // Waiting on a locked session is not the same as waiting on a broken engine. Asking
-            // the session directly costs two syscalls, where rebuilding DXGI to be told "access
-            // denied" again costs a device and an adapter walk — and would be repeated for the
-            // whole length of a lunch break.
-            let still_no_desktop = recovery
+            // Waiting for a desktop is not the same as recovering a broken engine. Asking whether
+            // there is anything to capture is cheap; building a D3D11 device and a duplication in
+            // order to be told "no" again is not, and would repeat for the length of a lunch
+            // break. So the cheap question is asked first, and the engine is only built once
+            // there is something for it to duplicate.
+            let waiting_for_source = recovery
                 .as_ref()
                 .is_some_and(|state| state.waiting_for_desktop)
-                && !desktop_is_back();
-            if still_no_desktop {
+                .then(capture_source_wait)
+                .filter(|wait| *wait != CaptureSourceWait::Ready);
+            if let Some(wait) = waiting_for_source {
                 if let Some(state) = recovery.as_mut() {
-                    state.next_attempt = Instant::now() + DESKTOP_POLL_INTERVAL;
+                    state.next_attempt = Instant::now() + wait.poll_interval();
                 }
             } else {
                 backend.take();
@@ -347,9 +352,7 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                             let _ = capture_notices.try_send(DaemonNotice::CaptureEngineRecovered);
                         }
                         if was_waiting_for_desktop {
-                            log::info!(
-                                "the session has its desktop back; capture engine initialized"
-                            );
+                            log::info!("a display is available again; capture engine initialized");
                         } else {
                             log::info!(
                                 "capture engine reinitialized; validation is deferred until capture"
@@ -426,7 +429,7 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                         .is_some_and(|state| state.waiting_for_desktop)
                     {
                         crate::logging::warn(format_args!(
-                            "capture {} ignored: the session does not own a desktop to capture yet",
+                            "capture {} ignored: there is no display to capture yet",
                             capture_id.0
                         ));
                     } else {
@@ -1201,7 +1204,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             .is_some_and(|state| !state.is_null())
         {
             log::info!(
-                "The capture engine is waiting for an interactive desktop; captures resume automatically once the session is unlocked"
+                "The capture engine is waiting for a display to capture; captures resume automatically once one is available"
             );
         }
         if let Some(path) = crate::logging::path() {
@@ -1768,6 +1771,56 @@ impl BackendRecovery {
 #[cfg(windows)]
 const DESKTOP_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// How often to ask whether any display has come back.
+///
+/// Slower than the session probe because it costs more: a DXGI factory and an adapter walk rather
+/// than two syscalls. Nothing about this case is racing a human hand — a monitor waking or a dock
+/// reconnecting is not followed by a hotkey in the same second — so it is paced for the machine
+/// instead, and a headless host left running overnight is not enumerating twice a second forever.
+#[cfg(windows)]
+const DISPLAY_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// What a daemon waiting for a capture source is actually waiting for.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaptureSourceWait {
+    /// The session does not own a desktop: locked, a secure prompt, or disconnected.
+    Session,
+    /// The session is fine and there are no displays: asleep, unplugged, or not yet enumerated.
+    Displays,
+    /// There is something to capture; the engine can be built.
+    Ready,
+}
+
+/// Asks the cheapest question that can still answer "is there anything to capture yet?".
+///
+/// The session probe comes first because it is two syscalls and short-circuits the common case.
+/// Enumeration only happens once the session says the desktop is ours, which is what keeps a
+/// locked workstation from walking the adapter list twice a second all night.
+#[cfg(windows)]
+fn capture_source_wait() -> CaptureSourceWait {
+    if !captastic_windows::desktop_state().is_interactive() {
+        return CaptureSourceWait::Session;
+    }
+    match captastic_windows::enumerate_displays() {
+        Ok(displays) if !displays.is_empty() => CaptureSourceWait::Ready,
+        // An enumeration that fails outright is not a reason to stop waiting: the rebuild below
+        // will produce the real error if it is a real one.
+        _ => CaptureSourceWait::Displays,
+    }
+}
+
+#[cfg(windows)]
+impl CaptureSourceWait {
+    fn poll_interval(self) -> Duration {
+        match self {
+            Self::Session => DESKTOP_POLL_INTERVAL,
+            Self::Displays => DISPLAY_POLL_INTERVAL,
+            Self::Ready => Duration::ZERO,
+        }
+    }
+}
+
 /// Whether an engine failure is the session not owning a desktop rather than anything broken.
 #[cfg(windows)]
 fn waiting_for_desktop(error: &AppError) -> bool {
@@ -1775,15 +1828,6 @@ fn waiting_for_desktop(error: &AppError) -> bool {
         error,
         AppError::Capture(error) if error.kind == CaptureErrorKind::DesktopUnavailable
     )
-}
-
-/// Whether the session owns a desktop right now.
-///
-/// Separated so the capture loop states its intent rather than reaching through two crates on a
-/// line that is really about scheduling.
-#[cfg(windows)]
-fn desktop_is_back() -> bool {
-    captastic_windows::desktop_state().is_interactive()
 }
 
 /// Whether a recovery back-off ran to completion or was cut short by a shutdown.
@@ -3131,6 +3175,37 @@ mod tests {
         assert_eq!(BackendRecovery::delay(9_999, true), DESKTOP_POLL_INTERVAL);
         // Short enough to be invisible between unlocking and reaching for a hotkey.
         assert!(DESKTOP_POLL_INTERVAL <= Duration::from_millis(500));
+    }
+
+    #[test]
+    fn each_wait_is_paced_by_what_it_costs_to_ask() {
+        // The session probe is two syscalls and is racing a human hand, so it runs often. Asking
+        // whether a display exists means a DXGI factory and an adapter walk, and nothing is racing
+        // it — a monitor waking is not followed by a hotkey in the same second.
+        assert_eq!(
+            CaptureSourceWait::Session.poll_interval(),
+            DESKTOP_POLL_INTERVAL
+        );
+        assert_eq!(
+            CaptureSourceWait::Displays.poll_interval(),
+            DISPLAY_POLL_INTERVAL
+        );
+        assert!(DISPLAY_POLL_INTERVAL > DESKTOP_POLL_INTERVAL);
+        // Ready waits for nothing: the engine is built on the same pass that finds a source.
+        assert_eq!(CaptureSourceWait::Ready.poll_interval(), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_source_that_is_ready_ends_the_wait_rather_than_scheduling_another() {
+        // The bug this shape prevents: treating "ready" as just another poll interval would leave
+        // the daemon waiting next to a perfectly good display.
+        let wait = Some(CaptureSourceWait::Ready).filter(|wait| *wait != CaptureSourceWait::Ready);
+        assert!(wait.is_none(), "a ready source must not schedule a retry");
+        for pending in [CaptureSourceWait::Session, CaptureSourceWait::Displays] {
+            assert!(Some(pending)
+                .filter(|wait| *wait != CaptureSourceWait::Ready)
+                .is_some());
+        }
     }
 
     #[test]

@@ -39,18 +39,7 @@ impl DxgiDisplayManager {
             .map(|(display, _)| display.clone())
             .collect();
         if displays.is_empty() {
-            // A locked or disconnected session reports exactly this — no attached outputs — and
-            // saying so without checking blames the hardware for something that will fix itself
-            // when the user signs back in (issue #51).
-            if let Some(obstacle) = crate::dxgi::desktop_obstacle("initialize") {
-                return Err(obstacle);
-            }
-            return Err(manager_error(
-                CaptureErrorKind::SourceUnavailable,
-                "initialize",
-                "no attached desktop displays were found",
-                false,
-            ));
+            return Err(crate::dxgi::no_desktop_to_capture("initialize"));
         }
         let virtual_bounds = DisplayTopology::new(0, displays.clone())
             .map_err(|error| {
