@@ -17,7 +17,7 @@ const CONTROL_EVENT_NAME: windows::core::PCWSTR = w!("Local\\CaptasticDaemonCont
 /// Names the process holding the control event, so a caller can tell a daemon from a squatter.
 ///
 /// A separate object because an event carries no payload. Same session and the same default security
-/// as the event itself: this identifies the holder, it does not protect the name.
+/// as the event itself: this identifies the holder, it does not protect the name (ADR 0007).
 const CONTROL_OWNER_NAME: windows::core::PCWSTR = w!("Local\\\\CaptasticDaemonControl-v1-owner");
 const HRESULT_ALREADY_EXISTS: i32 = 0x8007_00B7_u32 as i32;
 
