@@ -505,6 +505,29 @@ mod tests {
             .expect("save still succeeds");
     }
 
+    /// Saves, treating a contended lock as a refusal to retry rather than a failure.
+    ///
+    /// `FileLock` promises a writer two seconds to get in, not that every writer gets in. Under
+    /// eight-way contention on a loaded machine some writer will not, and the property this test
+    /// exists for is that no update is *lost* — which is a statement about exclusion, not about
+    /// how long the queue is. A caller that must not lose its update retries, so that is what is
+    /// modelled here. Asserting first-attempt success instead made this the flakiest test in the
+    /// suite (issue #55), failing on a runner where the same job took three times its usual wall
+    /// clock. Only a timeout retries: any other error still fails the test immediately.
+    fn save_insistently(state_path: &Path, display: &str, x: f64, y: f64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let store = UiStateStore::at(state_path);
+            match store.save_display_overlay_center(display, x, y) {
+                Ok(()) => return,
+                Err(ConfigError::Write { source, .. })
+                    if source.kind() == std::io::ErrorKind::TimedOut
+                        && std::time::Instant::now() < deadline => {}
+                Err(error) => panic!("concurrent save of {display}: {error}"),
+            }
+        }
+    }
+
     #[test]
     fn independent_updates_to_the_same_file_all_survive() {
         // M36: each save is a read-modify-write of the whole file, so without exclusion the last
@@ -516,14 +539,12 @@ mod tests {
             for index in 0..8_u32 {
                 let state_path = state_path.clone();
                 scope.spawn(move || {
-                    let store = UiStateStore::at(&state_path);
-                    store
-                        .save_display_overlay_center(
-                            &format!("display-{index}"),
-                            f64::from(index) / 10.0,
-                            0.5,
-                        )
-                        .expect("concurrent save");
+                    save_insistently(
+                        &state_path,
+                        &format!("display-{index}"),
+                        f64::from(index) / 10.0,
+                        0.5,
+                    );
                 });
             }
         });
