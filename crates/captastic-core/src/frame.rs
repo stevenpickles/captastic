@@ -156,6 +156,21 @@ pub struct FrameMetadata {
     pub native_ready_offset_ns: u64,
     pub cpu_ready_offset_ns: Option<u64>,
     pub frame_age_ns: Option<u64>,
+    /// When this frame was last *proven* to be what the screen shows, as an offset from the
+    /// trigger.
+    ///
+    /// Distinct from `frame_age_ns`, which says how long ago the frame was presented, and not
+    /// derivable from it. Desktop duplication yields a frame only when the desktop image changes,
+    /// so a zero-timeout acquisition that finds nothing pending proves that nothing has been
+    /// presented since — which means a frame presented thirty seconds ago is pixel-identical to the
+    /// screen right now. Both numbers are reported because they answer different questions, and a
+    /// caller that conflates them will be wrong in one direction or the other.
+    ///
+    /// A statement about the desktop image only. The pointer moves without dirtying it, so a
+    /// verified-current frame may carry a pointer position that has since changed; the position
+    /// composited into it is the one that belonged to those pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_current_offset_ns: Option<u64>,
     pub frame_generation: Option<u64>,
     pub copy_count: u32,
     pub pool_slot: Option<u16>,
@@ -408,6 +423,7 @@ mod tests {
                 native_ready_offset_ns: 1,
                 cpu_ready_offset_ns: Some(2),
                 frame_age_ns: Some(0),
+                verified_current_offset_ns: None,
                 frame_generation: Some(1),
                 copy_count: 1,
                 pool_slot: Some(0),

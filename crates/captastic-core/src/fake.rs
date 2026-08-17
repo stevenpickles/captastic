@@ -319,6 +319,8 @@ impl CaptureBackend for FakeBackend {
             copy_count: 0,
             pool_slot: Some((self.attempts % 3) as u16),
             cursor: None,
+            // The fake presents on demand, so it has nothing it could verify as unchanged.
+            verified_current_offset_ns: None,
         };
 
         let frame = if request.cpu_frame {
