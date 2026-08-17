@@ -268,27 +268,39 @@ fn run_capture_worker(context: CaptureWorkerContext) {
         .iter()
         .map(|sink| sink as &dyn crate::output::OutputSink)
         .collect();
-    let backend = match super::create_backend(&backend_name, &display_policy) {
-        Ok(backend) => backend,
+    let mut recovery: Option<BackendRecovery> = None;
+    let mut backend = match super::create_backend(&backend_name, &display_policy) {
+        Ok(backend) => Some(backend),
+        // A desktop that is not ours yet is not a reason to give up on the whole daemon. The user
+        // is at a lock screen and will come back; a resident tool that exits because of that is
+        // one the user finds missing when they return, having been told their monitors are gone
+        // (issue #51). Hotkeys still register, and the engine is built when the desktop arrives.
+        Err(error) if waiting_for_desktop(&error) => {
+            log::info!(
+                "waiting for an interactive desktop before initializing the capture engine: {error}"
+            );
+            recovery = Some(BackendRecovery::after_failure(0, true));
+            None
+        }
         Err(error) => {
             let _ = ready_sender.send(Err(error));
             return;
         }
     };
     let ready = json!({
-        "backend": backend.name(),
+        "backend": backend.as_ref().map_or(backend_name.as_str(), |backend| backend.name()),
         "configured_display": display_policy.as_config_value(),
-        "displays": backend.displays(),
+        "displays": backend.as_ref().map(|backend| backend.displays()),
+        // Absent when the engine is live, so an ordinary start reads exactly as it did before.
+        "capture_engine": backend.is_none().then_some("waiting_for_desktop"),
     });
     if ready_sender.send(Ok(ready)).is_err() {
         return;
     }
-    let mut backend = Some(backend);
 
     let mut attempts = 0_usize;
     let mut selections_in_flight = 0_usize;
     let mut next_capture_id = 1_u64;
-    let mut recovery: Option<BackendRecovery> = None;
     // Tracks whether the user has already been told about the current outage, so the
     // unbounded retry loop raises exactly one notice per outage and one on its recovery.
     let mut recovery_notified = false;
@@ -310,33 +322,70 @@ fn run_capture_worker(context: CaptureWorkerContext) {
             .as_ref()
             .is_some_and(|state| Instant::now() >= state.next_attempt)
         {
-            backend.take();
-            match super::create_backend(&backend_name, &display_policy) {
-                Ok(replacement) => {
-                    backend = Some(replacement);
-                    recovery = None;
-                    if std::mem::take(&mut recovery_notified) {
-                        let _ = capture_notices.try_send(DaemonNotice::CaptureEngineRecovered);
-                    }
-                    log::info!(
-                        "capture engine reinitialized; validation is deferred until capture"
-                    );
+            // Waiting on a locked session is not the same as waiting on a broken engine. Asking
+            // the session directly costs two syscalls, where rebuilding DXGI to be told "access
+            // denied" again costs a device and an adapter walk — and would be repeated for the
+            // whole length of a lunch break.
+            let still_no_desktop = recovery
+                .as_ref()
+                .is_some_and(|state| state.waiting_for_desktop)
+                && !desktop_is_back();
+            if still_no_desktop {
+                if let Some(state) = recovery.as_mut() {
+                    state.next_attempt = Instant::now() + DESKTOP_POLL_INTERVAL;
                 }
-                Err(error) => {
-                    let state = recovery
-                        .as_mut()
-                        .expect("recovery state exists while retrying");
-                    state.failed_attempts = state.failed_attempts.saturating_add(1);
-                    state.next_attempt = Instant::now() + recovery_delay(state.failed_attempts);
-                    crate::logging::warn(format_args!(
-                        "capture engine reinitialization failed; retrying in {:.0} ms: {error}",
-                        recovery_delay(state.failed_attempts).as_secs_f64() * 1_000.0
-                    ));
-                    // The retry loop has no ceiling, so without this the user would watch
-                    // hotkeys disappear into a recovering engine with nothing on screen.
-                    if backend_outage_needs_notice(state.failed_attempts, recovery_notified) {
-                        recovery_notified = true;
-                        let _ = capture_notices.try_send(DaemonNotice::CaptureEngineUnavailable);
+            } else {
+                backend.take();
+                match super::create_backend(&backend_name, &display_policy) {
+                    Ok(replacement) => {
+                        let was_waiting_for_desktop = recovery
+                            .as_ref()
+                            .is_some_and(|state| state.waiting_for_desktop);
+                        backend = Some(replacement);
+                        recovery = None;
+                        if std::mem::take(&mut recovery_notified) {
+                            let _ = capture_notices.try_send(DaemonNotice::CaptureEngineRecovered);
+                        }
+                        if was_waiting_for_desktop {
+                            log::info!(
+                                "the session has its desktop back; capture engine initialized"
+                            );
+                        } else {
+                            log::info!(
+                                "capture engine reinitialized; validation is deferred until capture"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        let waiting = waiting_for_desktop(&error);
+                        let state = recovery
+                            .as_mut()
+                            .expect("recovery state exists while retrying");
+                        state.failed_attempts = state.failed_attempts.saturating_add(1);
+                        state.waiting_for_desktop = waiting;
+                        let delay = BackendRecovery::delay(state.failed_attempts, waiting);
+                        state.next_attempt = Instant::now() + delay;
+                        if waiting {
+                            // One line, not one per attempt: this repeats for as long as the user
+                            // is away, and the reason has not changed since the last time.
+                            log::debug!("still waiting for an interactive desktop: {error}");
+                        } else {
+                            crate::logging::warn(format_args!(
+                                "capture engine reinitialization failed; retrying in {:.0} ms: {error}",
+                                delay.as_secs_f64() * 1_000.0
+                            ));
+                        }
+                        // The retry loop has no ceiling, so without this the user would watch
+                        // hotkeys disappear into a recovering engine with nothing on screen. A
+                        // locked session is exempt: the balloon would be raised at a lock screen
+                        // that cannot show it, to explain something the user already knows.
+                        if !waiting
+                            && backend_outage_needs_notice(state.failed_attempts, recovery_notified)
+                        {
+                            recovery_notified = true;
+                            let _ =
+                                capture_notices.try_send(DaemonNotice::CaptureEngineUnavailable);
+                        }
                     }
                 }
             }
@@ -369,10 +418,23 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                 let capture_id = CaptureId(next_capture_id);
                 next_capture_id = next_capture_id.saturating_add(1);
                 if backend.is_none() {
-                    crate::logging::warn(format_args!(
-                        "capture {} ignored while the capture engine is recovering",
-                        capture_id.0
-                    ));
+                    // Two different absences, and telling a user their capture was dropped by a
+                    // "recovering" engine when the real answer is that the desktop was locked is
+                    // the confusion issue #51 is about.
+                    if recovery
+                        .as_ref()
+                        .is_some_and(|state| state.waiting_for_desktop)
+                    {
+                        crate::logging::warn(format_args!(
+                            "capture {} ignored: the session does not own a desktop to capture yet",
+                            capture_id.0
+                        ));
+                    } else {
+                        crate::logging::warn(format_args!(
+                            "capture {} ignored while the capture engine is recovering",
+                            capture_id.0
+                        ));
+                    }
                     continue;
                 }
                 if selection_enabled
@@ -494,10 +556,10 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                             "capture engine reinitialization failed during capture {}: {reinitialize_error}",
                             capture_id.0
                         ));
-                    recovery = Some(BackendRecovery {
-                        failed_attempts: recovery_attempts,
-                        next_attempt: Instant::now() + recovery_delay(recovery_attempts),
-                    });
+                    recovery = Some(BackendRecovery::after_failure(
+                        recovery_attempts,
+                        waiting_for_desktop(&reinitialize_error),
+                    ));
                 }
                 if recovery_attempts > 0 && capture_result.is_ok() {
                     log::info!(
@@ -656,10 +718,10 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                         },
                     );
                 if let Some(reinitialize_error) = reinitialize_error {
-                    recovery = Some(BackendRecovery {
-                        failed_attempts: recovery_attempts,
-                        next_attempt: Instant::now() + recovery_delay(recovery_attempts),
-                    });
+                    recovery = Some(BackendRecovery::after_failure(
+                        recovery_attempts,
+                        waiting_for_desktop(&reinitialize_error),
+                    ));
                     crate::logging::warn(format_args!(
                             "capture engine reinitialization failed during confirmation capture {}: {reinitialize_error}",
                             capture_id.0
@@ -770,10 +832,10 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                         },
                     );
                 if let Some(reinitialize_error) = reinitialize_error {
-                    recovery = Some(BackendRecovery {
-                        failed_attempts: recovery_attempts,
-                        next_attempt: Instant::now() + recovery_delay(recovery_attempts),
-                    });
+                    recovery = Some(BackendRecovery::after_failure(
+                        recovery_attempts,
+                        waiting_for_desktop(&reinitialize_error),
+                    ));
                     crate::logging::warn(format_args!(
                             "capture engine reinitialization failed during preview fallback {}: {reinitialize_error}",
                             capture_id.0
@@ -1132,6 +1194,16 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                 "disabled"
             },
         );
+        // Said plainly rather than left to the reader of a log line above: the daemon is up and
+        // its hotkeys are registered, but a capture right now would find no desktop to read.
+        if ready
+            .get("capture_engine")
+            .is_some_and(|state| !state.is_null())
+        {
+            log::info!(
+                "The capture engine is waiting for an interactive desktop; captures resume automatically once the session is unlocked"
+            );
+        }
         if let Some(path) = crate::logging::path() {
             log::info!("Persistent log: {}", path.display());
         }
@@ -1647,6 +1719,15 @@ fn desktop_launcher_path() -> Result<std::path::PathBuf, std::io::Error> {
 struct BackendRecovery {
     failed_attempts: u32,
     next_attempt: Instant,
+    /// Whether what is missing is the desktop rather than the capture engine.
+    ///
+    /// The two want different cadences and different questions. A lost device or a topology
+    /// change is over in milliseconds, which is what `recovery_delay` is shaped for. A desktop
+    /// that belongs to the lock screen is over when a person comes back — rebuilding DXGI twice a
+    /// second until then is thousands of pointless device initializations, and the session probe
+    /// answers the same question in two syscalls. While this is set the loop asks the cheap
+    /// question and only rebuilds the engine once there is a desktop for it to duplicate.
+    waiting_for_desktop: bool,
 }
 
 #[cfg(windows)]
@@ -1655,8 +1736,54 @@ impl BackendRecovery {
         Self {
             failed_attempts: 0,
             next_attempt: Instant::now(),
+            waiting_for_desktop: false,
         }
     }
+
+    /// Schedules the next attempt after a failure, paced by what the failure was.
+    fn after_failure(failed_attempts: u32, waiting_for_desktop: bool) -> Self {
+        Self {
+            failed_attempts,
+            next_attempt: Instant::now() + Self::delay(failed_attempts, waiting_for_desktop),
+            waiting_for_desktop,
+        }
+    }
+
+    fn delay(failed_attempts: u32, waiting_for_desktop: bool) -> Duration {
+        if waiting_for_desktop {
+            DESKTOP_POLL_INTERVAL
+        } else {
+            recovery_delay(failed_attempts)
+        }
+    }
+}
+
+/// How often to ask whether the session has its desktop back.
+///
+/// Deliberately unrelated to `recovery_delay`, because it paces a different thing: two syscalls
+/// against a human unlocking a machine. Short enough that the engine is up before the user's hand
+/// reaches the hotkey — the alternative is a first capture after unlock that is dropped for a
+/// reason the user cannot see — and cheap enough that a workstation left locked overnight pays
+/// microseconds twice a second for it.
+#[cfg(windows)]
+const DESKTOP_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Whether an engine failure is the session not owning a desktop rather than anything broken.
+#[cfg(windows)]
+fn waiting_for_desktop(error: &AppError) -> bool {
+    matches!(
+        error,
+        AppError::Capture(error) if error.kind == CaptureErrorKind::DesktopUnavailable
+    )
+}
+
+/// Whether the session owns a desktop right now.
+///
+/// Separated so the capture loop states its intent rather than reaching through two crates on a
+/// line that is really about scheduling.
+#[cfg(windows)]
+fn desktop_is_back() -> bool {
+    captastic_windows::desktop_state().is_interactive()
 }
 
 /// Whether a recovery back-off ran to completion or was cut short by a shutdown.
@@ -2955,6 +3082,68 @@ mod tests {
         )));
         assert_eq!(recovery_delay(1), Duration::from_millis(50));
         assert_eq!(recovery_delay(99), Duration::from_millis(1_600));
+    }
+
+    #[test]
+    fn a_missing_desktop_is_not_treated_as_a_broken_engine() {
+        // The distinction issue #51 turns on. A lost device is a fault to recover from; a locked
+        // session is a fault in nothing at all, and the two must not share a response.
+        let error = |kind| CaptureError {
+            kind,
+            backend: "test",
+            operation: "test",
+            message: "test".to_owned(),
+            retryable: true,
+            native_code: None,
+        };
+        let desktop = AppError::Capture(error(CaptureErrorKind::DesktopUnavailable));
+        assert!(waiting_for_desktop(&desktop));
+        for other in [
+            CaptureErrorKind::AccessLost,
+            CaptureErrorKind::DeviceRemoved,
+            CaptureErrorKind::TopologyChanged,
+            // The kind a locked session used to arrive as. It still means what it always meant —
+            // the display asked for is not there — so it must not start an unbounded wait.
+            CaptureErrorKind::SourceUnavailable,
+        ] {
+            assert!(
+                !waiting_for_desktop(&AppError::Capture(error(other))),
+                "{other:?} should not put the daemon in a desktop wait"
+            );
+        }
+        assert!(!waiting_for_desktop(&AppError::BackendUnavailable(
+            "unknown backend".to_owned()
+        )));
+    }
+
+    #[test]
+    fn waiting_for_a_desktop_paces_itself_against_a_person_rather_than_a_device() {
+        // Rebuilding DXGI on the engine-recovery schedule would be ~1,800 device initializations
+        // an hour for as long as someone is at lunch, all of them refused for the same reason.
+        // The desktop wait is a fixed poll of a two-syscall question instead.
+        let engine = BackendRecovery::delay(4, false);
+        let desktop = BackendRecovery::delay(4, true);
+        assert_eq!(desktop, DESKTOP_POLL_INTERVAL);
+        assert_ne!(desktop, engine);
+        // Unaffected by how long the wait has already lasted: nothing about the tenth minute of a
+        // lock screen suggests the eleventh is less likely to end.
+        assert_eq!(BackendRecovery::delay(0, true), DESKTOP_POLL_INTERVAL);
+        assert_eq!(BackendRecovery::delay(9_999, true), DESKTOP_POLL_INTERVAL);
+        // Short enough to be invisible between unlocking and reaching for a hotkey.
+        assert!(DESKTOP_POLL_INTERVAL <= Duration::from_millis(500));
+    }
+
+    #[test]
+    fn a_desktop_wait_does_not_raise_the_engine_outage_balloon() {
+        // The balloon would be drawn on a lock screen that cannot show it, to tell the user
+        // something they are in the middle of doing. The wait stays silent and logs once instead.
+        let state = BackendRecovery::after_failure(0, true);
+        assert!(state.waiting_for_desktop);
+        assert_eq!(state.failed_attempts, 0);
+        assert!(
+            !backend_outage_needs_notice(state.failed_attempts, false),
+            "a fresh desktop wait must not trip the notice threshold"
+        );
     }
 
     #[test]
