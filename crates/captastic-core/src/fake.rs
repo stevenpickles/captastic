@@ -252,10 +252,20 @@ impl CaptureBackend for FakeBackend {
             ));
         }
         self.validate_request_capabilities(request)?;
-        let display = self.requested_display(&request.source)?;
         self.attempts = self.attempts.saturating_add(1);
         recorder.record(request.id, PerfEventKind::CaptureRequested, 0);
 
+        // Scripted failures are raised before the display is resolved, because that is the order
+        // the real backend works in: `DxgiBackend::capture` compares the display-configuration
+        // generation as its very first act and reports `TopologyChanged` without consulting its
+        // own display list, precisely because that list is the thing that may have gone stale.
+        //
+        // The fake used to resolve first, which made it impossible to express the situation a
+        // hot-plug creates: a request for a display this backend has never heard of, on a backend
+        // whose view of the world has moved. It answered `SourceUnavailable` — "that display does
+        // not exist" — where the real backend answers "my topology is stale, rebuild me", and the
+        // daemon rebuilds for one and not the other. A fake that cannot express the difference
+        // cannot test the recovery that depends on it.
         if let Some(failure) = self
             .config
             .failure_script
@@ -271,6 +281,7 @@ impl CaptureBackend for FakeBackend {
                 native_code: None,
             });
         }
+        let display = self.requested_display(&request.source)?;
 
         if self
             .config
@@ -606,6 +617,49 @@ mod tests {
         let frame = outcome.frame.expect("CPU frame");
         assert_eq!(frame.width(), 1080);
         assert_eq!(frame.height(), 1920);
+    }
+
+    #[test]
+    fn a_stale_topology_is_reported_before_the_display_is_looked_up() {
+        // Fidelity with `DxgiBackend::capture`, which compares the display-configuration
+        // generation as its first act and reports TopologyChanged without consulting its own
+        // display list — because that list is exactly what may have gone stale.
+        //
+        // The ordering is the contract, not an implementation detail: the daemon rebuilds for
+        // TopologyChanged and does not for SourceUnavailable, so a fake that answered "no such
+        // display" here would test the wrong recovery. Asking for a display this backend has never
+        // heard of is the sharpest way to state it.
+        let mut backend = FakeBackend::with_displays(
+            FakeBackendConfig {
+                failure_script: vec![FakeFailure::new(1, CaptureErrorKind::TopologyChanged, true)],
+                ..FakeBackendConfig::default()
+            },
+            vec![display("built-in", true)],
+        );
+        let mut recorder = EventRecorder::with_capacity(8);
+
+        let error = backend
+            .capture(
+                &request_for(
+                    DisplayId("never-heard-of".to_owned()),
+                    CaptureMode::Latest { max_age_ms: None },
+                ),
+                &mut recorder,
+            )
+            .expect_err("the scripted failure is raised");
+        assert_eq!(error.kind, CaptureErrorKind::TopologyChanged);
+
+        // With the script spent, the same request gets the answer about the display itself.
+        let error = backend
+            .capture(
+                &request_for(
+                    DisplayId("never-heard-of".to_owned()),
+                    CaptureMode::Latest { max_age_ms: None },
+                ),
+                &mut recorder,
+            )
+            .expect_err("an absent display is still absent");
+        assert_eq!(error.kind, CaptureErrorKind::SourceUnavailable);
     }
 
     #[test]
