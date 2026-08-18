@@ -270,7 +270,7 @@ impl DxgiBackend {
                 virtual_desktop_capture: false,
                 fresh_mode: true,
                 latest_mode: true,
-                cursor_control: false,
+                cursor_control: true,
                 hdr: false,
                 presentation_time: true,
                 warm_stream: false,
@@ -311,15 +311,6 @@ impl CaptureBackend for DxgiBackend {
                     self.display_configuration_generation, current_generation
                 ),
                 true,
-                None,
-            ));
-        }
-        if request.cursor == CursorMode::Include {
-            return Err(capture_error(
-                CaptureErrorKind::Unsupported,
-                "capture",
-                "cursor composition is not implemented in the native-frame milestone",
-                false,
                 None,
             ));
         }

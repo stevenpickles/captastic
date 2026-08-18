@@ -26,7 +26,8 @@ mode = "latest"
 fresh_timeout_ms = 100
 max_frame_age_ms = 0
 cpu_frame = true
-# "include" is not implemented yet (roadmap milestone 4); cursor must remain "exclude".
+# "include" composites the mouse pointer into the capture, shape and all. It is off by default
+# because a screenshot of a window is usually wanted without a cursor sitting in it.
 cursor = "exclude"
 # The CPU readback pool is currently fixed at three slots; buffer_slots must remain 3.
 buffer_slots = 3

@@ -904,6 +904,12 @@ fn benchmark(args: BenchmarkArgs) -> Result<(), AppError> {
     // claim - so it takes a different path and a different report rather than printing one summary
     // three times and leaving the reader to compare them by eye.
     if args.repeat > 1 {
+        // The backend created above resolved the capture source, and it is still holding a
+        // duplication. Every repeat builds its own - deliberately, so each run pays the first
+        // capture's allocation cost - and DXGI refuses a second duplication of the same output
+        // from the same process with "the parameter is incorrect", which is how this surfaced on
+        // real hardware after passing every test against the fake backend.
+        drop(native_backend.take());
         let backend_name = args.backend.clone();
         let display_policy = display_policy.clone();
         let repeated = benchmark::run_repeated(&options, args.repeat, move || {
