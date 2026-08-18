@@ -1108,6 +1108,17 @@ pub struct LoggingConfig {
     pub retained_files: usize,
 }
 
+/// The pre-split `[ui]` section, accepted so old configurations still load.
+///
+/// Nothing honours this. Remembered UI state lives in `state.toml`, and the one path that still
+/// reads a `[ui]` section — the migration in [`UiStateStore`] — uses its own lenient deserializer
+/// rather than this type, because it must cope with a configuration too damaged to parse as a
+/// whole. What this type is for is `deny_unknown_fields`: without a field to land in, every
+/// configuration written before the split would fail to load at all.
+///
+/// It is validated rather than ignored so a malformed section is still rejected on the one
+/// occasion it is read. [`UiStateStore::superseded_config_section`] reports a section that has
+/// outlived its migration, so a user can see which file is live.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UiConfig {

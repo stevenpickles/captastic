@@ -142,6 +142,18 @@ fn resolve_daemon_args_with_default(
         startup_warnings.push(message);
         captastic_config::UiState::default()
     });
+    // A configuration that still carries the pre-split [ui] section now holds a second, stale
+    // answer to a question state.toml already answers, and nothing in either file says which one
+    // the daemon reads. It is not rewritten - that file is the user's - so it is named instead.
+    if let Some((config_path, state_path)) = ui_state_store.superseded_config_section() {
+        let message = format!(
+            "{} still contains a [ui] section from before remembered state moved out of it;              it is ignored, and {} is what this daemon reads. It is safe to delete.",
+            config_path.display(),
+            state_path.display()
+        );
+        crate::logging::warn(format_args!("{message}"));
+        startup_warnings.push(message);
+    }
     let confirmed_regions = ui.confirmed_regions();
     let mode = args.mode.unwrap_or(match config.capture.mode.as_str() {
         "fresh" => ModeArg::Fresh,
@@ -2892,8 +2904,18 @@ mod tests {
         .expect("default recovery must permit daemon argument resolution");
 
         assert!(!resolved.backend.is_empty());
-        assert_eq!(resolved.startup_warnings.len(), 1);
-        assert!(resolved.startup_warnings[0].contains("quarantined"));
+        // Asserted by content rather than by count. With no --config the state store resolves to
+        // the real per-user storage, so a developer whose own configuration still carries a
+        // pre-split [ui] section legitimately collects a second warning that CI never sees. A
+        // count would make this test pass or fail on whose machine it ran.
+        assert!(
+            resolved
+                .startup_warnings
+                .iter()
+                .any(|warning| warning.contains("quarantined")),
+            "the recovering loader's warning must survive: {:?}",
+            resolved.startup_warnings
+        );
     }
 
     #[test]
