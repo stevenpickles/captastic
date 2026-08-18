@@ -237,7 +237,19 @@ explicit, tested behavior.
   desktop is capturable and its screenshot matches what other tools produce. Captastic implements no
   curve of its own. Preserving high dynamic range end to end is deliberately not addressed and needs
   an output format that can carry it.
-- Investigate ICC/color-profile awareness and preserve color metadata where output formats support it.
+- ~~Investigate ICC/color-profile awareness and preserve color metadata where output formats support
+  it.~~ **Done, and the answer was smaller than the question.** Captured pixels are sRGB by
+  construction — the compositor converts, the encoder refuses anything else (ADR 0006) — so the
+  metadata worth preserving is the tag saying so, not an embedded profile. Embedding the *display's*
+  ICC profile would be actively wrong: it describes the panel, not the numbers in the file.
+
+  PNG output now carries `sRGB` with the perceptual intent the specification names for photographic
+  content, plus the `gAMA` and `cHRM` fallbacks so a decoder predating `sRGB` still gets the right
+  transfer curve and primaries. The clipboard already declared it (`bV5CSType = LCS_sRGB`), so the
+  same capture used to be self-describing through one destination and silent through the other.
+
+  Not addressed, and out of scope until an output format can carry it: a wide-gamut or HDR source
+  preserved end to end. That needs the pixels, not the tag (ADR 0006).
 - Add recovery tests for display hot-plugging, sleep/wake, lock/unlock, GPU reset, Remote Desktop, and
   rapid session changes. Hot-plug, unplug and primary-promotion are covered deterministically
   through the daemon's rebuild seam; the no-source path is covered end to end (#56). Sleep/wake,

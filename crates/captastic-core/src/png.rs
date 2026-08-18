@@ -79,6 +79,46 @@ pub fn encode_frame(frame: &CpuFrame, effort: PngEffort) -> Result<Vec<u8>, PngE
     encoder.set_color(layout.color_type);
     encoder.set_depth(png::BitDepth::Eight);
     encoder.set_compression(effort.compression());
+    // Say which colour space these numbers are in. A PNG carrying no colour chunk is interpreted
+    // by whatever default the viewer has, and while most assume sRGB, a colour-managed viewer on a
+    // wide-gamut display may not — the same file then looks different in two applications, and
+    // neither is misbehaving.
+    //
+    // Captastic knows the answer without guessing: this encoder refuses anything that is not sRGB
+    // a few lines above, so the tag is a fact rather than an assumption. The clipboard has always
+    // declared it (`bV5CSType = LCS_sRGB` in the DIBV5 header); the file side did not, so the same
+    // capture was self-describing through one destination and silent through the other.
+    //
+    // Perceptual is the intent the PNG specification names for photographic content, which a
+    // screenshot is: it is a picture of what was on a screen, not a colour swatch to be matched.
+    // The crate writes the specification's recommended `gAMA` and `cHRM` fallbacks alongside, so a
+    // decoder that predates `sRGB` still gets the right transfer curve and primaries.
+    encoder.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
+    // The `sRGB` chunk alone is invisible to a decoder that predates it, which would then fall
+    // back to its own default and land exactly where an untagged file did. The specification's
+    // answer is to write `gAMA` and `cHRM` alongside, carrying sRGB's transfer curve and primaries
+    // in terms any decoder understands. These are the values the specification lists for sRGB
+    // (W3C REC-PNG-20031110 §11.3.3.5), and the encoder emits the two chunks only when they match
+    // them exactly — a near-miss would silently produce an sRGB file with no fallback at all.
+    encoder.set_source_gamma(png::ScaledFloat::from_scaled(45_455));
+    encoder.set_source_chromaticities(png::SourceChromaticities {
+        white: (
+            png::ScaledFloat::from_scaled(31_270),
+            png::ScaledFloat::from_scaled(32_900),
+        ),
+        red: (
+            png::ScaledFloat::from_scaled(64_000),
+            png::ScaledFloat::from_scaled(33_000),
+        ),
+        green: (
+            png::ScaledFloat::from_scaled(30_000),
+            png::ScaledFloat::from_scaled(60_000),
+        ),
+        blue: (
+            png::ScaledFloat::from_scaled(15_000),
+            png::ScaledFloat::from_scaled(6_000),
+        ),
+    });
     let mut writer = encoder.write_header().map_err(writer_error)?;
     {
         // Borrowed rather than owned so the destination can stay a plain `&mut Vec`; the stream
@@ -393,6 +433,41 @@ mod tests {
                 format: PixelFormat::Rgba16Float
             })
         );
+    }
+
+    #[test]
+    fn encoded_files_say_which_colour_space_they_are_in() {
+        // An untagged PNG is interpreted by whatever default the viewer holds. Most assume sRGB,
+        // but a colour-managed viewer on a wide-gamut display need not, and then the same file
+        // looks different in two applications with neither misbehaving. The clipboard has always
+        // declared sRGB in its DIBV5 header; this is the file side saying the same thing.
+        let frame = frame(
+            2,
+            2,
+            8,
+            vec![10, 20, 30, 255, 40, 50, 60, 255, 1, 2, 3, 255, 4, 5, 6, 255],
+        );
+        let encoded = encode_frame(&frame, PngEffort::Fast).expect("encode");
+
+        let decoder = png::Decoder::new(std::io::Cursor::new(&encoded));
+        let reader = decoder.read_info().expect("valid PNG");
+        assert_eq!(
+            reader.info().srgb,
+            Some(png::SrgbRenderingIntent::Perceptual),
+            "a screenshot is photographic content, which is the intent the specification names"
+        );
+
+        // Asserted against the bytes rather than the decoder's view. The specification's fallbacks
+        // exist for decoders that predate `sRGB`, and this crate's decoder does not surface them
+        // separately once it has read the `sRGB` chunk - so reading them back through it would
+        // report their absence whether they were written or not, and a near-miss on the values
+        // silently drops both chunks.
+        for chunk in ["sRGB", "gAMA", "cHRM"] {
+            assert!(
+                encoded.windows(4).any(|window| window == chunk.as_bytes()),
+                "{chunk} should be present so an older decoder still gets sRGB"
+            );
+        }
     }
 
     #[test]
