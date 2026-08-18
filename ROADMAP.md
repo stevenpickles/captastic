@@ -478,12 +478,19 @@ display appears. Verified end to end on 2026-08-17 with an injected blackout
 (`CAPTASTIC_TEST_NO_DISPLAYS_MS`, debug builds only): start with nothing attached, seven triggers
 refused with an accurate reason, engine built unattended, 4K captures following.
 
-The measurement that shaped it is worth keeping: **a plain `Win+L` lock does not break DXGI at
-all** on the development host. With `OpenInputDesktop` refused for 6.3 continuous seconds,
-enumeration and duplication both worked and a fresh daemon reported ready. Issue #51's stated
-mechanism was therefore wrong, and a fix keyed on the lock would have missed the failure it was
-filed about. The original condition — an empty list *and* a denied `QueryDisplayConfig` — has still
-not been reproduced on demand.
+The measurement that shaped it is worth keeping, with a later correction. A lock does **not** stop
+enumeration: displays enumerate with their persistent identities throughout, so a lock is not what
+produced the empty display list in #51, and a fix keyed on the lock would have missed the failure it
+was filed about. That original condition — an empty list *and* a denied `QueryDisplayConfig` — has
+still not been reproduced on demand.
+
+The first run of that test also had a fresh daemon build a duplication 0.3 s after the lock engaged,
+which led to the overly strong claim that a lock does not break DXGI at all. A later run with a
+daemon already holding a duplication showed otherwise: at the lock it takes `AccessLost` (`the keyed
+mutex was abandoned`), and the rebuild is refused with `DesktopUnavailable in dxgi/duplicate_output:
+the session is locked or a secure prompt owns the desktop`. It recovered by itself two seconds later
+at the unlock. So duplication *is* refused while the lock screen owns the desktop; there is simply a
+brief transitional window in which it can still be acquired.
 
 ## Recommended next branch
 
