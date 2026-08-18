@@ -438,6 +438,19 @@ alongside the overlay extraction and Milestone 4. The order below reflects what 
 4. Add annotation/pinning (Milestone 6, now ungated) or cross-platform work (Milestone 7), based on
    audience demand (existing decision gate).
 
+### The 4K DXGI resource step (#53), narrowed
+
+A 40-minute DXGI soak at 3840×2160 with the clipboard and file output **off** — 4,513 captures, no
+errors, no refusals, display sleep suppressed so it could not confound the counters — held GDI at
+exactly 10 for all 478 samples, USER within one, handles within a ±5 band netting −3, and private
+bytes within 0.3 MB. An 8-minute idle control was equally flat.
+
+So steady 4K capture does not cause the step recorded in #53. What remains between that run and
+this one is the clipboard destination, the file-output destination, the `BufferExhausted` refusal
+path that fired 787 times at a 250 ms interval and never here, and display power, which was
+uncontrolled then and suppressed now. The next run restores the clipboard and the 250 ms interval
+together, because a reproducer has to exist before bisecting means anything.
+
 ### Lifecycle recovery: a daemon with nothing to capture
 
 The daemon no longer exits when enumeration finds no displays. Locked, disconnected, asleep or
