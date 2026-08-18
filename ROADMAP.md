@@ -445,11 +445,29 @@ errors, no refusals, display sleep suppressed so it could not confound the count
 exactly 10 for all 478 samples, USER within one, handles within a ±5 band netting −3, and private
 bytes within 0.3 MB. An 8-minute idle control was equally flat.
 
-So steady 4K capture does not cause the step recorded in #53. What remains between that run and
-this one is the clipboard destination, the file-output destination, the `BufferExhausted` refusal
-path that fired 787 times at a 250 ms interval and never here, and display power, which was
-uncontrolled then and suppressed now. The next run restores the clipboard and the 250 ms interval
-together, because a reproducer has to exist before bisecting means anything.
+Two further legs restored the rest of the original configuration: the clipboard alone at 250 ms
+(5,359 captures, no refusals), then both destinations at 250 ms (2,548 captures, 2,407 files,
+4.17 GB, **141 `BufferExhausted` refusals**). GDI held at exactly 10 in every sample of all three
+runs — 12,420 captures across 79 minutes — against an original that stepped 10 → 33 and held.
+
+Every Captastic-side suspect is therefore exonerated: the capture path, both destinations, and the
+refusal path. What differed in all three runs is display power, uncontrolled in the original and
+suppressed here, and it fits the shape exactly — a one-time event allocating a batch of GDI and
+USER objects and then holding flat, unrelated to capture volume.
+
+A fourth run powered the display down for 30 seconds with captures running — the monitor entering
+sleep confirmed by observation rather than inferred — and GDI and USER did not move at all. That
+eliminates the last suspect: **12,472 captures across four runs and 81 minutes, with GDI at exactly
+10 in every sample of every run.** The step in #53 is not reproducible under any Captastic-side
+condition, and the remaining candidate is the lock transition that occurred during the original
+soak, which has never been measured with these counters.
+
+Two incidental findings. The refusals were never "250 ms is too fast for 4K": both destinations
+lease from the same three-slot CPU pool and the file worker holds its lease across a `Compact`
+encode plus the write, so the refusals are the two destinations contending — the clipboard alone at
+that rate refused none of 5,359. And Desktop Duplication keeps producing full-resolution frames
+while the monitor is asleep, so a sleeping display is still capturable and does not detach from
+enumeration.
 
 ### Lifecycle recovery: a daemon with nothing to capture
 
@@ -460,12 +478,19 @@ display appears. Verified end to end on 2026-08-17 with an injected blackout
 (`CAPTASTIC_TEST_NO_DISPLAYS_MS`, debug builds only): start with nothing attached, seven triggers
 refused with an accurate reason, engine built unattended, 4K captures following.
 
-The measurement that shaped it is worth keeping: **a plain `Win+L` lock does not break DXGI at
-all** on the development host. With `OpenInputDesktop` refused for 6.3 continuous seconds,
-enumeration and duplication both worked and a fresh daemon reported ready. Issue #51's stated
-mechanism was therefore wrong, and a fix keyed on the lock would have missed the failure it was
-filed about. The original condition — an empty list *and* a denied `QueryDisplayConfig` — has still
-not been reproduced on demand.
+The measurement that shaped it is worth keeping, with a later correction. A lock does **not** stop
+enumeration: displays enumerate with their persistent identities throughout, so a lock is not what
+produced the empty display list in #51, and a fix keyed on the lock would have missed the failure it
+was filed about. That original condition — an empty list *and* a denied `QueryDisplayConfig` — has
+still not been reproduced on demand.
+
+The first run of that test also had a fresh daemon build a duplication 0.3 s after the lock engaged,
+which led to the overly strong claim that a lock does not break DXGI at all. A later run with a
+daemon already holding a duplication showed otherwise: at the lock it takes `AccessLost` (`the keyed
+mutex was abandoned`), and the rebuild is refused with `DesktopUnavailable in dxgi/duplicate_output:
+the session is locked or a secure prompt owns the desktop`. It recovered by itself two seconds later
+at the unlock. So duplication *is* refused while the lock screen owns the desktop; there is simply a
+brief transitional window in which it can still be acquired.
 
 ## Recommended next branch
 

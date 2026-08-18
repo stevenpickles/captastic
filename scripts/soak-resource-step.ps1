@@ -32,9 +32,19 @@ param(
     [string] $Exe = 'C:\Users\Steven\work\captastic\target\release\captastic.exe',
     [string] $UserExe = 'C:\ProgramData\chocolatey\lib\captastic\tools\captastic\captastic.exe',
     [Parameter(Mandatory)] [string] $OutDir,
+    # Any leg set to zero minutes is skipped, so one harness can run a whole investigation or a
+    # single follow-up without editing it.
     [int] $IdleMinutes = 8,
     [int] $BusyMinutes = 40,
     [int] $TriggerIntervalMs = 500,
+    # The clipboard leg restores two of the original run's conditions at once: the clipboard
+    # destination, and the BufferExhausted refusals that a 250 ms interval produces at 4K.
+    [int] $ClipboardMinutes = 0,
+    [int] $ClipboardIntervalMs = 250,
+    # The full original configuration: both destinations at once. The only way to reach the
+    # BufferExhausted path, which needs the two of them contending for the three CPU pool slots.
+    [int] $BothMinutes = 0,
+    [int] $BothIntervalMs = 250,
     [int] $SampleSeconds = 5
 )
 
@@ -66,11 +76,65 @@ function Write-Line([string] $text) {
     "$stamp  $text" | Tee-Object -FilePath $log -Append | Out-Null
 }
 
+# Saves whatever the user has on the clipboard, so a soak that publishes thousands of captures to
+# it can put it back. This is not optional politeness: the clipboard leg overwrites the clipboard
+# roughly once a second for its whole duration, and an earlier soak destroyed a real clipboard
+# twice - once because no backup was taken, and once because the backup was taken before the
+# *previous* leg and had already been consumed. Re-save immediately before every leg that touches
+# it, never once at the top of a run.
+function Save-Clipboard([string] $Directory) {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    $saved = @{ Text = $null; Html = $null; ImagePath = $null; Formats = @() }
+    try {
+        $data = [System.Windows.Forms.Clipboard]::GetDataObject()
+        if ($null -eq $data) { return $saved }
+        $saved.Formats = @($data.GetFormats())
+        if ($data.GetDataPresent('UnicodeText')) { $saved.Text = [string] $data.GetData('UnicodeText') }
+        if ($data.GetDataPresent('HTML Format')) { $saved.Html = [string] $data.GetData('HTML Format') }
+        if ([System.Windows.Forms.Clipboard]::ContainsImage()) {
+            $image = [System.Windows.Forms.Clipboard]::GetImage()
+            if ($image) {
+                $saved.ImagePath = Join-Path $Directory 'clipboard-backup.png'
+                $image.Save($saved.ImagePath, [System.Drawing.Imaging.ImageFormat]::Png)
+                $image.Dispose()
+            }
+        }
+    } catch {
+        Write-Line "WARNING: could not fully read the clipboard to back it up: $_"
+    }
+    return $saved
+}
+
+function Restore-Clipboard($Saved) {
+    if (-not $Saved -or (-not $Saved.Text -and -not $Saved.Html -and -not $Saved.ImagePath)) {
+        Write-Line 'clipboard held nothing restorable; leaving the capture on it'
+        return
+    }
+    try {
+        if ($Saved.ImagePath -and (Test-Path $Saved.ImagePath)) {
+            $image = [System.Drawing.Image]::FromFile($Saved.ImagePath)
+            [System.Windows.Forms.Clipboard]::SetImage($image)
+            $image.Dispose()
+            Write-Line 'clipboard restored (image)'
+            return
+        }
+        $object = New-Object System.Windows.Forms.DataObject
+        if ($Saved.Text) { $object.SetData('UnicodeText', $Saved.Text) }
+        if ($Saved.Html) { $object.SetData('HTML Format', $Saved.Html) }
+        [System.Windows.Forms.Clipboard]::SetDataObject($object, $true)
+        Write-Line "clipboard restored (text $($Saved.Text.Length) chars)"
+    } catch {
+        Write-Line "WARNING: clipboard restore FAILED: $_"
+    }
+}
+
 # Runs one leg: start a daemon, sample it for the duration, stop it, and keep everything.
 function Invoke-Leg([string] $Name, [int] $Minutes, [string[]] $ExtraArgs) {
     $daemonOut = Join-Path $OutDir "$Name-daemon.log"
     $csv = Join-Path $OutDir "$Name-resources.csv"
-    $arguments = @('daemon', '--backend', 'dxgi', '--clipboard', 'false', '--selection', 'false') + $ExtraArgs
+    # Destinations are the caller's business: each leg exists to turn exactly one of them on or off.
+    $arguments = @('daemon', '--backend', 'dxgi', '--selection', 'false') + $ExtraArgs
     Write-Line "$Name leg: starting daemon ($($arguments -join ' '))"
     $daemon = Start-Process -FilePath $Exe -ArgumentList $arguments -RedirectStandardOutput "$daemonOut.out" `
         -RedirectStandardError $daemonOut -PassThru -WindowStyle Hidden
@@ -106,12 +170,115 @@ try {
     }
 
     # Control: no capture work at all. A step here indicts the environment, not Captastic.
-    Invoke-Leg -Name 'idle' -Minutes $IdleMinutes -ExtraArgs @()
+    if ($IdleMinutes -gt 0) {
+        Invoke-Leg -Name 'idle' -Minutes $IdleMinutes -ExtraArgs @('--clipboard', 'false')
+    }
 
     # Treatment: capture work, with the two destinations from the original run removed.
-    Invoke-Leg -Name 'busy' -Minutes $BusyMinutes -ExtraArgs @(
-        '--self-trigger', '--self-trigger-interval-ms', "$TriggerIntervalMs"
-    )
+    if ($BusyMinutes -gt 0) {
+        Invoke-Leg -Name 'busy' -Minutes $BusyMinutes -ExtraArgs @(
+            '--clipboard', 'false',
+            '--self-trigger', '--self-trigger-interval-ms', "$TriggerIntervalMs"
+        )
+    }
+
+    # Reproduction attempt: the clipboard destination back on, at the interval that produced the
+    # original run's 787 BufferExhausted refusals. Runs against a throwaway configuration so the
+    # user's captastic.toml and state.toml are not touched, and with clipboard retention allowed,
+    # because the original predates the opt-out added in #54 - a faithful reproduction has to
+    # include the format synthesis that a retained clipboard capture can provoke.
+    if ($ClipboardMinutes -gt 0) {
+        $configPath = Join-Path $OutDir 'soak-config.toml'
+        @'
+schema_version = 1
+
+[daemon]
+backend = "dxgi"
+display = "primary"
+
+[capture]
+mode = "latest"
+cpu_frame = true
+
+[clipboard]
+enabled = true
+queue_capacity = 1
+allow_history = true
+allow_cloud_sync = true
+
+[output]
+enabled = false
+
+[selection]
+enabled = false
+'@ | Set-Content -Path $configPath -Encoding UTF8
+        $backup = Save-Clipboard -Directory $OutDir
+        Write-Line "clipboard backed up before the leg (formats: $($backup.Formats -join ', '))"
+        try {
+            Invoke-Leg -Name 'clipboard' -Minutes $ClipboardMinutes -ExtraArgs @(
+                '--config', $configPath,
+                '--clipboard', 'true',
+                '--self-trigger', '--self-trigger-interval-ms', "$ClipboardIntervalMs"
+            )
+        }
+        finally {
+            Restore-Clipboard -Saved $backup
+        }
+    }
+
+    # The original configuration, reproduced whole: clipboard and file output together at 250 ms.
+    # Captures go to a scratch directory that is measured and deleted afterwards - roughly 3 MB
+    # each, so this is the one leg with a disk cost worth stating before it runs.
+    if ($BothMinutes -gt 0) {
+        $captureDir = Join-Path $OutDir 'captures'
+        New-Item -ItemType Directory -Force $captureDir | Out-Null
+        $configPath = Join-Path $OutDir 'both-config.toml'
+        $toml = @"
+schema_version = 1
+
+[daemon]
+backend = "dxgi"
+display = "primary"
+
+[capture]
+mode = "latest"
+cpu_frame = true
+
+[clipboard]
+enabled = true
+queue_capacity = 1
+allow_history = true
+allow_cloud_sync = true
+
+[output]
+enabled = true
+format = "png"
+queue_capacity = 2
+directory = '$captureDir'
+filename_template = "{timestamp}"
+
+[selection]
+enabled = false
+"@
+        Set-Content -Path $configPath -Value $toml -Encoding UTF8
+        $backup = Save-Clipboard -Directory $OutDir
+        Write-Line "clipboard backed up before the both leg (formats: $($backup.Formats -join ', '))"
+        try {
+            Invoke-Leg -Name 'both' -Minutes $BothMinutes -ExtraArgs @(
+                '--config', $configPath,
+                '--clipboard', 'true',
+                '--self-trigger', '--self-trigger-interval-ms', "$BothIntervalMs"
+            )
+        }
+        finally {
+            Restore-Clipboard -Saved $backup
+            $files = @(Get-ChildItem -Path $captureDir -Filter *.png -ErrorAction SilentlyContinue)
+            $bytes = ($files | Measure-Object -Property Length -Sum).Sum
+            Write-Line ("captures written: {0} files, {1:N2} GB" -f $files.Count, ($bytes / 1GB))
+            Remove-Item -Path $captureDir -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Line 'capture directory deleted'
+        }
+    }
 }
 finally {
     # Back to whatever the user's power plan says, immediately.
