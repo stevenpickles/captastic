@@ -381,6 +381,7 @@ impl CaptureBackend for DxgiBackend {
             }
             let timeout_ms = duration_to_timeout_ms(remaining);
             let acquired = AcquiredFrame::acquire(&self.duplication, timeout_ms)?;
+            self.record_pointer_report(&acquired)?;
             let presentation_offset_ns = if acquired.info.LastPresentTime == 0 {
                 None
             } else {
@@ -412,10 +413,22 @@ impl CaptureBackend for DxgiBackend {
 
             let native_ready_ns = duration_ns_u64(request.triggered_at.elapsed());
             recorder.record(request.id, PerfEventKind::NativeFrameReady, native_ready_ns);
-            let retained_pointer_at = acquired.info.PointerPosition.Visible.as_bool().then_some((
-                acquired.info.PointerPosition.Position.x,
-                acquired.info.PointerPosition.Position.y,
-            ));
+            // Same incremental contract as the live path: this frame describes the pointer only
+            // if it changed, so the report is recorded when it comes and remembered when it does
+            // not. This is the `latest` path, which is what the resident daemon runs, so reading
+            // the raw fields here meant a retained frame almost always recorded "no pointer".
+            if acquired.info.LastMouseUpdateTime != 0 {
+                self.pointer.store_position(
+                    acquired.info.PointerPosition.Position.x,
+                    acquired.info.PointerPosition.Position.y,
+                    acquired.info.PointerPosition.Visible.as_bool(),
+                );
+            }
+            let retained_pointer_at = self
+                .pointer
+                .position()
+                .filter(|position| position.visible)
+                .map(|position| (position.x, position.y));
             let frame_generation = self.retain_frame(
                 &texture,
                 texture_desc,
@@ -641,6 +654,7 @@ impl DxgiBackend {
 
     fn refresh_latest(&mut self, timeout_ms: u32) -> Result<bool, CaptureError> {
         let acquired = AcquiredFrame::acquire(&self.duplication, timeout_ms)?;
+        self.record_pointer_report(&acquired)?;
         if acquired.info.LastPresentTime == 0 {
             acquired.release()?;
             return Ok(false);
@@ -729,6 +743,29 @@ impl DxgiBackend {
     /// Returns `Ok(None)` when there is nothing to draw, with the reason already recorded on the
     /// metadata - a request that could not be honoured is reported rather than left looking like a
     /// request never made.
+    /// Takes whatever a freshly acquired frame says about the pointer, before anything decides
+    /// whether to keep the frame.
+    ///
+    /// DXGI's pointer stream is incremental *and* per-acquisition: each `AcquireNextFrame` reports
+    /// the changes since the previous one, and a report not read is gone. Recording at the point
+    /// of use loses every report that arrives on a frame the caller then discards - a stale frame
+    /// rejected in `fresh` mode, a frame drained in `latest` mode, or any frame captured while the
+    /// cursor was excluded. On this machine the very first acquisition carried the position *and*
+    /// a 9,216-byte shape, both were thrown away, and no further report arrived for seconds at a
+    /// time - so composition had nothing to draw and reported the pointer missing.
+    ///
+    /// Every acquisition feeds the cache, whatever becomes of its pixels.
+    fn record_pointer_report(&mut self, acquired: &AcquiredFrame) -> Result<(), CaptureError> {
+        if acquired.info.LastMouseUpdateTime != 0 {
+            self.pointer.store_position(
+                acquired.info.PointerPosition.Position.x,
+                acquired.info.PointerPosition.Position.y,
+                acquired.info.PointerPosition.Visible.as_bool(),
+            );
+        }
+        self.refresh_pointer_shape(acquired)
+    }
+
     fn pointer_for(
         &mut self,
         acquired: &AcquiredFrame,
@@ -744,7 +781,26 @@ impl DxgiBackend {
         // when it comes back.
         self.refresh_pointer_shape(acquired)?;
 
-        if !acquired.info.PointerPosition.Visible.as_bool() {
+        // A frame describes the pointer only when the pointer changed, which DXGI signals with a
+        // non-zero LastMouseUpdateTime; otherwise `PointerPosition` holds defaults that read as an
+        // invisible pointer at the origin. Taking those at face value is why composition almost
+        // never happened: a still pointer over a repainting desktop reported "not visible" on
+        // every frame. The report is recorded when it arrives and remembered when it does not,
+        // exactly as the shape already was.
+        if acquired.info.LastMouseUpdateTime != 0 {
+            self.pointer.store_position(
+                acquired.info.PointerPosition.Position.x,
+                acquired.info.PointerPosition.Position.y,
+                acquired.info.PointerPosition.Visible.as_bool(),
+            );
+        }
+        let Some(position) = self.pointer.position() else {
+            metadata.cursor = Some(CursorCapture::Absent {
+                reason: CursorAbsence::PositionNotYetKnown,
+            });
+            return Ok(None);
+        };
+        if !position.visible {
             metadata.cursor = Some(CursorCapture::Absent {
                 reason: CursorAbsence::NotVisible,
             });
@@ -767,10 +823,7 @@ impl DxgiBackend {
             });
             return Ok(None);
         }
-        Ok(Some((
-            acquired.info.PointerPosition.Position.x,
-            acquired.info.PointerPosition.Position.y,
-        )))
+        Ok(Some((position.x, position.y)))
     }
 
     /// The pointer decision for a frame that was captured earlier and is being materialized now.
@@ -2987,6 +3040,45 @@ mod tests {
     /// reason DXGI reports pointer position separately from frame content. Drag a window, scroll
     /// something, or play a video while this runs.
     ///
+    /// Moves the pointer one pixel and back, so the next duplicated frame carries a mouse update.
+    ///
+    /// DXGI populates `PointerPosition` only on frames where the pointer changed, so a stationary
+    /// pointer is indistinguishable from an absent one no matter how long a test waits.
+    fn nudge_pointer() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_MOVE, MOUSEINPUT,
+        };
+
+        // Parked mid-screen first. A pointer resting at a screen edge, or over an application
+        // that has hidden it, is reported visible with a fully transparent shape - which is a
+        // truthful answer to a question this test is not asking.
+        // SAFETY: Two coordinates inside the primary display.
+        unsafe { windows::Win32::UI::WindowsAndMessaging::SetCursorPos(960, 540) }.ok();
+        std::thread::sleep(std::time::Duration::from_millis(40));
+
+        let move_by = |dx: i32, dy: i32| {
+            let input = INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dx,
+                        dy,
+                        mouseData: 0,
+                        dwFlags: MOUSEEVENTF_MOVE,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            };
+            // SAFETY: One fully initialized INPUT record, described by its own size.
+            unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+        };
+        move_by(1, 0);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        move_by(-1, 0);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+
     /// cargo test --locked -p captastic-windows --release
     ///     -- --ignored --nocapture cursor_composition_changes_only_the_pointer_rectangle
     #[test]
@@ -3000,22 +3092,50 @@ mod tests {
             id: CaptureId(1),
             triggered_at: Instant::now(),
             source: CaptureSource::Display(DisplayId::primary()),
-            // Generous, because the frame has to arrive from whatever the tester is doing to the
-            // desktop rather than from anything this test can cause.
-            mode: CaptureMode::Fresh { timeout_ms: 10_000 },
+            // `latest` rather than `fresh`, so both captures read the *same* retained frame and
+            // the only difference between them is the composition. Two fresh frames are two
+            // moments, and on a desktop that repainted between them millions of pixels differ for
+            // reasons that have nothing to do with the pointer - which makes "the change is
+            // confined to the pointer rectangle" unprovable exactly when it matters.
+            mode: CaptureMode::Latest { max_age_ms: None },
             cpu_frame: true,
             retain_native_frame: false,
             cursor,
         };
 
+        // Nudged rather than waited for. DXGI fills in PointerPosition only on a frame that
+        // carries a mouse update, so a still pointer reads as `NotVisible` however long the wait -
+        // which is how this test first failed, having asked a human to move the mouse and then
+        // sampled before they could. A one-pixel round trip is an unambiguous update and leaves
+        // the pointer where it started.
+        let mut with = None;
+        for attempt in 0..20 {
+            nudge_pointer();
+            let frame = backend
+                .capture(&request(CursorMode::Include), &mut recorder)
+                .expect("capture with a cursor")
+                .frame
+                .expect("cpu frame");
+            println!("attempt {}: {:?}", attempt + 1, frame.metadata.cursor);
+            if matches!(
+                frame.metadata.cursor,
+                Some(CursorCapture::Composited { .. })
+            ) {
+                println!("composited pointer on attempt {}", attempt + 1);
+                with = Some(frame);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let with = with.expect(
+            "no capture in 20 attempts carried a composited pointer; is the pointer on this display,              and is something drawing its own cursor?",
+        );
+        // Taken after, and without touching the mouse in between, so it reads the same retained
+        // frame this one did. The pointer position is remembered, so excluding the cursor does not
+        // disturb it.
         let without = backend
             .capture(&request(CursorMode::Exclude), &mut recorder)
             .expect("capture without a cursor")
-            .frame
-            .expect("cpu frame");
-        let with = backend
-            .capture(&request(CursorMode::Include), &mut recorder)
-            .expect("capture with a cursor")
             .frame
             .expect("cpu frame");
 
@@ -3026,10 +3146,7 @@ mod tests {
             height,
         }) = with.metadata.cursor
         else {
-            panic!(
-                "expected a composited cursor, got {:?} - is the pointer on the primary display?",
-                with.metadata.cursor
-            );
+            unreachable!("the loop above only accepts a composited pointer");
         };
         assert_eq!(without.metadata.cursor, Some(CursorCapture::Excluded));
         println!("pointer reported at ({x},{y}) sized {width}x{height}");
@@ -3065,7 +3182,7 @@ mod tests {
         );
         assert!(
             differing_inside > 0,
-            "the cursor-on capture is identical inside the pointer rectangle: nothing was drawn"
+            "nothing was drawn inside the pointer rectangle. If the shape Windows supplied is              entirely transparent - an application that has hidden its cursor reports exactly              that, while still reporting the pointer visible - then this is a truthful capture of              an invisible pointer rather than a composition failure. Move the mouse over an              ordinary window and run it again."
         );
     }
 

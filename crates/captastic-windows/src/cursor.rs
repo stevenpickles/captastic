@@ -47,6 +47,26 @@ pub(crate) struct PointerShape {
 #[derive(Debug, Default)]
 pub(crate) struct PointerCache {
     shape: Option<PointerShape>,
+    /// The last position and visibility DXGI reported, and whether it has reported at all.
+    ///
+    /// DXGI describes the pointer incrementally: `DXGI_OUTDUPL_FRAME_INFO` carries a position and
+    /// a visibility flag only on a frame where the pointer changed, signalled by a non-zero
+    /// `LastMouseUpdateTime`, and leaves both at their defaults otherwise. Reading them
+    /// unconditionally means a stationary pointer reads as `Visible = false` on every frame that
+    /// was produced by the desktop repainting — which is nearly all of them, and is why
+    /// composition never fired outside a test that moved the mouse at exactly the right moment.
+    ///
+    /// So the position is remembered here for the same reason the shape is: the compositor tells
+    /// you what changed, and the caller is expected to know the rest.
+    position: Option<PointerPosition>,
+}
+
+/// Where the pointer was, the last time the compositor said anything about it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PointerPosition {
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    pub(crate) visible: bool,
 }
 
 impl PointerCache {
@@ -56,6 +76,16 @@ impl PointerCache {
 
     pub(crate) fn current(&self) -> Option<&PointerShape> {
         self.shape.as_ref()
+    }
+
+    /// Records what a frame reported about the pointer. Call only for a frame that reported.
+    pub(crate) fn store_position(&mut self, x: i32, y: i32, visible: bool) {
+        self.position = Some(PointerPosition { x, y, visible });
+    }
+
+    /// The last reported position, or `None` if the pointer has never been reported.
+    pub(crate) fn position(&self) -> Option<PointerPosition> {
+        self.position
     }
 }
 

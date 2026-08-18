@@ -120,6 +120,15 @@ pub enum CursorAbsence {
     /// changes, so a duplication that has just been created knows where the pointer is before it
     /// knows what it looks like.
     ShapeNotYetKnown,
+    /// The pointer has not been reported at all since this duplication was created.
+    ///
+    /// Distinct from [`Self::NotVisible`], which it used to be reported as, and the distinction is
+    /// the whole reason composition never happened in practice. DXGI reports the pointer
+    /// *incrementally*: a frame carries a position and a visibility flag only when the pointer
+    /// changed, and otherwise leaves both at their defaults — which read as "not visible" to a
+    /// caller that takes them at face value. "I have not been told" and "I have been told it is
+    /// hidden" are different facts, and only the second means there is nothing to draw.
+    PositionNotYetKnown,
 }
 
 /// What became of the cursor for one capture.
