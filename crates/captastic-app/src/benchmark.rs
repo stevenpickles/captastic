@@ -33,7 +33,7 @@ pub struct BenchmarkOptions {
     pub fake: FakeBackendConfig,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct EnvironmentFingerprint {
     pub os: &'static str,
     pub architecture: &'static str,
@@ -42,7 +42,7 @@ pub struct EnvironmentFingerprint {
     pub displays: Vec<DisplayFingerprint>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct DisplayFingerprint {
     pub id: String,
     pub name: String,
@@ -52,7 +52,7 @@ pub struct DisplayFingerprint {
     pub primary: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct BenchmarkReport {
     pub schema_version: u32,
     pub backend: &'static str,

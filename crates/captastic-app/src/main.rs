@@ -909,17 +909,45 @@ fn benchmark(args: BenchmarkArgs) -> Result<(), AppError> {
         let repeated = benchmark::run_repeated(&options, args.repeat, move || {
             create_backend(&backend_name, &display_policy)
         })?;
+        // Budgets apply to a repeat set too, and per run rather than to their average: a mean
+        // hides one run in three breaching, and "usually under 2 ms" is not a latency figure worth
+        // publishing. Silently ignoring --budgets here - which is what this did first - is the
+        // worst of the options, because the check was asked for and did nothing.
+        let budget_outcomes = args
+            .budgets
+            .as_deref()
+            .map(|path| budget::load(path).map(|file| budget::evaluate_each(&file, &repeated.runs)))
+            .transpose()?;
+        let combined = serde_json::json!({
+            "repeated": &repeated,
+            "budgets": &budget_outcomes,
+        });
         if let Some(path) = args.output_results.as_deref() {
-            benchmark::write_json(path, &repeated)?;
+            benchmark::write_json(path, &combined)?;
         }
         if args.json {
-            println!("{}", serde_json::to_string_pretty(&repeated)?);
+            println!("{}", serde_json::to_string_pretty(&combined)?);
         } else {
             report_repeated(&repeated);
+            if let Some(outcomes) = budget_outcomes.as_deref() {
+                for (index, outcome) in outcomes.iter().enumerate() {
+                    let heading = format!("run {}", index + 1);
+                    if outcome.applied() {
+                        log::info!("{heading}: {outcome}");
+                    } else {
+                        log::warn!("{heading}: {outcome}");
+                    }
+                }
+            }
         }
         if !repeated.incompatibilities.is_empty() {
             return Err(AppError::InvalidArgument(
                 "repeat runs are not comparable; see the reported differences".to_owned(),
+            ));
+        }
+        if budget_outcomes.as_deref().is_some_and(budget::any_breached) {
+            return Err(AppError::InvalidArgument(
+                "a repeat run breached a performance budget that applies to this host".to_owned(),
             ));
         }
         return Ok(());

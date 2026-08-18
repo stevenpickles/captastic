@@ -169,6 +169,24 @@ pub fn evaluate(budget: &BudgetFile, report: &BenchmarkReport) -> BudgetOutcome 
     }
 }
 
+/// Applies a budget file to every run of a repeat set.
+///
+/// A performance claim is supported by repeats that *all* meet the budget, not by their average. A
+/// mean hides one run in three breaching, and "usually under 2 ms" is not the claim anybody wants
+/// to read on a latency figure — so each run is judged on its own and the caller is told which
+/// ones failed.
+pub fn evaluate_each(budget: &BudgetFile, reports: &[BenchmarkReport]) -> Vec<BudgetOutcome> {
+    reports
+        .iter()
+        .map(|report| evaluate(budget, report))
+        .collect()
+}
+
+/// Whether any run that the budget applied to breached it.
+pub fn any_breached(outcomes: &[BudgetOutcome]) -> bool {
+    outcomes.iter().any(BudgetOutcome::breached)
+}
+
 fn host_mismatches(host: &HostMatch, report: &BenchmarkReport) -> Vec<String> {
     let mut mismatches = Vec::new();
     let mut compare = |field: &str, expected: Option<&str>, actual: &str| {
@@ -435,6 +453,33 @@ mod tests {
         let outcome = evaluate(&budget, &report);
         assert!(!outcome.breached());
         assert_eq!(outcome.checks[0].measured, "0.00x");
+    }
+
+    #[test]
+    fn every_repeat_must_meet_a_budget_for_it_to_be_met() {
+        // A mean would hide one run in three breaching. "Usually under 2 ms" is not a latency
+        // figure anybody wants to read, so each run is judged on its own.
+        let budget = BudgetFile {
+            host: HostMatch::default(),
+            absolute: AbsoluteBudgets {
+                native_frame_p50_ns: Some(2_000),
+                ..AbsoluteBudgets::default()
+            },
+            relative: RelativeBudgets::default(),
+        };
+        let mut good = report();
+        good.native_frame_latency = summary(1_000, 1_200);
+        let mut bad = report();
+        bad.native_frame_latency = summary(9_000, 9_500);
+
+        let all_good = evaluate_each(&budget, &[good.clone(), good.clone(), good.clone()]);
+        assert_eq!(all_good.len(), 3);
+        assert!(!any_breached(&all_good));
+
+        // One bad run in three is a breach, and the outcomes say which.
+        let mixed = evaluate_each(&budget, &[good.clone(), bad, good]);
+        assert!(any_breached(&mixed));
+        assert_eq!(mixed.iter().filter(|outcome| outcome.breached()).count(), 1);
     }
 
     #[test]
