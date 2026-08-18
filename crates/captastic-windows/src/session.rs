@@ -18,9 +18,9 @@ use std::fmt;
 
 use windows::Win32::Foundation::{BOOL, HANDLE};
 use windows::Win32::System::RemoteDesktop::{
-    WTSActive, WTSConnectQuery, WTSConnectState, WTSConnected, WTSDisconnected, WTSDown,
-    WTSFreeMemory, WTSIdle, WTSInit, WTSListen, WTSQuerySessionInformationW, WTSReset, WTSShadow,
-    WTS_CONNECTSTATE_CLASS,
+    WTSActive, WTSClientProtocolType, WTSConnectQuery, WTSConnectState, WTSConnected,
+    WTSDisconnected, WTSDown, WTSFreeMemory, WTSIdle, WTSInit, WTSListen,
+    WTSQuerySessionInformationW, WTSReset, WTSShadow, WTS_CONNECTSTATE_CLASS,
 };
 use windows::Win32::System::StationsAndDesktops::{
     CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, DESKTOP_CONTROL_FLAGS,
@@ -47,6 +47,12 @@ pub enum DesktopState {
     /// The session is not attached to a console or a client — a disconnected RDP session, or one
     /// still being set up.
     Detached { connect_state: &'static str },
+    /// The session is being driven remotely, so the desktop belongs to a virtual display adapter.
+    ///
+    /// Desktop Duplication is not available on one. Windows composes the remote session onto an
+    /// indirect display driver, and DXGI refuses to duplicate it — reported as a bare "Access is
+    /// denied", which reads like a permissions problem and is not one.
+    Remote { protocol: &'static str },
     /// The probe could not answer, which is not the same as answering "fine".
     Unknown { detail: String },
 }
@@ -62,7 +68,10 @@ impl DesktopState {
     /// `Unknown` is deliberately not temporary. Waiting forever on a question that was never
     /// answered would turn a probe failure into a daemon that silently never captures.
     pub fn is_temporary(&self) -> bool {
-        matches!(self, Self::NotOurs { .. } | Self::Detached { .. })
+        matches!(
+            self,
+            Self::NotOurs { .. } | Self::Detached { .. } | Self::Remote { .. }
+        )
     }
 }
 
@@ -82,6 +91,10 @@ impl fmt::Display for DesktopState {
             Self::Detached { connect_state } => {
                 write!(formatter, "the session is {connect_state}")
             }
+            Self::Remote { protocol } => write!(
+                formatter,
+                "this is a {protocol} session; Windows composes it onto a virtual display and DXGI will not duplicate one. Capture works from the physical console session."
+            ),
             Self::Unknown { detail } => {
                 write!(
                     formatter,
@@ -115,14 +128,18 @@ enum InputDesktop {
 /// Cheap enough to call on a failure path — two syscalls, no allocation beyond a desktop name —
 /// and deliberately not cached: the whole point is that the answer changes while the process runs.
 pub fn desktop_state() -> DesktopState {
-    classify(connect_state(), input_desktop())
+    classify(connect_state(), input_desktop(), remote_protocol())
 }
 
 /// Turns what the two probes saw into one answer.
 ///
 /// Separated from the syscalls so the truth table can be tested. It cannot be tested any other
 /// way: producing a locked session on a build agent means locking the build agent.
-fn classify(connect: ConnectState, desktop: InputDesktop) -> DesktopState {
+fn classify(
+    connect: ConnectState,
+    desktop: InputDesktop,
+    remote_protocol: Option<&'static str>,
+) -> DesktopState {
     // A detached session is reported first. It is the more fundamental condition — a session with
     // no client attached has no desktop for anyone to own — and its desktop probe result is not
     // worth explaining on top of it.
@@ -130,6 +147,12 @@ fn classify(connect: ConnectState, desktop: InputDesktop) -> DesktopState {
         return DesktopState::Detached {
             connect_state: state,
         };
+    }
+    // A remote session owns an ordinary `Default` desktop, so the desktop probe reports it as
+    // interactive and is not wrong - the session simply has no duplicable display behind it.
+    // Checked before that answer is taken at face value.
+    if let Some(protocol) = remote_protocol {
+        return DesktopState::Remote { protocol };
     }
     match desktop {
         InputDesktop::Named(name) if name.eq_ignore_ascii_case(INTERACTIVE_DESKTOP) => {
@@ -178,6 +201,46 @@ fn connect_state() -> ConnectState {
         Some(state) if state == WTSActive => ConnectState::Active,
         Some(state) => ConnectState::Other(connect_state_name(state)),
         None => ConnectState::Unavailable,
+    }
+}
+
+/// Reports the protocol driving this session, when it is not the physical console.
+///
+/// `WTSClientProtocolType` answers in one call what the symptom never does: a Remote Desktop
+/// session composes onto a virtual display adapter, and DXGI will not duplicate one. The failure
+/// surfaces as `duplicate_output: Access is denied`, which sends a reader looking for a
+/// permissions problem — observed on the development host, where enumeration succeeded, no other
+/// process held a duplication, the session was unlocked, and duplication was refused anyway.
+fn remote_protocol() -> Option<&'static str> {
+    let mut buffer = windows::core::PWSTR::null();
+    let mut bytes = 0_u32;
+    // SAFETY: The out-parameters are valid for the call; on success Windows allocates a buffer we
+    // own until the WTSFreeMemory below.
+    let queried = unsafe {
+        WTSQuerySessionInformationW(
+            WTS_CURRENT_SERVER,
+            WTS_CURRENT_SESSION,
+            WTSClientProtocolType,
+            &mut buffer,
+            &mut bytes,
+        )
+    };
+    if queried.is_err() || buffer.is_null() {
+        return None;
+    }
+    let protocol = (bytes as usize >= std::mem::size_of::<u16>()).then(|| {
+        // SAFETY: WTSClientProtocolType returns a USHORT, and the size check confirms Windows
+        // returned at least that many bytes.
+        unsafe { buffer.as_ptr().cast::<u16>().read_unaligned() }
+    });
+    // SAFETY: buffer was allocated by the successful query above and is freed exactly once.
+    unsafe { WTSFreeMemory(buffer.as_ptr().cast()) };
+    match protocol {
+        // 0 is the physical console, which is the only one that can be duplicated.
+        Some(0) | None => None,
+        Some(1) => Some("Citrix ICA"),
+        Some(2) => Some("Remote Desktop"),
+        Some(_) => Some("remote"),
     }
 }
 
@@ -250,14 +313,16 @@ mod tests {
         assert_eq!(
             classify(
                 ConnectState::Active,
-                InputDesktop::Named("Default".to_owned())
+                InputDesktop::Named("Default".to_owned()),
+                None,
             ),
             DesktopState::Interactive
         );
         // Windows is not consistent about the case of user-object names.
         assert!(classify(
             ConnectState::Active,
-            InputDesktop::Named("default".to_owned())
+            InputDesktop::Named("default".to_owned()),
+            None,
         )
         .is_interactive());
     }
@@ -267,7 +332,7 @@ mod tests {
         // The signature of a locked workstation: OpenInputDesktop is denied outright. Treating it
         // as an error would put the daemon back where issue #51 found it, reporting something that
         // sounds like broken hardware.
-        let state = classify(ConnectState::Active, InputDesktop::Refused);
+        let state = classify(ConnectState::Active, InputDesktop::Refused, None);
         assert_eq!(state, DesktopState::NotOurs { desktop: None });
         assert!(state.is_temporary());
         assert!(!state.is_interactive());
@@ -278,6 +343,7 @@ mod tests {
         let state = classify(
             ConnectState::Active,
             InputDesktop::Named("Winlogon".to_owned()),
+            None,
         );
         assert!(state.is_temporary());
         assert!(
@@ -295,7 +361,7 @@ mod tests {
             InputDesktop::Named("Default".to_owned()),
             InputDesktop::Failed("anything".to_owned()),
         ] {
-            let state = classify(ConnectState::Other("disconnected"), desktop);
+            let state = classify(ConnectState::Other("disconnected"), desktop, None);
             assert_eq!(
                 state,
                 DesktopState::Detached {
@@ -307,12 +373,61 @@ mod tests {
     }
 
     #[test]
+    fn a_remote_session_is_named_even_though_its_desktop_looks_ordinary() {
+        // The case that costs the most time to diagnose without this. A Remote Desktop session
+        // owns a perfectly ordinary `Default` desktop and reports itself active, so every other
+        // signal says "fine" - and duplication is refused anyway, because Windows composes the
+        // session onto a virtual display adapter that DXGI will not duplicate. The bare "Access
+        // is denied" that results reads like a permissions problem and is not one.
+        let state = classify(
+            ConnectState::Active,
+            InputDesktop::Named("Default".to_owned()),
+            Some("Remote Desktop"),
+        );
+        assert_eq!(
+            state,
+            DesktopState::Remote {
+                protocol: "Remote Desktop"
+            }
+        );
+        assert!(!state.is_interactive());
+        // Temporary: it clears when the user sits back down at the console.
+        assert!(state.is_temporary());
+        assert!(state.to_string().contains("console"), "{state}");
+
+        // A console session is not remote, and must not be reported as one.
+        assert!(classify(
+            ConnectState::Active,
+            InputDesktop::Named("Default".to_owned()),
+            None
+        )
+        .is_interactive());
+    }
+
+    #[test]
+    fn a_disconnected_remote_session_reports_the_disconnection_first() {
+        // Both are true at once when an RDP client drops. The disconnection is the more
+        // fundamental fact - there is no session to duplicate for, remote display or not.
+        assert_eq!(
+            classify(
+                ConnectState::Other("disconnected"),
+                InputDesktop::Refused,
+                Some("Remote Desktop")
+            ),
+            DesktopState::Detached {
+                connect_state: "disconnected"
+            }
+        );
+    }
+
+    #[test]
     fn an_unanswered_probe_is_not_treated_as_temporary() {
         // Waiting forever on a question nobody answered would turn one failed syscall into a
         // daemon that never captures and never says why.
         let state = classify(
             ConnectState::Active,
             InputDesktop::Failed("no name".to_owned()),
+            None,
         );
         assert!(!state.is_temporary());
         assert!(!state.is_interactive());
@@ -329,11 +444,12 @@ mod tests {
         assert_eq!(
             classify(
                 ConnectState::Unavailable,
-                InputDesktop::Named("Default".to_owned())
+                InputDesktop::Named("Default".to_owned()),
+                None,
             ),
             DesktopState::Interactive
         );
-        assert!(classify(ConnectState::Unavailable, InputDesktop::Refused).is_temporary());
+        assert!(classify(ConnectState::Unavailable, InputDesktop::Refused, None).is_temporary());
     }
 
     /// Runs the real probe. Asserts only what is true of any machine able to run it.

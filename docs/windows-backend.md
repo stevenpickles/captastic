@@ -157,6 +157,14 @@ Use `--mode fresh` for controlled tests where the desktop is known to present af
 
 Desktop Duplication access can be denied from an isolated sandbox even when the same executable succeeds in the user's interactive session. `captastic doctor` preserves the native HRESULT/message so the two cases are distinguishable.
 
+### Remote Desktop
+
+Captastic cannot capture from inside a Remote Desktop session. Windows composes a remote session onto a virtual display adapter — `Microsoft Remote Display Adapter`, carrying a generic `Default_Monitor` — and DXGI will not duplicate one. The symptom is `duplicate_output: Access is denied` on a session that is unlocked, enumerating normally, and holding no other duplication, which reads like a permissions problem and is not one.
+
+`WTSQuerySessionInformation(WTSClientProtocolType)` answers it in one call, so the condition is reported as `DesktopUnavailable` naming the protocol, and the daemon waits rather than exiting: connecting remotely no longer kills a daemon that was capturing happily at the console, and it resumes when the console session is used again.
+
+Two consequences worth knowing. The active display *identity* changes when a remote session takes over, because it genuinely is a different output — a remote session's generic monitor is not the physical panel, and the per-display remembered state is keyed accordingly. And a benchmark or soak run started over Remote Desktop measures nothing; run those from the console.
+
 ### A session without a desktop
 
 Displays asleep, unplugged mid-session, a disconnected RDP session, or a desktop owned by the lock screen all present to DXGI the same way: no attached outputs. Enumerating nothing is therefore `CaptureErrorKind::DesktopUnavailable` whatever the cause — it means "not now", where `SourceUnavailable` keeps its narrower meaning of "displays exist, but not the one configured", which stays fatal because waiting cannot fix a `display =` naming absent hardware.

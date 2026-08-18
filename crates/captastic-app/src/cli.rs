@@ -164,12 +164,26 @@ pub struct BenchmarkArgs {
     pub max_frame_age_ms: u64,
     #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
     pub cpu_frame: bool,
+    /// Composite the pointer into each capture. Milestone 5 asks for cursor-on and cursor-off to
+    /// be measured separately; this is the switch between the two runs.
+    #[arg(long, value_enum, default_value_t = CursorArg::Exclude)]
+    pub cursor: CursorArg,
+    /// Repeat the whole timed run this many times. Every repeat is an independent run against a
+    /// fresh backend, and the comparison refuses to aggregate runs whose environments differ.
+    #[arg(long, default_value_t = 1)]
+    pub repeat: usize,
     #[arg(long)]
     pub output_results: Option<PathBuf>,
     #[arg(long)]
     pub raw_events: Option<PathBuf>,
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum CursorArg {
+    Include,
+    Exclude,
 }
 
 #[derive(Debug, Subcommand)]
