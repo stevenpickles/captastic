@@ -455,10 +455,19 @@ refusal path. What differed in all three runs is display power, uncontrolled in 
 suppressed here, and it fits the shape exactly — a one-time event allocating a batch of GDI and
 USER objects and then holding flat, unrelated to capture volume.
 
-One incidental correction: the refusals were never "250 ms is too fast for 4K". Both destinations
+A fourth run powered the display down for 30 seconds with captures running — the monitor entering
+sleep confirmed by observation rather than inferred — and GDI and USER did not move at all. That
+eliminates the last suspect: **12,472 captures across four runs and 81 minutes, with GDI at exactly
+10 in every sample of every run.** The step in #53 is not reproducible under any Captastic-side
+condition, and the remaining candidate is the lock transition that occurred during the original
+soak, which has never been measured with these counters.
+
+Two incidental findings. The refusals were never "250 ms is too fast for 4K": both destinations
 lease from the same three-slot CPU pool and the file worker holds its lease across a `Compact`
-encode plus the write, so the refusals are the two destinations contending. The clipboard alone at
-that rate refused none of 5,359.
+encode plus the write, so the refusals are the two destinations contending — the clipboard alone at
+that rate refused none of 5,359. And Desktop Duplication keeps producing full-resolution frames
+while the monitor is asleep, so a sleeping display is still capturable and does not detach from
+enumeration.
 
 ### Lifecycle recovery: a daemon with nothing to capture
 
