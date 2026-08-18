@@ -433,8 +433,10 @@ alongside the overlay extraction and Milestone 4. The order below reflects what 
    pre-work: a documented detach budget, FakeBackend contract fidelity, and the pixel-format
    extension.
 3. Settle the outstanding design decisions — latest-mode currency on an idle desktop,
-   `fresh` + `virtual_desktop`, control-event hardening, and the mouse-capture/software-KVM
-   contract. Milestone 4's two product questions are now answered (ADR 0008).
+   `fresh` + `virtual_desktop`, and control-event hardening. Milestone 4's two product questions are
+   answered (ADR 0008), and the mouse-capture/software-KVM contract is settled in ADR 0009: each use
+   takes the pointer source that answers its own question, and Captastic promises nothing about
+   where a foreign owner has put the mouse.
 4. Add annotation/pinning (Milestone 6, now ungated) or cross-platform work (Milestone 7), based on
    audience demand (existing decision gate).
 

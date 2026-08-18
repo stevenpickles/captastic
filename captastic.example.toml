@@ -92,8 +92,15 @@ format = "compact"
 max_file_bytes = 5242880
 retained_files = 3
 
-# Legacy single-monitor values. Captastic still reads these as a fallback, but writes new state to
-# a persistent display-specific table like the example below.
+# Legacy, and inert on any installation that has run since remembered state moved out of this file.
+#
+# Captastic keeps what it remembers about how you last used it - toolbar position, last tool, last
+# region, per display - in its own state.toml beside this file. This section is read exactly once,
+# to carry a pre-split installation's values across, and is ignored from then on. It is left in
+# place rather than deleted because this file is yours; it is safe to remove, and Captastic says so
+# at startup if it finds one that no longer does anything.
+#
+# Everything below is kept only to document what those pre-split values looked like.
 [ui]
 # overlay_x = 640
 # overlay_y = 920

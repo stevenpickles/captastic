@@ -196,6 +196,31 @@ impl UiStateStore {
     }
 
     /// Reads the whole remembered state, migrating a pre-split `[ui]` section on first use.
+    /// Reports a `[ui]` section that has been superseded by `state.toml`, if there is one.
+    ///
+    /// The migration writes the new file and leaves the old section alone, deliberately: this
+    /// file belongs to the user, and rewriting it behind their back is the practice the split was
+    /// meant to end. The cost is a configuration that carries two answers to the same question and
+    /// no indication of which one is live — observed in the wild with a `[ui]` section saying the
+    /// last tool was `window` while `state.toml`, the file actually honoured, said `full_display`.
+    ///
+    /// So the section is not removed and not honoured; it is *named*. Returning the two paths lets
+    /// a caller say which file wins, which is the one thing a reader of either cannot work out.
+    /// `None` once the section is empty or absent, so a tidy installation stays quiet.
+    pub fn superseded_config_section(&self) -> Option<(PathBuf, PathBuf)> {
+        let config_path = self.config_path.as_deref()?;
+        let state_path = self.state_path.as_deref()?;
+        // Only a *live* state file supersedes anything. Without one the section is still the
+        // source of truth and will be migrated on the next read.
+        if !state_path.exists() {
+            return None;
+        }
+        let text = fs::read_to_string(config_path).ok()?;
+        let legacy = toml::from_str::<LegacyUiSection>(&text).ok()?;
+        let carried = UiState::from_config_section(&legacy.ui);
+        (!carried.is_empty()).then(|| (config_path.to_path_buf(), state_path.to_path_buf()))
+    }
+
     pub fn load(&self) -> Result<UiState, ConfigError> {
         let path = self.required_state_path()?;
         match read_state(path)? {
@@ -557,6 +582,77 @@ mod tests {
                 Some((f64::from(index) / 10.0, 0.5))
             );
         }
+    }
+
+    #[test]
+    fn a_superseded_ui_section_is_named_rather_than_removed_or_honoured() {
+        // The situation this exists for, taken from a real installation: the configuration says
+        // the last tool was Window, state.toml says FullDisplay, and the daemon honours the
+        // second. Nothing in either file says so.
+        let directory = TestDirectory::new("superseded");
+        let config_path = directory.join(CONFIG_FILE_NAME);
+        let state_path = directory.join(STATE_FILE_NAME);
+        fs::write(
+            &config_path,
+            "schema_version = 1
+[ui]
+last_capture_tool = \"window\"
+",
+        )
+        .expect("seed a pre-split configuration");
+        let store = UiStateStore::for_config(&config_path);
+
+        // With no state file the section is not superseded - it is still the source of truth, and
+        // the next read migrates it.
+        assert!(store.superseded_config_section().is_none());
+        assert_eq!(
+            store.load().expect("migrates").last_capture_tool,
+            Some(CaptureTool::Window)
+        );
+
+        // Once a state file exists and disagrees, the section is dead weight and is reported.
+        store
+            .save_display_overlay_center("display-1", 0.5, 0.5)
+            .expect("write state");
+        assert!(state_path.exists());
+        let (named_config, named_state) = store
+            .superseded_config_section()
+            .expect("a live state file supersedes the section");
+        assert_eq!(named_config, config_path);
+        assert_eq!(named_state, state_path);
+
+        // Naming it must not change it: the file belongs to the user, and rewriting it behind
+        // their back is the practice the split was meant to end.
+        let still_there = fs::read_to_string(&config_path).expect("configuration still readable");
+        assert!(still_there.contains("[ui]"), "{still_there}");
+    }
+
+    #[test]
+    fn a_tidy_installation_is_not_warned_at() {
+        // An empty or absent section carries no second answer, so there is nothing to say.
+        let directory = TestDirectory::new("tidy");
+        let config_path = directory.join(CONFIG_FILE_NAME);
+        fs::write(
+            &config_path,
+            "schema_version = 1
+",
+        )
+        .expect("seed a configuration");
+        let store = UiStateStore::for_config(&config_path);
+        store
+            .save_display_overlay_center("display-1", 0.5, 0.5)
+            .expect("write state");
+        assert!(store.superseded_config_section().is_none());
+
+        // A section that exists but holds nothing is equally quiet.
+        fs::write(
+            &config_path,
+            "schema_version = 1
+[ui]
+",
+        )
+        .expect("seed an empty section");
+        assert!(store.superseded_config_section().is_none());
     }
 
     #[test]
