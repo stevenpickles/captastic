@@ -245,8 +245,15 @@ explicit, tested behavior.
 - Build the controlled sequence-marker workload for freshness, orientation, crop, and cursor tests.
 - Collect environment fingerprints and automate warm-up, raw artifacts, repeat runs, and compatible
   baseline comparison.
-- Enforce relative and absolute performance budgets only on a documented physical benchmark host;
-  hosted CI should continue enforcing correctness rather than GPU timing.
+- ~~Enforce relative and absolute performance budgets only on a documented physical benchmark host;
+  hosted CI should continue enforcing correctness rather than GPU timing.~~ **Mechanism done.**
+  `captastic benchmark --budgets benchmarks/budgets.toml` judges a run, and a budget names the host
+  it describes: a run anywhere else is skipped *loudly* — every mismatch named, the measurements
+  still reported, exit status unchanged — because a GPU budget evaluated on a CI runner fails every
+  time and a check that always fails is one nobody reads. A breach on a matching host fails the
+  command. The relative budgets are populated, since a ratio needs no calibration; the absolute
+  ceilings are deliberately left unset until measured on the host from a console session, because
+  an invented threshold either passes trivially or gets deleted.
 
 ### Exit criteria
 
@@ -264,17 +271,23 @@ explicit, tested behavior.
   handles in a 186–188 band with no trend, private bytes flat from the first quarter onward
   (Q1 mean 4.83 MB, Q4 mean 5.40 MB).
 
-  A DXGI leg followed (2026-08-17, 2,000 attempts at 3840×2160 to both destinations, 9 minutes):
-  memory flat throughout at ~248 MB private, and the counters flat for the final six minutes — but
-  with one unexplained step of +22 GDI, +21 USER and +65 handles at the three-minute mark, tracked as
-  #53. Nine minutes is not long enough to know whether that step recurs, so the DXGI side of this
-  criterion is **not** claimed as met.
+  The DXGI side is **also met**, established across four runs on 2026-08-17 and 2026-08-18 after a
+  first 9-minute leg showed one unexplained step of +22 GDI, +21 USER and +65 handles (#53). Rather
+  than repeat that run for longer — a step that is flat afterwards is one-time initialisation, and a
+  longer run mostly re-observes it — each suspect was removed in turn: 4,513 captures with both
+  destinations off, 5,359 with the clipboard on at 250 ms, 2,548 with both destinations on including
+  141 `BufferExhausted` refusals, and a verified monitor sleep and a verified lock transition.
+  **12,670 captures across 81 minutes with GDI at exactly 10 in every sample of every run.** #53 is
+  closed as not reproducible; the harnesses are `scripts/soak-resource-step.ps1` and the two probes
+  beside it.
 
-  That run also measured the sustainable rate for large frames, which nothing had: at 250 ms with
-  8.3 MP frames going to clipboard and file, 787 of 2,000 attempts were refused with
-  `BufferExhausted` — three CPU frame slots against a ~13 ms readback plus a 33 MB clipboard payload
-  and a 3 MB PNG per capture. The bound behaves as designed and reports every refusal; the number is
-  worth knowing before promising a capture rate.
+  Those runs also measured the sustainable rate for large frames, which nothing had, and corrected
+  what it means. At 250 ms with 8.3 MP frames going to clipboard **and** file, 787 of 2,000 attempts
+  were refused with `BufferExhausted`; with the clipboard alone at the same rate, **none of 5,359
+  were**. The refusals are not a frame-rate ceiling but the two destinations contending for the same
+  three CPU slots, and the file worker holds its lease across a `Compact` encode plus the write —
+  far longer than the clipboard holds one. The bound behaves as designed and reports every refusal;
+  the figure to quote is per destination set, not per interval.
 - Three compatible repeat runs support every published performance claim.
 
 ## Milestone 6 — Annotation and pinning

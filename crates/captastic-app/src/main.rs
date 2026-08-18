@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 mod benchmark;
+mod budget;
 mod build_info;
 mod cli;
 #[cfg(windows)]
@@ -933,6 +934,13 @@ fn benchmark(args: BenchmarkArgs) -> Result<(), AppError> {
             &options,
         )?
     };
+    // Judged before the artifacts are written, so a breach cannot be mistaken for a clean run by
+    // whoever reads the files rather than the console.
+    let budget_outcome = args
+        .budgets
+        .as_deref()
+        .map(|path| budget::load(path).map(|file| budget::evaluate(&file, &run.report)))
+        .transpose()?;
     if let Some(path) = args.output_results.as_deref() {
         benchmark::write_json(path, &run.report)?;
     }
@@ -966,6 +974,19 @@ fn benchmark(args: BenchmarkArgs) -> Result<(), AppError> {
                 "invalid"
             }
         );
+    }
+    if let Some(outcome) = budget_outcome {
+        if outcome.applied() {
+            log::info!("{outcome}");
+        } else {
+            // A skip is not a pass. Reported at warning level so it cannot be read as silence.
+            log::warn!("{outcome}");
+        }
+        if outcome.breached() {
+            return Err(AppError::InvalidArgument(
+                "the run breached a performance budget that applies to this host".to_owned(),
+            ));
+        }
     }
     Ok(())
 }

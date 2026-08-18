@@ -21,6 +21,9 @@ clap.workspace = true
 log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Budget files are TOML for the same reason the configuration is: they are hand-written and
+# hand-reviewed, and a threshold nobody can read is a threshold nobody maintains.
+toml.workspace = true
 captastic-config = { path = "../captastic-config" }
 captastic-core = { path = "../captastic-core" }
 thiserror.workspace = true
