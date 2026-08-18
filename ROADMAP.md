@@ -445,11 +445,20 @@ errors, no refusals, display sleep suppressed so it could not confound the count
 exactly 10 for all 478 samples, USER within one, handles within a ±5 band netting −3, and private
 bytes within 0.3 MB. An 8-minute idle control was equally flat.
 
-So steady 4K capture does not cause the step recorded in #53. What remains between that run and
-this one is the clipboard destination, the file-output destination, the `BufferExhausted` refusal
-path that fired 787 times at a 250 ms interval and never here, and display power, which was
-uncontrolled then and suppressed now. The next run restores the clipboard and the 250 ms interval
-together, because a reproducer has to exist before bisecting means anything.
+Two further legs restored the rest of the original configuration: the clipboard alone at 250 ms
+(5,359 captures, no refusals), then both destinations at 250 ms (2,548 captures, 2,407 files,
+4.17 GB, **141 `BufferExhausted` refusals**). GDI held at exactly 10 in every sample of all three
+runs — 12,420 captures across 79 minutes — against an original that stepped 10 → 33 and held.
+
+Every Captastic-side suspect is therefore exonerated: the capture path, both destinations, and the
+refusal path. What differed in all three runs is display power, uncontrolled in the original and
+suppressed here, and it fits the shape exactly — a one-time event allocating a batch of GDI and
+USER objects and then holding flat, unrelated to capture volume.
+
+One incidental correction: the refusals were never "250 ms is too fast for 4K". Both destinations
+lease from the same three-slot CPU pool and the file worker holds its lease across a `Compact`
+encode plus the write, so the refusals are the two destinations contending. The clipboard alone at
+that rate refused none of 5,359.
 
 ### Lifecycle recovery: a daemon with nothing to capture
 

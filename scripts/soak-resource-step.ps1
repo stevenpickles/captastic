@@ -41,6 +41,10 @@ param(
     # destination, and the BufferExhausted refusals that a 250 ms interval produces at 4K.
     [int] $ClipboardMinutes = 0,
     [int] $ClipboardIntervalMs = 250,
+    # The full original configuration: both destinations at once. The only way to reach the
+    # BufferExhausted path, which needs the two of them contending for the three CPU pool slots.
+    [int] $BothMinutes = 0,
+    [int] $BothIntervalMs = 250,
     [int] $SampleSeconds = 5
 )
 
@@ -219,6 +223,60 @@ enabled = false
         }
         finally {
             Restore-Clipboard -Saved $backup
+        }
+    }
+
+    # The original configuration, reproduced whole: clipboard and file output together at 250 ms.
+    # Captures go to a scratch directory that is measured and deleted afterwards - roughly 3 MB
+    # each, so this is the one leg with a disk cost worth stating before it runs.
+    if ($BothMinutes -gt 0) {
+        $captureDir = Join-Path $OutDir 'captures'
+        New-Item -ItemType Directory -Force $captureDir | Out-Null
+        $configPath = Join-Path $OutDir 'both-config.toml'
+        $toml = @"
+schema_version = 1
+
+[daemon]
+backend = "dxgi"
+display = "primary"
+
+[capture]
+mode = "latest"
+cpu_frame = true
+
+[clipboard]
+enabled = true
+queue_capacity = 1
+allow_history = true
+allow_cloud_sync = true
+
+[output]
+enabled = true
+format = "png"
+queue_capacity = 2
+directory = '$captureDir'
+filename_template = "{timestamp}"
+
+[selection]
+enabled = false
+"@
+        Set-Content -Path $configPath -Value $toml -Encoding UTF8
+        $backup = Save-Clipboard -Directory $OutDir
+        Write-Line "clipboard backed up before the both leg (formats: $($backup.Formats -join ', '))"
+        try {
+            Invoke-Leg -Name 'both' -Minutes $BothMinutes -ExtraArgs @(
+                '--config', $configPath,
+                '--clipboard', 'true',
+                '--self-trigger', '--self-trigger-interval-ms', "$BothIntervalMs"
+            )
+        }
+        finally {
+            Restore-Clipboard -Saved $backup
+            $files = @(Get-ChildItem -Path $captureDir -Filter *.png -ErrorAction SilentlyContinue)
+            $bytes = ($files | Measure-Object -Property Length -Sum).Sum
+            Write-Line ("captures written: {0} files, {1:N2} GB" -f $files.Count, ($bytes / 1GB))
+            Remove-Item -Path $captureDir -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Line 'capture directory deleted'
         }
     }
 }
