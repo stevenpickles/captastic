@@ -14,8 +14,14 @@ use windows::core::{ComInterface, Error as WindowsError};
 use windows::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
     DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
-    DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
-    DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS,
+    DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO,
+    DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED,
+    DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EXTERNAL, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DVI,
+    DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HD15, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI,
+    DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EMBEDDED,
+    DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EXTERNAL, DISPLAYCONFIG_PATH_INFO,
+    DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME,
+    DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY, QDC_ONLY_ACTIVE_PATHS,
 };
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
@@ -2028,17 +2034,11 @@ fn display_config_identities() -> Result<Vec<DisplayConfigIdentity>, CaptureErro
                 for path in paths {
                     let source_name = display_config_source_name(&path)?;
                     let target_name = display_config_target_name(&path)?;
-                    let monitor_path = wide_array_to_string(&target_name.monitorDevicePath);
                     let friendly_name =
                         wide_array_to_string(&target_name.monitorFriendlyDeviceName);
-                    let identity_material = if monitor_path.is_empty() {
-                        source_name.clone()
-                    } else {
-                        monitor_path
-                    };
                     identities.push(DisplayConfigIdentity {
+                        persistent_id: display_identity(&target_name, &source_name),
                         gdi_name: source_name,
-                        persistent_id: persistent_display_id(&identity_material),
                         friendly_name,
                     });
                 }
@@ -2101,6 +2101,125 @@ fn display_config_error(operation: &'static str, result: i32) -> CaptureError {
         true,
         Some(i64::from(result)),
     )
+}
+
+/// Names a display by what the panel says it is, rather than by how it happens to be plugged in.
+///
+/// The identity is a persistence key: `state.toml` records the last tool and the last region per
+/// display under it, so a key that moves loses the user everything they had built up on that
+/// screen and leaves an orphan table behind. It moved. A single-monitor machine accumulated two
+/// entries, and the same panel reported two different ids four hours apart (issue #60).
+///
+/// The cause was the material. A monitor device path names the connection, not the panel: it
+/// carries a parent bus instance and a UID, both assigned per *connection*. EDID carries what the
+/// panel is: a manufacturer, a product code, and — with the connector it is attached to — enough
+/// to separate two identical monitors on different ports.
+///
+/// Three sources, tried in order, and the id says which one answered so a support question does
+/// not need this function to be read:
+///
+/// | id | material | stability |
+/// | --- | --- | --- |
+/// | `windows-monitor-DEL41B4-dp1` | EDID plus connector | survives power cycles and re-enumeration |
+/// | `windows-monitor-path-<hash>` | monitor device path | survives a reboot, not a reconnection |
+/// | `windows-monitor-session-DISPLAY1` | GDI device name | session-local; changes freely |
+///
+/// Changing the scheme resets every remembered display once, which is the cost of the key no
+/// longer moving afterwards. Old entries do not match anything and are inert, which is exactly
+/// what an entry for a monitor that is not attached has always been.
+fn display_identity(target: &DISPLAYCONFIG_TARGET_DEVICE_NAME, source_name: &str) -> DisplayId {
+    if let Some(edid) = edid_identity(target) {
+        return DisplayId(format!("windows-monitor-{edid}"));
+    }
+    // No EDID is not a rare edge. Windows binds the active path to a generic `Default_Monitor`
+    // device when it re-enumerates a display without reading EDID — a DisplayPort link event is
+    // enough — and reports a blank manufacturer, a blank friendly name and an output technology of
+    // -1 while it lasts. The real monitor's device node, EDID and serial can still be sitting in
+    // the device tree beside it; the *active path* simply is not attached to them, so no amount of
+    // care here can recover an identity Windows itself has lost. Logged at debug because it says
+    // something true about the machine rather than about this capture.
+    let monitor_path = wide_array_to_string(&target.monitorDevicePath);
+    if !monitor_path.is_empty() {
+        log::debug!(
+            "display {source_name} reports no EDID; identifying it by device path, which changes when it reconnects"
+        );
+        let DisplayId(hashed) = persistent_display_id(&monitor_path);
+        return DisplayId(hashed.replace("windows-monitor-", "windows-monitor-path-"));
+    }
+    log::debug!(
+        "display {source_name} reports neither EDID nor a device path; identifying it by session-local name"
+    );
+    DisplayId(format!(
+        "windows-monitor-session-{}",
+        sanitize_identity_fragment(source_name)
+    ))
+}
+
+/// Builds the EDID half of an identity, or nothing when the panel did not supply one.
+///
+/// A zero manufacturer id means no EDID was read — a virtual display, a KVM that does not pass
+/// EDID through, or a driver that declined. Guessing from a product code alone would collide
+/// across vendors, so the ladder falls through instead.
+fn edid_identity(target: &DISPLAYCONFIG_TARGET_DEVICE_NAME) -> Option<String> {
+    let manufacturer = edid_manufacturer(target.edidManufactureId)?;
+    // The connector distinguishes two identical monitors, which EDID alone cannot: many panels
+    // ship with a blank or duplicated serial, so the port is the more dependable tiebreaker.
+    Some(format!(
+        "{manufacturer}{:04X}-{}{}",
+        target.edidProductCodeId,
+        output_technology_tag(target.outputTechnology),
+        target.connectorInstance
+    ))
+}
+
+/// Decodes EDID's three packed five-bit letters into a manufacturer code such as `DEL`.
+///
+/// EDID stores the field big-endian while `DISPLAYCONFIG_TARGET_DEVICE_NAME` hands it over as a
+/// native `u16`, so the bytes are swapped back before unpacking. Dell's `DEL` is `0x10AC`, which
+/// is the value to reach for when checking this by hand.
+fn edid_manufacturer(raw: u16) -> Option<String> {
+    let packed = raw.swap_bytes();
+    if packed == 0 {
+        return None;
+    }
+    let letters = [(packed >> 10) & 0x1f, (packed >> 5) & 0x1f, packed & 0x1f];
+    let mut code = String::with_capacity(3);
+    for letter in letters {
+        // 1 is 'A'; 0 and anything past 'Z' means this is not a manufacturer code.
+        if !(1..=26).contains(&letter) {
+            return None;
+        }
+        code.push(char::from(b'A' + (letter as u8) - 1));
+    }
+    Some(code)
+}
+
+/// A short, stable tag for the connector type, so an id reads as `dp1` rather than a number.
+fn output_technology_tag(technology: DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY) -> &'static str {
+    match technology {
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EXTERNAL => "dp",
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED => "edp",
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI => "hdmi",
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DVI => "dvi",
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HD15 => "vga",
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL => "internal",
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EXTERNAL => "udi",
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EMBEDDED => "eudi",
+        _ => "out",
+    }
+}
+
+/// Reduces a device name to something safe to use as a TOML table key.
+fn sanitize_identity_fragment(value: &str) -> String {
+    let fragment: String = value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect();
+    if fragment.is_empty() {
+        "unnamed".to_owned()
+    } else {
+        fragment
+    }
 }
 
 fn persistent_display_id(identity: &str) -> DisplayId {
@@ -2465,6 +2584,92 @@ mod tests {
     #[test]
     fn converts_wide_device_names() {
         assert_eq!(wide_array_to_string(&[65, 66, 0, 67]), "AB");
+    }
+
+    /// Builds a target-name packet with the EDID fields a real monitor supplies.
+    fn edid_target(
+        manufacturer: u16,
+        product: u16,
+        instance: u32,
+    ) -> DISPLAYCONFIG_TARGET_DEVICE_NAME {
+        DISPLAYCONFIG_TARGET_DEVICE_NAME {
+            edidManufactureId: manufacturer,
+            edidProductCodeId: product,
+            connectorInstance: instance,
+            outputTechnology: DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EXTERNAL,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_edid_identity_names_the_panel_rather_than_the_cable() {
+        // 0x10AC is Dell's EDID manufacturer code, stored byte-swapped in the display-config
+        // packet. Checked against a real U2720Q, whose device node reads DISPLAY\DEL41B4.
+        let target = edid_target(0x10AC_u16.swap_bytes(), 0x41B4, 0);
+        assert_eq!(
+            display_identity(&target, r"\.\DISPLAY1").0,
+            "windows-monitor-DEL41B4-dp0"
+        );
+
+        // The point of the exercise: nothing in the id comes from the connection, so a monitor
+        // that reconnects with a new bus instance and UID still resolves to the same key.
+        let reconnected = edid_target(0x10AC_u16.swap_bytes(), 0x41B4, 0);
+        assert_eq!(
+            display_identity(&reconnected, r"\.\DISPLAY129").0,
+            display_identity(&target, r"\.\DISPLAY1").0
+        );
+    }
+
+    #[test]
+    fn two_identical_panels_are_separated_by_the_connector() {
+        // EDID alone cannot tell them apart - many panels ship with a blank or duplicated serial -
+        // so the port is the tiebreaker. Inheriting the other screen's remembered region would be
+        // worse than starting blank.
+        let first = edid_target(0x10AC_u16.swap_bytes(), 0x41B4, 0);
+        let second = edid_target(0x10AC_u16.swap_bytes(), 0x41B4, 1);
+        assert_ne!(
+            display_identity(&first, "a").0,
+            display_identity(&second, "b").0
+        );
+    }
+
+    #[test]
+    fn a_display_with_no_edid_falls_through_and_says_so() {
+        // Windows binds the active path to a generic Default_Monitor device when it re-enumerates
+        // a display without reading EDID: blank manufacturer, blank friendly name, output
+        // technology -1. Observed on the development host (issue #60). The identity cannot be
+        // recovered, so the id names the material it did use instead of pretending.
+        let mut generic = DISPLAYCONFIG_TARGET_DEVICE_NAME {
+            outputTechnology: DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY(-1),
+            ..Default::default()
+        };
+        let path = r"\?\DISPLAY#Default_Monitor#1&5771b5a&0&UID256#{e6f07b5f}";
+        for (index, unit) in path.encode_utf16().enumerate() {
+            generic.monitorDevicePath[index] = unit;
+        }
+        let id = display_identity(&generic, r"\.\DISPLAY129").0;
+        assert!(id.starts_with("windows-monitor-path-"), "{id}");
+
+        // And with nothing at all to go on, the id is visibly session-local rather than a hash
+        // that would pass for permanent in a configuration file.
+        let empty = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
+        assert_eq!(
+            display_identity(&empty, r"\.\DISPLAY129").0,
+            "windows-monitor-session-DISPLAY129"
+        );
+    }
+
+    #[test]
+    fn a_manufacturer_code_is_three_letters_or_nothing() {
+        assert_eq!(
+            edid_manufacturer(0x10AC_u16.swap_bytes()).as_deref(),
+            Some("DEL")
+        );
+        // No EDID at all.
+        assert_eq!(edid_manufacturer(0), None);
+        // A packed value whose letters fall outside A-Z is not a manufacturer code, and rendering
+        // it would put control characters into a file name and a TOML key.
+        assert_eq!(edid_manufacturer(0xFFFF), None);
     }
 
     #[test]
@@ -3281,6 +3486,71 @@ mod tests {
                 }
                 prop_assert_eq!(blue_channel(&region), blue_channel(&cropped));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod identity_probe {
+    use super::*;
+
+    /// Dumps the raw identity material Windows reports for every active display path.
+    ///
+    /// Temporary diagnostic for issue #60: the derived id is only as stable as its inputs, and
+    /// this is the only way to see which of them Windows is actually populating right now.
+    ///
+    /// cargo test --locked -p captastic-windows -- --ignored --nocapture raw_display_identity
+    #[test]
+    #[ignore = "diagnostic; prints live display-config material"]
+    fn raw_display_identity_material() {
+        let mut path_count = 0_u32;
+        let mut mode_count = 0_u32;
+        // SAFETY: Both counts are valid writable values and the flag requests active paths only.
+        unsafe {
+            GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count)
+        }
+        .expect("buffer sizes");
+        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
+        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
+        // SAFETY: The arrays have the capacities reported immediately above, and the counts
+        // describe their current lengths for Windows to update.
+        unsafe {
+            QueryDisplayConfig(
+                QDC_ONLY_ACTIVE_PATHS,
+                &mut path_count,
+                paths.as_mut_ptr(),
+                &mut mode_count,
+                modes.as_mut_ptr(),
+                None,
+            )
+        }
+        .expect("query display config");
+        paths.truncate(path_count as usize);
+        for path in paths {
+            let source = display_config_source_name(&path).expect("source name");
+            let target = display_config_target_name(&path).expect("target name");
+            println!("source gdi name       : {source}");
+            println!(
+                "friendly name         : {:?}",
+                wide_array_to_string(&target.monitorFriendlyDeviceName)
+            );
+            println!(
+                "monitor device path   : {:?}",
+                wide_array_to_string(&target.monitorDevicePath)
+            );
+            println!(
+                "edidManufactureId     : 0x{:04X} (swapped 0x{:04X}) -> {:?}",
+                target.edidManufactureId,
+                target.edidManufactureId.swap_bytes(),
+                edid_manufacturer(target.edidManufactureId)
+            );
+            println!("edidProductCodeId     : 0x{:04X}", target.edidProductCodeId);
+            println!("outputTechnology      : {:?}", target.outputTechnology.0);
+            println!("connectorInstance     : {}", target.connectorInstance);
+            println!(
+                "derived id            : {}",
+                display_identity(&target, &source).0
+            );
         }
     }
 }
