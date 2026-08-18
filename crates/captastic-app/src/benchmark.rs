@@ -67,6 +67,14 @@ pub struct BenchmarkReport {
     pub failures: usize,
     pub timeouts: usize,
     pub failures_by_kind: BTreeMap<&'static str, usize>,
+    /// What became of the pointer in each successful capture, counted by outcome.
+    ///
+    /// Without this a cursor-on run is indistinguishable from a cursor-off one: every capture
+    /// succeeds either way, and a capture that declined to composite - because the compositor had
+    /// not reported the pointer, or reported it hidden - looks exactly like one that drew it. Two
+    /// separate measurements of the same thing is the failure this exists to make visible, and it
+    /// is the failure that actually happened here twice before it was noticed.
+    pub cursor_outcomes: BTreeMap<&'static str, usize>,
     pub trigger_to_dequeue_latency: LatencySummary,
     pub native_frame_latency: LatencySummary,
     pub cpu_frame_latency: Option<LatencySummary>,
@@ -303,6 +311,7 @@ pub fn run_with_backend(
     let mut failures = 0_usize;
     let mut timeouts = 0_usize;
     let mut failures_by_kind = BTreeMap::new();
+    let mut cursor_outcomes: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut successful_ids = Vec::with_capacity(options.iterations);
 
     for index in 0..options.iterations {
@@ -330,6 +339,9 @@ pub fn run_with_backend(
         match backend.capture(&request, &mut recorder) {
             Ok(outcome) => {
                 successful_ids.push(capture_id);
+                *cursor_outcomes
+                    .entry(cursor_outcome_label(outcome.metadata.cursor.as_ref()))
+                    .or_insert(0) += 1;
                 native_samples.push(outcome.metadata.native_ready_offset_ns);
                 if let Some(value) = outcome.metadata.cpu_ready_offset_ns {
                     cpu_samples.push(value);
@@ -375,6 +387,7 @@ pub fn run_with_backend(
         failures,
         timeouts,
         failures_by_kind,
+        cursor_outcomes,
         trigger_to_dequeue_latency: LatencySummary::from_samples(&trigger_to_dequeue_samples),
         native_frame_latency: LatencySummary::from_samples(&native_samples),
         cpu_frame_latency: options
@@ -426,6 +439,24 @@ fn has_complete_capture_path(events: &[PerfEvent], id: CaptureId, cpu_frame: boo
         && (!cpu_frame
             || (kinds.contains(&PerfEventKind::ReadbackStarted)
                 && kinds.contains(&PerfEventKind::CpuFrameReady)))
+}
+
+/// Names what happened to the pointer, so a run can be checked for having measured it.
+fn cursor_outcome_label(cursor: Option<&captastic_core::CursorCapture>) -> &'static str {
+    use captastic_core::{CursorAbsence, CursorCapture};
+    match cursor {
+        None => "not_recorded",
+        Some(CursorCapture::Excluded) => "excluded",
+        Some(CursorCapture::Composited { .. }) => "composited",
+        Some(CursorCapture::Absent { reason }) => match reason {
+            CursorAbsence::NotVisible => "absent_not_visible",
+            CursorAbsence::SourceCannotCompose => "absent_source_cannot_compose",
+            CursorAbsence::SuppressedForSelection => "absent_suppressed_for_selection",
+            CursorAbsence::RotatedDisplayUnverified => "absent_rotated_display_unverified",
+            CursorAbsence::ShapeNotYetKnown => "absent_shape_not_yet_known",
+            CursorAbsence::PositionNotYetKnown => "absent_position_not_yet_known",
+        },
+    }
 }
 
 fn capture_error_kind_label(kind: CaptureErrorKind) -> &'static str {
