@@ -23,6 +23,13 @@ pub struct BenchmarkOptions {
     pub source: CaptureSource,
     pub trigger_queue_capacity: usize,
     pub metrics_capacity: usize,
+    /// Whether the pointer is composited into each capture.
+    ///
+    /// An option rather than a constant because composition is work: a shape lookup and a blend
+    /// over the pointer rectangle, on the capture thread. Milestone 5 asks for cursor-on and
+    /// cursor-off to be measured *separately*, and a benchmark that can only produce one of them
+    /// cannot answer what the other costs.
+    pub cursor: CursorMode,
     pub fake: FakeBackendConfig,
 }
 
@@ -50,6 +57,9 @@ pub struct BenchmarkReport {
     pub schema_version: u32,
     pub backend: &'static str,
     pub mode: String,
+    /// `include` or `exclude`. Recorded because two runs that differ only in this are the pair the
+    /// cursor criterion asks for, and a result file that does not say which it is cannot be paired.
+    pub cursor: &'static str,
     pub synthetic: bool,
     pub warmup_iterations: usize,
     pub timed_iterations: usize,
@@ -70,6 +80,186 @@ pub struct BenchmarkReport {
 pub struct BenchmarkRun {
     pub report: BenchmarkReport,
     pub events: Vec<PerfEvent>,
+}
+
+/// What has to match before two runs may be compared.
+///
+/// "Three compatible repeat runs support every published performance claim" turns on the word
+/// *compatible*. Averaging a run from a debug build with two from a release build, or a 4K run
+/// with two at 1080p, produces a number that describes nothing — and does it silently, which is
+/// the failure worth engineering against. So comparability is decided explicitly and a mismatch
+/// is named rather than absorbed.
+///
+/// Deliberately not part of it: iteration counts, timings, and anything the run measured. Those
+/// are the outputs. This is only about whether the runs were asking the same question.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RunCompatibility {
+    pub backend: String,
+    pub mode: String,
+    pub cursor: String,
+    pub cpu_frame: bool,
+    pub synthetic: bool,
+    pub build: String,
+    pub debug_assertions: bool,
+    pub displays: Vec<String>,
+}
+
+impl RunCompatibility {
+    fn of(report: &BenchmarkReport) -> Self {
+        Self {
+            backend: report.backend.to_owned(),
+            mode: report.mode.clone(),
+            cursor: report.cursor.to_owned(),
+            cpu_frame: report.cpu_frame_latency.is_some(),
+            synthetic: report.synthetic,
+            build: report.environment.build.version.to_owned(),
+            debug_assertions: report.environment.debug_assertions,
+            displays: report
+                .environment
+                .displays
+                .iter()
+                .map(|display| {
+                    format!(
+                        "{}:{}x{}@{}",
+                        display.id, display.width, display.height, display.rotation_degrees
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// Names every field that differs, so a refusal to compare says what to fix.
+    fn differences(&self, other: &Self) -> Vec<String> {
+        let mut differences = Vec::new();
+        let mut note = |field: &str, first: String, second: String| {
+            if first != second {
+                differences.push(format!("{field} ({first} vs {second})"));
+            }
+        };
+        note("backend", self.backend.clone(), other.backend.clone());
+        note("mode", self.mode.clone(), other.mode.clone());
+        note("cursor", self.cursor.clone(), other.cursor.clone());
+        note(
+            "cpu_frame",
+            self.cpu_frame.to_string(),
+            other.cpu_frame.to_string(),
+        );
+        note(
+            "synthetic",
+            self.synthetic.to_string(),
+            other.synthetic.to_string(),
+        );
+        note("build", self.build.clone(), other.build.clone());
+        note(
+            "debug_assertions",
+            self.debug_assertions.to_string(),
+            other.debug_assertions.to_string(),
+        );
+        note(
+            "displays",
+            self.displays.join(","),
+            other.displays.join(","),
+        );
+        differences
+    }
+}
+
+/// Several timed runs of the same question, and what they agree on.
+#[derive(Debug, Serialize)]
+pub struct RepeatedBenchmark {
+    pub schema_version: u32,
+    pub runs: Vec<BenchmarkReport>,
+    pub compatibility: RunCompatibility,
+    /// Empty when every run matched. Populated, and the summary withheld, when one did not.
+    pub incompatibilities: Vec<String>,
+    /// Present only when the runs are compatible: a claim needs runs that measured the same thing.
+    pub agreement: Option<RepeatAgreement>,
+}
+
+/// How closely the repeats agreed, which is the part a performance claim rests on.
+///
+/// The spread matters more than the average. Three runs whose medians differ by 40% do not
+/// support a claim however good the mean looks, and reporting only a mean would hide exactly that.
+#[derive(Debug, Serialize)]
+pub struct RepeatAgreement {
+    pub runs: usize,
+    pub native_p50_ns: Vec<u64>,
+    pub native_p50_spread_percent: f64,
+    pub cpu_p50_ns: Vec<u64>,
+    pub cpu_p50_spread_percent: f64,
+    pub total_successes: usize,
+    pub total_failures: usize,
+}
+
+/// Spread as a percentage of the smallest sample, or zero when there is nothing to compare.
+fn spread_percent(samples: &[u64]) -> f64 {
+    let Some(smallest) = samples.iter().copied().min() else {
+        return 0.0;
+    };
+    let largest = samples.iter().copied().max().unwrap_or(smallest);
+    if smallest == 0 {
+        // A zero floor makes a percentage meaningless rather than infinite; the samples are
+        // reported alongside so the reader can see what happened.
+        return 0.0;
+    }
+    ((largest - smallest) as f64 / smallest as f64) * 100.0
+}
+
+/// Runs the benchmark `repeat` times and reports whether the results may be compared at all.
+pub fn run_repeated(
+    options: &BenchmarkOptions,
+    repeat: usize,
+    mut make_backend: impl FnMut() -> Result<Box<dyn CaptureBackend>, AppError>,
+) -> Result<RepeatedBenchmark, AppError> {
+    if repeat == 0 {
+        return Err(AppError::InvalidArgument(
+            "repeat must be greater than zero".to_owned(),
+        ));
+    }
+    let mut runs = Vec::with_capacity(repeat);
+    for _ in 0..repeat {
+        // A fresh backend per run, because a warm one is a different measurement: the first
+        // capture allocates a staging texture and a CPU slot, and reusing one across repeats
+        // would hide that cost in every run but the first.
+        let mut backend = make_backend()?;
+        runs.push(run_with_backend(backend.as_mut(), options)?.report);
+    }
+
+    let compatibility = RunCompatibility::of(&runs[0]);
+    let mut incompatibilities = Vec::new();
+    for (index, report) in runs.iter().enumerate().skip(1) {
+        for difference in compatibility.differences(&RunCompatibility::of(report)) {
+            incompatibilities.push(format!("run {} differs in {difference}", index + 1));
+        }
+    }
+
+    let agreement = incompatibilities.is_empty().then(|| {
+        let native: Vec<u64> = runs
+            .iter()
+            .map(|run| run.native_frame_latency.p50_ns)
+            .collect();
+        let cpu: Vec<u64> = runs
+            .iter()
+            .filter_map(|run| run.cpu_frame_latency.as_ref().map(|summary| summary.p50_ns))
+            .collect();
+        RepeatAgreement {
+            runs: runs.len(),
+            native_p50_spread_percent: spread_percent(&native),
+            native_p50_ns: native,
+            cpu_p50_spread_percent: spread_percent(&cpu),
+            cpu_p50_ns: cpu,
+            total_successes: runs.iter().map(|run| run.successes).sum(),
+            total_failures: runs.iter().map(|run| run.failures).sum(),
+        }
+    });
+
+    Ok(RepeatedBenchmark {
+        schema_version: 1,
+        runs,
+        compatibility,
+        incompatibilities,
+        agreement,
+    })
 }
 
 pub fn run(options: &BenchmarkOptions) -> Result<BenchmarkRun, AppError> {
@@ -93,6 +283,7 @@ pub fn run_with_backend(
             &options.source,
             &options.mode,
             options.cpu_frame,
+            options.cursor,
         );
         let _ = backend.capture(&request, &mut warmup_recorder);
     }
@@ -122,6 +313,7 @@ pub fn run_with_backend(
             &options.source,
             &options.mode,
             options.cpu_frame,
+            options.cursor,
         );
         let triggered_at = request.triggered_at;
         trigger_sender.try_send(request).map_err(|error| {
@@ -170,6 +362,10 @@ pub fn run_with_backend(
     let successes = options.iterations.saturating_sub(failures);
     let report = BenchmarkReport {
         schema_version: 2,
+        cursor: match options.cursor {
+            CursorMode::Include => "include",
+            CursorMode::Exclude => "exclude",
+        },
         backend: backend.name(),
         mode: options.mode.name().to_owned(),
         synthetic: backend.name() == "fake",
@@ -271,7 +467,13 @@ pub fn write_json_lines(path: &Path, events: &[PerfEvent]) -> Result<(), AppErro
     })
 }
 
-fn request(id: u64, source: &CaptureSource, mode: &CaptureMode, cpu_frame: bool) -> CaptureRequest {
+fn request(
+    id: u64,
+    source: &CaptureSource,
+    mode: &CaptureMode,
+    cpu_frame: bool,
+    cursor: CursorMode,
+) -> CaptureRequest {
     CaptureRequest {
         id: CaptureId(id),
         triggered_at: Instant::now(),
@@ -279,7 +481,7 @@ fn request(id: u64, source: &CaptureSource, mode: &CaptureMode, cpu_frame: bool)
         mode: mode.clone(),
         cpu_frame,
         retain_native_frame: false,
-        cursor: CursorMode::Exclude,
+        cursor,
     }
 }
 
@@ -298,6 +500,95 @@ pub fn fake_config(native_us: u64, readback_us: u64, frame_age_us: u64) -> FakeB
 
 #[cfg(test)]
 mod tests {
+    /// Options that make a run finish immediately, so a repeat test measures logic not delays.
+    fn instant_options(cursor: CursorMode) -> BenchmarkOptions {
+        BenchmarkOptions {
+            iterations: 3,
+            warmup: 1,
+            mode: CaptureMode::Latest { max_age_ms: None },
+            cpu_frame: true,
+            cursor,
+            source: CaptureSource::Display(captastic_core::DisplayId::primary()),
+            trigger_queue_capacity: 4,
+            metrics_capacity: 128,
+            fake: FakeBackendConfig {
+                native_delay: Duration::ZERO,
+                readback_delay: Duration::ZERO,
+                ..FakeBackendConfig::default()
+            },
+        }
+    }
+
+    #[test]
+    fn compatible_repeats_are_summarised_by_their_spread() {
+        // Three runs of the same question. The spread is what a performance claim rests on: a
+        // mean alone would look identical whether the runs agreed or disagreed wildly.
+        let options = instant_options(CursorMode::Exclude);
+        let repeated = run_repeated(&options, 3, || {
+            Ok(Box::new(FakeBackend::new(options.fake.clone())) as Box<dyn CaptureBackend>)
+        })
+        .expect("three runs");
+
+        assert_eq!(repeated.runs.len(), 3);
+        assert!(repeated.incompatibilities.is_empty());
+        let agreement = repeated.agreement.expect("compatible runs are summarised");
+        assert_eq!(agreement.runs, 3);
+        assert_eq!(agreement.native_p50_ns.len(), 3);
+        assert_eq!(agreement.total_successes, 9);
+        assert_eq!(agreement.total_failures, 0);
+    }
+
+    #[test]
+    fn a_run_that_measured_something_else_is_refused_rather_than_averaged() {
+        // The failure this exists to prevent is silent: averaging a cursor-on run with two
+        // cursor-off runs produces a number that describes neither, and nothing about the output
+        // would say so. The mismatch is named instead, field by field.
+        let mut with_cursor = RunCompatibility {
+            backend: "fake".to_owned(),
+            mode: "latest".to_owned(),
+            cursor: "include".to_owned(),
+            cpu_frame: true,
+            synthetic: true,
+            build: "0.1.0".to_owned(),
+            debug_assertions: false,
+            displays: vec!["primary:1920x1080@0".to_owned()],
+        };
+        let without_cursor = RunCompatibility {
+            cursor: "exclude".to_owned(),
+            ..with_cursor.clone()
+        };
+        let differences = with_cursor.differences(&without_cursor);
+        assert_eq!(differences.len(), 1);
+        assert!(differences[0].contains("cursor"), "{differences:?}");
+
+        // Every field that changes the question is covered, not just the one the test author
+        // happened to think of.
+        with_cursor.displays = vec!["primary:3840x2160@0".to_owned()];
+        with_cursor.debug_assertions = true;
+        with_cursor.build = "0.2.0".to_owned();
+        let differences = with_cursor.differences(&without_cursor);
+        assert_eq!(differences.len(), 4, "{differences:?}");
+    }
+
+    #[test]
+    fn a_spread_needs_a_floor_to_be_a_percentage_of() {
+        assert_eq!(spread_percent(&[]), 0.0);
+        assert_eq!(spread_percent(&[100, 100, 100]), 0.0);
+        assert!((spread_percent(&[100, 150]) - 50.0).abs() < f64::EPSILON);
+        // A zero floor would make the percentage infinite, which reports worse than nothing; the
+        // raw samples travel alongside so the reader can see what happened.
+        assert_eq!(spread_percent(&[0, 500]), 0.0);
+    }
+
+    #[test]
+    fn repeating_zero_times_is_refused() {
+        let options = instant_options(CursorMode::Exclude);
+        assert!(run_repeated(&options, 0, || {
+            Ok(Box::new(FakeBackend::new(options.fake.clone())) as Box<dyn CaptureBackend>)
+        })
+        .is_err());
+    }
+
     use super::*;
     use captastic_core::DisplayId;
 
@@ -310,6 +601,7 @@ mod tests {
                 max_age_ms: Some(25),
             },
             cpu_frame: true,
+            cursor: CursorMode::Exclude,
             source: CaptureSource::Display(DisplayId::primary()),
             trigger_queue_capacity: 1,
             metrics_capacity: 100,

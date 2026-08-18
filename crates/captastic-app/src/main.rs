@@ -886,6 +886,10 @@ fn benchmark(args: BenchmarkArgs) -> Result<(), AppError> {
             other => capture_mode(other),
         },
         cpu_frame: args.cpu_frame,
+        cursor: match args.cursor {
+            cli::CursorArg::Include => CursorMode::Include,
+            cli::CursorArg::Exclude => CursorMode::Exclude,
+        },
         source,
         trigger_queue_capacity: 4,
         metrics_capacity: args.iterations.saturating_mul(10).saturating_add(32),
@@ -895,6 +899,30 @@ fn benchmark(args: BenchmarkArgs) -> Result<(), AppError> {
             args.frame_age_us,
         ),
     };
+    // More than one run is a different question - do these results agree well enough to support a
+    // claim - so it takes a different path and a different report rather than printing one summary
+    // three times and leaving the reader to compare them by eye.
+    if args.repeat > 1 {
+        let backend_name = args.backend.clone();
+        let display_policy = display_policy.clone();
+        let repeated = benchmark::run_repeated(&options, args.repeat, move || {
+            create_backend(&backend_name, &display_policy)
+        })?;
+        if let Some(path) = args.output_results.as_deref() {
+            benchmark::write_json(path, &repeated)?;
+        }
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&repeated)?);
+        } else {
+            report_repeated(&repeated);
+        }
+        if !repeated.incompatibilities.is_empty() {
+            return Err(AppError::InvalidArgument(
+                "repeat runs are not comparable; see the reported differences".to_owned(),
+            ));
+        }
+        return Ok(());
+    }
     let run = if args.backend == "fake" {
         benchmark::run(&options)?
     } else {
@@ -1200,6 +1228,45 @@ fn ns_to_ms(ns: u64) -> f64 {
 #[cfg(windows)]
 fn duration_ns(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Prints what several repeat runs agreed on, or why they cannot be compared.
+///
+/// The spread leads rather than the average. Three runs whose medians differ by a third do not
+/// support a performance claim however tidy their mean is, and a reader who sees only a mean has
+/// no way to know that.
+fn report_repeated(repeated: &benchmark::RepeatedBenchmark) {
+    if !repeated.incompatibilities.is_empty() {
+        log::error!(
+            "these {} runs cannot be compared, so no figure is reported from them:",
+            repeated.runs.len()
+        );
+        for difference in &repeated.incompatibilities {
+            log::error!("  {difference}");
+        }
+        return;
+    }
+    let Some(agreement) = repeated.agreement.as_ref() else {
+        return;
+    };
+    log::info!(
+        "{} compatible runs: {} successful, {} failed",
+        agreement.runs,
+        agreement.total_successes,
+        agreement.total_failures
+    );
+    log::info!(
+        "  native frame p50 spread {:.1}% across {:?} ns",
+        agreement.native_p50_spread_percent,
+        agreement.native_p50_ns
+    );
+    if !agreement.cpu_p50_ns.is_empty() {
+        log::info!(
+            "  CPU frame p50 spread {:.1}% across {:?} ns",
+            agreement.cpu_p50_spread_percent,
+            agreement.cpu_p50_ns
+        );
+    }
 }
 
 #[cfg(test)]
