@@ -11,7 +11,8 @@
 #   3. triggers during the blackout are refused with the desktop message, not "recovering"
 #   4. when the blackout lapses it builds the engine by itself and captures succeed
 param(
-    [string] $Repo = 'C:\Users\Steven\work\captastic',
+    # The repository this script lives in, rather than one machine's home directory.
+    [string] $Repo = (Split-Path $PSScriptRoot -Parent),
     [string] $OutDir,
     [int] $BlackoutMs = 9000,
     [string] $UserExe = 'C:\ProgramData\chocolatey\lib\captastic\tools\captastic\captastic.exe'

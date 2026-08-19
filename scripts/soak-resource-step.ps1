@@ -29,7 +29,9 @@
 #>
 [CmdletBinding()]
 param(
-    [string] $Exe = 'C:\Users\Steven\work\captastic\target\release\captastic.exe',
+    # Defaults to the release build of the repository this script lives in, so the script
+    # works from a clone rather than from one machine's home directory.
+    [string] $Exe = (Join-Path (Split-Path $PSScriptRoot -Parent) 'target\release\captastic.exe'),
     [string] $UserExe = 'C:\ProgramData\chocolatey\lib\captastic\tools\captastic\captastic.exe',
     [Parameter(Mandatory)] [string] $OutDir,
     # Any leg set to zero minutes is skipped, so one harness can run a whole investigation or a
