@@ -548,9 +548,21 @@ The first run of that test also had a fresh daemon build a duplication 0.3 s aft
 which led to the overly strong claim that a lock does not break DXGI at all. A later run with a
 daemon already holding a duplication showed otherwise: at the lock it takes `AccessLost` (`the keyed
 mutex was abandoned`), and the rebuild is refused with `DesktopUnavailable in dxgi/duplicate_output:
-the session is locked or a secure prompt owns the desktop`. It recovered by itself two seconds later
-at the unlock. So duplication *is* refused while the lock screen owns the desktop; there is simply a
-brief transitional window in which it can still be acquired.
+the session is locked or a secure prompt owns the desktop`.
+
+That correction was itself too strong, and continuous sampling across three lock cycles replaced it.
+Duplication is not refused *because* the lock screen owns the desktop — for as long as the lock
+screen is lit it keeps working, 12 seconds of it in one run, and `OpenInputDesktop` answers
+`Default` throughout because Windows 11's lock screen is an ordinary application rather than a
+secure desktop. What ends duplication is the **display power-down**: about three seconds after the
+monitors sleep it begins refusing, and one 190-second run held that state for 125 seconds. A
+sleeping display is capturable while unlocked, so it is the combination that refuses.
+
+The refusal that the earlier run saw was real but was the credential-prompt phase, which is the one
+phase the desktop probe can see. In the phase that matters — locked, displays asleep, `Default`
+desktop — the probe reported an ordinary interactive session on all 499 failing samples, so the
+failure arrived as a bare `Access is denied`. `WTSSessionInfoEx` answers in every phase and is now
+what the probe keys on.
 
 ## Recommended next branch
 
