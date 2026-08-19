@@ -678,10 +678,17 @@ impl DxgiBackend {
         // Cached before the frame is retained, so a shape delivered alongside this frame is
         // available when the frame is materialized later.
         self.refresh_pointer_shape(&acquired)?;
-        let pointer_at = acquired.info.PointerPosition.Visible.as_bool().then_some((
-            acquired.info.PointerPosition.Position.x,
-            acquired.info.PointerPosition.Position.y,
-        ));
+        // From the cache, not from this frame's raw fields, for the same reason the live path
+        // reads the cache: `PointerPosition` is filled in only on a frame carrying a mouse update,
+        // and a frame retained on a plain repaint would otherwise record "no pointer" while the
+        // cache knew exactly where it was. Measured on an idle desktop with the pointer parked and
+        // never touched, 9 of 40 `latest` captures reported `NotVisible`. `record_pointer_report`
+        // ran at the top of this function, so the cache already accounts for this acquisition.
+        let pointer_at = self
+            .pointer
+            .position()
+            .filter(|position| position.visible)
+            .map(|position| (position.x, position.y));
         self.retain_frame(&texture, desc, acquired.info.LastPresentTime, pointer_at)?;
         acquired.release()?;
         Ok(true)
@@ -3040,43 +3047,59 @@ mod tests {
     /// reason DXGI reports pointer position separately from frame content. Drag a window, scroll
     /// something, or play a video while this runs.
     ///
-    /// Moves the pointer one pixel and back, so the next duplicated frame carries a mouse update.
+    /// Makes this process speak physical pixels, as DXGI does.
+    ///
+    /// A test binary carries no manifest, so it starts DPI-unaware and `GetCursorPos` and
+    /// `SetCursorPos` would report and accept virtualized coordinates while DXGI reports physical
+    /// ones. On a 150% display the two differ by a third, which reads exactly like a rotation bug.
+    fn make_process_dpi_aware() {
+        use windows::Win32::UI::HiDpi::{
+            SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        };
+
+        // SAFETY: No DPI-dependent call has been made yet, and a second call in the same process
+        // is a no-op failure that nothing here depends on.
+        let _ =
+            unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    }
+
+    fn park_pointer(x: i32, y: i32) {
+        // SAFETY: SetCursorPos takes two plain coordinates.
+        unsafe { windows::Win32::UI::WindowsAndMessaging::SetCursorPos(x, y) }.ok();
+    }
+
+    fn pointer_position() -> (i32, i32) {
+        let mut point = windows::Win32::Foundation::POINT::default();
+        // SAFETY: point is valid writable storage.
+        unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut point) }
+            .expect("GetCursorPos");
+        (point.x, point.y)
+    }
+
+    /// Moves the pointer one pixel and back, so the next duplicated frame carries a mouse update,
+    /// and leaves it exactly on `(x, y)`.
     ///
     /// DXGI populates `PointerPosition` only on frames where the pointer changed, so a stationary
     /// pointer is indistinguishable from an absent one no matter how long a test waits.
+    ///
+    /// Absolute moves rather than a `SendInput` relative pair. A relative move goes through pointer
+    /// acceleration, so a +1/-1 round trip does not reliably return to where it started; over a
+    /// retry loop the drift reached tens of pixels, which is indistinguishable from the position
+    /// being reported in the wrong coordinate space.
+    fn nudge_pointer_at(x: i32, y: i32) {
+        park_pointer(x + 1, y);
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        park_pointer(x, y);
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+
+    /// Nudges the pointer where the primary display's own tests want it.
+    ///
+    /// Parked mid-screen first. A pointer resting at a screen edge, or over an application that has
+    /// hidden it, is reported visible with a fully transparent shape - which is a truthful answer
+    /// to a question those tests are not asking.
     fn nudge_pointer() {
-        use windows::Win32::UI::Input::KeyboardAndMouse::{
-            SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_MOVE, MOUSEINPUT,
-        };
-
-        // Parked mid-screen first. A pointer resting at a screen edge, or over an application
-        // that has hidden it, is reported visible with a fully transparent shape - which is a
-        // truthful answer to a question this test is not asking.
-        // SAFETY: Two coordinates inside the primary display.
-        unsafe { windows::Win32::UI::WindowsAndMessaging::SetCursorPos(960, 540) }.ok();
-        std::thread::sleep(std::time::Duration::from_millis(40));
-
-        let move_by = |dx: i32, dy: i32| {
-            let input = INPUT {
-                r#type: INPUT_MOUSE,
-                Anonymous: INPUT_0 {
-                    mi: MOUSEINPUT {
-                        dx,
-                        dy,
-                        mouseData: 0,
-                        dwFlags: MOUSEEVENTF_MOVE,
-                        time: 0,
-                        dwExtraInfo: 0,
-                    },
-                },
-            };
-            // SAFETY: One fully initialized INPUT record, described by its own size.
-            unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
-        };
-        move_by(1, 0);
-        std::thread::sleep(std::time::Duration::from_millis(30));
-        move_by(-1, 0);
-        std::thread::sleep(std::time::Duration::from_millis(30));
+        nudge_pointer_at(960, 540);
     }
 
     /// cargo test --locked -p captastic-windows --release
@@ -3183,6 +3206,87 @@ mod tests {
         assert!(
             differing_inside > 0,
             "nothing was drawn inside the pointer rectangle. If the shape Windows supplied is              entirely transparent - an application that has hidden its cursor reports exactly              that, while still reporting the pointer visible - then this is a truthful capture of              an invisible pointer rather than a composition failure. Move the mouse over an              ordinary window and run it again."
+        );
+    }
+
+    /// A retained frame must keep the pointer it was retained with, even though the acquisition
+    /// that produced it carried no mouse update.
+    ///
+    /// `latest` is the mode the resident daemon runs, and it composites from a retained frame. The
+    /// frame is retained by whichever acquisition happened to find a repaint pending, and a repaint
+    /// is not a pointer move - so the raw `PointerPosition` on that acquisition is at its defaults,
+    /// which read as an invisible pointer at the origin. Reading them there recorded "no pointer"
+    /// on a frame whose pixels were captured with the pointer plainly on screen, and the capture
+    /// came back `Absent { NotVisible }` while the cache held the position all along.
+    ///
+    /// The pointer is parked once and then never touched, which is the case that used to fail; the
+    /// printing keeps the console repainting so frames keep being retained.
+    ///
+    /// cargo test --locked -p captastic-windows --release
+    ///     -- --ignored --nocapture a_retained_frame_keeps_the_pointer_across_a_repaint
+    #[test]
+    #[ignore = "requires an interactive desktop with a visible pointer"]
+    fn a_retained_frame_keeps_the_pointer_across_a_repaint() {
+        use std::time::Instant;
+
+        make_process_dpi_aware();
+        let mut backend = DxgiBackend::new_primary().expect("dxgi backend");
+        let bounds = backend.selected.bounds;
+        let parked = (
+            bounds.x + bounds.width as i32 / 2,
+            bounds.y + bounds.height as i32 / 2,
+        );
+        let mut recorder = EventRecorder::with_capacity(16);
+        let request = || CaptureRequest {
+            id: CaptureId(1),
+            triggered_at: Instant::now(),
+            source: CaptureSource::Display(DisplayId::primary()),
+            mode: CaptureMode::Latest { max_age_ms: None },
+            cpu_frame: true,
+            retain_native_frame: false,
+            cursor: CursorMode::Include,
+        };
+
+        // Warm up until composition is working at all, so what follows measures retention rather
+        // than a duplication that has not yet been told what the pointer looks like.
+        let mut ready = false;
+        for _ in 0..20 {
+            nudge_pointer_at(parked.0, parked.1);
+            let outcome = backend.capture(&request(), &mut recorder).expect("capture");
+            let cursor = outcome.frame.expect("cpu frame").metadata.cursor;
+            if matches!(cursor, Some(CursorCapture::Composited { .. })) {
+                ready = true;
+                break;
+            }
+        }
+        assert!(
+            ready,
+            "composition never worked even with the pointer moving, so this test cannot say             anything about retention; is the pointer on the primary display?"
+        );
+
+        // From here the pointer is not touched again.
+        let mut composited = 0_u32;
+        let mut absences = Vec::new();
+        for round in 0..40 {
+            println!("round {round}: keeping the console repainting, pointer untouched");
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            let outcome = backend.capture(&request(), &mut recorder).expect("capture");
+            let frame = outcome.frame.expect("cpu frame");
+            match frame.metadata.cursor {
+                Some(CursorCapture::Composited { .. }) => composited += 1,
+                other => absences.push(format!("{other:?}")),
+            }
+        }
+        assert_eq!(
+            pointer_position(),
+            parked,
+            "something moved the pointer during the measurement, so its result means nothing"
+        );
+        println!("{composited} of 40 captures composited");
+        assert!(
+            absences.is_empty(),
+            "the pointer never moved and its position was known throughout, yet {} of 40 retained             frames reported no pointer: {absences:?}",
+            absences.len()
         );
     }
 
