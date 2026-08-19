@@ -25,11 +25,34 @@ The current capture path supports:
 - separate native-frame, CPU-frame, and readback latency summaries.
 - asynchronous CF_DIBV5 plus registered PNG clipboard publication with top-down BGRA/RGBA layout;
 - bounded clipboard-open retries and explicit native allocation ownership transfer.
+- optional cursor composition, off by default, described below.
 
 The current path deliberately rejects:
 
-- cursor inclusion, because DXGI may supply a separate hardware cursor that must be composed deliberately;
 - multi-adapter virtual-desktop topologies, which return a structured unsupported error.
+
+## Cursor composition
+
+`cursor = "include"` blends the pointer into the CPU frame; `exclude`, the default, leaves the frame
+as the desktop image DXGI hands over. A composited capture records where the pointer was drawn, and
+one that draws nothing records why, so a caller can tell an absent pointer from an unasked question.
+
+DXGI describes the pointer **incrementally and per acquisition**. `AcquireNextFrame` reports position
+and shape only on a frame whose `LastMouseUpdateTime` is non-zero, and leaves those fields at their
+defaults on every other frame — defaults indistinguishable from an invisible pointer at the origin.
+Two consequences drive the implementation: the pointer state must be cached across acquisitions
+rather than read from the current frame, and it must be recorded the moment a frame is acquired,
+before any decision to keep or discard that frame, because a discarded frame takes its only copy of
+the report with it. A pointer resting still over a repainting desktop is otherwise reported absent
+indefinitely.
+
+Shapes arrive as colour BGRA, monochrome double-height AND/XOR masks, or masked colour, and are
+cached until DXGI replaces them. `PointerPosition` already reports the top-left of the shape rather
+than the hotspot, so nothing is subtracted when positioning — the hotspot matters to whoever asks
+where the user is pointing, not to where the bitmap goes. The pointer is composited before any crop,
+so a pointer straddling a selection edge is clipped by that crop exactly as it is clipped by the edge
+of the screen, leaving one bounds test rather than two that could disagree. Composition on a rotated
+display is unverified and reported as such rather than assumed.
 
 ## Resident hotkey path
 

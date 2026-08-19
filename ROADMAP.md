@@ -229,8 +229,22 @@ readable.
 **Outcome:** Captastic handles the remaining pixel formats and Windows lifecycle transitions with
 explicit, tested behavior.
 
-- Add optional cursor composition, including DXGI pointer shapes, hotspots, visibility, clipping, and
-  WGC-equivalent semantics.
+- ~~Add optional cursor composition, including DXGI pointer shapes, hotspots, visibility, clipping,
+  and WGC-equivalent semantics.~~ **Done, after finding it had never once worked.** Two independent
+  bugs sat between the request and the implementation. `DxgiBackend::capture` still rejected
+  `CursorMode::Include` with a guard left over from the native-frame milestone, so every capture
+  that asked for a pointer failed outright while the implementation waited behind it. With the gate
+  open, composition still drew nothing: DXGI reports the pointer *incrementally and per
+  acquisition*, filling in position and shape only on a frame that carries a mouse update and
+  leaving the fields at their defaults otherwise — defaults that read as an invisible pointer at the
+  origin. So a stationary pointer over a repainting desktop reported not-visible on every frame, and
+  a report that arrived on a frame later discarded was gone for good. Every acquisition now feeds
+  the pointer cache before anything decides whether to keep the frame, and
+  `CursorAbsence::PositionNotYetKnown` separates "has not been told" from "has been told it is
+  hidden".
+
+  Rotation under composition is still unverified (`RotatedDisplayUnverified`) and needs a rotated
+  display rather than a decision.
 - Complete rotation coverage discovered during the multi-monitor milestone.
 - ~~Detect HDR/scRGB sources and implement a documented SDR clipboard/file tone-mapping policy.~~
   **Done** (ADR 0006): the compositor is asked for 8-bit BGRA and performs the conversion, so an HDR
@@ -269,7 +283,23 @@ explicit, tested behavior.
 
 ### Exit criteria
 
-- Cursor-on and cursor-off output are pixel-correct and separately measured.
+- Cursor-on and cursor-off output are pixel-correct and separately measured. **Pixel-correctness is
+  met**, which first required fixing composition (above). The check compares a cursor-on and a
+  cursor-off capture of the *same retained frame*, so composition is the only difference between
+  them rather than two moments of a desktop that repainted in between — which is what makes
+  "the change is confined to the pointer" provable at all. The latest run differed in 280 of the
+  2,304 pixels inside the reported 48×48 pointer rectangle and in **none** outside it: an arrow with
+  transparent corners, blended where the pointer is and nowhere else.
+
+  **Separately measured is not met, and the figures that claimed it were wrong.** Two cursor-on
+  benchmark runs were reported at +171 and −157 microseconds before per-capture outcome counting
+  showed that all 600 captures in each had returned `absent_not_visible` — they had measured
+  cursor-off twice under another name. Those counts are now part of every benchmark report precisely
+  so that a run which composited nothing says so instead of producing a plausible number. A real
+  figure needs the pointer visible for a whole run, which depends on whether a human is touching the
+  mouse, and a 2,304-pixel blend against an 8.3-megapixel readback sits well below the 1.7–6.6%
+  run-to-run spread. The measurement worth building is therefore of the blend itself, which the code
+  already times at debug level, and not of the pipeline around it.
 - HDR input never produces silently clipped or incorrectly tagged SDR output. **Met:** the sinks
   refuse what they cannot describe (#41) and the capture path no longer produces it (ADR 0006), so
   there is no path by which wide-gamut samples reach an 8-bit destination unconverted. Unverified on
