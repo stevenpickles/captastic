@@ -51,8 +51,23 @@ cached until DXGI replaces them. `PointerPosition` already reports the top-left 
 than the hotspot, so nothing is subtracted when positioning — the hotspot matters to whoever asks
 where the user is pointing, not to where the bitmap goes. The pointer is composited before any crop,
 so a pointer straddling a selection edge is clipped by that crop exactly as it is clipped by the edge
-of the screen, leaving one bounds test rather than two that could disagree. Composition on a rotated
-display is unverified and reported as such rather than assumed.
+of the screen, leaving one bounds test rather than two that could disagree.
+
+Rotation needs no transform, which is measured rather than assumed. Captured pixels are
+rotation-normalized — a 270° panel's 3840×2160 surface becomes a 2160×3840 upright frame — so the
+obvious expectation is that the pointer needs the same mapping. It does not. `PointerPosition` is
+reported in upright desktop coordinates relative to the output's own origin, which is already the
+normalized frame's coordinate space, and `GetFramePointerShape` hands back the logical cursor
+bitmap the user sees rather than one turned to match the panel. Both were checked on a display
+driven through 0°, 90°, 180° and 270°: against `GetCursorPos`, which is upright by definition, the
+reported position was exact at every orientation across six spread-out sample points, while the
+transposed reading would have been out by up to ~3,500 px; the delivered shape was the same upright
+arrow every time. Composition therefore draws the shape at the reported position on a rotated
+display exactly as it does on an upright one. Both wrong answers — a transposed position, a shape
+turned to match the panel — produce a screenshot that looks plausible, so
+`cursor_composition_on_a_rotated_display_is_upright_and_in_place` checks the position against
+`GetCursorPos` and the shape against GDI's rendering of the same cursor, which has no orientation
+of its own.
 
 ## Resident hotkey path
 
