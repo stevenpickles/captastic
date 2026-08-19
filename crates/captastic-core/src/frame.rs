@@ -107,13 +107,6 @@ pub enum CursorAbsence {
     SourceCannotCompose,
     /// A live selection: the pointer at confirmation time was on Captastic's own overlay.
     SuppressedForSelection,
-    /// The display is rotated, and where the pointer belongs on it has not been established.
-    ///
-    /// The position plainly needs the rotation normalization the pixels get; whether the shape
-    /// arrives already rotated is not settled by the documentation and needs a rotated display to
-    /// answer. Reported rather than guessed, because a cursor drawn in the wrong place is a worse
-    /// answer than no cursor and a reason.
-    RotatedDisplayUnverified,
     /// The pointer is visible but no shape has been received for it yet.
     ///
     /// A real state rather than an error. The compositor only sends a pointer shape when it

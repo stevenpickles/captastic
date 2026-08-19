@@ -813,17 +813,10 @@ impl DxgiBackend {
             });
             return Ok(None);
         }
-        // Refused rather than guessed. The position arrives in the duplicated surface's own
-        // coordinates and clearly needs the rotation normalization the pixels get, but whether the
-        // *shape* arrives rotated with it is not something the documentation settles, and this
-        // machine has no rotated display to settle it on. Drawing a cursor in the wrong place, or
-        // the right place at the wrong angle, is worse than drawing none and saying so.
-        if metadata.rotation_degrees != 0 {
-            metadata.cursor = Some(CursorCapture::Absent {
-                reason: CursorAbsence::RotatedDisplayUnverified,
-            });
-            return Ok(None);
-        }
+        // Nothing here turns with the display, and that is a measurement rather than an assumption:
+        // `PointerPosition` is reported in the same upright desktop space `normalize_bgra_into`
+        // produces, and `GetFramePointerShape` hands back the logical cursor bitmap, upright, at
+        // every orientation. See `cursor_composition_on_a_rotated_display_is_upright_and_in_place`.
         if self.pointer.current().is_none() {
             metadata.cursor = Some(CursorCapture::Absent {
                 reason: CursorAbsence::ShapeNotYetKnown,
@@ -850,8 +843,6 @@ impl DxgiBackend {
         }
         let reason = if pointer_at.is_none() {
             CursorAbsence::NotVisible
-        } else if metadata.rotation_degrees != 0 {
-            CursorAbsence::RotatedDisplayUnverified
         } else if self.pointer.current().is_none() {
             CursorAbsence::ShapeNotYetKnown
         } else {
@@ -3047,6 +3038,20 @@ mod tests {
     /// reason DXGI reports pointer position separately from frame content. Drag a window, scroll
     /// something, or play a video while this runs.
     ///
+    /// Serializes the tests that drive the mouse.
+    ///
+    /// There is one pointer on a desk, and these tests park it somewhere and then assert on where
+    /// it ended up. Run in parallel they take it from each other, and the assertion that fails is
+    /// the position one - so a scheduling collision reads exactly like the rotation bug these
+    /// tests exist to catch.
+    fn pointer_lock() -> std::sync::MutexGuard<'static, ()> {
+        static POINTER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // A test that panics while holding this poisons it, and the next one still needs the desk.
+        POINTER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Makes this process speak physical pixels, as DXGI does.
     ///
     /// A test binary carries no manifest, so it starts DPI-unaware and `GetCursorPos` and
@@ -3108,6 +3113,8 @@ mod tests {
     #[ignore = "requires an interactive desktop with a visible pointer"]
     fn cursor_composition_changes_only_the_pointer_rectangle() {
         use std::time::Instant;
+
+        let _pointer = pointer_lock();
 
         let mut backend = DxgiBackend::new_primary().expect("dxgi backend");
         let mut recorder = EventRecorder::with_capacity(16);
@@ -3209,6 +3216,641 @@ mod tests {
         );
     }
 
+    /// Milestone 5's rotation question, settled by measurement rather than left as a refusal: on a
+    /// rotated display the pointer must be drawn where the user sees it, the right way up.
+    ///
+    /// Both halves of DXGI's pointer report turn out to be in the *upright* desktop space already -
+    /// the space `normalize_bgra_into` produces - so composition needs no transform at all. That is
+    /// a surprising answer, and the whole point of this test is that the two ways of getting it
+    /// wrong both produce a screenshot a human would accept:
+    ///
+    /// * A position run through the same mapping the pixels get. On a quarter turn that is a
+    ///   transpose, so the pointer lands somewhere else entirely on screen but still inside the
+    ///   frame, looking like nothing worse than a mis-parked mouse.
+    /// * A shape turned to match the panel. The arrow is then drawn lying on its side, in exactly
+    ///   the right place, which reads as a rendering artefact rather than a coordinate bug.
+    ///
+    /// So the position is checked against `GetCursorPos` - which is upright by definition - with an
+    /// explicit assertion that the transposed answer would have been *different*, and the shape is
+    /// checked against GDI's rendering of the same cursor, which has no orientation of its own.
+    ///
+    /// Verified on a DELL U2723QE driven through 0, 90, 180 and 270 by `ChangeDisplaySettingsExW`;
+    /// residuals against `GetCursorPos` were 0 px at every orientation across six spread-out sample
+    /// points, while the transposed hypothesis was out by up to ~3,500 px.
+    ///
+    /// cargo test --locked -p captastic-windows --release
+    ///     -- --ignored --nocapture cursor_composition_on_a_rotated_display_is_upright_and_in_place
+    #[test]
+    #[ignore = "requires an interactive desktop with a rotated display"]
+    fn cursor_composition_on_a_rotated_display_is_upright_and_in_place() {
+        use std::time::Instant;
+
+        let _pointer = pointer_lock();
+
+        make_process_dpi_aware();
+        let displays = enumerate_display_adapters().expect("enumerate displays");
+        let Some((display, _)) = displays
+            .iter()
+            .find(|(display, _)| display.rotation_degrees != 0)
+        else {
+            println!(
+                "no rotated display is attached, so there is nothing here to verify. Turn one to             portrait in Settings > System > Display and run this again."
+            );
+            return;
+        };
+        let rotation = display.rotation_degrees;
+        let bounds = display.bounds;
+        println!(
+            "display {} at {rotation} degrees, bounds {},{} {}x{}",
+            display.id.0, bounds.x, bounds.y, bounds.width, bounds.height
+        );
+
+        // Deliberately off-centre and off-diagonal, so that the transposed reading of the same
+        // point is a different point - and still inside the frame, because a transform that merely
+        // pushed the pointer out of bounds would be caught by the clipping rather than by this.
+        let chosen = (bounds.width as i32 * 3 / 10, bounds.height as i32 / 5);
+        let parked = (bounds.x + chosen.0, bounds.y + chosen.1);
+        let (raw_width, raw_height) =
+            dimensions_after_rotation(bounds.width, bounds.height, rotation);
+
+        let mut backend =
+            DxgiBackend::new(&display.id).expect("dxgi backend for a rotated display");
+        let mut recorder = EventRecorder::with_capacity(16);
+        let request = |cursor, mode| CaptureRequest {
+            id: CaptureId(1),
+            triggered_at: Instant::now(),
+            source: CaptureSource::Display(display.id.clone()),
+            mode,
+            cpu_frame: true,
+            retain_native_frame: false,
+            cursor,
+        };
+        let latest = || CaptureMode::Latest { max_age_ms: None };
+
+        // What DXGI says about the pointer, on its own, before any frame is involved. This needs
+        // no repaint: the cache is fed at every acquisition, whatever becomes of the pixels.
+        //
+        // `GetCursorPos` answers with the hotspot and DXGI answers with the shape's top-left, so
+        // the hotspot of whatever cursor is under the pointer stands between the two. Read here
+        // rather than assumed zero: over plain desktop it is an arrow and it is zero, but over a
+        // link or a window edge it is not, and a test that only ever ran over wallpaper would pass
+        // for the wrong reason. Subtracting it also pins the top-left semantics the positioning
+        // relies on - if DXGI ever reported the hotspot instead, this is what would notice.
+        //
+        // The pointer is put back on the chosen point every attempt, but what the assertion uses
+        // is where it actually *was*, sampled either side of the read. A hand on the mouse then
+        // costs an attempt instead of failing the run, and the geometry is unaffected: any point
+        // on this display discriminates as long as it is not on the symmetry, which is checked.
+        let mut measurement = None;
+        for _ in 0..30 {
+            nudge_pointer_at(parked.0, parked.1);
+            let before = pointer_position();
+            let _ = backend.capture(&request(CursorMode::Exclude, latest()), &mut recorder);
+            let Some(at) = backend.pointer.position().filter(|at| at.visible) else {
+                continue;
+            };
+            let Some(shape) = backend.pointer.current() else {
+                continue;
+            };
+            let Some(hotspot) = cursor_hotspot(shape.width) else {
+                continue;
+            };
+            if pointer_position() == before {
+                measurement = Some((at, hotspot, before));
+                break;
+            }
+        }
+        let (reported, hotspot, desktop) = measurement.expect(
+            "never got a reading with the pointer holding still on the rotated display. Something             is moving the mouse - a hand on it, or another test - so nothing here can be compared             against anything",
+        );
+        let observed = (desktop.0 - bounds.x, desktop.1 - bounds.y);
+        assert!(
+            observed.0 >= 0
+                && observed.1 >= 0
+                && observed.0 < bounds.width as i32
+                && observed.1 < bounds.height as i32,
+            "the pointer ended up at {desktop:?}, which is not on the rotated display at all"
+        );
+        let expected_top_left = (observed.0 - hotspot.0, observed.1 - hotspot.1);
+        let transposed = upright_from_raw(
+            expected_top_left,
+            raw_width as i32,
+            raw_height as i32,
+            rotation,
+        );
+        assert_ne!(
+            transposed, expected_top_left,
+            "the sample point reads the same in both coordinate spaces, so it cannot tell them             apart; move it off the symmetry"
+        );
+        println!(
+            "GetCursorPos {observed:?} minus hotspot {hotspot:?} is {expected_top_left:?}; DXGI             reported ({},{})",
+            reported.x, reported.y
+        );
+        assert_eq!(
+            (reported.x, reported.y),
+            expected_top_left,
+            "DXGI reported the pointer at ({},{}) on a {rotation} degree display, but GetCursorPos             puts its shape's top-left at {expected_top_left:?} in the frame's own coordinates. Had             the position needed the rotation mapping the pixels get, it would have read             {transposed:?}",
+            reported.x,
+            reported.y
+        );
+
+        // Now end to end, through both pointer paths. `fresh` runs the live one and needs a frame,
+        // and a display showing something static produces none - so the desktop is asked to
+        // repaint. `latest` then reads the frame that capture retained, which is the path the
+        // resident daemon actually runs.
+        // Where the pointer was when *this* frame was taken, sampled either side of the capture
+        // for the same reason as above: the frame and the desktop have to describe one moment.
+        let mut with = None;
+        for _ in 0..30 {
+            nudge_pointer_at(parked.0, parked.1);
+            force_desktop_repaint();
+            let before = pointer_position();
+            let Ok(outcome) = backend.capture(
+                &request(CursorMode::Include, CaptureMode::Fresh { timeout_ms: 500 }),
+                &mut recorder,
+            ) else {
+                continue;
+            };
+            let frame = outcome.frame.expect("cpu frame");
+            if pointer_position() != before {
+                continue;
+            }
+            if matches!(
+                frame.metadata.cursor,
+                Some(CursorCapture::Composited { .. })
+            ) {
+                with = Some((frame, before));
+                break;
+            }
+            println!("live path did not composite: {:?}", frame.metadata.cursor);
+        }
+        let (with, desktop) = with.expect(
+            "no fresh capture composited a pointer on the rotated display while the pointer held             still; if the shape Windows supplies there is entirely transparent, park the pointer             over an ordinary window and run it again",
+        );
+        let Some(CursorCapture::Composited {
+            x,
+            y,
+            width,
+            height,
+        }) = with.metadata.cursor
+        else {
+            unreachable!("the loop above only accepts a composited pointer");
+        };
+        let drawn_at = (
+            desktop.0 - bounds.x - hotspot.0,
+            desktop.1 - bounds.y - hotspot.1,
+        );
+        let transposed = upright_from_raw(drawn_at, raw_width as i32, raw_height as i32, rotation);
+        println!("composited at ({x},{y}) sized {width}x{height}, expected {drawn_at:?}");
+        assert_ne!(
+            transposed, drawn_at,
+            "the pointer ended up on the symmetry, where both coordinate spaces read alike, so this             capture cannot tell them apart"
+        );
+        assert_eq!(
+            (x, y),
+            drawn_at,
+            "the live path drew the pointer at ({x},{y}) instead of {drawn_at:?}; the transposed             reading of that point is {transposed:?}"
+        );
+
+        // The retained path, reading the frame the capture above retained, must agree with the
+        // live one. They are separate decisions in separate functions, and a guard removed from
+        // one and left in the other is exactly the kind of divergence this pins down.
+        let retained = backend
+            .capture(&request(CursorMode::Include, latest()), &mut recorder)
+            .expect("retained capture with a cursor")
+            .frame
+            .expect("cpu frame");
+        assert_eq!(
+            retained.metadata.cursor,
+            Some(CursorCapture::Composited {
+                x,
+                y,
+                width,
+                height
+            }),
+            "the retained path disagreed with the live one about the same pointer"
+        );
+
+        // Same retained frame, cursor excluded, so composition is the only difference between the
+        // two images and every differing pixel outside the rectangle is a desktop repaint.
+        let without = backend
+            .capture(&request(CursorMode::Exclude, latest()), &mut recorder)
+            .expect("retained capture without a cursor")
+            .frame
+            .expect("cpu frame");
+        assert_eq!(without.metadata.cursor, Some(CursorCapture::Excluded));
+        let stride = retained.stride_bytes() as usize;
+        let mut differing_inside = 0_u64;
+        let mut differing_outside = 0_u64;
+        for row in 0..retained.height() as usize {
+            for column in 0..retained.width() as usize {
+                let start = row * stride + column * 4;
+                if retained.pixels()[start..start + 4] == without.pixels()[start..start + 4] {
+                    continue;
+                }
+                let inside = (column as i64) >= i64::from(x)
+                    && (column as i64) < i64::from(x) + i64::from(width)
+                    && (row as i64) >= i64::from(y)
+                    && (row as i64) < i64::from(y) + i64::from(height);
+                if inside {
+                    differing_inside += 1;
+                } else {
+                    differing_outside += 1;
+                }
+            }
+        }
+        println!(
+            "{differing_inside}/{} pixels differ inside the pointer rectangle, {differing_outside}             outside it",
+            u64::from(width) * u64::from(height)
+        );
+        assert!(
+            differing_inside > 0,
+            "nothing was drawn inside the pointer rectangle"
+        );
+        assert_eq!(
+            differing_outside, 0,
+            "the two captures read the same retained frame, so a difference outside the pointer             rectangle means something other than the pointer was drawn"
+        );
+
+        // And the shape's orientation, against an oracle that knows nothing about DXGI. GDI draws
+        // the logical cursor, which does not turn with the panel, so if what DXGI delivered has
+        // been turned it will match one of the other three quarters better than it matches this.
+        let shape = backend.pointer.current().expect("a cached pointer shape");
+        assert_eq!(
+            shape.width, shape.height,
+            "this comparison turns the shape in quarters, which needs it square; DXGI delivered             {}x{}",
+            shape.width, shape.height
+        );
+        let delivered = shape_ink(shape);
+        let reference = gdi_cursor_ink(shape.width)
+            .expect("GDI would not render the current cursor, so there is nothing to compare to");
+        let size = shape.width as usize;
+
+        let self_similarity = quarter_turn_overlaps(&reference, &reference, size);
+        println!("reference against its own quarter turns: {self_similarity:?}");
+        let most_symmetric = self_similarity[1]
+            .max(self_similarity[2])
+            .max(self_similarity[3]);
+        assert!(
+            most_symmetric < 0.85,
+            "the cursor under the pointer is too close to rotationally symmetric to say which way             up it is ({most_symmetric:.2} overlap with one of its own quarter turns). Park the             pointer over plain desktop, where it is an arrow, and run it again"
+        );
+
+        let overlaps = quarter_turn_overlaps(&reference, &delivered, size);
+        println!(
+            "delivered shape against GDI's rendering, by quarter turn: 0 {:.2}, 90 {:.2}, 180             {:.2}, 270 {:.2}",
+            overlaps[0], overlaps[1], overlaps[2], overlaps[3]
+        );
+        let best_turned = overlaps[1].max(overlaps[2]).max(overlaps[3]);
+        assert!(
+            overlaps[0] > best_turned + 0.15,
+            "the shape DXGI delivered on a {rotation} degree display matches a quarter turn of the             cursor better than it matches the cursor itself ({:.2} against {best_turned:.2}), so it             arrived rotated and drawing it as-is would put the arrow on its side",
+            overlaps[0]
+        );
+    }
+
+    /// Reads a position in the duplicated surface's own coordinates as one in the upright frame,
+    /// which is the mapping `normalize_bgra_into` applies to the pixels.
+    ///
+    /// Present only so the test above can say what the wrong answer would have looked like.
+    fn upright_from_raw(
+        position: (i32, i32),
+        raw_width: i32,
+        raw_height: i32,
+        rotation_degrees: u16,
+    ) -> (i32, i32) {
+        let (x, y) = position;
+        match rotation_degrees {
+            90 => (raw_height - 1 - y, x),
+            180 => (raw_width - 1 - x, raw_height - 1 - y),
+            270 => (y, raw_width - 1 - x),
+            _ => position,
+        }
+    }
+
+    /// Asks every window to repaint, so a duplication of a display showing something static still
+    /// yields a frame. A null window means the desktop, which covers every display.
+    fn force_desktop_repaint() {
+        use windows::Win32::Graphics::Gdi::{
+            RedrawWindow, HRGN, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW,
+        };
+
+        // SAFETY: A null window and a null update region ask for the whole desktop.
+        unsafe {
+            RedrawWindow(
+                None,
+                None,
+                HRGN(0),
+                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+            )
+        };
+        std::thread::sleep(std::time::Duration::from_millis(60));
+    }
+
+    /// Which pixels of a pointer shape leave a mark, whatever their format says about how.
+    ///
+    /// Colour and inversion are both marks; only "leave the frame alone" is not. That is the right
+    /// abstraction for comparing silhouettes, because the two mask formats have no colour to
+    /// compare in the first place.
+    fn shape_ink(shape: &crate::cursor::PointerShape) -> Vec<bool> {
+        let width = shape.width as usize;
+        let height = shape.height as usize;
+        let pitch = shape.pitch as usize;
+        let mut ink = vec![false; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                ink[y * width + x] = match shape.kind {
+                    crate::cursor::PointerShapeKind::Color => {
+                        shape.pixels[y * pitch + x * 4 + 3] != 0
+                    }
+                    crate::cursor::PointerShapeKind::MaskedColor => {
+                        let pixel = &shape.pixels[y * pitch + x * 4..y * pitch + x * 4 + 4];
+                        // Alpha is a selector here: zero copies the colour, anything else XORs it,
+                        // and XOR with black changes nothing.
+                        pixel[3] == 0 || pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0
+                    }
+                    crate::cursor::PointerShapeKind::Monochrome => {
+                        let bit =
+                            |row: usize| shape.pixels[row * pitch + x / 8] & (0x80 >> (x % 8)) != 0;
+                        // AND clear paints; AND set with XOR set inverts; the fourth case is the
+                        // transparent one.
+                        !bit(y) || bit(height + y)
+                    }
+                };
+            }
+        }
+        ink
+    }
+
+    /// The hotspot of the cursor Windows currently has on screen, in the pixels of a shape `size`
+    /// wide.
+    ///
+    /// Windows hands out DPI-scaled cursors, so the handle behind `GetCursorInfo` is not always
+    /// the size DXGI delivers; the hotspot is scaled by the ratio between them rather than assumed
+    /// to be in the same units.
+    fn cursor_hotspot(size: u32) -> Option<(i32, i32)> {
+        use windows::Win32::Graphics::Gdi::{DeleteObject, GetObjectW, BITMAP};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetCursorInfo, GetIconInfo, CURSORINFO, CURSORINFO_FLAGS, HICON, ICONINFO,
+        };
+
+        let mut cursor = CURSORINFO {
+            cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: cursor is writable storage carrying its own size.
+        unsafe { GetCursorInfo(&mut cursor) }.ok()?;
+        if cursor.flags != CURSORINFO_FLAGS(1) {
+            return None;
+        }
+        let mut icon = ICONINFO::default();
+        // SAFETY: the handle comes from GetCursorInfo and icon is writable storage. The two
+        // bitmaps it fills in belong to the caller and are deleted below.
+        unsafe { GetIconInfo(HICON(cursor.hCursor.0), &mut icon) }.ok()?;
+
+        // A monochrome cursor has no colour bitmap, and its mask carries both halves stacked - so
+        // width is the measurement to take, and it is the same either way.
+        let source = if icon.hbmColor.is_invalid() {
+            icon.hbmMask
+        } else {
+            icon.hbmColor
+        };
+        let mut bitmap = BITMAP::default();
+        // SAFETY: source is a live bitmap handle and bitmap is storage of the size given.
+        let written = unsafe {
+            GetObjectW(
+                source,
+                std::mem::size_of::<BITMAP>() as i32,
+                Some(std::ptr::addr_of_mut!(bitmap).cast()),
+            )
+        };
+        // SAFETY: both handles came from GetIconInfo, which passes ownership to the caller, and
+        // an invalid one is simply not deleted.
+        unsafe {
+            if !icon.hbmColor.is_invalid() {
+                let _ = DeleteObject(icon.hbmColor);
+            }
+            if !icon.hbmMask.is_invalid() {
+                let _ = DeleteObject(icon.hbmMask);
+            }
+        }
+        if written == 0 || bitmap.bmWidth <= 0 {
+            return None;
+        }
+        let scale = f64::from(size) / f64::from(bitmap.bmWidth);
+        Some((
+            (f64::from(icon.xHotspot) * scale).round() as i32,
+            (f64::from(icon.yHotspot) * scale).round() as i32,
+        ))
+    }
+
+    /// The silhouette of the cursor Windows currently has on screen, rendered by GDI at `size`.
+    ///
+    /// Independent of DXGI by construction: `DrawIconEx` draws the logical cursor, which has no
+    /// orientation of its own, so this is the same picture whichever way the panel is turned.
+    ///
+    /// Drawn twice, once over white and once over black, because a cursor is not simply an image
+    /// with alpha - the mask formats invert what is underneath, and there is no single background
+    /// that reveals them. A pixel the cursor covers comes out the same over both backgrounds; one
+    /// it leaves alone comes out white and then black.
+    fn gdi_cursor_ink(size: u32) -> Option<Vec<bool>> {
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, PatBlt, SelectObject,
+            BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLACKNESS, DIB_RGB_COLORS, HDC, WHITENESS,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DrawIconEx, GetCursorInfo, CURSORINFO, CURSORINFO_FLAGS, DI_NORMAL, HICON,
+        };
+
+        let mut cursor = CURSORINFO {
+            cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: cursor is writable storage carrying its own size.
+        unsafe { GetCursorInfo(&mut cursor) }.ok()?;
+        const CURSOR_SHOWING: CURSORINFO_FLAGS = CURSORINFO_FLAGS(1);
+        if cursor.flags != CURSOR_SHOWING {
+            return None;
+        }
+        let icon = HICON(cursor.hCursor.0);
+
+        // SAFETY: a null DC asks for one compatible with the screen.
+        let dc = unsafe { CreateCompatibleDC(HDC(0)) };
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: size as i32,
+                // Negative for a top-down bitmap, so its rows are in the order every other buffer
+                // here is in.
+                biHeight: -(size as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits = std::ptr::null_mut();
+        // SAFETY: info describes the section being asked for and bits receives its address.
+        let bitmap =
+            unsafe { CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, HANDLE(0), 0) }.ok()?;
+        // SAFETY: both handles are live and were just created.
+        let previous = unsafe { SelectObject(dc, bitmap) };
+
+        let side = size as i32;
+        let pixels = size as usize * size as usize * 4;
+        let draw_over = |fill| {
+            // SAFETY: the DC holds the section, and the rectangle is the whole of it.
+            unsafe { PatBlt(dc, 0, 0, side, side, fill) };
+            // SAFETY: as above; the icon handle belongs to the system cursor and is not owned here.
+            let _ = unsafe { DrawIconEx(dc, 0, 0, icon, side, side, 0, None, DI_NORMAL) };
+            // SAFETY: CreateDIBSection returned a buffer of exactly this size, and the drawing
+            // above has completed into it.
+            unsafe { std::slice::from_raw_parts(bits.cast::<u8>(), pixels) }.to_vec()
+        };
+        let over_white = draw_over(WHITENESS);
+        let over_black = draw_over(BLACKNESS);
+
+        // SAFETY: restoring and releasing the objects this function created.
+        unsafe {
+            SelectObject(dc, previous);
+            let _ = DeleteObject(bitmap);
+            let _ = DeleteDC(dc);
+        }
+
+        Some(
+            (0..size as usize * size as usize)
+                .map(|index| {
+                    let start = index * 4;
+                    over_white[start..start + 3] == over_black[start..start + 3]
+                })
+                .collect(),
+        )
+    }
+
+    /// How well `candidate` overlaps `reference` at each quarter turn, as intersection over union.
+    ///
+    /// Union rather than a plain pixel count, so a shape that simply covers more does not score
+    /// better than one that covers the same pixels.
+    fn quarter_turn_overlaps(reference: &[bool], candidate: &[bool], size: usize) -> [f64; 4] {
+        let mut turned = candidate.to_vec();
+        let mut overlaps = [0.0; 4];
+        for overlap in &mut overlaps {
+            let mut intersection = 0_u32;
+            let mut union = 0_u32;
+            for index in 0..size * size {
+                if reference[index] && turned[index] {
+                    intersection += 1;
+                }
+                if reference[index] || turned[index] {
+                    union += 1;
+                }
+            }
+            *overlap = if union == 0 {
+                0.0
+            } else {
+                f64::from(intersection) / f64::from(union)
+            };
+            turned = quarter_turn(&turned, size);
+        }
+        overlaps
+    }
+
+    /// One quarter turn clockwise of a square grid.
+    fn quarter_turn(grid: &[bool], size: usize) -> Vec<bool> {
+        let mut turned = vec![false; size * size];
+        for y in 0..size {
+            for x in 0..size {
+                turned[y * size + x] = grid[(size - 1 - x) * size + y];
+            }
+        }
+        turned
+    }
+
+    /// The shape comparison the rotated-display test leans on has to be able to *fail*.
+    ///
+    /// Every quarter turn scoring zero is the right answer for an arrow and also exactly what a
+    /// broken rotation that produced an empty grid would report, so the two are told apart here,
+    /// with no desktop involved: a silhouette that arrived turned must score best at the turn that
+    /// undoes it and worse than that where it started.
+    #[test]
+    fn a_silhouette_that_arrived_turned_scores_best_where_it_is_undone() {
+        // An L, which shares no pixel with any of its own quarter turns except the corner.
+        let size = 8;
+        let mut upright = vec![false; size * size];
+        for y in 1..6 {
+            upright[y * size + 1] = true;
+        }
+        for x in 1..5 {
+            upright[5 * size + x] = true;
+        }
+
+        let overlaps = quarter_turn_overlaps(&upright, &upright, size);
+        assert_eq!(overlaps[0], 1.0, "a silhouette must match itself exactly");
+        for (turn, overlap) in overlaps.iter().enumerate().skip(1) {
+            assert!(
+                *overlap < 0.2,
+                "the L overlaps its own {}-degree turn by {overlap}, so it cannot serve as an              asymmetric fixture",
+                turn * 90
+            );
+        }
+
+        // What a shape delivered already rotated looks like: undone by three further turns, and
+        // conspicuously wrong where it arrived.
+        let turned = quarter_turn(&upright, size);
+        let overlaps = quarter_turn_overlaps(&upright, &turned, size);
+        assert_eq!(overlaps[3], 1.0, "three more turns must put the L back");
+        assert!(
+            overlaps[0] < overlaps[3],
+            "a turned silhouette scored {} where it arrived and {} once undone, so the comparison              cannot tell the two apart",
+            overlaps[0],
+            overlaps[3]
+        );
+    }
+
+    /// The rotated-display test claims a particular wrong answer - the position read as if it were
+    /// in the duplicated surface's coordinates - and that claim is only worth making if it matches
+    /// what actually happens to the pixels.
+    ///
+    /// So `upright_from_raw` is checked against `normalize_bgra_into` itself rather than against a
+    /// second copy of the same arithmetic: every source pixel is labelled, the frame is normalized,
+    /// and the label has to turn up exactly where the mapping says it will.
+    #[test]
+    fn the_transposed_reading_is_the_one_the_pixels_actually_get() {
+        let (raw_width, raw_height, stride) = (3_u32, 2_u32, 16_usize);
+        let raw = labeled_bgra(raw_width, raw_height, stride);
+        for rotation in [0_u16, 90, 180, 270] {
+            let (width, height) = dimensions_after_rotation(raw_width, raw_height, rotation);
+            let mut normalized = vec![0_u8; (width * height * 4) as usize];
+            let layout = normalize_bgra_into(
+                &raw,
+                raw_width,
+                raw_height,
+                stride,
+                rotation,
+                &mut normalized,
+            )
+            .expect("rotation normalization");
+            for source_y in 0..raw_height as i32 {
+                for source_x in 0..raw_width as i32 {
+                    let label = raw[source_y as usize * stride + source_x as usize * 4];
+                    let (x, y) = upright_from_raw(
+                        (source_x, source_y),
+                        raw_width as i32,
+                        raw_height as i32,
+                        rotation,
+                    );
+                    let found = normalized[y as usize * layout.stride as usize + x as usize * 4];
+                    assert_eq!(
+                        found, label,
+                        "at {rotation} degrees the pixel at raw ({source_x},{source_y}) was              mapped to ({x},{y}), where the frame holds {found} rather than {label}"
+                    );
+                }
+            }
+        }
+    }
+
     /// A retained frame must keep the pointer it was retained with, even though the acquisition
     /// that produced it carried no mouse update.
     ///
@@ -3228,6 +3870,8 @@ mod tests {
     #[ignore = "requires an interactive desktop with a visible pointer"]
     fn a_retained_frame_keeps_the_pointer_across_a_repaint() {
         use std::time::Instant;
+
+        let _pointer = pointer_lock();
 
         make_process_dpi_aware();
         let mut backend = DxgiBackend::new_primary().expect("dxgi backend");

@@ -452,7 +452,6 @@ fn cursor_outcome_label(cursor: Option<&captastic_core::CursorCapture>) -> &'sta
             CursorAbsence::NotVisible => "absent_not_visible",
             CursorAbsence::SourceCannotCompose => "absent_source_cannot_compose",
             CursorAbsence::SuppressedForSelection => "absent_suppressed_for_selection",
-            CursorAbsence::RotatedDisplayUnverified => "absent_rotated_display_unverified",
             CursorAbsence::ShapeNotYetKnown => "absent_shape_not_yet_known",
             CursorAbsence::PositionNotYetKnown => "absent_position_not_yet_known",
         },

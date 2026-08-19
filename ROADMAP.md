@@ -243,8 +243,11 @@ explicit, tested behavior.
   `CursorAbsence::PositionNotYetKnown` separates "has not been told" from "has been told it is
   hidden".
 
-  Rotation under composition is still unverified (`RotatedDisplayUnverified`) and needs a rotated
-  display rather than a decision.
+  Rotation is settled, and the answer was that there is nothing to do. Both halves of the pointer
+  report arrive in the upright desktop space the normalized frame already uses — position exact
+  against `GetCursorPos` at 0°, 90°, 180° and 270°, shape delivered as the upright cursor rather
+  than one turned to match the panel — so `RotatedDisplayUnverified` was refusing work that already
+  worked, and is gone.
 - Complete rotation coverage discovered during the multi-monitor milestone.
 - ~~Detect HDR/scRGB sources and implement a documented SDR clipboard/file tone-mapping policy.~~
   **Done** (ADR 0006): the compositor is asked for 8-bit BGRA and performs the conversion, so an HDR
