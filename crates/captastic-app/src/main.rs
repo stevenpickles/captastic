@@ -60,6 +60,7 @@ impl DisplayPolicy {
 
 fn main() {
     let cli = Cli::parse();
+    let invocation = invocation_name(cli.command.as_ref());
     let logging_config = resolve_logging_config(&cli);
     let persistent_logging = uses_persistent_logging(&cli);
     let logging_result = if persistent_logging {
@@ -85,16 +86,48 @@ fn main() {
     };
     if let Err(error) = run(cli) {
         if logging_available {
-            log::error!("Captastic stopped with an error: {error}");
+            log::error!("captastic {invocation} failed: {error}");
             log::logger().flush();
         } else {
             eprintln!("captastic: {error}");
         }
         process::exit(error.exit_code());
     }
-    if logging_available {
-        log::info!("Captastic stopped successfully");
+    // Only where it earns its place. In a persistent log this pairs with the start line above and
+    // says the process came down cleanly, which is worth having for `daemon` and `capture`. On the
+    // console after a read-only command it is noise the exit code already carries — and worse than
+    // noise, because "Captastic stopped successfully" printed under a `status` that just reported
+    // the daemon *running* reads as an announcement that the check killed it (issue #67).
+    if persistent_logging && logging_available {
+        log::info!("captastic {invocation} finished successfully");
         log::logger().flush();
+    }
+}
+
+/// What to call this invocation in the lines that mark it failing or finishing.
+///
+/// The exit lines used to be about *Captastic* rather than about *this process*, and said the same
+/// thing whatever had run. Naming the subcommand is what stops a `status` line from being read as
+/// a lifecycle event: "captastic status finished successfully" cannot be mistaken for the daemon
+/// stopping, and "Captastic stopped successfully" always could.
+fn invocation_name(command: Option<&Command>) -> &'static str {
+    let Some(command) = command else {
+        // No subcommand runs the daemon, so it is named as one.
+        return "daemon";
+    };
+    // Matched exhaustively rather than with a fallback, so a subcommand added later cannot quietly
+    // inherit a name that is wrong for it.
+    match command {
+        Command::Daemon(_) => "daemon",
+        Command::Status { .. } => "status",
+        Command::Stop => "stop",
+        Command::Displays { .. } => "displays",
+        Command::Capture(_) => "capture",
+        Command::Benchmark(_) => "benchmark",
+        Command::Version { .. } => "version",
+        Command::Doctor { .. } => "doctor",
+        Command::Startup { .. } => "startup",
+        Command::Config { .. } => "config",
     }
 }
 
@@ -1330,6 +1363,72 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    /// Every subcommand names itself in the line that marks it finishing.
+    ///
+    /// Parsed from argv rather than built by hand, so this exercises the path `main` actually
+    /// takes - including the bare invocation, where clap yields no subcommand at all and the name
+    /// has to come from knowing what that runs.
+    #[test]
+    fn every_subcommand_names_itself_on_the_way_out() {
+        for (argv, expected) in [
+            (vec!["captastic"], "daemon"),
+            (vec!["captastic", "daemon"], "daemon"),
+            (vec!["captastic", "status"], "status"),
+            (vec!["captastic", "stop"], "stop"),
+            (vec!["captastic", "displays"], "displays"),
+            (vec!["captastic", "capture"], "capture"),
+            (vec!["captastic", "benchmark"], "benchmark"),
+            (vec!["captastic", "version"], "version"),
+            (vec!["captastic", "doctor"], "doctor"),
+            (vec!["captastic", "startup", "status"], "startup"),
+            (vec!["captastic", "config", "show"], "config"),
+        ] {
+            let cli = Cli::try_parse_from(&argv).expect("argv parses");
+            assert_eq!(
+                invocation_name(cli.command.as_ref()),
+                expected,
+                "{argv:?} should report itself as {expected}"
+            );
+        }
+    }
+
+    /// The bug in issue #67 was that a read-only command claimed a lifecycle event, so the two
+    /// must not be able to produce the same line.
+    ///
+    /// A bare `captastic` runs the daemon and is expected to match `daemon` exactly; every other
+    /// pair has to differ, which is what stops a future subcommand from being given a neighbour's
+    /// name by a careless copy.
+    #[test]
+    fn a_read_only_command_cannot_report_itself_as_the_daemon() {
+        let named = [
+            "daemon",
+            "status",
+            "stop",
+            "displays",
+            "capture",
+            "benchmark",
+            "version",
+            "doctor",
+            "startup",
+            "config",
+        ];
+        for (index, name) in named.iter().enumerate() {
+            for other in &named[index + 1..] {
+                assert_ne!(
+                    name, other,
+                    "two subcommands share the name {name}, so their exit lines are               indistinguishable"
+                );
+            }
+        }
+        let bare = Cli::try_parse_from(["captastic"]).expect("argv parses");
+        let status = Cli::try_parse_from(["captastic", "status"]).expect("argv parses");
+        assert_ne!(
+            invocation_name(bare.command.as_ref()),
+            invocation_name(status.command.as_ref()),
+            "`captastic status` still reports the same thing a daemon run does"
+        );
+    }
 
     #[cfg(windows)]
     fn pointer_error(kind: captastic_core::CaptureErrorKind) -> captastic_core::CaptureError {
