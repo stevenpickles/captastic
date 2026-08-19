@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 mod benchmark;
+mod budget;
 mod build_info;
 mod cli;
 #[cfg(windows)]
@@ -903,22 +904,56 @@ fn benchmark(args: BenchmarkArgs) -> Result<(), AppError> {
     // claim - so it takes a different path and a different report rather than printing one summary
     // three times and leaving the reader to compare them by eye.
     if args.repeat > 1 {
+        // The backend created above resolved the capture source, and it is still holding a
+        // duplication. Every repeat builds its own - deliberately, so each run pays the first
+        // capture's allocation cost - and DXGI refuses a second duplication of the same output
+        // from the same process with "the parameter is incorrect", which is how this surfaced on
+        // real hardware after passing every test against the fake backend.
+        drop(native_backend.take());
         let backend_name = args.backend.clone();
         let display_policy = display_policy.clone();
         let repeated = benchmark::run_repeated(&options, args.repeat, move || {
             create_backend(&backend_name, &display_policy)
         })?;
+        // Budgets apply to a repeat set too, and per run rather than to their average: a mean
+        // hides one run in three breaching, and "usually under 2 ms" is not a latency figure worth
+        // publishing. Silently ignoring --budgets here - which is what this did first - is the
+        // worst of the options, because the check was asked for and did nothing.
+        let budget_outcomes = args
+            .budgets
+            .as_deref()
+            .map(|path| budget::load(path).map(|file| budget::evaluate_each(&file, &repeated.runs)))
+            .transpose()?;
+        let combined = serde_json::json!({
+            "repeated": &repeated,
+            "budgets": &budget_outcomes,
+        });
         if let Some(path) = args.output_results.as_deref() {
-            benchmark::write_json(path, &repeated)?;
+            benchmark::write_json(path, &combined)?;
         }
         if args.json {
-            println!("{}", serde_json::to_string_pretty(&repeated)?);
+            println!("{}", serde_json::to_string_pretty(&combined)?);
         } else {
             report_repeated(&repeated);
+            if let Some(outcomes) = budget_outcomes.as_deref() {
+                for (index, outcome) in outcomes.iter().enumerate() {
+                    let heading = format!("run {}", index + 1);
+                    if outcome.applied() {
+                        log::info!("{heading}: {outcome}");
+                    } else {
+                        log::warn!("{heading}: {outcome}");
+                    }
+                }
+            }
         }
         if !repeated.incompatibilities.is_empty() {
             return Err(AppError::InvalidArgument(
                 "repeat runs are not comparable; see the reported differences".to_owned(),
+            ));
+        }
+        if budget_outcomes.as_deref().is_some_and(budget::any_breached) {
+            return Err(AppError::InvalidArgument(
+                "a repeat run breached a performance budget that applies to this host".to_owned(),
             ));
         }
         return Ok(());
@@ -933,6 +968,13 @@ fn benchmark(args: BenchmarkArgs) -> Result<(), AppError> {
             &options,
         )?
     };
+    // Judged before the artifacts are written, so a breach cannot be mistaken for a clean run by
+    // whoever reads the files rather than the console.
+    let budget_outcome = args
+        .budgets
+        .as_deref()
+        .map(|path| budget::load(path).map(|file| budget::evaluate(&file, &run.report)))
+        .transpose()?;
     if let Some(path) = args.output_results.as_deref() {
         benchmark::write_json(path, &run.report)?;
     }
@@ -966,6 +1008,19 @@ fn benchmark(args: BenchmarkArgs) -> Result<(), AppError> {
                 "invalid"
             }
         );
+    }
+    if let Some(outcome) = budget_outcome {
+        if outcome.applied() {
+            log::info!("{outcome}");
+        } else {
+            // A skip is not a pass. Reported at warning level so it cannot be read as silence.
+            log::warn!("{outcome}");
+        }
+        if outcome.breached() {
+            return Err(AppError::InvalidArgument(
+                "the run breached a performance budget that applies to this host".to_owned(),
+            ));
+        }
     }
     Ok(())
 }

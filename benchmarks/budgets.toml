@@ -1,0 +1,49 @@
+# Performance budgets for the documented benchmark host.
+#
+# These are claims about hardware, not about correctness, which is why they live here rather than
+# in the test suite. Hosted CI runs on a software adapter and would breach every GPU figure below
+# on every run; a check that always fails is a check nobody reads, so `captastic benchmark
+# --budgets` skips a budget whose host does not match the run and says so rather than passing it.
+#
+# Reproducing a run these apply to:
+#
+#   captastic benchmark --backend dxgi --cursor exclude --repeat 3 --iterations 200 \
+#       --budgets benchmarks/budgets.toml
+#
+# from a *console* session. A Remote Desktop session composes onto a virtual display adapter that
+# DXGI will not duplicate, so a run started over RDP measures nothing and reports why.
+
+[host]
+description = "the documented benchmark host: RTX 3070, Dell U2720Q at 3840x2160, release build"
+backend = "dxgi"
+mode = "latest"
+cursor = "exclude"
+# A synthetic run's timings are configured rather than measured, so a budget would be judging its
+# own inputs.
+synthetic = false
+# A debug build is slower by a margin no budget should absorb.
+debug_assertions = false
+display_resolution = "3840x2160"
+
+# Ceilings in nanoseconds.
+#
+# Left unset until measured on the host from a console session. An invented number is worse than an
+# absent one: it either passes trivially and protects nothing, or fails honestly and gets deleted.
+# The relative budgets below need no such calibration, which is why they are populated first.
+[absolute]
+# native_frame_p50_ns = ...
+# native_frame_p99_ns = ...
+# cpu_frame_p50_ns = ...
+# cpu_frame_p99_ns = ...
+# trigger_to_dequeue_p99_ns = ...
+
+# Ceilings expressed against the run itself.
+#
+# These survive a hardware change, which absolute numbers do not: "the tail is within 6x the
+# median" still means something on a machine twice as fast, while "p99 under 3 ms" quietly stops
+# testing anything. They also catch the regression that matters most for a capture tool — a long
+# tail that a median hides, felt by the user as an occasional stutter.
+[relative]
+native_p99_over_p50 = 6.0
+cpu_p99_over_p50 = 6.0
+failure_percent = 0.0

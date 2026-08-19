@@ -229,15 +229,41 @@ readable.
 **Outcome:** Captastic handles the remaining pixel formats and Windows lifecycle transitions with
 explicit, tested behavior.
 
-- Add optional cursor composition, including DXGI pointer shapes, hotspots, visibility, clipping, and
-  WGC-equivalent semantics.
+- ~~Add optional cursor composition, including DXGI pointer shapes, hotspots, visibility, clipping,
+  and WGC-equivalent semantics.~~ **Done, after finding it had never once worked.** Two independent
+  bugs sat between the request and the implementation. `DxgiBackend::capture` still rejected
+  `CursorMode::Include` with a guard left over from the native-frame milestone, so every capture
+  that asked for a pointer failed outright while the implementation waited behind it. With the gate
+  open, composition still drew nothing: DXGI reports the pointer *incrementally and per
+  acquisition*, filling in position and shape only on a frame that carries a mouse update and
+  leaving the fields at their defaults otherwise — defaults that read as an invisible pointer at the
+  origin. So a stationary pointer over a repainting desktop reported not-visible on every frame, and
+  a report that arrived on a frame later discarded was gone for good. Every acquisition now feeds
+  the pointer cache before anything decides whether to keep the frame, and
+  `CursorAbsence::PositionNotYetKnown` separates "has not been told" from "has been told it is
+  hidden".
+
+  Rotation under composition is still unverified (`RotatedDisplayUnverified`) and needs a rotated
+  display rather than a decision.
 - Complete rotation coverage discovered during the multi-monitor milestone.
 - ~~Detect HDR/scRGB sources and implement a documented SDR clipboard/file tone-mapping policy.~~
   **Done** (ADR 0006): the compositor is asked for 8-bit BGRA and performs the conversion, so an HDR
   desktop is capturable and its screenshot matches what other tools produce. Captastic implements no
   curve of its own. Preserving high dynamic range end to end is deliberately not addressed and needs
   an output format that can carry it.
-- Investigate ICC/color-profile awareness and preserve color metadata where output formats support it.
+- ~~Investigate ICC/color-profile awareness and preserve color metadata where output formats support
+  it.~~ **Done, and the answer was smaller than the question.** Captured pixels are sRGB by
+  construction — the compositor converts, the encoder refuses anything else (ADR 0006) — so the
+  metadata worth preserving is the tag saying so, not an embedded profile. Embedding the *display's*
+  ICC profile would be actively wrong: it describes the panel, not the numbers in the file.
+
+  PNG output now carries `sRGB` with the perceptual intent the specification names for photographic
+  content, plus the `gAMA` and `cHRM` fallbacks so a decoder predating `sRGB` still gets the right
+  transfer curve and primaries. The clipboard already declared it (`bV5CSType = LCS_sRGB`), so the
+  same capture used to be self-describing through one destination and silent through the other.
+
+  Not addressed, and out of scope until an output format can carry it: a wide-gamut or HDR source
+  preserved end to end. That needs the pixels, not the tag (ADR 0006).
 - Add recovery tests for display hot-plugging, sleep/wake, lock/unlock, GPU reset, Remote Desktop, and
   rapid session changes. Hot-plug, unplug and primary-promotion are covered deterministically
   through the daemon's rebuild seam; the no-source path is covered end to end (#56). Sleep/wake,
@@ -245,12 +271,35 @@ explicit, tested behavior.
 - Build the controlled sequence-marker workload for freshness, orientation, crop, and cursor tests.
 - Collect environment fingerprints and automate warm-up, raw artifacts, repeat runs, and compatible
   baseline comparison.
-- Enforce relative and absolute performance budgets only on a documented physical benchmark host;
-  hosted CI should continue enforcing correctness rather than GPU timing.
+- ~~Enforce relative and absolute performance budgets only on a documented physical benchmark host;
+  hosted CI should continue enforcing correctness rather than GPU timing.~~ **Mechanism done.**
+  `captastic benchmark --budgets benchmarks/budgets.toml` judges a run, and a budget names the host
+  it describes: a run anywhere else is skipped *loudly* — every mismatch named, the measurements
+  still reported, exit status unchanged — because a GPU budget evaluated on a CI runner fails every
+  time and a check that always fails is one nobody reads. A breach on a matching host fails the
+  command. The relative budgets are populated, since a ratio needs no calibration; the absolute
+  ceilings are deliberately left unset until measured on the host from a console session, because
+  an invented threshold either passes trivially or gets deleted.
 
 ### Exit criteria
 
-- Cursor-on and cursor-off output are pixel-correct and separately measured.
+- Cursor-on and cursor-off output are pixel-correct and separately measured. **Pixel-correctness is
+  met**, which first required fixing composition (above). The check compares a cursor-on and a
+  cursor-off capture of the *same retained frame*, so composition is the only difference between
+  them rather than two moments of a desktop that repainted in between — which is what makes
+  "the change is confined to the pointer" provable at all. The latest run differed in 280 of the
+  2,304 pixels inside the reported 48×48 pointer rectangle and in **none** outside it: an arrow with
+  transparent corners, blended where the pointer is and nowhere else.
+
+  **Separately measured is not met, and the figures that claimed it were wrong.** Two cursor-on
+  benchmark runs were reported at +171 and −157 microseconds before per-capture outcome counting
+  showed that all 600 captures in each had returned `absent_not_visible` — they had measured
+  cursor-off twice under another name. Those counts are now part of every benchmark report precisely
+  so that a run which composited nothing says so instead of producing a plausible number. A real
+  figure needs the pointer visible for a whole run, which depends on whether a human is touching the
+  mouse, and a 2,304-pixel blend against an 8.3-megapixel readback sits well below the 1.7–6.6%
+  run-to-run spread. The measurement worth building is therefore of the blend itself, which the code
+  already times at debug level, and not of the pipeline around it.
 - HDR input never produces silently clipped or incorrectly tagged SDR output. **Met:** the sinks
   refuse what they cannot describe (#41) and the capture path no longer produces it (ADR 0006), so
   there is no path by which wide-gamut samples reach an 8-bit destination unconverted. Unverified on
@@ -264,17 +313,23 @@ explicit, tested behavior.
   handles in a 186–188 band with no trend, private bytes flat from the first quarter onward
   (Q1 mean 4.83 MB, Q4 mean 5.40 MB).
 
-  A DXGI leg followed (2026-08-17, 2,000 attempts at 3840×2160 to both destinations, 9 minutes):
-  memory flat throughout at ~248 MB private, and the counters flat for the final six minutes — but
-  with one unexplained step of +22 GDI, +21 USER and +65 handles at the three-minute mark, tracked as
-  #53. Nine minutes is not long enough to know whether that step recurs, so the DXGI side of this
-  criterion is **not** claimed as met.
+  The DXGI side is **also met**, established across four runs on 2026-08-17 and 2026-08-18 after a
+  first 9-minute leg showed one unexplained step of +22 GDI, +21 USER and +65 handles (#53). Rather
+  than repeat that run for longer — a step that is flat afterwards is one-time initialisation, and a
+  longer run mostly re-observes it — each suspect was removed in turn: 4,513 captures with both
+  destinations off, 5,359 with the clipboard on at 250 ms, 2,548 with both destinations on including
+  141 `BufferExhausted` refusals, and a verified monitor sleep and a verified lock transition.
+  **12,670 captures across 81 minutes with GDI at exactly 10 in every sample of every run.** #53 is
+  closed as not reproducible; the harnesses are `scripts/soak-resource-step.ps1` and the two probes
+  beside it.
 
-  That run also measured the sustainable rate for large frames, which nothing had: at 250 ms with
-  8.3 MP frames going to clipboard and file, 787 of 2,000 attempts were refused with
-  `BufferExhausted` — three CPU frame slots against a ~13 ms readback plus a 33 MB clipboard payload
-  and a 3 MB PNG per capture. The bound behaves as designed and reports every refusal; the number is
-  worth knowing before promising a capture rate.
+  Those runs also measured the sustainable rate for large frames, which nothing had, and corrected
+  what it means. At 250 ms with 8.3 MP frames going to clipboard **and** file, 787 of 2,000 attempts
+  were refused with `BufferExhausted`; with the clipboard alone at the same rate, **none of 5,359
+  were**. The refusals are not a frame-rate ceiling but the two destinations contending for the same
+  three CPU slots, and the file worker holds its lease across a `Compact` encode plus the write —
+  far longer than the clipboard holds one. The bound behaves as designed and reports every refusal;
+  the figure to quote is per destination set, not per interval.
 - Three compatible repeat runs support every published performance claim.
 
 ## Milestone 6 — Annotation and pinning

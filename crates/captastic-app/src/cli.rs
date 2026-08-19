@@ -172,6 +172,11 @@ pub struct BenchmarkArgs {
     /// fresh backend, and the comparison refuses to aggregate runs whose environments differ.
     #[arg(long, default_value_t = 1)]
     pub repeat: usize,
+    /// Judge the run against a budget file. Budgets name the host they describe and are skipped,
+    /// loudly, anywhere else — a GPU timing budget evaluated on a CI runner fails every time, and
+    /// a check that always fails is one nobody reads.
+    #[arg(long)]
+    pub budgets: Option<PathBuf>,
     #[arg(long)]
     pub output_results: Option<PathBuf>,
     #[arg(long)]
