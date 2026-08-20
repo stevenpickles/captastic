@@ -269,8 +269,11 @@ explicit, tested behavior.
   preserved end to end. That needs the pixels, not the tag (ADR 0006).
 - Add recovery tests for display hot-plugging, sleep/wake, lock/unlock, GPU reset, Remote Desktop, and
   rapid session changes. Hot-plug, unplug and primary-promotion are covered deterministically
-  through the daemon's rebuild seam; the no-source path is covered end to end (#56). Sleep/wake,
-  GPU reset and Remote Desktop still need a machine rather than a fake.
+  through the daemon's rebuild seam; the no-source path is covered end to end (#56). Lock/unlock
+  diagnosis is covered by a live harness (`a_locked_session_explains_every_duplication_failure` in
+  `crates/captastic-windows/src/session.rs`, `#[ignore]`d because it locks the machine for ~8 minutes
+  and cannot unlock itself); recovery through lock → displays asleep → unlock is not yet verified.
+  Sleep/wake, GPU reset and Remote Desktop still need a machine rather than a fake.
 - Build the controlled sequence-marker workload for freshness, orientation, crop, and cursor tests.
 - Collect environment fingerprints and automate warm-up, raw artifacts, repeat runs, and compatible
   baseline comparison.
@@ -567,10 +570,13 @@ what the probe keys on.
 ## Recommended next branch
 
 Milestone 5's lifecycle-recovery and soak work, now that its pre-work (issue #19) is complete.
-Display hot-plug, sleep/wake, lock/unlock and GPU reset are the tests most likely to find something,
-because they exercise the recovery paths that shipped with the least live verification — and they
-are testable on this machine, unlike the multi-adapter work and unlike HDR tone mapping, which needs
-an HDR display to judge rather than merely to compile.
+Display hot-plug, sleep/wake, lock/unlock recovery and GPU reset recovery are the tests most likely
+to find something, because they exercise the recovery paths that shipped with the least live
+verification. Lock/unlock diagnosis is already covered by a live harness
+(`a_locked_session_explains_every_duplication_failure`); what remains open there is recovery through
+lock → displays asleep → unlock. GPU reset recovery is likewise open — its classification is tested
+only against synthetic HRESULTs today. Both are testable on this machine, unlike the multi-adapter
+work and unlike HDR tone mapping, which needs an HDR display to judge rather than merely to compile.
 
 FakeBackend fidelity keeps its leverage beyond this milestone and is worth extending as gaps appear:
 much of Milestone 4 shipped with daemon-side behaviour verified only by unit tests, because a second
