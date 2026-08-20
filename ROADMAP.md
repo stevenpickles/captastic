@@ -570,10 +570,13 @@ what the probe keys on.
 ## Recommended next branch
 
 Milestone 5's lifecycle-recovery and soak work, now that its pre-work (issue #19) is complete.
-Display hot-plug, sleep/wake, lock/unlock and GPU reset are the tests most likely to find something,
-because they exercise the recovery paths that shipped with the least live verification — and they
-are testable on this machine, unlike the multi-adapter work and unlike HDR tone mapping, which needs
-an HDR display to judge rather than merely to compile.
+Display hot-plug, sleep/wake, lock/unlock recovery and GPU reset recovery are the tests most likely
+to find something, because they exercise the recovery paths that shipped with the least live
+verification. Lock/unlock diagnosis is already covered by a live harness
+(`a_locked_session_explains_every_duplication_failure`); what remains open there is recovery through
+lock → displays asleep → unlock. GPU reset recovery is likewise open — its classification is tested
+only against synthetic HRESULTs today. Both are testable on this machine, unlike the multi-adapter
+work and unlike HDR tone mapping, which needs an HDR display to judge rather than merely to compile.
 
 FakeBackend fidelity keeps its leverage beyond this milestone and is worth extending as gaps appear:
 much of Milestone 4 shipped with daemon-side behaviour verified only by unit tests, because a second
