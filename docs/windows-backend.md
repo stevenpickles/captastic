@@ -273,21 +273,40 @@ What that measures, and what it does not:
   `daemon.rs` draws between the two absences held for the whole outage.
 - **What it does not measure:** one lock, one host, one display policy. A lock that never darkens
   its displays would stop at the first phase, and the `PermissionDenied` below is a loose end this
-  run found rather than one it closed.
+  run found rather than one it closed — it has since been closed in code, but no live run has seen
+  the fix.
 
-### Found, not fixed: the cursor probe denies without explaining
+### The cursor probe denied without explaining, and now explains itself
 
 Two captures failed 1.2 s after the lock with
 `PermissionDenied in windows/get_physical_cursor_position: Access is denied. (0x80070005)` — the
-`pointer` display policy asking where the cursor is while the credential prompt owned input. This is
-the bare, permissions-shaped `Access is denied` that issue #51 exists to prevent, and unlike the
-duplication path it arrives with no session context attached: `PermissionDenied` is neither
-`DesktopUnavailable` nor a `requires_backend_recovery` kind, so it is reported as a failed capture
-and nothing says the workstation was locked. It is transient and the daemon recovered from it
-without help, so it costs a confusing pair of log lines rather than a capture the user wanted.
-Routing that denial through `desktop_obstacle` the way `duplicate_output` already is would fix it;
-that has not been done, and until it is, a locked-session cursor denial reads like a permissions
-problem.
+`pointer` display policy asking where the cursor is while the credential prompt owned input. That was
+the bare, permissions-shaped `Access is denied` that issue #51 exists to prevent, arriving with no
+session context at all: `PermissionDenied` is neither `DesktopUnavailable` nor a
+`requires_backend_recovery` kind, so it was reported as a failed capture and nothing said the
+workstation was locked. Transient, and the daemon recovered without help, so it cost a confusing pair
+of log lines rather than a capture the user wanted — but the confusion is the whole of what #51 is
+about.
+
+That denial now takes the route `duplicate_output` has taken since #51. `desktop_obstacle` has been
+split into the syscall and the decision (`session_obstacle`, `dxgi.rs`), the decision carrying its
+backend name so the cursor query keeps reporting itself as `windows/get_physical_cursor_position`
+rather than being rewritten to `dxgi` — the operation a log reader greps for is unchanged, only the
+explanation is new. `cursor_query_error` (`display_manager.rs`) asks the session **only** when the
+call came back `E_ACCESSDENIED`, so the four syscalls behind the probe stay off the path every
+`pointer` capture takes. A session that explains the denial — locked, at a secure desktop, detached,
+or remote — produces `DesktopUnavailable` naming the cause, which the daemon already routes to the
+session wait and already declines to rebuild the capture engine for. A session that does not explain
+it keeps the original `PermissionDenied`, message and native code; a genuine rights problem on an
+unlocked console must not be swallowed by a comfortable message about a lock, and an unanswered
+session probe counts as "does not explain it".
+
+**Status: verified by unit tests, not re-measured live.** Five tests cover it — the locked case, the
+other temporary session states, the two states that must preserve the original error, the probe
+being paid only on a denial, and the daemon reading the re-classified kind as a desktop wait rather
+than a broken engine. Nobody has watched a real lock produce the new message: the run above is still
+the only live evidence, and it predates the fix. `scripts/measure-lock-unlock-recovery.ps1
+-Confirmed` is the way to re-measure it when a live lock run is next approved.
 
 `CAPTASTIC_TEST_NO_DISPLAYS_MS` reports no attached outputs for that many milliseconds from process start, so the wait-and-recover path can be exercised without detaching a display. Debug builds only; `scripts/verify-no-display-recovery.ps1` drives it.
 

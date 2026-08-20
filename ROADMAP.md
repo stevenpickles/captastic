@@ -278,7 +278,10 @@ explicit, tested behavior.
   waited on the session probe for 402 polls over 207 s **without walking the adapter list once**,
   and rebuilt 0.6 s after the unlock with 59 successful captures after it and no intervention. The
   same run found one loose end it did not close: a locked-session
-  `get_physical_cursor_position` denial still arrives as a bare `PermissionDenied`, unexplained.
+  `get_physical_cursor_position` denial arrived as a bare `PermissionDenied`, unexplained. That
+  denial now goes through the same session check `duplicate_output` uses and comes out as
+  `DesktopUnavailable` naming the lock, keeping the original error whenever the session cannot
+  account for it — covered by unit tests, and not yet seen by a live lock run.
   GPU-reset recovery is now measured against real hardware for one of its two limbs: a driver
   restart took all three of the daemon's retained DXGI sessions away with `DXGI_ERROR_ACCESS_LOST`,
   and the daemon classified it, rebuilt all three, and finished the capture unattended in one
