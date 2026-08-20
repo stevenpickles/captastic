@@ -272,7 +272,13 @@ explicit, tested behavior.
   through the daemon's rebuild seam; the no-source path is covered end to end (#56). Lock/unlock
   diagnosis is covered by a live harness (`a_locked_session_explains_every_duplication_failure` in
   `crates/captastic-windows/src/session.rs`, `#[ignore]`d because it locks the machine for ~8 minutes
-  and cannot unlock itself); recovery through lock → displays asleep → unlock is not yet verified.
+  and cannot unlock itself). Recovery through lock → displays asleep → unlock is now measured too
+  (`scripts/measure-lock-unlock-recovery.ps1`): across a 229 s lock the daemon lost its duplication
+  to `AccessLost`, had the rebuild refused as `DesktopUnavailable ... the workstation is locked`,
+  waited on the session probe for 402 polls over 207 s **without walking the adapter list once**,
+  and rebuilt 0.6 s after the unlock with 59 successful captures after it and no intervention. The
+  same run found one loose end it did not close: a locked-session
+  `get_physical_cursor_position` denial still arrives as a bare `PermissionDenied`, unexplained.
   GPU-reset recovery is now measured against real hardware for one of its two limbs: a driver
   restart took all three of the daemon's retained DXGI sessions away with `DXGI_ERROR_ACCESS_LOST`,
   and the daemon classified it, rebuilt all three, and finished the capture unattended in one
@@ -577,9 +583,10 @@ what the probe keys on.
 Milestone 5's lifecycle-recovery and soak work, now that its pre-work (issue #19) is complete.
 Display hot-plug, sleep/wake, lock/unlock recovery and GPU reset recovery are the tests most likely
 to find something, because they exercise the recovery paths that shipped with the least live
-verification. Lock/unlock diagnosis is already covered by a live harness
-(`a_locked_session_explains_every_duplication_failure`); what remains open there is recovery through
-lock → displays asleep → unlock. GPU reset recovery has since been measured for its `AccessLost`
+verification. Lock/unlock is now closed at both ends: diagnosis by a live harness
+(`a_locked_session_explains_every_duplication_failure`) and recovery through lock → displays asleep
+→ unlock by `scripts/measure-lock-unlock-recovery.ps1`, which measured an unattended rebuild 0.6 s
+after the unlock. GPU reset recovery has since been measured for its `AccessLost`
 limb against a real driver restart; its `DEVICE_REMOVED`/`DEVICE_RESET` limb is still open, and
 closing it needs the elevated adapter cycle. Both remaining questions are testable on this machine,
 unlike the multi-adapter work and unlike HDR tone mapping, which needs an HDR display to judge

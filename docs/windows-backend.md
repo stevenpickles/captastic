@@ -220,7 +220,74 @@ Measured on the development host, a lock does not stop *enumeration*: displays s
 
 An existing duplication is invalidated at the lock with `AccessLost` (`the keyed mutex was abandoned`). A new one can still be acquired for as long as the lock screen is lit — not a brief transitional window, but the whole of it: 12 seconds in one probe run, and it ends with the display power-down rather than with the lock. About three seconds after the displays sleep, `DuplicateOutput` begins refusing and keeps refusing; one 190-second run held that state for 125 seconds. That last row is the one worth naming, because the desktop probe cannot see it — every one of those 125 seconds reported `Access is denied` while `OpenInputDesktop` answered `Default`, which is the bare permissions-shaped error issue #51 exists to prevent. Note also that a sleeping display is capturable while *unlocked*; it is the combination that refuses.
 
-The daemon treats the condition as a wait: it starts, registers hotkeys, reports `capture_engine: "waiting_for_desktop"` in its ready event, and builds the capture engine once there is something to capture. Each wait is polled at the cost of asking — 500 ms for the two-syscall session probe, 2 s for an enumeration, and never by rebuilding DXGI on the engine-recovery schedule, which would be roughly 1,800 device initializations an hour for the length of a lock screen.
+The daemon treats the condition as a wait: it starts, registers hotkeys, reports `capture_engine: "waiting_for_desktop"` in its ready event, and builds the capture engine once there is something to capture. Each wait is polled at the cost of asking — 500 ms for the two-syscall session probe, 2 s for an enumeration, and never by rebuilding DXGI on the engine-recovery schedule, which would be roughly 1,800 device initializations an hour for the length of a lock screen. That last clause is now measured rather than asserted; see below.
+
+### Measured: the daemon loses its engine to a locked, dark session and comes back on its own
+
+2026-08-20 17:16:31–17:21:53Z, same three-display host, `scripts/measure-lock-unlock-recovery.ps1
+-Confirmed`. The daemon self-triggered once a second with the clipboard and selection off; the
+script locked the workstation, asked the displays to power down, and then did nothing at all until
+the operator returned and signed in 229.3 seconds later. Every log line is judged against a lock
+flag sampled once a second and read either side of it, so a line timestamped across a transition is
+counted and not judged — two were.
+
+```
+17:17:01.6  (LockWorkStation)
+17:17:02.8  capture 33 failed: PermissionDenied in windows/get_physical_cursor_position: Access is denied.
+17:17:04.0  capture 35 lost the capture engine; retrying 1/3 in 50 ms: AccessLost in
+            dxgi/acquire_next_frame: The keyed mutex was abandoned. (0x887A0026)   <- rebuild succeeded
+17:17:04.5  capture 35 failed: Timeout ...            (20 timeouts against a lit, motionless lock screen)
+17:17:24.5  capture 55 lost the capture engine; retrying 1/3 in 50 ms: AccessLost ...
+17:17:25.5  capture engine reinitialization failed during capture 55:
+            DesktopUnavailable in dxgi/initialize: the workstation is locked        <- rebuild refused
+17:17:25.5  capture 56 ignored: there is no display to capture yet      (203 of these, all judged locked)
+17:17:55.9  still waiting for a capture source: 59 source poll(s) over 30.4 s, 0 of which walked the adapter list
+            ... six such lines, the last 354 polls over 182.0 s, every one of them 0 ...
+17:20:52.2  (operator signs in)
+17:20:52.8  a display is available again; capture engine initialized after 402 source poll(s)
+            over 207.3 s, 1 of which walked the adapter list
+17:20:52.9  59 successful captures follow, none refused, no further engine loss
+```
+
+What that measures, and what it does not:
+
+- **Both halves of the lock, in one run.** The lock invalidated the held duplication with
+  `AccessLost` and the rebuild *succeeded* — the lit-lock-screen row of the table above, reached
+  through the daemon rather than through a raw duplication loop. Twenty seconds later, when the
+  panels actually slept, the next `AccessLost` met a **refused** rebuild. The displays took about
+  20.5 s to power down after being asked, so the two phases separated cleanly on their own.
+- **The refusal explained itself.** `DesktopUnavailable in dxgi/initialize: the workstation is
+  locked` is the issue #51 criterion met on the daemon's own recovery path: the kind routes it to
+  the session wait instead of the engine-recovery curve, and the message names the cause.
+- **The 500 ms session poll, and no adapter walk.** 402 polls over 207.3 s is 1.94 a second, which
+  is `DESKTOP_POLL_INTERVAL`; **401 of them cost two syscalls and nothing else**, and the single
+  adapter walk is the one that ended the wait. Before this run the claim rested on reading the
+  code — a daemon waiting out a lock used to log nothing between the line saying it was waiting and
+  the line saying it had stopped. The counters and the half-minute heartbeat exist to make it
+  readable, and are the only production change this measurement needed.
+- **Recovery took 0.6 s and nobody helped.** Engine rebuilt 0.6 s after the lock flag cleared,
+  first capture with pixels 0.7 s after it, then 59 successes with no relapse. Nothing touched the
+  daemon between the lock and the unlock; the script issued no commands in that window.
+- **Dropped, not mis-described.** All 203 dropped captures took the "there is no display to capture
+  yet" branch and none took "while the capture engine is recovering" — the distinction
+  `daemon.rs` draws between the two absences held for the whole outage.
+- **What it does not measure:** one lock, one host, one display policy. A lock that never darkens
+  its displays would stop at the first phase, and the `PermissionDenied` below is a loose end this
+  run found rather than one it closed.
+
+### Found, not fixed: the cursor probe denies without explaining
+
+Two captures failed 1.2 s after the lock with
+`PermissionDenied in windows/get_physical_cursor_position: Access is denied. (0x80070005)` — the
+`pointer` display policy asking where the cursor is while the credential prompt owned input. This is
+the bare, permissions-shaped `Access is denied` that issue #51 exists to prevent, and unlike the
+duplication path it arrives with no session context attached: `PermissionDenied` is neither
+`DesktopUnavailable` nor a `requires_backend_recovery` kind, so it is reported as a failed capture
+and nothing says the workstation was locked. It is transient and the daemon recovered from it
+without help, so it costs a confusing pair of log lines rather than a capture the user wanted.
+Routing that denial through `desktop_obstacle` the way `duplicate_output` already is would fix it;
+that has not been done, and until it is, a locked-session cursor denial reads like a permissions
+problem.
 
 `CAPTASTIC_TEST_NO_DISPLAYS_MS` reports no attached outputs for that many milliseconds from process start, so the wait-and-recover path can be exercised without detaching a display. Debug builds only; `scripts/verify-no-display-recovery.ps1` drives it.
 
