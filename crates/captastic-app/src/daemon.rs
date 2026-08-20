@@ -342,11 +342,23 @@ fn run_capture_worker(context: CaptureWorkerContext) {
             // order to be told "no" again is not, and would repeat for the length of a lunch
             // break. So the cheap question is asked first, and the engine is only built once
             // there is something for it to duplicate.
-            let waiting_for_source = recovery
+            let source = recovery
                 .as_ref()
                 .is_some_and(|state| state.waiting_for_desktop)
-                .then(capture_source_wait)
-                .filter(|wait| *wait != CaptureSourceWait::Ready);
+                .then(capture_source_wait);
+            // Counted before it is acted on, including the poll that ends the wait, so the line
+            // printed on the way out describes every question the wait asked rather than every
+            // question but the last one.
+            if let (Some(wait), Some(state)) = (source, recovery.as_mut()) {
+                let now = Instant::now();
+                if state.wait.record(wait, now) {
+                    log::debug!(
+                        "still waiting for a capture source: {}",
+                        state.wait.describe(now)
+                    );
+                }
+            }
+            let waiting_for_source = source.filter(|wait| *wait != CaptureSourceWait::Ready);
             if let Some(wait) = waiting_for_source {
                 if let Some(state) = recovery.as_mut() {
                     state.next_attempt = Instant::now() + wait.poll_interval();
@@ -355,16 +367,21 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                 backend.take();
                 match super::create_backend(&backend_name, &display_policy) {
                     Ok(replacement) => {
-                        let was_waiting_for_desktop = recovery
+                        let waited = recovery
                             .as_ref()
-                            .is_some_and(|state| state.waiting_for_desktop);
+                            .and_then(|state| state.waiting_for_desktop.then_some(state.wait));
                         backend = Some(replacement);
                         recovery = None;
                         if std::mem::take(&mut recovery_notified) {
                             let _ = capture_notices.try_send(DaemonNotice::CaptureEngineRecovered);
                         }
-                        if was_waiting_for_desktop {
-                            log::info!("a display is available again; capture engine initialized");
+                        if let Some(waited) = waited {
+                            // What the wait cost, on the one line a reader is certain to reach:
+                            // how long the user was away, and how much the daemon spent asking.
+                            log::info!(
+                                "a display is available again; capture engine initialized after {}",
+                                waited.describe(Instant::now())
+                            );
                         } else {
                             log::info!(
                                 "capture engine reinitialized; validation is deferred until capture"
@@ -1743,6 +1760,8 @@ struct BackendRecovery {
     /// answers the same question in two syscalls. While this is set the loop asks the cheap
     /// question and only rebuilds the engine once there is a desktop for it to duplicate.
     waiting_for_desktop: bool,
+    /// How that cheap question has been answered so far, for the log to report afterwards.
+    wait: SourceWaitTally,
 }
 
 #[cfg(windows)]
@@ -1752,6 +1771,7 @@ impl BackendRecovery {
             failed_attempts: 0,
             next_attempt: Instant::now(),
             waiting_for_desktop: false,
+            wait: SourceWaitTally::started(Instant::now()),
         }
     }
 
@@ -1761,6 +1781,7 @@ impl BackendRecovery {
             failed_attempts,
             next_attempt: Instant::now() + Self::delay(failed_attempts, waiting_for_desktop),
             waiting_for_desktop,
+            wait: SourceWaitTally::started(Instant::now()),
         }
     }
 
@@ -1830,6 +1851,76 @@ impl CaptureSourceWait {
             Self::Displays => DISPLAY_POLL_INTERVAL,
             Self::Ready => Duration::ZERO,
         }
+    }
+
+    /// Whether reaching this answer cost a DXGI factory and a walk of every adapter's outputs.
+    ///
+    /// `Session` is answered and returned before enumeration is reached, which is the entire
+    /// reason the session probe is asked first.
+    fn walks_the_adapter_list(self) -> bool {
+        !matches!(self, Self::Session)
+    }
+}
+
+/// How long a wait may go without saying it is still going.
+///
+/// The wait is otherwise silent — a daemon left at a lock screen writes nothing between the line
+/// that says it is waiting and the line that says it stopped — so a log covering an outage could
+/// not distinguish a daemon patiently polling from one that had wedged. Half a minute is rare
+/// enough that a workstation locked overnight adds a couple of thousand debug lines, and often
+/// enough that any outage worth reading about has several.
+#[cfg(windows)]
+const SOURCE_WAIT_REPORT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How a wait for something to capture has been spent.
+///
+/// The two counts exist because the gap between them is the claim [`capture_source_wait`] makes: a
+/// session that does not own its desktop is answered by two syscalls, and the adapter list is only
+/// walked once the session says there is a desktop to walk it for. That has been the shape of the
+/// code since issue #51 and had never been *observed*, because the wait logs nothing while it
+/// lasts. Counting is what turns "a locked workstation does not enumerate twice a second all
+/// night" from a comment into a number a run can print.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+struct SourceWaitTally {
+    since: Instant,
+    reported_at: Instant,
+    polls: u32,
+    adapter_walks: u32,
+}
+
+#[cfg(windows)]
+impl SourceWaitTally {
+    fn started(now: Instant) -> Self {
+        Self {
+            since: now,
+            reported_at: now,
+            polls: 0,
+            adapter_walks: 0,
+        }
+    }
+
+    /// Records one poll, and answers whether the wait is due to report itself.
+    fn record(&mut self, wait: CaptureSourceWait, now: Instant) -> bool {
+        self.polls = self.polls.saturating_add(1);
+        if wait.walks_the_adapter_list() {
+            self.adapter_walks = self.adapter_walks.saturating_add(1);
+        }
+        if now.saturating_duration_since(self.reported_at) < SOURCE_WAIT_REPORT_INTERVAL {
+            return false;
+        }
+        self.reported_at = now;
+        true
+    }
+
+    /// Both counts, always — the one that stayed at zero is the one worth reading.
+    fn describe(&self, now: Instant) -> String {
+        format!(
+            "{} source poll(s) over {:.1} s, {} of which walked the adapter list",
+            self.polls,
+            now.saturating_duration_since(self.since).as_secs_f64(),
+            self.adapter_walks
+        )
     }
 }
 
@@ -3228,6 +3319,71 @@ mod tests {
                 .filter(|wait| *wait != CaptureSourceWait::Ready)
                 .is_some());
         }
+    }
+
+    #[test]
+    fn a_wait_on_the_session_never_counts_an_adapter_walk() {
+        // The claim under test is the one `capture_source_wait` has always made and no run has
+        // ever shown: while the session says the desktop is not ours, nothing enumerates. A locked
+        // workstation produces `Session` for the whole lock, so the walk count stays at zero until
+        // the session comes back — at which point exactly the polls that reached enumeration
+        // count, including the one that ends the wait.
+        let start = Instant::now();
+        let mut tally = SourceWaitTally::started(start);
+        for _ in 0..240 {
+            tally.record(CaptureSourceWait::Session, start);
+        }
+        assert_eq!(tally.polls, 240);
+        assert_eq!(
+            tally.adapter_walks, 0,
+            "a session wait must be answered before enumeration is reached"
+        );
+        tally.record(CaptureSourceWait::Displays, start);
+        tally.record(CaptureSourceWait::Ready, start);
+        assert_eq!(tally.polls, 242);
+        assert_eq!(tally.adapter_walks, 2);
+
+        let described = tally.describe(start + Duration::from_secs(120));
+        assert!(described.contains("242 source poll(s)"), "{described}");
+        assert!(
+            described.contains("2 of which walked the adapter list"),
+            "{described}"
+        );
+        assert!(described.contains("120.0 s"), "{described}");
+    }
+
+    #[test]
+    fn a_wait_reports_itself_on_a_schedule_rather_than_every_poll() {
+        // Twice a second for a lunch break is 3,600 identical lines saying nothing changed. The
+        // point of the heartbeat is only that a reader can tell a patient daemon from a wedged
+        // one, and that needs one line per half-minute, not one per poll.
+        let start = Instant::now();
+        let mut tally = SourceWaitTally::started(start);
+        let mut reports = 0_u32;
+        for poll in 0..240_u32 {
+            let now = start + DESKTOP_POLL_INTERVAL * poll;
+            if tally.record(CaptureSourceWait::Session, now) {
+                reports += 1;
+            }
+        }
+        // 240 polls at 500 ms starting from zero end at 119.5 s, which contains three whole
+        // report intervals and not the fourth - the poll that would have crossed 120 s is the one
+        // after the last.
+        assert_eq!(
+            reports,
+            3,
+            "a wait of {:.1} s should report itself once per {SOURCE_WAIT_REPORT_INTERVAL:?}",
+            (DESKTOP_POLL_INTERVAL * 239).as_secs_f64()
+        );
+        assert_eq!(tally.polls, 240);
+    }
+
+    #[test]
+    fn only_a_session_wait_is_free_of_enumeration() {
+        assert!(!CaptureSourceWait::Session.walks_the_adapter_list());
+        // Both of the others got their answer from enumeration, so both cost one.
+        assert!(CaptureSourceWait::Displays.walks_the_adapter_list());
+        assert!(CaptureSourceWait::Ready.walks_the_adapter_list());
     }
 
     #[test]
