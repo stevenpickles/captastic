@@ -25,6 +25,7 @@
 
 use std::fmt;
 
+use captastic_core::{CaptureError, CaptureErrorKind};
 use windows::Win32::Foundation::{BOOL, HANDLE};
 use windows::Win32::System::RemoteDesktop::{
     WTSActive, WTSClientProtocolType, WTSConnectQuery, WTSConnectState, WTSConnected,
@@ -139,6 +140,66 @@ impl fmt::Display for DesktopState {
             }
         }
     }
+}
+
+/// The HRESULT every session-refused desktop call comes back with: `E_ACCESSDENIED`.
+///
+/// One constant rather than one per module, because it is the single fact that gates every session
+/// probe in this crate: a call that failed some other way has nothing for the session to explain.
+pub(crate) const HRESULT_ACCESS_DENIED: i32 = 0x8007_0005_u32 as i32;
+
+/// Explains a denial the session can account for, and asks the session only when it was a denial.
+///
+/// This is the whole of the discipline three backends now share, written once. `duplicate_output`
+/// established it for issue #51, `get_physical_cursor_position` (#74) and the display-identity
+/// query (#75) followed, and `create_d3d11_device` and the window-capture paths follow here. Two
+/// halves, and both matter:
+///
+/// - **Only on a denial.** [`desktop_state`] costs four syscalls, and these calls sit on paths that
+///   run every capture. `code` is checked before `probe_session` is called at all, and the probe is
+///   taken as a closure so that can be shown by a counter in a test rather than asserted in a
+///   comment.
+/// - **Only when the session accounts for it.** A temporary session state — locked, secure desktop,
+///   detached, remote — becomes `DesktopUnavailable` naming the state. Anything else, `Interactive`
+///   and `Unknown` alike, returns `None` and leaves the caller's original error exactly as it was.
+///   An unlocked console session that is genuinely refused has a rights problem the user needs to
+///   see, and a probe that could not answer answered nothing, which is not "locked".
+pub(crate) fn denied_by_session(
+    backend: &'static str,
+    operation: &'static str,
+    code: i32,
+    probe_session: impl FnOnce() -> DesktopState,
+) -> Option<CaptureError> {
+    if code != HRESULT_ACCESS_DENIED {
+        return None;
+    }
+    session_obstacle(backend, operation, &probe_session())
+}
+
+/// The decision alone, over a session state somebody else sampled.
+///
+/// Separated from the syscalls for the same reason [`classify`] is: the interesting cases are a
+/// locked workstation and a credential prompt, and reproducing either on a test runner means
+/// locking the test runner. It carries the backend name because the denial it explains does not
+/// always come from DXGI — the `pointer` policy's cursor query reports itself as `windows` and the
+/// window-capture paths as `windows-window-capture`, and rewriting either to `dxgi` would move the
+/// operation a log reader greps for.
+pub(crate) fn session_obstacle(
+    backend: &'static str,
+    operation: &'static str,
+    state: &DesktopState,
+) -> Option<CaptureError> {
+    if !state.is_temporary() {
+        return None;
+    }
+    Some(CaptureError {
+        kind: CaptureErrorKind::DesktopUnavailable,
+        backend,
+        operation,
+        message: format!("{state}"),
+        retryable: true,
+        native_code: None,
+    })
 }
 
 /// What the connect-state query saw.

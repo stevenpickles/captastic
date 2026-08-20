@@ -10,6 +10,7 @@ use windows::Win32::Foundation::POINT;
 use windows::Win32::UI::WindowsAndMessaging::GetPhysicalCursorPos;
 
 use crate::dxgi::{enumerate_display_adapters, DxgiBackend};
+use crate::session::HRESULT_ACCESS_DENIED;
 
 const COMPOSITE_BUFFER_SLOTS: usize = 3;
 const MAX_COMPOSITE_FRAME_BYTES: usize = 512 * 1024 * 1024;
@@ -480,11 +481,12 @@ fn copy_frame_into(
     Ok(())
 }
 
-/// The HRESULT a cursor query refused by a secure desktop comes back with.
-const HRESULT_ACCESS_DENIED: i32 = 0x8007_0005_u32 as i32;
-
 /// The operation name a denied cursor query is reported under, in the log and in these tests.
 const CURSOR_QUERY: &str = "get_physical_cursor_position";
+
+/// The backend name the cursor query reports itself under. Not `dxgi`: this is a Win32 call, and
+/// the operation a log reader greps for is `windows/get_physical_cursor_position`.
+const CURSOR_BACKEND: &str = "windows";
 
 /// Explains a failed cursor query, asking the session about it only when it was denied.
 ///
@@ -494,25 +496,22 @@ const CURSOR_QUERY: &str = "get_physical_cursor_position";
 /// the permissions-shaped lie issue #51 exists to prevent, on a path #51 never covered:
 /// `duplicate_output` has asked the session about its denials since #51 and this had not.
 ///
-/// The session is asked **only** on a denial, and only after the call has already failed. Every
-/// capture under the `pointer` policy runs this query, so the four syscalls behind
-/// [`crate::session::desktop_state`] must not be on the path a working cursor takes; the probe is
-/// taken as a closure so a successful query, and a failure that is not a denial, never call it.
-///
-/// A denial the session cannot explain keeps its original kind, message and native code. Swallowing
-/// a real access failure behind a comfortable message about a lock would be the same defect pointing
-/// the other way.
+/// [`crate::session::denied_by_session`] holds both halves of the discipline. The session is asked
+/// **only** on a denial, and only after the call has already failed: every capture under the
+/// `pointer` policy runs this query, so the four syscalls behind the probe must not be on the path a
+/// working cursor takes, and the probe is taken as a closure so a successful query, and a failure
+/// that is not a denial, can be shown never to call it. A denial the session cannot explain keeps
+/// its original kind, message and native code — swallowing a real access failure behind a
+/// comfortable message about a lock would be the same defect pointing the other way.
 fn cursor_query_error(
     code: i32,
     message: String,
     probe_session: impl FnOnce() -> crate::session::DesktopState,
 ) -> CaptureError {
-    if code == HRESULT_ACCESS_DENIED {
-        if let Some(obstacle) =
-            crate::dxgi::session_obstacle("windows", CURSOR_QUERY, &probe_session())
-        {
-            return obstacle;
-        }
+    if let Some(obstacle) =
+        crate::session::denied_by_session(CURSOR_BACKEND, CURSOR_QUERY, code, probe_session)
+    {
+        return obstacle;
     }
     CaptureError {
         kind: if code == HRESULT_ACCESS_DENIED {
@@ -520,7 +519,7 @@ fn cursor_query_error(
         } else {
             CaptureErrorKind::NativeFailure
         },
-        backend: "windows",
+        backend: CURSOR_BACKEND,
         operation: CURSOR_QUERY,
         message,
         retryable: true,

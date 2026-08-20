@@ -106,33 +106,11 @@ pub(crate) fn no_desktop_to_capture(operation: &'static str) -> CaptureError {
 /// self-evidently "nothing to capture"; a denial is only a session problem if the session says so,
 /// and swallowing an unexplained denial would hide a real fault behind a comfortable message.
 pub(crate) fn desktop_obstacle(operation: &'static str) -> Option<CaptureError> {
-    session_obstacle("dxgi", operation, &crate::session::desktop_state())
+    crate::session::session_obstacle(DXGI_BACKEND, operation, &crate::session::desktop_state())
 }
 
-/// The decision inside [`desktop_obstacle`], with the syscalls lifted out.
-///
-/// Separated for the same reason `session::classify` is: the interesting cases are a locked
-/// workstation and a credential prompt, and reproducing either on a test runner means locking the
-/// test runner. It also carries the backend name, because the denial this explains does not always
-/// come from DXGI — the `pointer` policy's cursor query is refused by the same lock and reports
-/// itself as `windows`, and rewriting that to `dxgi` would move the operation a reader greps for.
-pub(crate) fn session_obstacle(
-    backend: &'static str,
-    operation: &'static str,
-    state: &crate::session::DesktopState,
-) -> Option<CaptureError> {
-    if !state.is_temporary() {
-        return None;
-    }
-    Some(CaptureError {
-        kind: CaptureErrorKind::DesktopUnavailable,
-        backend,
-        operation,
-        message: format!("{state}"),
-        retryable: true,
-        native_code: None,
-    })
-}
+/// The backend name every DXGI failure reports itself under, in the log and in these tests.
+const DXGI_BACKEND: &str = "dxgi";
 
 pub(crate) fn enumerate_display_adapters() -> Result<Vec<(DisplayInfo, i64)>, CaptureError> {
     enumerate_outputs().map(|outputs| {
@@ -2084,9 +2062,6 @@ fn display_identity_fallback_log(error: &CaptureError) -> String {
     line
 }
 
-/// The HRESULT a display-configuration query refused by the session comes back with.
-const HRESULT_ACCESS_DENIED: i32 = 0x8007_0005_u32 as i32;
-
 /// The operation a failed display-identity query is reported under, in the log and in these tests.
 const DISPLAY_CONFIG_QUERY: &str = "query_display_config";
 
@@ -2106,26 +2081,21 @@ const DISPLAY_CONFIG_SIZES: &str = "display_config_buffer_sizes";
 /// problem was that nobody was signed in to it.
 ///
 /// The mapping is done here rather than in `map_windows_error`, which serves every DXGI operation
-/// and has no business asking the session about a failed texture map. The session is asked **only**
-/// on `E_ACCESSDENIED`, and only after the call has already failed, so enumeration — which runs this
-/// query every time it walks the adapters — never pays the four syscalls behind
-/// [`crate::session::desktop_state`] on a working machine. The probe is taken as a closure so that
-/// can be shown rather than asserted.
-///
-/// A denial the session cannot account for keeps its original kind, message and native code. An
-/// unlocked console session that is genuinely refused this query has something wrong with its
-/// rights, and reporting a lock instead would be the same defect pointing the other way.
+/// and has no business asking the session about a failed texture map.
+/// [`crate::session::denied_by_session`] holds both halves of the discipline: the session is asked
+/// only on `E_ACCESSDENIED`, so enumeration — which runs this query every time it walks the
+/// adapters — never pays the four syscalls behind the probe on a working machine, and a denial the
+/// session cannot account for keeps its original kind, message and native code. An unlocked console
+/// session that is genuinely refused this query has something wrong with its rights, and reporting a
+/// lock instead would be the same defect pointing the other way. The probe is taken as a closure so
+/// the cost can be shown by a counter rather than asserted.
 fn display_config_query_error(
     operation: &'static str,
     error: WindowsError,
     probe_session: impl FnOnce() -> crate::session::DesktopState,
 ) -> CaptureError {
-    if error.code().0 == HRESULT_ACCESS_DENIED {
-        if let Some(obstacle) = session_obstacle("dxgi", operation, &probe_session()) {
-            return obstacle;
-        }
-    }
-    map_windows_error(operation, error)
+    crate::session::denied_by_session(DXGI_BACKEND, operation, error.code().0, probe_session)
+        .unwrap_or_else(|| map_windows_error(operation, error))
 }
 
 fn display_config_identities() -> Result<Vec<DisplayConfigIdentity>, CaptureError> {
@@ -2706,6 +2676,7 @@ fn capture_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::HRESULT_ACCESS_DENIED;
     use captastic_core::{CaptureId, CaptureSource, CursorMode};
     use windows::core::HRESULT;
 
