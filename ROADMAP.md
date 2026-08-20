@@ -269,8 +269,11 @@ explicit, tested behavior.
   preserved end to end. That needs the pixels, not the tag (ADR 0006).
 - Add recovery tests for display hot-plugging, sleep/wake, lock/unlock, GPU reset, Remote Desktop, and
   rapid session changes. Hot-plug, unplug and primary-promotion are covered deterministically
-  through the daemon's rebuild seam; the no-source path is covered end to end (#56). Sleep/wake,
-  GPU reset and Remote Desktop still need a machine rather than a fake.
+  through the daemon's rebuild seam; the no-source path is covered end to end (#56). Lock/unlock
+  diagnosis is covered by a live harness (`a_locked_session_explains_every_duplication_failure` in
+  `crates/captastic-windows/src/session.rs`, `#[ignore]`d because it locks the machine for ~8 minutes
+  and cannot unlock itself); recovery through lock → displays asleep → unlock is not yet verified.
+  Sleep/wake, GPU reset and Remote Desktop still need a machine rather than a fake.
 - Build the controlled sequence-marker workload for freshness, orientation, crop, and cursor tests.
 - Collect environment fingerprints and automate warm-up, raw artifacts, repeat runs, and compatible
   baseline comparison.
