@@ -1966,9 +1966,7 @@ fn enumerate_outputs() -> Result<Vec<OutputRecord>, CaptureError> {
     let identities = match display_config_identities() {
         Ok(identities) => identities,
         Err(error) => {
-            log::warn!(
-                "persistent display identity query failed; using session-local output names: {error}"
-            );
+            log::warn!("{}", display_identity_fallback_log(&error));
             Vec::new()
         }
     };
@@ -2060,6 +2058,67 @@ fn effective_monitor_scale(monitor: HMONITOR, display_name: &str) -> f32 {
     dpi_x as f32 / BASE_DPI as f32
 }
 
+/// What the log says when the display-identity query fails and enumeration carries on without it.
+///
+/// This failure does not fail a capture. `enumerate_outputs` degrades to the names DXGI hands out
+/// by itself, so this one line is the whole of what anybody ever sees of it — which is why the
+/// wording is the fix. Until 2026-08-20 a locked or disconnected session produced exactly
+/// `NativeFailure in dxgi/query_display_config: Access is denied.` here, the line quoted in issue
+/// #51, describing a permissions problem the user did not have.
+///
+/// The prefix is left alone so a search that already finds this line keeps finding it. When the
+/// session accounts for the failure the line also says what the fallback costs and when it ends,
+/// because the fallback identity is derived from the GDI device name rather than from the panel:
+/// a display named by that branch does not match what `state.toml` remembered under its persistent
+/// id, and a `display =` naming a persistent id does not select it either.
+fn display_identity_fallback_log(error: &CaptureError) -> String {
+    let mut line = format!(
+        "persistent display identity query failed; using session-local output names: {error}"
+    );
+    if error.kind == CaptureErrorKind::DesktopUnavailable {
+        line.push_str(
+            "; this clears when the session comes back, and until it does displays are identified \
+             by their session-local device names rather than by their panels",
+        );
+    }
+    line
+}
+
+/// The HRESULT a display-configuration query refused by the session comes back with.
+const HRESULT_ACCESS_DENIED: i32 = 0x8007_0005_u32 as i32;
+
+/// The operation a failed display-identity query is reported under, in the log and in these tests.
+const DISPLAY_CONFIG_QUERY: &str = "query_display_config";
+
+/// Explains a failed `QueryDisplayConfig`, asking the session about it only when it was denied.
+///
+/// A locked or disconnected session refuses this call, and the refusal used to arrive through the
+/// generic `map_windows_error` as `NativeFailure in dxgi/query_display_config: Access is denied.` —
+/// the literal line issue #51 was filed about, naming a permissions problem in a session whose only
+/// problem was that nobody was signed in to it.
+///
+/// The mapping is done here rather than in `map_windows_error`, which serves every DXGI operation
+/// and has no business asking the session about a failed texture map. The session is asked **only**
+/// on `E_ACCESSDENIED`, and only after the call has already failed, so enumeration — which runs this
+/// query every time it walks the adapters — never pays the four syscalls behind
+/// [`crate::session::desktop_state`] on a working machine. The probe is taken as a closure so that
+/// can be shown rather than asserted.
+///
+/// A denial the session cannot account for keeps its original kind, message and native code. An
+/// unlocked console session that is genuinely refused this query has something wrong with its
+/// rights, and reporting a lock instead would be the same defect pointing the other way.
+fn display_config_query_error(
+    error: WindowsError,
+    probe_session: impl FnOnce() -> crate::session::DesktopState,
+) -> CaptureError {
+    if error.code().0 == HRESULT_ACCESS_DENIED {
+        if let Some(obstacle) = session_obstacle("dxgi", DISPLAY_CONFIG_QUERY, &probe_session()) {
+            return obstacle;
+        }
+    }
+    map_windows_error(DISPLAY_CONFIG_QUERY, error)
+}
+
 fn display_config_identities() -> Result<Vec<DisplayConfigIdentity>, CaptureError> {
     const MAX_ATTEMPTS: usize = 3;
     for attempt in 0..MAX_ATTEMPTS {
@@ -2106,7 +2165,12 @@ fn display_config_identities() -> Result<Vec<DisplayConfigIdentity>, CaptureErro
                     "display identity query raced or failed transiently; retrying: {error}"
                 );
             }
-            Err(error) => return Err(map_windows_error("query_display_config", error)),
+            Err(error) => {
+                return Err(display_config_query_error(
+                    error,
+                    crate::session::desktop_state,
+                ))
+            }
         }
     }
     unreachable!("display identity query loop always returns")
@@ -2631,6 +2695,158 @@ fn capture_error(
 mod tests {
     use super::*;
     use captastic_core::{CaptureId, CaptureSource, CursorMode};
+    use windows::core::HRESULT;
+
+    /// The denial a locked or disconnected session gives this query, as Windows reports it.
+    fn access_denied() -> WindowsError {
+        WindowsError::from(HRESULT(HRESULT_ACCESS_DENIED))
+    }
+
+    /// The line issue #51 was filed about, and what the fix has to turn it into.
+    ///
+    /// `NativeFailure in dxgi/query_display_config: Access is denied.` is quoted verbatim in #51:
+    /// a session with nobody signed in to it refuses the display-identity query, and the report
+    /// named a permissions problem instead of the sign-in state that caused it. The operation stays
+    /// `dxgi/query_display_config` because that is what a log reader greps for; only the
+    /// explanation is new.
+    #[test]
+    fn a_locked_session_explains_a_denied_display_identity_query() {
+        let denied =
+            display_config_query_error(access_denied(), || crate::session::DesktopState::Locked {
+                desktop: Some("Winlogon".to_owned()),
+            });
+        assert_eq!(denied.kind, CaptureErrorKind::DesktopUnavailable);
+        assert!(
+            denied.message.contains("locked"),
+            "the whole point is that the message says so: {denied}"
+        );
+        assert!(denied.message.contains("Winlogon"), "{denied}");
+        assert_eq!(denied.backend, "dxgi");
+        assert_eq!(denied.operation, DISPLAY_CONFIG_QUERY);
+        assert!(denied.retryable);
+    }
+
+    /// Every other temporary session state explains it too, because every one of them refuses.
+    ///
+    /// A disconnected RDP session and a secure desktop deny this call for reasons no more a
+    /// permissions problem than a lock is, and they clear the same way — by somebody coming back.
+    #[test]
+    fn any_session_that_owns_no_desktop_explains_a_denied_display_identity_query() {
+        for state in [
+            crate::session::DesktopState::Locked { desktop: None },
+            crate::session::DesktopState::NotOurs {
+                desktop: Some("Winlogon".to_owned()),
+            },
+            crate::session::DesktopState::Detached {
+                connect_state: "disconnected",
+            },
+            crate::session::DesktopState::Remote {
+                protocol: "Remote Desktop",
+            },
+        ] {
+            let denied = display_config_query_error(access_denied(), || state.clone());
+            assert_eq!(
+                denied.kind,
+                CaptureErrorKind::DesktopUnavailable,
+                "{state:?} should explain the denial"
+            );
+            assert_eq!(denied.message, state.to_string());
+            assert_eq!(denied.operation, DISPLAY_CONFIG_QUERY);
+        }
+    }
+
+    /// A denial the session cannot account for stays exactly what it was.
+    ///
+    /// This is the half that makes the re-classification safe. An unlocked, attached, console
+    /// session that is refused this query has something genuinely wrong with its rights, and a
+    /// comfortable message about a lock would trade one misleading line for another. `Unknown`
+    /// counts as "cannot account for it": a probe that failed answered nothing, and nothing is not
+    /// "locked".
+    #[test]
+    fn an_unlocked_session_leaves_a_denied_display_identity_query_alone() {
+        for state in [
+            crate::session::DesktopState::Interactive,
+            crate::session::DesktopState::Unknown {
+                detail: "the input desktop could not be named".to_owned(),
+            },
+        ] {
+            let denied = display_config_query_error(access_denied(), || state.clone());
+            assert_eq!(
+                denied.kind,
+                CaptureErrorKind::NativeFailure,
+                "{state:?} does not explain a denial and must not hide one"
+            );
+            assert_eq!(denied.message, access_denied().to_string());
+            assert_eq!(denied.native_code, Some(i64::from(HRESULT_ACCESS_DENIED)));
+            assert_eq!(denied.backend, "dxgi");
+            assert_eq!(denied.operation, DISPLAY_CONFIG_QUERY);
+        }
+    }
+
+    /// The session probe costs four syscalls, and every enumeration runs this query. It may only be
+    /// paid on the one failure it can explain.
+    ///
+    /// `duplicate_output` set that discipline — it asks the session inside `map_err` and nowhere
+    /// else. Here the probe is a closure precisely so the cheap paths can be shown never to call
+    /// it: a successful query does not reach this function at all, and a failure that is not
+    /// `E_ACCESSDENIED` has nothing for the session to say about it, so it keeps the mapping
+    /// `map_windows_error` has always given it.
+    #[test]
+    fn only_a_denied_display_identity_query_pays_for_the_session_probe() {
+        let probes = std::cell::Cell::new(0_u32);
+        let probe = || {
+            probes.set(probes.get() + 1);
+            crate::session::DesktopState::Locked { desktop: None }
+        };
+        let device_error = WindowsError::from(HRESULT(0x8007_001f_u32 as i32));
+        let failed = display_config_query_error(device_error.clone(), probe);
+        assert_eq!(probes.get(), 0, "a non-denial must not ask the session");
+        assert_eq!(failed.kind, CaptureErrorKind::NativeFailure);
+        assert_eq!(failed.message, device_error.to_string());
+        assert_eq!(failed.native_code, Some(i64::from(0x8007_001f_u32 as i32)));
+        assert_eq!(failed.operation, DISPLAY_CONFIG_QUERY);
+
+        let denied = display_config_query_error(access_denied(), || {
+            probes.set(probes.get() + 1);
+            crate::session::DesktopState::Locked { desktop: None }
+        });
+        assert_eq!(probes.get(), 1, "a denial asks the session exactly once");
+        assert_eq!(denied.kind, CaptureErrorKind::DesktopUnavailable);
+    }
+
+    /// The log line is the entire user-visible artifact of this failure, so it is tested as one.
+    ///
+    /// `enumerate_outputs` does not fail when the identity query does — it warns and carries on
+    /// with the names DXGI supplies itself. Nothing else about the capture changes, which is why
+    /// the re-classification is only worth anything if it reaches this line.
+    #[test]
+    fn the_display_identity_fallback_log_names_the_session_that_denied_the_query() {
+        let explained =
+            display_identity_fallback_log(&display_config_query_error(access_denied(), || {
+                crate::session::DesktopState::Locked { desktop: None }
+            }));
+        assert!(
+            explained.starts_with("persistent display identity query failed"),
+            "the searchable prefix must not move: {explained}"
+        );
+        assert!(
+            explained.contains("the workstation is locked"),
+            "the log line is the fix; it has to say what happened: {explained}"
+        );
+        assert!(
+            explained.contains("clears when the session comes back"),
+            "a fallback that ends by itself should say so: {explained}"
+        );
+
+        // A failure the session cannot account for keeps the plain line, because there is nothing
+        // extra that is true to say about it: nobody knows when, or whether, it clears.
+        let unexplained =
+            display_identity_fallback_log(&display_config_query_error(access_denied(), || {
+                crate::session::DesktopState::Interactive
+            }));
+        assert!(unexplained.contains("NativeFailure in dxgi/query_display_config"));
+        assert!(!unexplained.contains("clears when the session comes back"));
+    }
 
     #[test]
     fn converts_qpc_ticks_without_losing_sign() {
