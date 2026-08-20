@@ -2090,7 +2090,15 @@ const HRESULT_ACCESS_DENIED: i32 = 0x8007_0005_u32 as i32;
 /// The operation a failed display-identity query is reported under, in the log and in these tests.
 const DISPLAY_CONFIG_QUERY: &str = "query_display_config";
 
-/// Explains a failed `QueryDisplayConfig`, asking the session about it only when it was denied.
+/// The operation the sizing call that precedes it is reported under.
+///
+/// The same query, one call earlier, and denied by the same sessions: Windows documents
+/// `ERROR_ACCESS_DENIED` from `GetDisplayConfigBufferSizes` for a caller that does not have access
+/// to the current desktop. Whichever of the two the session refuses first produces the log line, so
+/// explaining only the second one would leave the bare denial reachable under another name.
+const DISPLAY_CONFIG_SIZES: &str = "display_config_buffer_sizes";
+
+/// Explains a failed display-identity query, asking the session about it only when it was denied.
 ///
 /// A locked or disconnected session refuses this call, and the refusal used to arrive through the
 /// generic `map_windows_error` as `NativeFailure in dxgi/query_display_config: Access is denied.` —
@@ -2108,15 +2116,16 @@ const DISPLAY_CONFIG_QUERY: &str = "query_display_config";
 /// unlocked console session that is genuinely refused this query has something wrong with its
 /// rights, and reporting a lock instead would be the same defect pointing the other way.
 fn display_config_query_error(
+    operation: &'static str,
     error: WindowsError,
     probe_session: impl FnOnce() -> crate::session::DesktopState,
 ) -> CaptureError {
     if error.code().0 == HRESULT_ACCESS_DENIED {
-        if let Some(obstacle) = session_obstacle("dxgi", DISPLAY_CONFIG_QUERY, &probe_session()) {
+        if let Some(obstacle) = session_obstacle("dxgi", operation, &probe_session()) {
             return obstacle;
         }
     }
-    map_windows_error(DISPLAY_CONFIG_QUERY, error)
+    map_windows_error(operation, error)
 }
 
 fn display_config_identities() -> Result<Vec<DisplayConfigIdentity>, CaptureError> {
@@ -2128,7 +2137,9 @@ fn display_config_identities() -> Result<Vec<DisplayConfigIdentity>, CaptureErro
         unsafe {
             GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count)
         }
-        .map_err(|error| map_windows_error("display_config_buffer_sizes", error))?;
+        .map_err(|error| {
+            display_config_query_error(DISPLAY_CONFIG_SIZES, error, crate::session::desktop_state)
+        })?;
         let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
         let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
         // SAFETY: The arrays have the capacities reported immediately above. The mutable counts
@@ -2167,6 +2178,7 @@ fn display_config_identities() -> Result<Vec<DisplayConfigIdentity>, CaptureErro
             }
             Err(error) => {
                 return Err(display_config_query_error(
+                    DISPLAY_CONFIG_QUERY,
                     error,
                     crate::session::desktop_state,
                 ))
@@ -2711,10 +2723,11 @@ mod tests {
     /// explanation is new.
     #[test]
     fn a_locked_session_explains_a_denied_display_identity_query() {
-        let denied =
-            display_config_query_error(access_denied(), || crate::session::DesktopState::Locked {
+        let denied = display_config_query_error(DISPLAY_CONFIG_QUERY, access_denied(), || {
+            crate::session::DesktopState::Locked {
                 desktop: Some("Winlogon".to_owned()),
-            });
+            }
+        });
         assert_eq!(denied.kind, CaptureErrorKind::DesktopUnavailable);
         assert!(
             denied.message.contains("locked"),
@@ -2744,7 +2757,8 @@ mod tests {
                 protocol: "Remote Desktop",
             },
         ] {
-            let denied = display_config_query_error(access_denied(), || state.clone());
+            let denied =
+                display_config_query_error(DISPLAY_CONFIG_QUERY, access_denied(), || state.clone());
             assert_eq!(
                 denied.kind,
                 CaptureErrorKind::DesktopUnavailable,
@@ -2753,6 +2767,31 @@ mod tests {
             assert_eq!(denied.message, state.to_string());
             assert_eq!(denied.operation, DISPLAY_CONFIG_QUERY);
         }
+    }
+
+    /// The sizing call one line earlier is the same query and is explained the same way.
+    ///
+    /// `GetDisplayConfigBufferSizes` is documented as returning `ERROR_ACCESS_DENIED` to a caller
+    /// without access to the current desktop, exactly as `QueryDisplayConfig` is, and it runs first.
+    /// If only the second call were explained, a session that refused the pair would still produce a
+    /// bare `Access is denied` — the same defect under a different operation name. Each keeps its
+    /// own name, because they are two calls and a log reader should be able to tell which failed.
+    #[test]
+    fn the_sizing_call_before_the_query_is_explained_under_its_own_name() {
+        let denied = display_config_query_error(DISPLAY_CONFIG_SIZES, access_denied(), || {
+            crate::session::DesktopState::Detached {
+                connect_state: "disconnected",
+            }
+        });
+        assert_eq!(denied.kind, CaptureErrorKind::DesktopUnavailable);
+        assert_eq!(denied.operation, DISPLAY_CONFIG_SIZES);
+        assert!(denied.message.contains("disconnected"), "{denied}");
+
+        let unexplained = display_config_query_error(DISPLAY_CONFIG_SIZES, access_denied(), || {
+            crate::session::DesktopState::Interactive
+        });
+        assert_eq!(unexplained.kind, CaptureErrorKind::NativeFailure);
+        assert_eq!(unexplained.operation, DISPLAY_CONFIG_SIZES);
     }
 
     /// A denial the session cannot account for stays exactly what it was.
@@ -2770,7 +2809,8 @@ mod tests {
                 detail: "the input desktop could not be named".to_owned(),
             },
         ] {
-            let denied = display_config_query_error(access_denied(), || state.clone());
+            let denied =
+                display_config_query_error(DISPLAY_CONFIG_QUERY, access_denied(), || state.clone());
             assert_eq!(
                 denied.kind,
                 CaptureErrorKind::NativeFailure,
@@ -2799,14 +2839,14 @@ mod tests {
             crate::session::DesktopState::Locked { desktop: None }
         };
         let device_error = WindowsError::from(HRESULT(0x8007_001f_u32 as i32));
-        let failed = display_config_query_error(device_error.clone(), probe);
+        let failed = display_config_query_error(DISPLAY_CONFIG_QUERY, device_error.clone(), probe);
         assert_eq!(probes.get(), 0, "a non-denial must not ask the session");
         assert_eq!(failed.kind, CaptureErrorKind::NativeFailure);
         assert_eq!(failed.message, device_error.to_string());
         assert_eq!(failed.native_code, Some(i64::from(0x8007_001f_u32 as i32)));
         assert_eq!(failed.operation, DISPLAY_CONFIG_QUERY);
 
-        let denied = display_config_query_error(access_denied(), || {
+        let denied = display_config_query_error(DISPLAY_CONFIG_QUERY, access_denied(), || {
             probes.set(probes.get() + 1);
             crate::session::DesktopState::Locked { desktop: None }
         });
@@ -2821,10 +2861,11 @@ mod tests {
     /// the re-classification is only worth anything if it reaches this line.
     #[test]
     fn the_display_identity_fallback_log_names_the_session_that_denied_the_query() {
-        let explained =
-            display_identity_fallback_log(&display_config_query_error(access_denied(), || {
-                crate::session::DesktopState::Locked { desktop: None }
-            }));
+        let explained = display_identity_fallback_log(&display_config_query_error(
+            DISPLAY_CONFIG_QUERY,
+            access_denied(),
+            || crate::session::DesktopState::Locked { desktop: None },
+        ));
         assert!(
             explained.starts_with("persistent display identity query failed"),
             "the searchable prefix must not move: {explained}"
@@ -2840,10 +2881,11 @@ mod tests {
 
         // A failure the session cannot account for keeps the plain line, because there is nothing
         // extra that is true to say about it: nobody knows when, or whether, it clears.
-        let unexplained =
-            display_identity_fallback_log(&display_config_query_error(access_denied(), || {
-                crate::session::DesktopState::Interactive
-            }));
+        let unexplained = display_identity_fallback_log(&display_config_query_error(
+            DISPLAY_CONFIG_QUERY,
+            access_denied(),
+            || crate::session::DesktopState::Interactive,
+        ));
         assert!(unexplained.contains("NativeFailure in dxgi/query_display_config"));
         assert!(!unexplained.contains("clears when the session comes back"));
     }
