@@ -193,7 +193,7 @@ cargo run --release -p captastic-app -- daemon --backend dxgi --mode latest --cp
 
 Use `--mode fresh` for controlled tests where the desktop is known to present after every trigger. Timeouts on an unchanged desktop are correct in that mode.
 
-Desktop Duplication access can be denied from an isolated sandbox even when the same executable succeeds in the user's interactive session. `captastic doctor` preserves the native HRESULT/message so the two cases are distinguishable.
+Desktop Duplication access can be denied from an isolated sandbox even when the same executable succeeds in the user's interactive session. `captastic doctor` preserves the native HRESULT/message so the two cases are distinguishable, and it still does: a denial the session cannot account for keeps its original kind, message and native code everywhere the session check was added (see [the last bare denials](#the-last-bare-denials-the-capture-device-and-the-two-window-backends)).
 
 ### Remote Desktop
 
@@ -358,6 +358,85 @@ persistent identities throughout — so the denial in #51 remains un-reproduced 
 on the same session probe that explains the paths that *have* been measured.
 `scripts/measure-lock-unlock-recovery.ps1 -Confirmed` is the way to look for it when a live lock run
 is next approved.
+
+### The last bare denials: the capture device, and the two window backends
+
+Three more calls were refusing without explaining, on the same shape as the two above. All three now
+go through one check.
+
+**`create_d3d11_device` (`dxgi.rs`).** The first call `DxgiBackend::new` makes after enumerating, and
+the one this document already noted can be denied from an isolated sandbox. Routed through the
+generic `map_windows_error`, a session that refused it produced
+`NativeFailure in dxgi/create_d3d11_device: Access is denied.` — and that kind decided daemon
+behaviour, not just wording:
+
+| | as `NativeFailure` (before) | as `DesktopUnavailable` (now) |
+|---|---|---|
+| Daemon start-up, `display = primary` or a fixed id | not a desktop wait, so the error went to `ready_sender` and the daemon **exited** | hotkeys stay registered, `capture_engine: waiting_for_desktop`, engine built when the desktop returns |
+| Rebuild after a failed capture | paced by `recovery_delay`: a fresh D3D11 device against a lock screen on an exponential back-off, one warn per attempt | the 500 ms two-syscall session poll, at debug level, rebuilding once there is a desktop |
+| `requires_backend_recovery` | no | no — unchanged, because no number of rebuilds makes a credential prompt hand back a device |
+
+The guard one layer up in `display_manager`'s `initialize` is not a substitute: it runs only for the
+`pointer` and `virtual-desktop` policies, only once *every* display has failed, and the per-display
+warn line it does reach quotes the bare denial.
+
+**`window_capture.rs` and `window_capture_wgc.rs`.** Neither window backend had a session check
+anywhere in it. Each carries its own `capture_error`/`windows_error` pair, so a desktop this process
+cannot read refusing `GetWindowRect`, the screen-compatible DC `PrintWindow` renders into,
+`CreateForWindow` or `StartCapture` came out as
+`NativeFailure in windows-window-capture/<operation>: Access is denied.` or the
+`windows-graphics-capture` equivalent. Both are reached from the same overlay selection —
+`PrintWindow` first, Windows Graphics Capture when it is refused or renders blank — so explaining one
+and not the other would have left the bare denial reachable by whichever route the fallback took.
+These errors end a selection with `selection_failed` and a message; they do not reach
+`waiting_for_desktop`, so what changes here is the message, not the routing.
+
+Doing this in each file's own mapper rather than at picked call sites is the one deliberate
+difference from the display-identity fix. `map_windows_error` was left generic there because it
+serves a per-frame duplication path; these two serve one capture attempt end to end, and the
+operations they name are desktop operations to a one. The GDI scaling failures that also map through
+`window_capture`'s helper are untouched, because a `StretchBlt` between two blocks of this process's
+own memory does not fail with `E_ACCESSDENIED`.
+
+**One check, one home.** `session_obstacle` moved from `dxgi.rs` to `session.rs`, next to the probe
+it reads, and the gate around it — `denied_by_session` — is now written once rather than at each of
+the five call sites. Both halves of the discipline live there: the session is asked **only** on
+`E_ACCESSDENIED`, so no success path and no other failure pays the four syscalls behind the probe;
+and only a temporary session state re-classifies anything, so a denial on an interactive session, or
+one whose probe could not answer, keeps its original kind, message, native code and `retryable` flag.
+That last part is what keeps the isolated-sandbox case above diagnosable, and what keeps an ordinary
+window refusal — `PrintWindow` across the normal-to-elevated integrity boundary — reported as
+itself. Backend names and operation strings are unchanged throughout.
+
+**Status: verified by unit tests, not measured live.** Thirteen tests cover it — for each of the
+three call sites, the locked or secure-desktop case, every other temporary state, the two states that
+must preserve the original error, and a probe counter; plus a daemon-level test asserting the
+start-up routing and the rebuild pacing on both sides of the `create_d3d11_device` change. Nobody has
+watched a live secure desktop or sandbox produce any of the new messages. None of these three
+denials has been reproduced on this host at all: a lock here denies the cursor query and the
+duplication, and leaves device creation and window capture alone.
+
+### Checked and left alone
+
+The rest of the crate was surveyed for `E_ACCESSDENIED` reaching a user-visible error without a
+session check. These were found and deliberately not changed:
+
+- **`clipboard.rs` (`open_clipboard`).** A different cause: `OpenClipboard` returns
+  `ERROR_ACCESS_DENIED` for clipboard *ownership*, another process holding it. It is already
+  retried and already reported as a `Timeout` naming how long the clipboard stayed busy.
+- **`tray.rs` (`shell_notify_error`).** Not a capture operation, and its classification is a
+  deliberate one: `ERROR_TIMEOUT` from a busy notification area is retryable and everything else is
+  a permanent misuse of the API that must not be retried. Nothing downstream reads it as a desktop
+  wait.
+- **`overlay.rs` (`overlay_error`).** Same bare shape, but the overlay is entered only from a hotkey
+  or a tray click on a desktop the session already owns, and the mapper covers dozens of
+  window-management calls whose denials are genuinely not session states — a `SetForegroundWindow`
+  refused by the foreground lock is not a locked workstation. A capture that reaches the overlay
+  while the session is locked has already failed in DXGI, where it is explained.
+- **`hotkey.rs`, `startup.rs`, `daemon_control.rs`, `console.rs`.** Hotkey registration collides
+  (`ERROR_HOTKEY_ALREADY_REGISTERED`); the startup registry key and the daemon control channel are
+  refused for real ownership and policy reasons. None of them is a desktop operation, and a session
+  probe would answer a question nobody asked.
 
 `CAPTASTIC_TEST_NO_DISPLAYS_MS` reports no attached outputs for that many milliseconds from process start, so the wait-and-recover path can be exercised without detaching a display. Debug builds only; `scripts/verify-no-display-recovery.ps1` drives it.
 

@@ -1630,14 +1630,52 @@ fn last_error(operation: &'static str) -> CaptureError {
 }
 
 fn windows_error(operation: &'static str, error: WindowsError, retryable: bool) -> CaptureError {
-    capture_error(
-        CaptureErrorKind::NativeFailure,
-        operation,
-        error.to_string(),
-        retryable,
-        Some(i64::from(error.code().0)),
-    )
+    session_explained_error(operation, error, retryable, crate::session::desktop_state)
 }
+
+/// Maps a window-capture failure, asking the session about it only when it was denied.
+///
+/// The same check `window_capture_wgc` does, for the same reason: this backend had none anywhere,
+/// so a secure desktop refusing `GetWindowRect` on the selected window, or refusing the
+/// screen-compatible device context `PrintWindow` renders into, produced `NativeFailure in
+/// windows-window-capture/<operation>: Access is denied.` and said nothing about the desktop. Both
+/// window backends are reached from the same overlay selection, so explaining only one of them
+/// would leave the bare denial reachable by whichever route the fallback happened to take.
+///
+/// Everything the gate in [`crate::session::denied_by_session`] guarantees applies here too, and
+/// one consequence is worth naming: the GDI scaling operations in this file also map through this
+/// function, and they are untouched by it, because a `StretchBlt` between two memory DIBs does not
+/// fail with `E_ACCESSDENIED` and the session is never asked about a failure that is not a denial.
+/// A denial the session cannot account for keeps its kind, message, native code and `retryable`
+/// flag — which is what keeps the ordinary refusals this backend already expects, such as
+/// `PrintWindow` across the normal-to-elevated integrity boundary, reported as themselves.
+fn session_explained_error(
+    operation: &'static str,
+    error: WindowsError,
+    retryable: bool,
+    probe_session: impl FnOnce() -> crate::session::DesktopState,
+) -> CaptureError {
+    crate::session::denied_by_session(
+        WINDOW_CAPTURE_BACKEND,
+        operation,
+        error.code().0,
+        probe_session,
+    )
+    .unwrap_or_else(|| {
+        capture_error(
+            CaptureErrorKind::NativeFailure,
+            operation,
+            error.to_string(),
+            retryable,
+            Some(i64::from(error.code().0)),
+        )
+    })
+}
+
+/// The backend name every window-capture failure reports itself under, in the log and in these
+/// tests. A session-explained denial keeps it, so the operation a reader greps for does not move
+/// when the explanation is added.
+const WINDOW_CAPTURE_BACKEND: &str = "windows-window-capture";
 
 fn capture_error(
     kind: CaptureErrorKind,
@@ -1648,7 +1686,7 @@ fn capture_error(
 ) -> CaptureError {
     CaptureError {
         kind,
-        backend: "windows-window-capture",
+        backend: WINDOW_CAPTURE_BACKEND,
         operation,
         message: message.into(),
         retryable,
@@ -1662,9 +1700,134 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+    use crate::session::{DesktopState, HRESULT_ACCESS_DENIED};
     use captastic_core::{
         CaptureId, CaptureMode, ColorSpace, DisplayId, FrameOrigin, PixelFormat, TimingProvenance,
     };
+    use windows::core::HRESULT;
+
+    /// The refusal a secure desktop gives a window query, as Windows reports it.
+    fn access_denied() -> WindowsError {
+        WindowsError::from(HRESULT(HRESULT_ACCESS_DENIED))
+    }
+
+    /// A lock refusing the selected window's bounds has to say so.
+    ///
+    /// `GetWindowRect` is the first thing this backend asks about the window the user picked, and a
+    /// desktop this process cannot read refuses it. Before this it reported `NativeFailure in
+    /// windows-window-capture/get_selected_window_bounds: Access is denied.`, with nothing to say
+    /// the desktop was the reason. The operation and backend are what a log reader greps for and
+    /// neither moves.
+    #[test]
+    fn a_locked_session_explains_a_refused_window_query() {
+        let denied =
+            session_explained_error("get_selected_window_bounds", access_denied(), true, || {
+                DesktopState::Locked {
+                    desktop: Some("Winlogon".to_owned()),
+                }
+            });
+        assert_eq!(denied.kind, CaptureErrorKind::DesktopUnavailable);
+        assert!(
+            denied.message.contains("locked"),
+            "the whole point is that the message says so: {denied}"
+        );
+        assert!(denied.message.contains("Winlogon"), "{denied}");
+        assert_eq!(denied.backend, WINDOW_CAPTURE_BACKEND);
+        assert_eq!(denied.operation, "get_selected_window_bounds");
+        assert!(denied.retryable);
+    }
+
+    /// Every other temporary session state explains it too, because every one of them refuses.
+    #[test]
+    fn any_session_that_owns_no_desktop_explains_a_refused_window_query() {
+        for state in [
+            DesktopState::Locked { desktop: None },
+            DesktopState::NotOurs {
+                desktop: Some("Screen-saver".to_owned()),
+            },
+            DesktopState::Detached {
+                connect_state: "disconnected",
+            },
+            DesktopState::Remote {
+                protocol: "Remote Desktop",
+            },
+        ] {
+            let denied =
+                session_explained_error("create_window_capture_dc", access_denied(), true, || {
+                    state.clone()
+                });
+            assert_eq!(
+                denied.kind,
+                CaptureErrorKind::DesktopUnavailable,
+                "{state:?} should explain the refusal"
+            );
+            assert_eq!(denied.message, state.to_string());
+            assert_eq!(denied.operation, "create_window_capture_dc");
+        }
+    }
+
+    /// A refusal the session cannot account for stays exactly what it was.
+    ///
+    /// Window capture is refused for ordinary reasons all the time — a window owned by a
+    /// higher-integrity process is the reason the Windows Graphics Capture fallback exists — and
+    /// those refusals have to keep saying what they are. The caller's own `retryable` choice
+    /// survives with the rest of the error.
+    #[test]
+    fn an_interactive_session_leaves_a_refused_window_query_alone() {
+        for state in [
+            DesktopState::Interactive,
+            DesktopState::Unknown {
+                detail: "the input desktop could not be named".to_owned(),
+            },
+        ] {
+            let denied = session_explained_error(
+                "get_selected_window_bounds",
+                access_denied(),
+                false,
+                || state.clone(),
+            );
+            assert_eq!(
+                denied.kind,
+                CaptureErrorKind::NativeFailure,
+                "{state:?} does not explain a refusal and must not hide one"
+            );
+            assert_eq!(denied.message, access_denied().to_string());
+            assert_eq!(denied.native_code, Some(i64::from(HRESULT_ACCESS_DENIED)));
+            assert_eq!(denied.backend, WINDOW_CAPTURE_BACKEND);
+            assert_eq!(denied.operation, "get_selected_window_bounds");
+            assert!(!denied.retryable, "the call site's own choice, preserved");
+        }
+    }
+
+    /// The session probe costs four syscalls, and this mapper also serves the GDI scaling path. It
+    /// may only be paid on the one failure it can explain.
+    ///
+    /// `scale_window_thumbnail` and the DIB stretches behind it fail between two blocks of this
+    /// process's own memory. There is nothing for a session to say about one, and the counter here
+    /// is what proves it is never asked.
+    #[test]
+    fn only_a_refused_window_query_pays_for_the_session_probe() {
+        let probes = std::cell::Cell::new(0_u32);
+        let probe = || {
+            probes.set(probes.get() + 1);
+            DesktopState::Locked { desktop: None }
+        };
+        let out_of_memory = WindowsError::from(HRESULT(0x8007_000E_u32 as i32));
+        let failed =
+            session_explained_error("scale_window_thumbnail", out_of_memory.clone(), true, probe);
+        assert_eq!(probes.get(), 0, "a non-denial must not ask the session");
+        assert_eq!(failed.kind, CaptureErrorKind::NativeFailure);
+        assert_eq!(failed.message, out_of_memory.to_string());
+        assert_eq!(failed.native_code, Some(i64::from(0x8007_000E_u32 as i32)));
+
+        let denied =
+            session_explained_error("get_selected_window_bounds", access_denied(), true, || {
+                probes.set(probes.get() + 1);
+                DesktopState::Locked { desktop: None }
+            });
+        assert_eq!(probes.get(), 1, "a denial asks the session exactly once");
+        assert_eq!(denied.kind, CaptureErrorKind::DesktopUnavailable);
+    }
 
     #[test]
     fn native_window_bounds_are_normalized() {

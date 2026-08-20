@@ -3305,6 +3305,55 @@ mod tests {
         assert!(!requires_backend_recovery(&bare));
     }
 
+    /// The re-classified device refusal changes what the daemon does, on three separate paths.
+    ///
+    /// `create_d3d11_device` is the first call `DxgiBackend::new` makes, so a session that refuses
+    /// it decides whether the daemon starts, not just whether one capture succeeds. As a bare
+    /// `NativeFailure` it was:
+    ///
+    /// - at start-up, neither `waiting_for_desktop` nor recoverable, so the worker prologue sent it
+    ///   to `ready_sender` and the daemon exited — the resident tool that is simply gone when the
+    ///   user unlocks, which is the complaint issue #51 opens with;
+    /// - during a rebuild, paced by `recovery_delay`, which builds a fresh D3D11 device against a
+    ///   lock screen on an exponential back-off and warns once per attempt;
+    /// - never a `requires_backend_recovery` kind, which is right and stays right: no number of
+    ///   rebuilds makes a credential prompt hand back a device.
+    ///
+    /// As `DesktopUnavailable` the first two change and the third does not. The daemon keeps its
+    /// hotkeys and waits, and the wait is the two-syscall session probe on a flat poll instead of a
+    /// device build on a growing one.
+    #[test]
+    fn a_refused_capture_device_explained_by_the_session_waits_instead_of_exiting() {
+        let device_error = |kind| CaptureError {
+            kind,
+            backend: "dxgi",
+            operation: "create_d3d11_device",
+            message: "the workstation is locked".to_owned(),
+            retryable: true,
+            native_code: None,
+        };
+        let explained = device_error(CaptureErrorKind::DesktopUnavailable);
+        assert!(
+            waiting_for_desktop(&AppError::Capture(explained.clone())),
+            "the start-up prologue keeps the daemon alive only for errors this recognizes"
+        );
+        assert!(
+            !requires_backend_recovery(&explained),
+            "a lock is not a lost device; rebuilding cannot unlock it"
+        );
+
+        // What it used to be. A bare native failure belongs to no path: it is not a desktop wait,
+        // so start-up gives up on it, and it is not recoverable either.
+        let bare = device_error(CaptureErrorKind::NativeFailure);
+        assert!(!waiting_for_desktop(&AppError::Capture(bare.clone())));
+        assert!(!requires_backend_recovery(&bare));
+
+        // And the rebuild loop's pacing follows from the same flag, so the change is also the
+        // difference between polling a syscall and building a device until somebody comes back.
+        assert_eq!(BackendRecovery::delay(6, true), DESKTOP_POLL_INTERVAL);
+        assert!(BackendRecovery::delay(6, false) > DESKTOP_POLL_INTERVAL);
+    }
+
     #[test]
     fn waiting_for_a_desktop_paces_itself_against_a_person_rather_than_a_device() {
         // Rebuilding DXGI on the engine-recovery schedule would be ~1,800 device initializations
