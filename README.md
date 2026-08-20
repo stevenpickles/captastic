@@ -1,6 +1,21 @@
 # Captastic
 
-Captastic is a Windows-first Rust prototype for measuring extremely fast screenshot capture and providing a native selection-to-clipboard workflow.
+Captastic is a fast, native screenshot tool for Windows, written in Rust. It runs as a resident
+daemon behind configurable global hotkeys, opens a live overlay for full-display, window, or
+resizable-region selection, and publishes the result to the Windows clipboard, to a PNG file, or to
+both. It keeps a bounded history of recent captures, targets the display the user means across
+multi-monitor and mixed-DPI layouts, and installs, upgrades, and uninstalls for the current user from
+a portable archive that needs no administrator privileges, or from a Chocolatey package.
+Windows is the only supported platform: capture, overlay, hotkeys, and clipboard output are native
+Windows implementations rather than a portable abstraction, and other platforms are roadmap work
+rather than shipped code.
+
+The capture engine is what the rest is built to stay out of the way of. Disk, network, compression,
+and configuration work are kept off the path between the hotkey and the frame, and the daemon holds
+its capture resources warm so that pressing a hotkey does not initialize a device. Each stage —
+native frame, CPU readback, selection, clipboard, encoding, and file output — is reported separately
+rather than collapsed into one number, and every capture carries its own freshness and timing
+provenance.
 
 The DXGI backend supports two deliberately different modes. `latest` is the resident-daemon default: when a capture is triggered, it drains any immediately available desktop frame and otherwise reuses the last retained image, so the daemon performs no DXGI acquisition while idle. Only the first capture may wait briefly when no retained image exists yet. `fresh` waits for a desktop frame presented after the trigger and is intended for controlled latency experiments. Both modes report frame age/timing provenance, and BGRA8 CPU readback uses preallocated staging and CPU buffers. By default, the resident daemon opens a native live overlay before acquiring pixels. Its floating toolbar provides full-display, window, and resizable-region modes, an Options menu, and a Capture button. Region and full-display selection leave the desktop visible and changing until confirmation, then remove the overlay and request the output frame. Window mode uses DWM compositor relationships so animations and video keep updating in the chooser; clicking still performs a fresh isolated native window render. Results are published to the Windows clipboard as uncompressed DIBV5 images; straight-alpha window captures also include a registered PNG compatibility representation. Captures are marked so Windows keeps them out of the Win+V clipboard history and off the sync to the signed-in Microsoft account; `clipboard.allow_history` and `clipboard.allow_cloud_sync` opt back in.
 
@@ -75,7 +90,8 @@ Running Captastic without a subcommand starts the resident desktop capture daemo
 configuration. The explicit `daemon` form remains available for scripts, diagnostics, and CLI
 overrides. A named per-session control event prevents more than one daemon instance from running.
 While the daemon is active, Captastic places an icon in the Windows notification area. Double-click
-the icon to capture, or right-click it to capture, pause/resume the global hotkey, open
+the icon to capture, or right-click it to capture, open the most recent capture or show it in its
+folder (**Open Last Capture** and **Show in Folder**), pause/resume the global hotkey, open
 `captastic.toml`, open the persistent log, toggle **Start with Windows**, or exit cleanly. If Windows
 Explorer restarts, Captastic restores its notification icon automatically. Tray initialization
 failures are logged and do not disable the capture daemon.
@@ -113,6 +129,12 @@ Unblock-File .\captastic-<version>-windows-x86_64.zip
 
 If the archive was extracted before it was unblocked, run
 `Get-ChildItem -Recurse | Unblock-File` inside the extracted directory before launching the scripts.
+
+Current releases are not Authenticode-signed, so Windows marks the download and SmartScreen shows a
+*Windows protected your PC* prompt the first time the downloaded executable runs. See
+[Unsigned releases](docs/unsigned-releases.md) for why signing is sequenced later, what the prompts
+look like, and how to verify a download against its published SHA-256 checksum and `artifacts.json`
+hashes.
 
 The installer copies the CLI and console-free desktop launcher to
 `%LOCALAPPDATA%\Programs\Captastic`, creates a per-user Start Menu shortcut, and starts the tray
@@ -272,6 +294,25 @@ cargo run -p captastic-app -- daemon --backend dxgi --mode latest --cpu-frame tr
 
 Ctrl+C or `captastic stop` requests an orderly shutdown, stops admitting capture triggers, and gives the daemon three seconds to drain before overdue workers are detached. Windows close, logoff, and shutdown notifications request the same bounded teardown; the native handler waits up to four seconds for its completion signal, while a canceled shutdown query leaves the daemon running. Configuration recovery, persistence failures, clipboard failures, and Open Config errors detected during normal operation are reported through context-specific notification-area messages. The persistent log is authoritative for failures and timeouts detected during final teardown because the notification icon is being removed. `captastic status` reports whether the per-session daemon is running on Windows and reports `unsupported` on platforms without a native daemon. DXGI access/device loss drops the abandoned session before replacement construction and retries the same capture up to three times with bounded backoff. If those attempts fail, background reinitialization continues without acquiring another frame until the next capture.
 
+## Known limitations
+
+- **Multi-adapter virtual desktops are not composed.** `daemon.display = "virtual_desktop"` composes
+  every display only when all outputs share one DXGI adapter. A topology whose outputs span more
+  than one adapter returns an explicit structured unsupported-topology error rather than a partial
+  or silently substituted composite. Cross-adapter transfer, mixed-refresh freshness, and mixed
+  color behavior are unresolved design questions, not an implementation gap.
+- **HDR sources are captured as SDR.** Captastic asks the compositor for 8-bit BGRA and lets Windows
+  perform the conversion, so an HDR desktop is capturable and its screenshot matches what other
+  tools produce; Captastic implements no tone-mapping curve of its own. Preserving high dynamic
+  range end to end is deliberately not addressed and needs an output format that can carry it. See
+  [ADR 0006](docs/adr/0006-hdr-source-handling.md).
+- **Everything is scoped to one user session.** Installation, launch-at-login registration,
+  configuration, and the daemon control signal belong to the installing interactive user.
+  Deployment as `SYSTEM`, elevation with a different administrator account, and multi-user or
+  fast-user-switching migration are not supported; managed deployment tooling should stop Captastic
+  in each affected user session before modifying files. See
+  [Chocolatey packaging](docs/chocolatey.md).
+
 ## Performance implementation notes
 
 - Region-mode overlay startup does not enumerate application windows or construct the blurred chooser background; both are created only if Window is selected.
@@ -287,6 +328,7 @@ Ctrl+C or `captastic stop` requests an orderly shutdown, stops admitting capture
 
 For a smaller distributable binary without changing the profiled release build, use `cargo build --profile dist -p captastic-app`.
 
-See [ROADMAP.md](ROADMAP.md) for prioritized work after the Windows desktop milestone and
+See [ROADMAP.md](ROADMAP.md) for prioritized work after v0.1.0 — the remaining milestones, their
+status, and the release signing and distribution backlog — and
 [outputs/Captastic-Specification.md](outputs/Captastic-Specification.md) for the complete original
 implementation plan.
