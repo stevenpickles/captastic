@@ -224,6 +224,87 @@ The daemon treats the condition as a wait: it starts, registers hotkeys, reports
 
 `CAPTASTIC_TEST_NO_DISPLAYS_MS` reports no attached outputs for that many milliseconds from process start, so the wait-and-recover path can be exercised without detaching a display. Debug builds only; `scripts/verify-no-display-recovery.ps1` drives it.
 
+## GPU device loss
+
+Three error kinds send a capture back through a rebuild rather than out to the caller:
+`AccessLost`, `DeviceRemoved`, and `TopologyChanged` (`requires_backend_recovery`,
+`crates/captastic-app/src/daemon.rs:1912`). A capture that fails with one of them drops the backend,
+waits `recovery_delay` — 50 ms doubling to a 2 s ceiling — and rebuilds, up to three times inside
+the same capture (`capture_with_backend_recovery`, `daemon.rs:1922`). If those are spent, the
+capture fails and the daemon keeps rebuilding in the background on the same curve, with no ceiling,
+raising one notification-area outage notice on the third consecutive failure. A rebuild that fails
+because there is no desktop at all switches to the session/display poll instead, which is slower on
+purpose.
+
+DXGI only ever produces two of those three. `map_windows_error` (`dxgi.rs:2561`) turns
+`DXGI_ERROR_ACCESS_LOST` into `AccessLost` and both `DXGI_ERROR_DEVICE_REMOVED` and
+`DXGI_ERROR_DEVICE_RESET` into `DeviceRemoved`; everything else becomes a non-retryable
+`NativeFailure`, which is *not* rebuilt for. That matters because the removal *reason* behind a
+device-removed HRESULT is usually `DEVICE_HUNG` or `DRIVER_INTERNAL_ERROR`, neither of which the
+generic mapping recovers from — so reasons are routed through `device_removed_error`
+(`dxgi.rs:2588`) instead, which reports every non-success reason as `DeviceRemoved` and keeps the
+reason as the native code. `TopologyChanged` comes from the display-configuration generation and
+from a readback whose dimensions disagree with the display, not from an HRESULT.
+
+The daemon is idle between hotkeys, so a device lost while nothing is capturing is not noticed until
+the next trigger; the first capture after a loss is the one that pays for it.
+
+### Measuring it
+
+Two harnesses, because the two questions are different. Neither runs by default.
+
+`a_real_device_loss_routes_through_the_rebuild_path` (`crates/captastic-windows/src/dxgi.rs`,
+`#[ignore]`d) measures raw duplication: it captures on a loop, brackets every attempt with
+`GetDeviceRemovedReason`, and records which HRESULT arrived, at which `operation`, with which
+removal reason behind it, then rebuilds on the daemon's own curve and records whether and when
+duplication comes back. Samples are counted rather than timed, because a DXGI call against a
+restarting driver can block for seconds. It writes `%TEMP%\captastic-gpu-reset.log`.
+
+`scripts/measure-gpu-reset-recovery.ps1` measures the product: it runs the daemon self-triggering
+twice a second with the clipboard and selection off, and reads its log for the recovery lines. This
+is the one that answers whether the daemon's classification actually routes a real loss to the
+rebuild path, because those lines are only written from that path.
+
+### Triggers, and what each costs
+
+Do not assume they are equivalent — which HRESULT each produces is exactly what has never been
+measured here.
+
+**Ctrl+Win+Shift+B** restarts the display driver stack. The screen blanks for a second or two with
+a beep. Needs no elevation and no shell. Cheapest of the three and the one to run first. Whether
+`SendInput` can inject it is unverified: it is a win32k chord rather than a `RegisterHotKey`
+binding, and injected input carries `LLKHF_INJECTED`, so the harness waits for a human hand unless
+`CAPTASTIC_GPU_RESET_SENDINPUT=1` says otherwise.
+
+**Disabling and re-enabling the display adapter** is the heavy one, and on a hybrid laptop the
+choice of adapter decides whether it is a measurement or an outage. Find the adapter that actually
+owns the outputs — duplication builds its D3D11 device on the adapter of the selected output
+(`dxgi.rs:202`), so an adapter with no display children is not the one under test:
+
+```powershell
+Get-PnpDevice -Class Display | Select-Object Status, FriendlyName, InstanceId
+(Get-PnpDeviceProperty -InstanceId '<adapter instance id>' -KeyName 'DEVPKEY_Device_Children').Data
+```
+
+On the development host that is the Intel Arc iGPU; the RTX 4060 has no display children at all,
+so disabling it would prove nothing. Disabling the one with the monitors on it takes every display
+down to the basic display driver, and the shell that has to re-enable it is a shell nobody can
+see — so both commands belong in one elevated invocation with the sleep between them, never typed
+one at a time:
+
+```powershell
+# ELEVATED. The screen goes black for the duration of the sleep.
+pnputil /disable-device "<adapter instance id>"; Start-Sleep -Seconds 10; pnputil /enable-device "<adapter instance id>"
+```
+
+**A TDR** cannot be caused without either a deliberate hang shader or a registry change to
+`HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers` (`TdrLevel`, `TdrDelay`) and a reboot. The
+first is a GPU workload written to hang, which is a new artifact to build and maintain for one
+measurement; the second changes global recovery behaviour on a machine somebody works on. Neither
+is worth it while the other two triggers are available, and a TDR's observable result — device
+removed with a `DEVICE_HUNG` reason — is already covered by
+`every_device_removal_reason_triggers_recovery`.
+
 ## Safety invariants
 
 - COM initialization is balanced on the creating thread.
