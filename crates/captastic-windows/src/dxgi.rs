@@ -106,17 +106,32 @@ pub(crate) fn no_desktop_to_capture(operation: &'static str) -> CaptureError {
 /// self-evidently "nothing to capture"; a denial is only a session problem if the session says so,
 /// and swallowing an unexplained denial would hide a real fault behind a comfortable message.
 pub(crate) fn desktop_obstacle(operation: &'static str) -> Option<CaptureError> {
-    let state = crate::session::desktop_state();
+    session_obstacle("dxgi", operation, &crate::session::desktop_state())
+}
+
+/// The decision inside [`desktop_obstacle`], with the syscalls lifted out.
+///
+/// Separated for the same reason `session::classify` is: the interesting cases are a locked
+/// workstation and a credential prompt, and reproducing either on a test runner means locking the
+/// test runner. It also carries the backend name, because the denial this explains does not always
+/// come from DXGI — the `pointer` policy's cursor query is refused by the same lock and reports
+/// itself as `windows`, and rewriting that to `dxgi` would move the operation a reader greps for.
+pub(crate) fn session_obstacle(
+    backend: &'static str,
+    operation: &'static str,
+    state: &crate::session::DesktopState,
+) -> Option<CaptureError> {
     if !state.is_temporary() {
         return None;
     }
-    Some(capture_error(
-        CaptureErrorKind::DesktopUnavailable,
+    Some(CaptureError {
+        kind: CaptureErrorKind::DesktopUnavailable,
+        backend,
         operation,
-        format!("{state}"),
-        true,
-        None,
-    ))
+        message: format!("{state}"),
+        retryable: true,
+        native_code: None,
+    })
 }
 
 pub(crate) fn enumerate_display_adapters() -> Result<Vec<(DisplayInfo, i64)>, CaptureError> {

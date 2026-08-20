@@ -3273,6 +3273,38 @@ mod tests {
         )));
     }
 
+    /// The re-classified cursor denial has to land on the locked-session path, not a new one.
+    ///
+    /// Measured 2026-08-20, 1.2 s into a real lock: the `pointer` policy's cursor query was denied
+    /// and reported `PermissionDenied in windows/get_physical_cursor_position`, which the daemon
+    /// reads as neither a lock nor a broken engine — a failed capture with no explanation on it.
+    /// Re-classified as `DesktopUnavailable` it joins the answers a lock already produces: the
+    /// session wait recognizes it, and it still does not rebuild the capture engine, because
+    /// rebuilding DXGI cannot make a credential prompt hand back the cursor.
+    #[test]
+    fn a_cursor_denial_explained_by_the_session_joins_the_other_locked_session_failures() {
+        let cursor_error = |kind| CaptureError {
+            kind,
+            backend: "windows",
+            operation: "get_physical_cursor_position",
+            message: "the workstation is locked".to_owned(),
+            retryable: true,
+            native_code: None,
+        };
+        let explained = cursor_error(CaptureErrorKind::DesktopUnavailable);
+        assert!(waiting_for_desktop(&AppError::Capture(explained.clone())));
+        assert!(
+            !requires_backend_recovery(&explained),
+            "a locked cursor is not a lost device, and three rebuilds would not unlock it"
+        );
+
+        // What it used to be, kept here as the thing that changed: a bare denial belongs to no
+        // path at all, which is exactly why the log line said nothing about the lock.
+        let bare = cursor_error(CaptureErrorKind::PermissionDenied);
+        assert!(!waiting_for_desktop(&AppError::Capture(bare.clone())));
+        assert!(!requires_backend_recovery(&bare));
+    }
+
     #[test]
     fn waiting_for_a_desktop_paces_itself_against_a_person_rather_than_a_device() {
         // Rebuilding DXGI on the engine-recovery schedule would be ~1,800 device initializations

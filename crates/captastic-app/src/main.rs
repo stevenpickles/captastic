@@ -1148,8 +1148,9 @@ fn resolve_capture_source(
 /// display. The choice is logged rather than made silently, because the resulting capture is of a
 /// display the user did not point at.
 ///
-/// Every other failure still fails: a denied cursor query is a permissions problem the user needs
-/// to see, not a reason to quietly photograph a different screen.
+/// Every other failure still fails: a denied cursor query — whether it is a genuine permissions
+/// problem or the lock that explains one — is something the user needs to see, not a reason to
+/// quietly photograph a different screen.
 #[cfg(windows)]
 fn pointer_source_or_primary(
     resolved: Result<DisplayId, captastic_core::CaptureError>,
@@ -1460,11 +1461,16 @@ mod tests {
 
     /// The fallback is for one condition only. A cursor query that was denied is a permissions
     /// problem the user has to see; quietly photographing a different screen would hide it.
+    ///
+    /// `DesktopUnavailable` is the same denial once the session has explained it, and it must not
+    /// be swallowed either — there is nothing on the primary display to photograph while the
+    /// workstation is locked, and the message naming the lock is the only useful part of it.
     #[cfg(windows)]
     #[test]
     fn other_pointer_failures_are_not_swallowed_by_the_fallback() {
         for kind in [
             captastic_core::CaptureErrorKind::PermissionDenied,
+            captastic_core::CaptureErrorKind::DesktopUnavailable,
             captastic_core::CaptureErrorKind::NativeFailure,
         ] {
             let resolved = pointer_source_or_primary(Err(pointer_error(kind)));

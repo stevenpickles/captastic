@@ -480,21 +480,64 @@ fn copy_frame_into(
     Ok(())
 }
 
-/// Resolves the pointer once. This function does not poll or retain any input hooks.
-pub fn display_containing_pointer(displays: &[DisplayInfo]) -> Result<DisplayId, CaptureError> {
-    let mut point = POINT::default();
-    // SAFETY: point is valid writable storage for the duration of this one-shot query.
-    unsafe { GetPhysicalCursorPos(&mut point) }.map_err(|error| CaptureError {
-        kind: if error.code().0 == 0x8007_0005_u32 as i32 {
+/// The HRESULT a cursor query refused by a secure desktop comes back with.
+const HRESULT_ACCESS_DENIED: i32 = 0x8007_0005_u32 as i32;
+
+/// The operation name a denied cursor query is reported under, in the log and in these tests.
+const CURSOR_QUERY: &str = "get_physical_cursor_position";
+
+/// Explains a failed cursor query, asking the session about it only when it was denied.
+///
+/// A lock refuses this call while the credential prompt owns input, and until 2026-08-20 the
+/// refusal arrived as a bare `PermissionDenied in windows/get_physical_cursor_position: Access is
+/// denied.` — measured twice, 1.2 s after a real lock, under the `pointer` display policy. That is
+/// the permissions-shaped lie issue #51 exists to prevent, on a path #51 never covered:
+/// `duplicate_output` has asked the session about its denials since #51 and this had not.
+///
+/// The session is asked **only** on a denial, and only after the call has already failed. Every
+/// capture under the `pointer` policy runs this query, so the four syscalls behind
+/// [`crate::session::desktop_state`] must not be on the path a working cursor takes; the probe is
+/// taken as a closure so a successful query, and a failure that is not a denial, never call it.
+///
+/// A denial the session cannot explain keeps its original kind, message and native code. Swallowing
+/// a real access failure behind a comfortable message about a lock would be the same defect pointing
+/// the other way.
+fn cursor_query_error(
+    code: i32,
+    message: String,
+    probe_session: impl FnOnce() -> crate::session::DesktopState,
+) -> CaptureError {
+    if code == HRESULT_ACCESS_DENIED {
+        if let Some(obstacle) =
+            crate::dxgi::session_obstacle("windows", CURSOR_QUERY, &probe_session())
+        {
+            return obstacle;
+        }
+    }
+    CaptureError {
+        kind: if code == HRESULT_ACCESS_DENIED {
             CaptureErrorKind::PermissionDenied
         } else {
             CaptureErrorKind::NativeFailure
         },
         backend: "windows",
-        operation: "get_physical_cursor_position",
-        message: error.to_string(),
+        operation: CURSOR_QUERY,
+        message,
         retryable: true,
-        native_code: Some(i64::from(error.code().0)),
+        native_code: Some(i64::from(code)),
+    }
+}
+
+/// Resolves the pointer once. This function does not poll or retain any input hooks.
+pub fn display_containing_pointer(displays: &[DisplayInfo]) -> Result<DisplayId, CaptureError> {
+    let mut point = POINT::default();
+    // SAFETY: point is valid writable storage for the duration of this one-shot query.
+    unsafe { GetPhysicalCursorPos(&mut point) }.map_err(|error| {
+        cursor_query_error(
+            error.code().0,
+            error.to_string(),
+            crate::session::desktop_state,
+        )
     })?;
     display_containing_point(displays, point.x, point.y)
         .map(|display| display.id.clone())
@@ -1173,5 +1216,135 @@ mod tests {
         .unwrap_err();
         assert_eq!(oversized.kind, CaptureErrorKind::Unsupported);
         assert!(oversized.message.contains("bounded 512 MiB"));
+    }
+
+    /// The message a real lock produced, and what the fix has to turn it into.
+    ///
+    /// Measured 2026-08-20 17:17:02.8Z, 1.2 s after `LockWorkStation`, twice: `PermissionDenied in
+    /// windows/get_physical_cursor_position: Access is denied. (0x80070005)`. The credential prompt
+    /// owned input and refused the `pointer` policy's cursor query, and the reported error named a
+    /// permissions problem the user did not have — the same bare denial issue #51 was filed about,
+    /// on the one path #51 never covered.
+    #[test]
+    fn a_locked_session_explains_a_denied_cursor_query() {
+        let denied = cursor_query_error(
+            HRESULT_ACCESS_DENIED,
+            "Access is denied. (0x80070005)".to_owned(),
+            || crate::session::DesktopState::Locked {
+                desktop: Some("Winlogon".to_owned()),
+            },
+        );
+        assert_eq!(denied.kind, CaptureErrorKind::DesktopUnavailable);
+        assert!(
+            denied.message.contains("locked"),
+            "the whole point is that the message says so: {denied}"
+        );
+        assert!(denied.message.contains("Winlogon"), "{denied}");
+        // The operation a log reader greps for is unchanged; only the explanation is new.
+        assert_eq!(denied.backend, "windows");
+        assert_eq!(denied.operation, CURSOR_QUERY);
+        assert!(denied.retryable);
+    }
+
+    /// Every other temporary session state explains it too, because every one of them refuses.
+    ///
+    /// A disconnected RDP session, a UAC prompt and a screensaver deny this call for reasons that
+    /// are no more a permissions problem than a lock is, and they clear the same way.
+    #[test]
+    fn any_session_that_owns_no_desktop_explains_a_denied_cursor_query() {
+        for state in [
+            crate::session::DesktopState::Locked { desktop: None },
+            crate::session::DesktopState::NotOurs {
+                desktop: Some("Winlogon".to_owned()),
+            },
+            crate::session::DesktopState::Detached {
+                connect_state: "disconnected",
+            },
+            crate::session::DesktopState::Remote {
+                protocol: "Remote Desktop",
+            },
+        ] {
+            let denied = cursor_query_error(
+                HRESULT_ACCESS_DENIED,
+                "Access is denied. (0x80070005)".to_owned(),
+                || state.clone(),
+            );
+            assert_eq!(
+                denied.kind,
+                CaptureErrorKind::DesktopUnavailable,
+                "{state:?} should explain the denial"
+            );
+            assert_eq!(denied.message, state.to_string());
+        }
+    }
+
+    /// A denial the session cannot account for stays exactly what it was.
+    ///
+    /// This is the half that makes the fix safe to make. If an unlocked, attached, console session
+    /// is denied the cursor, something really is wrong with this process's rights, and reporting a
+    /// lock instead would trade one misleading message for another. `Unknown` counts as "cannot
+    /// account for it": a probe that failed answered nothing, and nothing is not "locked".
+    #[test]
+    fn an_unlocked_session_leaves_a_denied_cursor_query_alone() {
+        for state in [
+            crate::session::DesktopState::Interactive,
+            crate::session::DesktopState::Unknown {
+                detail: "the input desktop could not be named".to_owned(),
+            },
+        ] {
+            let denied = cursor_query_error(
+                HRESULT_ACCESS_DENIED,
+                "Access is denied. (0x80070005)".to_owned(),
+                || state.clone(),
+            );
+            assert_eq!(
+                denied.kind,
+                CaptureErrorKind::PermissionDenied,
+                "{state:?} does not explain a denial and must not hide one"
+            );
+            assert_eq!(denied.message, "Access is denied. (0x80070005)");
+            assert_eq!(denied.native_code, Some(i64::from(HRESULT_ACCESS_DENIED)));
+            assert_eq!(denied.backend, "windows");
+            assert_eq!(denied.operation, CURSOR_QUERY);
+        }
+    }
+
+    /// The session probe costs four syscalls, and the `pointer` policy runs this query every
+    /// capture. It may only be paid on the failure it can explain.
+    ///
+    /// `duplicate_output` set that discipline — it asks the session inside `map_err` and nowhere
+    /// else. Here the probe is a closure precisely so the cheap paths can be shown never to call
+    /// it: a successful query does not reach this function at all, and a failure that is not
+    /// `E_ACCESSDENIED` has nothing for the session to say about it.
+    #[test]
+    fn only_a_denied_cursor_query_pays_for_the_session_probe() {
+        let probes = std::cell::Cell::new(0_u32);
+        let probe = || {
+            probes.set(probes.get() + 1);
+            crate::session::DesktopState::Locked { desktop: None }
+        };
+        let failed = cursor_query_error(
+            0x8007_001f_u32 as i32,
+            "A device attached to the system is not functioning.".to_owned(),
+            probe,
+        );
+        assert_eq!(probes.get(), 0, "a non-denial must not ask the session");
+        assert_eq!(failed.kind, CaptureErrorKind::NativeFailure);
+        assert_eq!(
+            failed.message,
+            "A device attached to the system is not functioning."
+        );
+        assert_eq!(failed.native_code, Some(i64::from(0x8007_001f_u32 as i32)));
+
+        let denied = cursor_query_error(
+            HRESULT_ACCESS_DENIED,
+            "Access is denied.".to_owned(),
+            || {
+                probes.set(probes.get() + 1);
+                crate::session::DesktopState::Locked { desktop: None }
+            },
+        );
+        assert_eq!(probes.get(), 1, "a denial asks the session exactly once");
+        assert_eq!(denied.kind, CaptureErrorKind::DesktopUnavailable);
     }
 }
