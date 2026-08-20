@@ -46,49 +46,60 @@ if (-not (Test-Path $exe)) {
 }
 
 # The installed daemon owns the hotkeys and would compete for them. Stopped for the run and put
-# back afterwards, exactly as verify-no-display-recovery.ps1 does.
-$userDaemon = Get-Process captastic -ErrorAction SilentlyContinue
-if ($userDaemon) {
-    & $UserExe stop 2>&1 | Out-Null
-    Start-Sleep -Seconds 2
+# back afterwards, exactly as verify-no-display-recovery.ps1 does. Everything from here to the
+# `finally` runs with the user's daemon down, so it runs inside a try: this script causes a device
+# loss on purpose, and a throw anywhere in that window - a rebuild that never comes back, a DXGI
+# call that outlives the budget - must not be the reason the user's daemon stays down afterwards.
+$userWasRunning = [bool] (Get-Process captastic -ErrorAction SilentlyContinue)
+$process = $null
+try {
+    if ($userWasRunning) {
+        & $UserExe stop 2>&1 | Out-Null
+        Start-Sleep -Seconds 2
+    }
+
+    # Clipboard and selection off: this is about the capture engine's lifecycle, and a soak that
+    # quietly replaces the user's clipboard is how their clipboard got destroyed twice before.
+    $daemonArgs = @(
+        '--log-file', $log, '--log-level', 'debug', '--log-format', 'compact',
+        'daemon', '--backend', 'dxgi', '--mode', 'latest', '--cpu-frame', 'true',
+        '--clipboard', 'false', '--selection', 'false',
+        '--self-trigger', '--self-trigger-interval-ms', "$IntervalMs", '--max-captures', "$Captures"
+    )
+    $process = Start-Process -FilePath $exe -ArgumentList $daemonArgs -RedirectStandardOutput $out `
+        -RedirectStandardError $err -PassThru -WindowStyle Hidden
+
+    Start-Sleep -Seconds $TriggerAfterSeconds
+    ''
+    '>>> The daemon is capturing. Cause the device loss NOW, then leave the machine alone.'
+    '>>>   driver restart:  press Ctrl+Win+Shift+B'
+    '>>>   adapter cycle:   see docs/windows-backend.md; needs an elevated shell that survives a black screen'
+    ''
+
+    # Bounded by the run's own length plus slack for a device loss that makes every DXGI call slow.
+    $budget = [int](($Captures * $IntervalMs) / 1000) + 120
+    $deadline = (Get-Date).AddSeconds($budget)
+    while (-not $process.HasExited -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 1 }
+    if (-not $process.HasExited) {
+        & $exe stop 2>&1 | Out-Null
+        Start-Sleep -Seconds 5
+        if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
+    }
+} finally {
+    if ($process -and -not $process.HasExited) { Stop-Process -Id $process.Id -Force }
+    if ($userWasRunning) {
+        Start-Process -FilePath $UserExe -WindowStyle Hidden
+        Start-Sleep -Seconds 4
+        $back = Get-Process captastic -ErrorAction SilentlyContinue
+        "user's daemon: " + $(if ($back) { "restarted (pid $($back.Id))" } else { 'NOT RUNNING - restart it by hand' })
+    } else {
+        # Said out loud, because the previous wording printed a bare "NOT RUNNING" here and the
+        # reader could not tell it apart from a restart that failed.
+        "user's daemon: was not running before the run; nothing to restore"
+    }
 }
-
-# Clipboard and selection off: this is about the capture engine's lifecycle, and a soak that
-# quietly replaces the user's clipboard is how their clipboard got destroyed twice before.
-$daemonArgs = @(
-    '--log-file', $log, '--log-level', 'debug', '--log-format', 'compact',
-    'daemon', '--backend', 'dxgi', '--mode', 'latest', '--cpu-frame', 'true',
-    '--clipboard', 'false', '--selection', 'false',
-    '--self-trigger', '--self-trigger-interval-ms', "$IntervalMs", '--max-captures', "$Captures"
-)
-$process = Start-Process -FilePath $exe -ArgumentList $daemonArgs -RedirectStandardOutput $out `
-    -RedirectStandardError $err -PassThru -WindowStyle Hidden
-
-Start-Sleep -Seconds $TriggerAfterSeconds
-''
-'>>> The daemon is capturing. Cause the device loss NOW, then leave the machine alone.'
-'>>>   driver restart:  press Ctrl+Win+Shift+B'
-'>>>   adapter cycle:   see docs/windows-backend.md; needs an elevated shell that survives a black screen'
-''
-
-# Bounded by the run's own length plus slack for a device loss that makes every DXGI call slow.
-$budget = [int](($Captures * $IntervalMs) / 1000) + 120
-$deadline = (Get-Date).AddSeconds($budget)
-while (-not $process.HasExited -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 1 }
-if (-not $process.HasExited) {
-    & $exe stop 2>&1 | Out-Null
-    Start-Sleep -Seconds 5
-    if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
-}
-
-if ($userDaemon) {
-    Start-Process -FilePath $UserExe -WindowStyle Hidden
-    Start-Sleep -Seconds 4
-}
-$back = Get-Process captastic -ErrorAction SilentlyContinue
 
 "exit code: $($process.ExitCode)"
-"user's daemon: " + $(if ($back) { "running (pid $($back.Id))" } else { 'NOT RUNNING' })
 "log: $log"
 ''
 '--- recovery seam ---'
