@@ -444,6 +444,13 @@ foreach ($name in $patterns.Keys) {
     $tally[$name] = @{ preLock = 0; locked = 0; postUnlock = 0; unjudged = 0; total = 0 }
 }
 $notable = New-Object System.Collections.Generic.List[string]
+# Every line in which a rebuild was refused, whichever of the two paths refused it. The daemon has
+# two, and only one of them is reachable during a lock: once the wait is set, `capture_source_wait`
+# answers `Session` and the loop stops calling `create_backend` at all, so the line that reports a
+# *failed rebuild* is the one a lock produces and the line that reports a *skipped* one never
+# appears. An earlier version of this script asserted on the unreachable one and failed a run that
+# had in fact explained itself perfectly.
+$refusalLines = New-Object System.Collections.Generic.List[string]
 $failureKinds = @{}
 $heartbeatWalks = New-Object System.Collections.Generic.List[object]
 $recoveredAtUtc = $null
@@ -486,8 +493,8 @@ foreach ($line in (Get-Content -Path $log)) {
                     }
                 }
                 'LostEngine' { $lastLostEngineUtc = $at; $notable.Add($line) }
-                'ReinitFailed' { $notable.Add($line) }
-                'StillWaiting' { $notable.Add($line) }
+                'ReinitFailed' { $notable.Add($line); $refusalLines.Add($line) }
+                'StillWaiting' { $notable.Add($line); $refusalLines.Add($line) }
                 'Recovered' {
                     $recoveredAtUtc = $at
                     $notable.Add($line)
@@ -575,8 +582,11 @@ Add-Verdict 'daemon survived the lock' ($daemonAliveAtUnlock -and -not $gaveUp) 
 Add-Verdict 'the lock was measured' ($measuredWhileLocked -gt 0) `
     ("$measuredWhileLocked capture(s) were refused or dropped while the lock flag agreed either side, alongside $($tally['Timeout']['locked']) timeout(s). " +
      'It is the display power-down rather than the lock that ends duplication, so zero refusals with a healthy run of timeouts is a lock whose monitors stayed awake - or a held duplication that never noticed they had not, which is a finding rather than a harness fault. Zero of both is a run that measured nothing at all')
-Add-Verdict 'the refusal was explained' ($tally['StillWaiting']['total'] -gt 0) `
-    "$($tally['StillWaiting']['total']) line(s) classified the refused rebuild as a missing desktop rather than a broken engine"
+$explained = @($refusalLines | Where-Object { $_ -match 'DesktopUnavailable' })
+$namedTheLock = @($refusalLines | Where-Object { $_ -match 'locked' })
+Add-Verdict 'the refusal was explained' `
+    (($refusalLines.Count -gt 0) -and ($explained.Count -eq $refusalLines.Count) -and ($namedTheLock.Count -gt 0)) `
+    "$($refusalLines.Count) refused rebuild(s), $($explained.Count) classified DesktopUnavailable and $($namedTheLock.Count) naming the lock. A refusal that arrives as anything else is the bare Access is denied issue #51 exists to prevent"
 Add-Verdict 'no adapter walk while locked' (($lockedHeartbeats.Count -gt 0) -and ($walkedWhileLocked.Count -eq 0)) `
     "$($lockedHeartbeats.Count) heartbeat(s) inside the lock, $($walkedWhileLocked.Count) of which had walked the adapter list. Zero heartbeats means the lock was too short to have measured this"
 Add-Verdict 'the engine came back' (($null -ne $recoveredAtUtc) -and ($null -ne $unlockedAtUtc) -and ($recoveredAtUtc -ge $unlockedAtUtc)) `
