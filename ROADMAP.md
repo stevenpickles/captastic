@@ -2,11 +2,15 @@
 
 Captastic now has a fast Windows-native DXGI capture engine, clipboard output, region and window
 selection, persistent UI state, a notification-area desktop experience, current-user installation,
-and release packaging. The next work should make Captastic more useful on real workstations while
-preserving the low-latency, native design.
+and release packaging. The immediate work is the first formal release, v0.1.0; after it, the work
+should make Captastic more useful on real workstations while preserving the low-latency, native
+design.
 
-This roadmap is ordered by user impact and architectural dependency. Authenticode signing remains
-important for a future public release, but it does not gate the capture milestones below.
+This roadmap is ordered by user impact and architectural dependency, with release readiness placed
+first because it is the only time-bound section. Closed investigations have moved to
+[docs/investigations.md](docs/investigations.md) so this file carries planning signal rather than
+narrative; every fact they recorded survives there. Authenticode signing remains important for a
+public release, but it gates neither v0.1.0 nor the capture milestones below.
 
 ## Product principles
 
@@ -36,6 +40,72 @@ important for a future public release, but it does not gate the capture mileston
 - Live selection previews (`selection.preview = auto|live|frozen`) with confirmation-anchored
   capture, per-pixel-alpha live overlays, and a DWM-thumbnail window chooser with static fallback
   surfaces (ADR 0004, PR #14).
+
+## Release readiness — v0.1.0
+
+**Status:** In progress on `feature/release-readiness`. v0.1.0 is a deliberately unsigned first
+tag whose purpose is to exercise the release mechanics end to end and to describe honestly what
+Captastic is and is not. It is not gated on the capture milestones below, and it makes no
+performance claim.
+
+### Gates — before the tag
+
+- **Unsigned-release documentation and README repositioning.** Landing alongside this refresh as
+  `docs/unsigned-releases.md`, which states what an unsigned release means for the person
+  installing it and how a download is verified against the published SHA-256, and as a README that
+  positions Captastic for a first release rather than for a development audience. Nothing is
+  advertised that signing would be needed to claim.
+- **A release-notes draft (`docs/release-notes-v0.1.0.md`) that publishes no absolute performance
+  numbers.** The decision, recorded here rather than left implicit: Milestone 5's exit criterion
+  *"Three compatible repeat runs support every published performance claim"* is **deferred past
+  v0.1.0**, and is satisfied vacuously at v0.1.0 by publishing no absolute claims at all — with no
+  published number there is nothing for repeat runs to support. The criterion binds again the
+  moment an absolute figure is published, and publishing one waits on the repeat-run and
+  environment-fingerprint automation Milestone 5 still lists as outstanding, and on the absolute
+  budgets deliberately left unset until measured on the documented benchmark host. Release notes
+  may describe the design and its latency boundaries; they may not quote a millisecond.
+- **Release mechanics never yet exercised live.** Four of them, in the order they occur:
+  - The **tag-triggered path of the release workflow**. The one successful workflow run was a
+    `workflow_dispatch`, which takes the CI-prerelease branch (`-PrereleaseLabel ci.…`). The
+    `-ReleaseTag` branch of `scripts/build-packages.ps1` has never run: it additionally proves the
+    matching tag points at `HEAD`, the source is clean, the Cargo version matches, and both
+    executables embed the exact formal version, and only then marks the manifest publishable and
+    records a direct tagged-release URL in `VERIFICATION.txt`. Every one of those proofs is
+    untested against a real tag.
+  - The **disposable-VM checklist** in [docs/chocolatey.md](docs/chocolatey.md): Start Menu entry
+    launches the tray application, the global hotkey captures, an upgrade stops a running daemon
+    cleanly, and `~/.captastic` survives uninstall. Hosted CI covers silent install, shims,
+    shortcut, upgrade and uninstall cleanup, but has no interactive desktop, so this cannot be
+    delegated to it.
+  - The **manual `choco push`**, only after the tagged GitHub release exists, its direct download
+    URLs work, and its manifest hashes match. A first submission also has to pass Chocolatey
+    community validation and moderation before `choco install captastic` works against the default
+    source, so it is not finished when the push returns.
+  - The **immediate post-tag workspace version bump**, so subsequent `dev` and `ci` identifiers are
+    prereleases of the next release rather than of the one just published.
+
+### Operator-run verification — recommended before the tag, formally deferrable
+
+These need a human at the machine, and they are the recovery paths that shipped with the least live
+verification. Recommended before the tag; deferrable past it only if the release notes disclose
+that they are unverified.
+
+- Live **sleep/wake** recovery.
+- Live **Remote Desktop** recovery.
+- The **`DEVICE_REMOVED`/`DEVICE_RESET` limb** of GPU-reset recovery, via the elevated adapter
+  cycle. Its `AccessLost` limb is already measured against a real driver restart.
+
+### Explicitly not gating
+
+- **Multi-adapter composition** (Milestone 1) — hardware-gated, and the structured unsupported
+  error is an honest answer rather than a silent wrong one.
+- **HDR verification on a real HDR display** — hardware; the sinks already refuse what they cannot
+  describe.
+- **Authenticode signing** — deliberately sequenced after a stable release channel exists, which is
+  what v0.1.0 creates.
+- **Milestone 3's follow-ups** (retained sessions, the backend trait, richer metrics) — internal
+  quality, no user-visible contract.
+- **Milestones 6 and 7** — post-release by the existing decision gate.
 
 ## Milestone 1 — Multi-monitor and topology support
 
@@ -222,32 +292,26 @@ misinterpreting their bytes — so the exit criterion that HDR input is never si
 already met for the destinations, and the remaining work is detecting HDR sources and deciding what
 tone mapping should do. `FakeBackend` honours the freshness contract the recovery tests depend on.
 
-The first exit criterion to plan around is the soak. It is the one that needs a machine left alone
-for a long time rather than a design decision, and the detach ledger is what makes its result
-readable.
+The soak criteria are met on both backends, and the detach ledger is what made their results
+readable. What is left to plan around is evidence rather than resilience: the sequence-marker
+workload, and the environment-fingerprint and repeat-run automation that the deferred
+published-claim criterion waits on. The live lifecycle verifications that remain — sleep/wake,
+Remote Desktop, and the `DEVICE_REMOVED`/`DEVICE_RESET` limb of GPU reset — are listed under
+[Release readiness](#release-readiness--v010) because they are recommended before the tag.
 
 **Outcome:** Captastic handles the remaining pixel formats and Windows lifecycle transitions with
 explicit, tested behavior.
 
 - ~~Add optional cursor composition, including DXGI pointer shapes, hotspots, visibility, clipping,
   and WGC-equivalent semantics.~~ **Done, after finding it had never once worked.** Two independent
-  bugs sat between the request and the implementation. `DxgiBackend::capture` still rejected
-  `CursorMode::Include` with a guard left over from the native-frame milestone, so every capture
-  that asked for a pointer failed outright while the implementation waited behind it. With the gate
-  open, composition still drew nothing: DXGI reports the pointer *incrementally and per
-  acquisition*, filling in position and shape only on a frame that carries a mouse update and
-  leaving the fields at their defaults otherwise — defaults that read as an invisible pointer at the
-  origin. So a stationary pointer over a repainting desktop reported not-visible on every frame, and
-  a report that arrived on a frame later discarded was gone for good. Every acquisition now feeds
-  the pointer cache before anything decides whether to keep the frame, and
+  bugs sat between the request and the implementation: a guard left over from the native-frame
+  milestone that rejected `CursorMode::Include` outright, and DXGI's incremental per-acquisition
+  pointer reporting, whose unfilled defaults read as an invisible pointer at the origin. Every
+  acquisition now feeds the pointer cache before anything decides whether to keep the frame, and
   `CursorAbsence::PositionNotYetKnown` separates "has not been told" from "has been told it is
-  hidden".
-
-  Rotation is settled, and the answer was that there is nothing to do. Both halves of the pointer
-  report arrive in the upright desktop space the normalized frame already uses — position exact
-  against `GetCursorPos` at 0°, 90°, 180° and 270°, shape delivered as the upright cursor rather
-  than one turned to match the panel — so `RotatedDisplayUnverified` was refusing work that already
-  worked, and is gone.
+  hidden"; rotation turned out to need no work at all, so `RotatedDisplayUnverified` is gone. Full
+  narrative:
+  [docs/investigations.md](docs/investigations.md#cursor-composition-and-the-two-bugs-behind-it).
 - Complete rotation coverage discovered during the multi-monitor milestone.
 - ~~Detect HDR/scRGB sources and implement a documented SDR clipboard/file tone-mapping policy.~~
   **Done** (ADR 0006): the compositor is asked for 8-bit BGRA and performs the conversion, so an HDR
@@ -269,30 +333,21 @@ explicit, tested behavior.
   preserved end to end. That needs the pixels, not the tag (ADR 0006).
 - Add recovery tests for display hot-plugging, sleep/wake, lock/unlock, GPU reset, Remote Desktop, and
   rapid session changes. Hot-plug, unplug and primary-promotion are covered deterministically
-  through the daemon's rebuild seam; the no-source path is covered end to end (#56). Lock/unlock
-  diagnosis is covered by a live harness (`a_locked_session_explains_every_duplication_failure` in
+  through the daemon's rebuild seam; the no-source path is covered end to end (#56).
+  **Lock/unlock is closed at both ends:** diagnosis by a live harness
+  (`a_locked_session_explains_every_duplication_failure` in
   `crates/captastic-windows/src/session.rs`, `#[ignore]`d because it locks the machine for ~8 minutes
-  and cannot unlock itself). Recovery through lock → displays asleep → unlock is now measured too
-  (`scripts/measure-lock-unlock-recovery.ps1`): across a 229 s lock the daemon lost its duplication
-  to `AccessLost`, had the rebuild refused as `DesktopUnavailable ... the workstation is locked`,
-  waited on the session probe for 402 polls over 207 s **without walking the adapter list once**,
-  and rebuilt 0.6 s after the unlock with 59 successful captures after it and no intervention. The
-  same run found one loose end it did not close: a locked-session
-  `get_physical_cursor_position` denial arrived as a bare `PermissionDenied`, unexplained. That
-  denial now goes through the same session check `duplicate_output` uses and comes out as
-  `DesktopUnavailable` naming the lock, keeping the original error whenever the session cannot
-  account for it — covered by unit tests, and not yet seen by a live lock run. The display-identity
-  query (`QueryDisplayConfig`) took the same route afterwards; it degrades rather than failing, so
-  what it changes is a warn line. It was called the last bare denial on the #51 lineage, and a
-  survey of the crate then found three more: `create_d3d11_device`, and the two window-capture
-  backends, neither of which had a session check anywhere in it. All three now go through the same
-  check, which lives in `session.rs` with its "only on a denial" gate written once instead of at
-  five call sites. `create_d3d11_device` is the one that changes behaviour rather than wording: a
-  session that refused the capture device used to make a `display = primary` daemon exit at start-up
-  and, on a rebuild, build a fresh D3D11 device against a lock screen on an exponential back-off; it
-  now waits on the session probe like every other explained denial. Unit-tested; no live secure
-  desktop or sandbox has been watched producing the new messages, and none of the three denials has
-  been reproduced on this host.
+  and cannot unlock itself), and recovery through lock → displays asleep → unlock by
+  `scripts/measure-lock-unlock-recovery.ps1`, which measured an unattended rebuild 0.6 s after the
+  unlock ending a 229 s lock, with no adapter walk while it waited. Five call sites that could
+  return a bare `PermissionDenied` — `duplicate_output`, `get_physical_cursor_position`,
+  `QueryDisplayConfig`, `create_d3d11_device`, and the two window-capture backends — now share one
+  session check in `session.rs`, so a denial the session can account for is reported as
+  `DesktopUnavailable` naming the session state and the original error survives when it cannot;
+  `create_d3d11_device` is the only one whose behaviour changed rather than its wording, and the
+  three most recently converted denials are unit-tested but unreproduced on this host. Measurements
+  and the denial survey:
+  [docs/investigations.md](docs/investigations.md#lock-phases-and-the-denials-the-session-can-now-explain).
   GPU-reset recovery is now measured against real hardware for one of its two limbs: a driver
   restart took all three of the daemon's retained DXGI sessions away with `DXGI_ERROR_ACCESS_LOST`,
   and the daemon classified it, rebuilt all three, and finished the capture unattended in one
@@ -352,7 +407,9 @@ explicit, tested behavior.
   141 `BufferExhausted` refusals, and a verified monitor sleep and a verified lock transition.
   **12,670 captures across 81 minutes with GDI at exactly 10 in every sample of every run.** #53 is
   closed as not reproducible; the harnesses are `scripts/soak-resource-step.ps1` and the two probes
-  beside it.
+  beside it, `scripts/probe-display-power.ps1` and `scripts/probe-session-lock.ps1`. Run-by-run
+  detail:
+  [docs/investigations.md](docs/investigations.md#the-4k-dxgi-resource-step-53-narrowed).
 
   Those runs also measured the sustainable rate for large frames, which nothing had, and corrected
   what it means. At 250 ms with 8.3 MP frames going to clipboard **and** file, 787 of 2,000 attempts
@@ -361,7 +418,10 @@ explicit, tested behavior.
   three CPU slots, and the file worker holds its lease across a `Compact` encode plus the write —
   far longer than the clipboard holds one. The bound behaves as designed and reports every refusal;
   the figure to quote is per destination set, not per interval.
-- Three compatible repeat runs support every published performance claim.
+- Three compatible repeat runs support every published performance claim. **Deferred past v0.1.0**,
+  which publishes no absolute performance claims and so satisfies this vacuously until the
+  repeat-run and environment-fingerprint automation exists — see
+  [Release readiness — v0.1.0](#release-readiness--v010).
 
 ## Milestone 6 — Annotation and pinning
 
@@ -505,113 +565,56 @@ Authenticode is deliberately not on the near-term critical path. Until signing i
 
 ## Recommended implementation order
 
-Rotated-output normalization and same-adapter virtual-desktop composition shipped in PRs #8–#9.
-The 2026-08 code, architecture, and roadmap review is fully remediated: the three confirmed High
-defects and the silent-drop, sticky-failure, config-write and dormant-surface findings were fixed on
-the review branch, and the Medium findings that were deferred into batched issues — window-capture
-alpha and geometry parity, timeout budgets, worker exhaustion, log-rotation coexistence, the
-clipboard's stored-DEFLATE encoder, unlocked state writes, and the unreachable schema error — closed
-alongside the overlay extraction and Milestone 4. The order below reflects what remains.
+Rotated-output normalization and same-adapter virtual-desktop composition shipped in PRs #8–#9, and
+the 2026-08 code, architecture, and roadmap review is fully remediated — its findings and their
+disposition are recorded in
+[docs/investigations.md](docs/investigations.md#the-2026-08-code-architecture-and-roadmap-review).
+The order below reflects what remains.
 
-1. Complete Milestone 1 (multi-adapter composition and the hardware validation matrix). The only
+1. Ship v0.1.0: the gates above, then the operator-run live verifications, then the tag, the
+   disposable-VM check, the manual `choco push`, and the workspace version bump. First because it
+   is time-bound and because the release mechanics are exercised by nothing else.
+2. Complete Milestone 1 (multi-adapter composition and the hardware validation matrix). The only
    milestone in progress, and the one whose remaining work needs hardware rather than design.
-2. Build capture-quality completeness and performance evidence (Milestone 5), starting with its
-   pre-work: a documented detach budget, FakeBackend contract fidelity, and the pixel-format
-   extension.
-3. Settle the outstanding design decisions — latest-mode currency on an idle desktop,
+3. Build capture-quality completeness and performance evidence (Milestone 5), whose pre-work
+   (issue #19) is complete: the sequence-marker workload, and the environment fingerprints and
+   repeat-run automation that the deferred published-claim criterion waits on.
+4. Settle the outstanding design decisions — latest-mode currency on an idle desktop,
    `fresh` + `virtual_desktop`, and control-event hardening. Milestone 4's two product questions are
    answered (ADR 0008), and the mouse-capture/software-KVM contract is settled in ADR 0009: each use
    takes the pointer source that answers its own question, and Captastic promises nothing about
    where a foreign owner has put the mouse.
-4. Add annotation/pinning (Milestone 6, now ungated) or cross-platform work (Milestone 7), based on
+5. Add annotation/pinning (Milestone 6, now ungated) or cross-platform work (Milestone 7), based on
    audience demand (existing decision gate).
 
-### The 4K DXGI resource step (#53), narrowed
+### Lifecycle recovery: what the investigation settled
 
-A 40-minute DXGI soak at 3840×2160 with the clipboard and file output **off** — 4,513 captures, no
-errors, no refusals, display sleep suppressed so it could not confound the counters — held GDI at
-exactly 10 for all 478 samples, USER within one, handles within a ±5 band netting −3, and private
-bytes within 0.3 MB. An 8-minute idle control was equally flat.
-
-Two further legs restored the rest of the original configuration: the clipboard alone at 250 ms
-(5,359 captures, no refusals), then both destinations at 250 ms (2,548 captures, 2,407 files,
-4.17 GB, **141 `BufferExhausted` refusals**). GDI held at exactly 10 in every sample of all three
-runs — 12,420 captures across 79 minutes — against an original that stepped 10 → 33 and held.
-
-Every Captastic-side suspect is therefore exonerated: the capture path, both destinations, and the
-refusal path. What differed in all three runs is display power, uncontrolled in the original and
-suppressed here, and it fits the shape exactly — a one-time event allocating a batch of GDI and
-USER objects and then holding flat, unrelated to capture volume.
-
-A fourth run powered the display down for 30 seconds with captures running — the monitor entering
-sleep confirmed by observation rather than inferred — and GDI and USER did not move at all. That
-eliminates the last suspect: **12,472 captures across four runs and 81 minutes, with GDI at exactly
-10 in every sample of every run.** The step in #53 is not reproducible under any Captastic-side
-condition, and the remaining candidate is the lock transition that occurred during the original
-soak, which has never been measured with these counters.
-
-Two incidental findings. The refusals were never "250 ms is too fast for 4K": both destinations
-lease from the same three-slot CPU pool and the file worker holds its lease across a `Compact`
-encode plus the write, so the refusals are the two destinations contending — the clipboard alone at
-that rate refused none of 5,359. And Desktop Duplication keeps producing full-resolution frames
-while the monitor is asleep, so a sleeping display is still capturable and does not detach from
-enumeration.
-
-### Lifecycle recovery: a daemon with nothing to capture
-
-The daemon no longer exits when enumeration finds no displays. Locked, disconnected, asleep or
-unplugged all reach DXGI as an empty output list, so they share one kind — `DesktopUnavailable`,
-"not now" — and the daemon waits, registers its hotkeys, and builds the capture engine when a
-display appears. Verified end to end on 2026-08-17 with an injected blackout
-(`CAPTASTIC_TEST_NO_DISPLAYS_MS`, debug builds only): start with nothing attached, seven triggers
-refused with an accurate reason, engine built unattended, 4K captures following.
-
-The measurement that shaped it is worth keeping, with a later correction. A lock does **not** stop
-enumeration: displays enumerate with their persistent identities throughout, so a lock is not what
-produced the empty display list in #51, and a fix keyed on the lock would have missed the failure it
-was filed about. That original condition — an empty list *and* a denied `QueryDisplayConfig` — has
-still not been reproduced on demand. The denied `QueryDisplayConfig` half no longer reports itself as
-a permissions problem when it does happen: it goes through the same session check as the other two
-denials and comes out as `DesktopUnavailable` naming the session state, keeping the original error
-whenever the session cannot account for it. That is unit-tested and unmeasured, for the same reason
-the condition is un-reproduced. The same is now true of `create_d3d11_device` and of both
-window-capture backends, which had no session check at all; the check itself lives in `session.rs`,
-and its "ask the session only on `E_ACCESSDENIED`" gate is written once rather than at each call
-site.
-
-The first run of that test also had a fresh daemon build a duplication 0.3 s after the lock engaged,
-which led to the overly strong claim that a lock does not break DXGI at all. A later run with a
-daemon already holding a duplication showed otherwise: at the lock it takes `AccessLost` (`the keyed
-mutex was abandoned`), and the rebuild is refused with `DesktopUnavailable in dxgi/duplicate_output:
-the session is locked or a secure prompt owns the desktop`.
-
-That correction was itself too strong, and continuous sampling across three lock cycles replaced it.
-Duplication is not refused *because* the lock screen owns the desktop — for as long as the lock
-screen is lit it keeps working, 12 seconds of it in one run, and `OpenInputDesktop` answers
-`Default` throughout because Windows 11's lock screen is an ordinary application rather than a
-secure desktop. What ends duplication is the **display power-down**: about three seconds after the
-monitors sleep it begins refusing, and one 190-second run held that state for 125 seconds. A
-sleeping display is capturable while unlocked, so it is the combination that refuses.
-
-The refusal that the earlier run saw was real but was the credential-prompt phase, which is the one
-phase the desktop probe can see. In the phase that matters — locked, displays asleep, `Default`
-desktop — the probe reported an ordinary interactive session on all 499 failing samples, so the
-failure arrived as a bare `Access is denied`. `WTSSessionInfoEx` answers in every phase and is now
-what the probe keys on.
+The daemon no longer exits when enumeration finds no displays: locked, disconnected, asleep and
+unplugged all reach DXGI as an empty output list, so they share one `DesktopUnavailable` "not now"
+kind, and the daemon waits, registers its hotkeys, and builds the capture engine when a display
+appears (verified end to end on 2026-08-17 with an injected blackout). What ends duplication is not
+the lock screen owning the desktop but the **display power-down**, and `WTSSessionInfoEx` is the
+only signal that answers in every lock phase, so it is what the session probe keys on. The
+narrative, including the two claims that were corrected along the way and the #51 condition still
+not reproduced on demand, is in
+[docs/investigations.md](docs/investigations.md#lifecycle-recovery-a-daemon-with-nothing-to-capture).
 
 ## Recommended next branch
 
-Milestone 5's lifecycle-recovery and soak work, now that its pre-work (issue #19) is complete.
-Display hot-plug, sleep/wake, lock/unlock recovery and GPU reset recovery are the tests most likely
-to find something, because they exercise the recovery paths that shipped with the least live
-verification. Lock/unlock is now closed at both ends: diagnosis by a live harness
-(`a_locked_session_explains_every_duplication_failure`) and recovery through lock → displays asleep
-→ unlock by `scripts/measure-lock-unlock-recovery.ps1`, which measured an unattended rebuild 0.6 s
-after the unlock. GPU reset recovery has since been measured for its `AccessLost`
-limb against a real driver restart; its `DEVICE_REMOVED`/`DEVICE_RESET` limb is still open, and
-closing it needs the elevated adapter cycle. Both remaining questions are testable on this machine,
-unlike the multi-adapter work and unlike HDR tone mapping, which needs an HDR display to judge
-rather than merely to compile.
+This one: v0.1.0 release readiness (`feature/release-readiness`) — the unsigned-release
+documentation, the README repositioning, and the release-notes draft, which are what the tag is
+waiting on.
+
+After it, the operator-run live verifications are the work most likely to find something, because
+they exercise the recovery paths that shipped with the least live verification: sleep/wake, Remote
+Desktop, and the `DEVICE_REMOVED`/`DEVICE_RESET` limb of GPU-reset recovery through the elevated
+adapter cycle. Lock/unlock is closed at both ends and GPU reset is closed for its `AccessLost` limb
+against a real driver restart, so those three are what is left, and all three are testable on this
+machine — unlike the multi-adapter work, and unlike HDR tone mapping, which needs an HDR display to
+judge rather than merely to compile.
+
+Then the release itself: the tag, the disposable-VM checklist, the manual `choco push` once the
+release URLs and hashes verify, and the version bump.
 
 FakeBackend fidelity keeps its leverage beyond this milestone and is worth extending as gaps appear:
 much of Milestone 4 shipped with daemon-side behaviour verified only by unit tests, because a second
