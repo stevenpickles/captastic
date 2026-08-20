@@ -3020,15 +3020,39 @@ mod tests {
     /// sample `CAPTASTIC_GPU_RESET_TRIGGER_SAMPLE`; see [`send_display_driver_reset_chord`] for why
     /// that is opt-in rather than the default.
     ///
+    /// `CAPTASTIC_GPU_RESET_EXPECT` says which outcome the chosen trigger is supposed to produce,
+    /// because they are not all supposed to produce the same one and a harness that assumes they
+    /// are cannot record the difference. `loss` (the default) is for a trigger believed to take the
+    /// device away: no loss observed means the run proved nothing and it fails. `survival` is for a
+    /// trigger measured *not* to take it away: it asserts the opposite, that every sample captured,
+    /// which turns a negative result into a standing guard rather than an anecdote. Either way a
+    /// loss that does occur has its classification and its recovery judged identically.
+    ///
+    /// Measured on 2026-08-20, Intel Arc iGPU, Windows 11 26200: a Ctrl+Win+Shift+B driver restart,
+    /// screen blanked and machine beeped, confirmed by the operator at the keyboard, produced
+    /// **1800 captures out of 1800 samples and not one lost device**, over 194 s. So on this host
+    /// the chord is a `survival` trigger. The assumption it was hired to check, that
+    /// Ctrl+Win+Shift+B raises `DXGI_ERROR_DEVICE_REMOVED` on a duplication device, is measured
+    /// false; the driver stack restarts underneath duplication without disturbing it.
+    ///
     /// Every sample is written to `%TEMP%\captastic-gpu-reset.log`, overridable with
     /// `CAPTASTIC_GPU_RESET_LOG`, and flushed line by line so a run that hangs still leaves its
-    /// evidence. The assertions at the end are deliberately few - the log is the deliverable, and a
-    /// driver restart is not something to re-run because an assertion was phrased too tightly.
+    /// evidence. Successes are aggregated rather than logged one by one, but any sample slower than
+    /// `SLOW_SAMPLE` gets its own line: the first run of this test could say only that 1800 samples
+    /// cost 194 s in total, which bounds a stall without locating one, and "was the sample next to
+    /// the blank slow?" is the question that wanted answering.
     ///
     /// **Restarts the GPU driver.** The screen blanks for a second or two and every Direct3D
     /// application on the machine may lose its device: games, GPU-composited browsers, and video
     /// calls can drop out or close. Nothing is written to the clipboard or to disk, and the desktop
     /// is not otherwise disturbed.
+    ///
+    /// For the driver-restart chord, which is now known not to remove the device:
+    ///
+    /// CAPTASTIC_GPU_RESET_EXPECT=survival cargo test --locked -p captastic-windows --release
+    ///     -- --ignored --nocapture a_real_device_loss_routes_through_the_rebuild_path
+    ///
+    /// For a trigger expected to remove it, such as an adapter cycle:
     ///
     /// cargo test --locked -p captastic-windows --release
     ///     -- --ignored --nocapture a_real_device_loss_routes_through_the_rebuild_path
@@ -3041,6 +3065,10 @@ mod tests {
         /// restart is not missed between two attempts, slow enough that the run is not itself a
         /// duplication soak.
         const SAMPLE_CADENCE: Duration = Duration::from_millis(100);
+        /// A capture slow enough to be worth a line of its own. Healthy samples on this host cost
+        /// single-digit milliseconds, so this is far above the noise and well below the seconds a
+        /// stalled DXGI call is expected to cost.
+        const SLOW_SAMPLE: Duration = Duration::from_millis(250);
         /// The kinds the daemon's `requires_backend_recovery` rebuilds for. Restated here because
         /// it lives in the binary crate and this one cannot see it; if the two ever disagree, this
         /// harness is measuring a recovery the product does not perform.
@@ -3086,6 +3114,8 @@ mod tests {
         let samples = env_u32("CAPTASTIC_GPU_RESET_SAMPLES", 400);
         let inject = std::env::var("CAPTASTIC_GPU_RESET_SENDINPUT").is_ok_and(|value| value == "1");
         let trigger_sample = env_u32("CAPTASTIC_GPU_RESET_TRIGGER_SAMPLE", 25);
+        let expect_survival = std::env::var("CAPTASTIC_GPU_RESET_EXPECT")
+            .is_ok_and(|value| value.eq_ignore_ascii_case("survival"));
         let log_path = std::env::var_os("CAPTASTIC_GPU_RESET_LOG").map_or_else(
             || std::env::temp_dir().join("captastic-gpu-reset.log"),
             std::path::PathBuf::from,
@@ -3105,8 +3135,13 @@ mod tests {
 
         record(format!("measurement log: {}", log_path.display()));
         record(format!(
-            "{samples} samples at {} ms; trigger: {}",
+            "{samples} samples at {} ms; expecting the trigger to {}; trigger: {}",
             SAMPLE_CADENCE.as_millis(),
+            if expect_survival {
+                "leave the device alone"
+            } else {
+                "remove the device"
+            },
             if inject {
                 format!("injected at sample {trigger_sample}")
             } else {
@@ -3129,6 +3164,11 @@ mod tests {
         let mut surfaced_in: Vec<String> = Vec::new();
         let mut misclassified: Vec<String> = Vec::new();
         let mut unexplained: Vec<String> = Vec::new();
+        // Aggregate capture cost, kept because the first run could report only that the whole
+        // sweep took 194 s - enough to bound a stall, not enough to find one.
+        let mut capture_cost = Duration::ZERO;
+        let mut slowest = Duration::ZERO;
+        let mut slow_samples = 0_u32;
 
         for sample in 0..samples {
             if inject && sample == trigger_sample {
@@ -3187,6 +3227,18 @@ mod tests {
             let took = attempt_started.elapsed();
             let reason_after = removal_reason(&active.device);
             let at = started.elapsed();
+            capture_cost = capture_cost.saturating_add(took);
+            slowest = slowest.max(took);
+            if took >= SLOW_SAMPLE {
+                slow_samples = slow_samples.saturating_add(1);
+                record(format!(
+                    "t={:7.3}s sample={sample} SLOW {:.0} ms; device {} -> {}",
+                    at.as_secs_f64(),
+                    took.as_secs_f64() * 1_000.0,
+                    describe_reason(reason_before),
+                    describe_reason(reason_after)
+                ));
+            }
 
             match outcome {
                 Ok(_) => {
@@ -3267,6 +3319,13 @@ mod tests {
             started.elapsed().as_secs_f64(),
             unexplained.len()
         ));
+        record(format!(
+            "capture cost: {:.1}s total, {:.1} ms mean, {:.0} ms slowest, {slow_samples} over {} ms",
+            capture_cost.as_secs_f64(),
+            capture_cost.as_secs_f64() * 1_000.0 / f64::from(successes.max(1)),
+            slowest.as_secs_f64() * 1_000.0,
+            SLOW_SAMPLE.as_millis()
+        ));
         for surfaced in &surfaced_in {
             record(format!("the loss surfaced in {surfaced}"));
         }
@@ -3274,21 +3333,45 @@ mod tests {
             record(format!("unexplained: {line}"));
         }
 
-        assert!(
-            losses > 0,
-            "no duplication call ever saw a removed device, so nothing here was measured. Either \
-             the trigger never fired, or it does not remove the device this backend holds - and \
-             the second would itself be the finding. The log is at {}",
-            log_path.display()
-        );
+        if expect_survival {
+            // The trigger is one already measured not to take the device away, so the finding is
+            // the survival itself and the run is a guard against that changing. A loss here would
+            // not fail the run - it would mean the trigger became a `loss` trigger, which the
+            // classification and recovery assertions below then judge on their own terms.
+            assert_eq!(
+                successes,
+                samples,
+                "the trigger was expected to leave duplication alone and {} of {samples} samples \
+                 did not capture. That is the interesting direction: something now breaks \
+                 duplication that did not before. The log is at {}",
+                samples.saturating_sub(successes),
+                log_path.display()
+            );
+            record(format!(
+                "expected survival and got it: {successes}/{samples} samples captured, {losses} lost devices"
+            ));
+        } else {
+            assert!(
+                losses > 0,
+                "no duplication call ever saw a removed device, so this trigger measured nothing \
+                 about the recovery path. Either it never fired, or it does not remove the device \
+                 this backend holds - which is what Ctrl+Win+Shift+B was measured to do on \
+                 2026-08-20, and why that chord wants CAPTASTIC_GPU_RESET_EXPECT=survival rather \
+                 than this branch. The log is at {}",
+                log_path.display()
+            );
+        }
         assert!(
             misclassified.is_empty(),
             "the device was gone and the error said something the daemon does not rebuild for, \
              which is exactly the demotion `device_removed_error` exists to prevent:\n{}",
             misclassified.join("\n")
         );
+        // Conditional on there having been something to recover from. Unconditional, this would
+        // report a trigger that never removed the device as a failure to recover from a loss that
+        // never happened, which is the wrong finding written over the right one.
         assert!(
-            recovered_at.is_some(),
+            losses == 0 || recovered_at.is_some(),
             "duplication never came back on its own after the loss, so the daemon would not have \
              either. The log is at {}",
             log_path.display()

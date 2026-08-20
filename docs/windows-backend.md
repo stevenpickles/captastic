@@ -265,16 +265,39 @@ twice a second with the clipboard and selection off, and reads its log for the r
 is the one that answers whether the daemon's classification actually routes a real loss to the
 rebuild path, because those lines are only written from that path.
 
+### Measured: a driver restart does not remove the device
+
+2026-08-20, Intel Arc iGPU, Windows 11 26200, three attached displays. The operator pressed
+Ctrl+Win+Shift+B once during the sampling window; the screen blanked and the machine beeped, so the
+restart genuinely happened. Duplication did not notice: **1800 captures out of 1800 samples, zero
+lost devices, zero rebuilds, zero unexplained failures, over 194 seconds.** Aggregate capture cost
+was about 14 s across all 1800 samples — roughly 8 ms each — which bounds any stall around the blank
+well under the length of the blank itself, though that first run recorded no per-sample timings and
+so could not locate one. It records them now.
+
+The assumption this was hired to check — that Ctrl+Win+Shift+B raises `DXGI_ERROR_DEVICE_REMOVED`
+on a duplication device — is therefore false on this hardware. The chord restarts the driver stack
+underneath an existing duplication without invalidating it, so it cannot be used to exercise the
+recovery path, and the recovery path remains unmeasured against a real loss. Do not read this as
+"device loss recovery works"; read it as "this trigger does not produce a device loss".
+
+It is still worth running as a guard, with `CAPTASTIC_GPU_RESET_EXPECT=survival`, which asserts the
+survival instead of the loss. That direction matters: a future driver or Windows build that starts
+breaking duplication on a restart would fail the test loudly rather than quietly changing what the
+product does when a user hits the chord.
+
 ### Triggers, and what each costs
 
-Do not assume they are equivalent — which HRESULT each produces is exactly what has never been
-measured here.
+Do not assume they are equivalent — see above for one that has now been measured and did not do what
+it was assumed to do.
 
 **Ctrl+Win+Shift+B** restarts the display driver stack. The screen blanks for a second or two with
-a beep. Needs no elevation and no shell. Cheapest of the three and the one to run first. Whether
-`SendInput` can inject it is unverified: it is a win32k chord rather than a `RegisterHotKey`
-binding, and injected input carries `LLKHF_INJECTED`, so the harness waits for a human hand unless
-`CAPTASTIC_GPU_RESET_SENDINPUT=1` says otherwise.
+a beep. Needs no elevation and no shell, which made it the one to try first — and it does not
+remove the device, so it is now a survival guard rather than a way to reach the recovery path.
+Whether `SendInput` can inject it is still unverified, and no longer worth verifying for this
+purpose: it is a win32k chord rather than a `RegisterHotKey` binding, and injected input carries
+`LLKHF_INJECTED`, so the harness waits for a human hand unless `CAPTASTIC_GPU_RESET_SENDINPUT=1`
+says otherwise.
 
 **Disabling and re-enabling the display adapter** is the heavy one, and on a hybrid laptop the
 choice of adapter decides whether it is a measurement or an outage. Find the adapter that actually
