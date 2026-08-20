@@ -308,6 +308,57 @@ than a broken engine. Nobody has watched a real lock produce the new message: th
 the only live evidence, and it predates the fix. `scripts/measure-lock-unlock-recovery.ps1
 -Confirmed` is the way to re-measure it when a live lock run is next approved.
 
+### The display-identity query denied without explaining, and now explains itself
+
+The other half of the pair issue #51 quoted is the one that opens it:
+
+```
+WARN  persistent display identity query failed; using session-local output names:
+      NativeFailure in dxgi/query_display_config: Access is denied. (0x80070005)
+```
+
+`QueryDisplayConfig` is what turns a GDI device name into a persistent display identity, and a
+session that is locked, disconnected, or behind a secure desktop refuses it. Routed through the
+generic `map_windows_error`, that refusal arrived as a permissions problem with no session context
+on it — the same shape as the duplication and cursor denials, on the path that produced the literal
+first line of #51.
+
+It is the mildest of the three, and worth being clear about why: this failure does not fail a
+capture. `enumerate_outputs` warns, falls back to the names DXGI supplies itself, and carries on. The
+log line is the whole of the cost, and the whole of the fix.
+
+`display_config_query_error` (`dxgi.rs`) now asks the session about it, the way `duplicate_output`
+has since #51 and `get_physical_cursor_position` has since #74. The mapping sits at the call site
+rather than in `map_windows_error`, which serves every DXGI operation and has no business asking the
+session about a failed texture map; the session is asked **only** on `E_ACCESSDENIED` and only after
+the call has already failed, so an enumeration on a working machine does not pay four syscalls for a
+probe. A temporary session state produces `DesktopUnavailable` naming it; anything else — including
+a denial in a session that reports itself interactive, and a session probe that could not answer —
+keeps the original kind, message and native code. The operation stays `dxgi/query_display_config`,
+so a search that found this line still finds it.
+
+`GetDisplayConfigBufferSizes`, one call earlier in the same function, goes the same way and keeps its
+own name (`dxgi/display_config_buffer_sizes`). It is the same query and Windows documents the same
+`ERROR_ACCESS_DENIED` for it — a caller without access to the current desktop — so whichever of the
+two a session refuses first is the one that writes the log line; explaining only the second would
+have left the bare denial reachable under the other name.
+
+The warn line keeps its prefix and gains a tail when the session explains the denial, because the
+fallback has a cost worth naming: the identities it falls back to are derived from the GDI device
+name rather than from the panel (`persistent_display_id`), so while it is in force a display does not
+match what `state.toml` remembered under its persistent id, and a `display =` naming a persistent id
+does not select it.
+
+**Status: verified by unit tests, not measured live.** Six tests cover it — the locked case, the
+other temporary session states, the sizing call under its own name, the two states that must
+preserve the original error, the probe being paid only on a denial (a counter, as for the cursor
+query), and the warn line itself, which is the only artifact a user ever sees. No live run has produced the new message, and none is likely to
+on demand: a lock on this host does **not** deny this query — displays enumerate with their
+persistent identities throughout — so the denial in #51 remains un-reproduced here, and the fix rests
+on the same session probe that explains the paths that *have* been measured.
+`scripts/measure-lock-unlock-recovery.ps1 -Confirmed` is the way to look for it when a live lock run
+is next approved.
+
 `CAPTASTIC_TEST_NO_DISPLAYS_MS` reports no attached outputs for that many milliseconds from process start, so the wait-and-recover path can be exercised without detaching a display. Debug builds only; `scripts/verify-no-display-recovery.ps1` drives it.
 
 ## GPU device loss
