@@ -273,7 +273,12 @@ explicit, tested behavior.
   diagnosis is covered by a live harness (`a_locked_session_explains_every_duplication_failure` in
   `crates/captastic-windows/src/session.rs`, `#[ignore]`d because it locks the machine for ~8 minutes
   and cannot unlock itself); recovery through lock → displays asleep → unlock is not yet verified.
-  Sleep/wake, GPU reset and Remote Desktop still need a machine rather than a fake.
+  GPU-reset recovery is now measured against real hardware for one of its two limbs: a driver
+  restart took all three of the daemon's retained DXGI sessions away with `DXGI_ERROR_ACCESS_LOST`,
+  and the daemon classified it, rebuilt all three, and finished the capture unattended in one
+  attempt and about 1.5 s. `DEVICE_REMOVED`/`DEVICE_RESET` recovery stays unverified: no trigger
+  available without elevation removes the device on this host, and the elevated adapter cycle that
+  would has not been run. Sleep/wake and Remote Desktop still need a machine rather than a fake.
 - Build the controlled sequence-marker workload for freshness, orientation, crop, and cursor tests.
 - Collect environment fingerprints and automate warm-up, raw artifacts, repeat runs, and compatible
   baseline comparison.
@@ -574,9 +579,11 @@ Display hot-plug, sleep/wake, lock/unlock recovery and GPU reset recovery are th
 to find something, because they exercise the recovery paths that shipped with the least live
 verification. Lock/unlock diagnosis is already covered by a live harness
 (`a_locked_session_explains_every_duplication_failure`); what remains open there is recovery through
-lock → displays asleep → unlock. GPU reset recovery is likewise open — its classification is tested
-only against synthetic HRESULTs today. Both are testable on this machine, unlike the multi-adapter
-work and unlike HDR tone mapping, which needs an HDR display to judge rather than merely to compile.
+lock → displays asleep → unlock. GPU reset recovery has since been measured for its `AccessLost`
+limb against a real driver restart; its `DEVICE_REMOVED`/`DEVICE_RESET` limb is still open, and
+closing it needs the elevated adapter cycle. Both remaining questions are testable on this machine,
+unlike the multi-adapter work and unlike HDR tone mapping, which needs an HDR display to judge
+rather than merely to compile.
 
 FakeBackend fidelity keeps its leverage beyond this milestone and is worth extending as gaps appear:
 much of Milestone 4 shipped with daemon-side behaviour verified only by unit tests, because a second

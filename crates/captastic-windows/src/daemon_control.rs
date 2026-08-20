@@ -18,7 +18,12 @@ const CONTROL_EVENT_NAME: windows::core::PCWSTR = w!("Local\\CaptasticDaemonCont
 ///
 /// A separate object because an event carries no payload. Same session and the same default security
 /// as the event itself: this identifies the holder, it does not protect the name (ADR 0007).
-const CONTROL_OWNER_NAME: windows::core::PCWSTR = w!("Local\\\\CaptasticDaemonControl-v1-owner");
+///
+/// Exactly one backslash, separating the `Local` namespace from the object name. A second one puts
+/// a separator inside the name, which the object manager rejects with `ERROR_INVALID_NAME`, and the
+/// publish is best-effort so the only symptom is a debug line and a diagnosis that can never name
+/// its holder. `a_control_name_is_a_valid_local_object_name` is what keeps the count at one.
+const CONTROL_OWNER_NAME: windows::core::PCWSTR = w!("Local\\CaptasticDaemonControl-v1-owner");
 const HRESULT_ALREADY_EXISTS: i32 = 0x8007_00B7_u32 as i32;
 
 pub struct DaemonControl {
@@ -230,6 +235,31 @@ mod tests {
 
     /// A name of this test's own, so exercising the record cannot overwrite a running daemon's.
     const TEST_OWNER_NAME: windows::core::PCWSTR = w!("Local\\CaptasticDaemonControlTest-owner");
+
+    /// The owner record shipped for weeks under `Local\\CaptasticDaemonControl-v1-owner` - two
+    /// backslashes in the name Windows saw - so every daemon start failed the publish with
+    /// `ERROR_INVALID_NAME` and every "already held" diagnosis fell back to "did not identify
+    /// itself". Nothing caught it because the tests below publish under a name of their own, which
+    /// was spelled correctly. This checks the constants the product actually uses.
+    #[test]
+    fn a_control_name_is_a_valid_local_object_name() {
+        for name in [CONTROL_EVENT_NAME, CONTROL_OWNER_NAME] {
+            // SAFETY: both constants are static, NUL-terminated UTF-16 literals.
+            let name = unsafe { name.to_string() }.expect("a control name is valid UTF-16");
+            assert_eq!(
+                name.matches('\\').count(),
+                1,
+                "a session-local object name has exactly one separator, and {name} has more"
+            );
+            let object = name
+                .strip_prefix("Local\\")
+                .unwrap_or_else(|| panic!("{name} must live in the session-local namespace"));
+            assert!(
+                !object.is_empty(),
+                "the name after the namespace prefix cannot be empty"
+            );
+        }
+    }
 
     #[test]
     fn a_published_owner_can_be_read_back_and_named() {

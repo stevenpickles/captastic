@@ -2909,6 +2909,487 @@ mod tests {
         );
     }
 
+    /// Presses Ctrl+Win+Shift+B, the chord Windows binds to "restart the graphics driver".
+    ///
+    /// Injected only when the operator asks for it, because whether it works is unknown. The chord
+    /// is handled inside win32k rather than through `RegisterHotKey`, `SendInput` stamps every
+    /// event it delivers as `LLKHF_INJECTED`, and nothing in the documentation says what win32k
+    /// does with an injected copy of this particular chord. The honest answer is that it can only
+    /// be learned by sending it on a machine that can afford to have its screen blank, so the
+    /// default path below waits for a human hand and this is the opt-in.
+    ///
+    /// The modifiers are released in reverse order after `B`, so the Windows key is consumed by
+    /// the chord rather than left looking like a bare press, which would open the Start menu.
+    fn send_display_driver_reset_chord() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+            KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_SHIFT,
+        };
+
+        const VK_B: VIRTUAL_KEY = VIRTUAL_KEY(0x42);
+
+        fn key(code: VIRTUAL_KEY, flags: KEYBD_EVENT_FLAGS) -> INPUT {
+            INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: code,
+                        wScan: 0,
+                        dwFlags: flags,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            }
+        }
+
+        let press = KEYBD_EVENT_FLAGS(0);
+        let inputs = [
+            key(VK_CONTROL, press),
+            key(VK_LWIN, press),
+            key(VK_SHIFT, press),
+            key(VK_B, press),
+            key(VK_B, KEYEVENTF_KEYUP),
+            key(VK_SHIFT, KEYEVENTF_KEYUP),
+            key(VK_LWIN, KEYEVENTF_KEYUP),
+            key(VK_CONTROL, KEYEVENTF_KEYUP),
+        ];
+        let stride = i32::try_from(std::mem::size_of::<INPUT>()).expect("INPUT fits in an i32");
+        // SAFETY: every element is a fully initialized keyboard event, and the stride describes
+        // this build's own INPUT layout.
+        let sent = unsafe { SendInput(&inputs, stride) };
+        assert_eq!(
+            sent as usize,
+            inputs.len(),
+            "the injected chord was blocked before it reached the desktop, so nothing below \
+             could have measured a device loss this test caused"
+        );
+    }
+
+    /// Names the DXGI removal reasons, because a bare HRESULT in a measurement log is a number the
+    /// reader has to go and look up.
+    fn removal_reason_name(code: i32) -> &'static str {
+        use windows::Win32::Graphics::Dxgi::{
+            DXGI_ERROR_DEVICE_HUNG, DXGI_ERROR_DRIVER_INTERNAL_ERROR, DXGI_ERROR_INVALID_CALL,
+        };
+
+        if code == DXGI_ERROR_DEVICE_REMOVED.0 {
+            "DXGI_ERROR_DEVICE_REMOVED"
+        } else if code == DXGI_ERROR_DEVICE_RESET.0 {
+            "DXGI_ERROR_DEVICE_RESET"
+        } else if code == DXGI_ERROR_DEVICE_HUNG.0 {
+            "DXGI_ERROR_DEVICE_HUNG"
+        } else if code == DXGI_ERROR_DRIVER_INTERNAL_ERROR.0 {
+            "DXGI_ERROR_DRIVER_INTERNAL_ERROR"
+        } else if code == DXGI_ERROR_ACCESS_LOST.0 {
+            "DXGI_ERROR_ACCESS_LOST"
+        } else if code == DXGI_ERROR_INVALID_CALL.0 {
+            "DXGI_ERROR_INVALID_CALL"
+        } else {
+            "unrecognized"
+        }
+    }
+
+    /// What a *real* GPU device loss does to duplication, and whether the rebuild seam gets it
+    /// back with nobody helping.
+    ///
+    /// Every other test of this seam is synthetic. `every_device_removal_reason_triggers_recovery`
+    /// hands `device_removed_error` HRESULTs this process invented, and the daemon's recovery tests
+    /// drive a scripted fake; between them they prove the mapping table and the retry loop, and
+    /// nothing at all about which code Windows actually raises, at which call, when a driver really
+    /// goes away. Issue #53 is that gap: the recovery path has never seen a device it did not fake,
+    /// so "DXGI device loss is recovered from" has so far been a claim about a lookup table.
+    ///
+    /// Continuous rather than a single before/after pair, for the reason the lock harness in
+    /// `session.rs` learned expensively: a transition sampled once describes whichever side of it
+    /// the sample happened to land on, and then generalises from there. Every attempt here is
+    /// bracketed by `GetDeviceRemovedReason`, and the pair decides what the sample is allowed to
+    /// say. Both reads healthy and the failure was not a device loss at all, whatever it looked
+    /// like. Both reads removed and the loss predates the call, so the classification is fully
+    /// judgeable. A disagreement is the sample the loss landed *inside*, which is the only kind
+    /// that can name where a loss surfaces - `AcquireNextFrame`, `Map`, or the next
+    /// `DuplicateOutput` - and `operation` on the error is what names it.
+    ///
+    /// Counted in samples rather than run to a wall-clock deadline. A DXGI call against a driver
+    /// that is restarting can block for seconds, so a run bounded by time becomes a loop that
+    /// samples almost nothing and then reports that nothing was wrong.
+    ///
+    /// The trigger belongs to the operator by default: the test builds the backend, starts
+    /// sampling, and says to press Ctrl+Win+Shift+B whenever they are ready, with the sample budget
+    /// as its patience. `CAPTASTIC_GPU_RESET_SENDINPUT=1` makes the test press it instead, at
+    /// sample `CAPTASTIC_GPU_RESET_TRIGGER_SAMPLE`; see [`send_display_driver_reset_chord`] for why
+    /// that is opt-in rather than the default.
+    ///
+    /// `CAPTASTIC_GPU_RESET_EXPECT` says which outcome the chosen trigger is supposed to produce,
+    /// because they are not all supposed to produce the same one and a harness that assumes they
+    /// are cannot record the difference. `loss` (the default) is for a trigger believed to take the
+    /// device away: no loss observed means the run proved nothing and it fails. `survival` is for a
+    /// trigger measured *not* to take it away: it asserts the opposite, that every sample captured,
+    /// which turns a negative result into a standing guard rather than an anecdote. Either way a
+    /// loss that does occur has its classification and its recovery judged identically.
+    ///
+    /// Measured on 2026-08-20, Intel Arc iGPU, Windows 11 26200: a Ctrl+Win+Shift+B driver restart,
+    /// screen blanked and machine beeped, confirmed by the operator at the keyboard, produced
+    /// **1800 captures out of 1800 samples and not one lost device**, over 194 s. The assumption it
+    /// was hired to check, that Ctrl+Win+Shift+B raises `DXGI_ERROR_DEVICE_REMOVED` on a duplication
+    /// device, is measured false: 3600 bracketing `GetDeviceRemovedReason` calls all returned
+    /// success.
+    ///
+    /// It does not follow that the chord leaves duplication alone. Later the same day, the same
+    /// chord on the same host took all three of the daemon's retained sessions away with
+    /// `DXGI_ERROR_ACCESS_LOST` - a different failure from the one this test looks for, and one the
+    /// daemon recovered from in a single rebuild. This test holds *one* `new_primary()` duplication
+    /// and has no message loop, so it cannot see a display reconfiguration and cannot say whether
+    /// its run had one. Nothing yet explains the difference; `docs/windows-backend.md` keeps both
+    /// results and the candidate explanations. Pick `CAPTASTIC_GPU_RESET_EXPECT` for the outcome
+    /// the run is meant to guard, and read a `survival` failure as that open question rather than
+    /// as a regression until it is closed.
+    ///
+    /// Every sample is written to `%TEMP%\captastic-gpu-reset.log`, overridable with
+    /// `CAPTASTIC_GPU_RESET_LOG`, and flushed line by line so a run that hangs still leaves its
+    /// evidence. Successes are aggregated rather than logged one by one, but any sample slower than
+    /// `SLOW_SAMPLE` gets its own line: the first run of this test could say only that 1800 samples
+    /// cost 194 s in total, which bounds a stall without locating one, and "was the sample next to
+    /// the blank slow?" is the question that wanted answering.
+    ///
+    /// **Restarts the GPU driver.** The screen blanks for a second or two and every Direct3D
+    /// application on the machine may lose its device: games, GPU-composited browsers, and video
+    /// calls can drop out or close. Nothing is written to the clipboard or to disk, and the desktop
+    /// is not otherwise disturbed.
+    ///
+    /// For the driver-restart chord, which is now known not to remove the device:
+    ///
+    /// CAPTASTIC_GPU_RESET_EXPECT=survival cargo test --locked -p captastic-windows --release
+    ///     -- --ignored --nocapture a_real_device_loss_routes_through_the_rebuild_path
+    ///
+    /// For a trigger expected to remove it, such as an adapter cycle:
+    ///
+    /// cargo test --locked -p captastic-windows --release
+    ///     -- --ignored --nocapture a_real_device_loss_routes_through_the_rebuild_path
+    #[test]
+    #[ignore = "restarts the GPU driver: the screen blanks and Direct3D applications can lose their devices"]
+    fn a_real_device_loss_routes_through_the_rebuild_path() {
+        use std::io::Write as _;
+
+        /// How long between capture samples while the backend is healthy. Fast enough that a
+        /// restart is not missed between two attempts, slow enough that the run is not itself a
+        /// duplication soak.
+        const SAMPLE_CADENCE: Duration = Duration::from_millis(100);
+        /// A capture slow enough to be worth a line of its own. Healthy samples on this host cost
+        /// single-digit milliseconds, so this is far above the noise and well below the seconds a
+        /// stalled DXGI call is expected to cost.
+        const SLOW_SAMPLE: Duration = Duration::from_millis(250);
+        /// The kinds the daemon's `requires_backend_recovery` rebuilds for. Restated here because
+        /// it lives in the binary crate and this one cannot see it; if the two ever disagree, this
+        /// harness is measuring a recovery the product does not perform.
+        const REBUILDABLE: [CaptureErrorKind; 3] = [
+            CaptureErrorKind::AccessLost,
+            CaptureErrorKind::DeviceRemoved,
+            CaptureErrorKind::TopologyChanged,
+        ];
+
+        fn env_u32(name: &str, fallback: u32) -> u32 {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(fallback)
+        }
+
+        /// The daemon's own back-off curve, 50 ms doubling to a 2 s ceiling, restated for the same
+        /// reason as `REBUILDABLE`. A harness that waited on a different curve would measure a
+        /// recovery nobody ships.
+        fn recovery_delay(failed_attempts: u32) -> Duration {
+            let exponent = failed_attempts.saturating_sub(1).min(5);
+            Duration::from_millis(50_u64.saturating_mul(1_u64 << exponent))
+                .min(Duration::from_secs(2))
+        }
+
+        /// What the device says about itself, as the raw HRESULT, so the log reads against the
+        /// DXGI header rather than against this crate's opinion of it.
+        fn removal_reason(device: &ID3D11Device) -> Option<i32> {
+            // SAFETY: the device is a live COM interface owned by the backend that lent it.
+            match unsafe { device.GetDeviceRemovedReason() } {
+                Ok(()) => None,
+                Err(reason) => Some(reason.code().0),
+            }
+        }
+
+        fn describe_reason(reason: Option<i32>) -> String {
+            reason.map_or_else(
+                || "live".to_owned(),
+                |code| format!("{code:#010X}/{}", removal_reason_name(code)),
+            )
+        }
+
+        let samples = env_u32("CAPTASTIC_GPU_RESET_SAMPLES", 400);
+        let inject = std::env::var("CAPTASTIC_GPU_RESET_SENDINPUT").is_ok_and(|value| value == "1");
+        let trigger_sample = env_u32("CAPTASTIC_GPU_RESET_TRIGGER_SAMPLE", 25);
+        let expect_survival = std::env::var("CAPTASTIC_GPU_RESET_EXPECT")
+            .is_ok_and(|value| value.eq_ignore_ascii_case("survival"));
+        let log_path = std::env::var_os("CAPTASTIC_GPU_RESET_LOG").map_or_else(
+            || std::env::temp_dir().join("captastic-gpu-reset.log"),
+            std::path::PathBuf::from,
+        );
+        let mut sink = std::fs::File::create(&log_path).unwrap_or_else(|error| {
+            panic!(
+                "the measurement log at {} must be writable, because it is the deliverable: {error}",
+                log_path.display()
+            )
+        });
+        let started = Instant::now();
+        let mut record = |line: String| {
+            println!("{line}");
+            let _ = writeln!(sink, "{line}");
+            let _ = sink.flush();
+        };
+
+        record(format!("measurement log: {}", log_path.display()));
+        record(format!(
+            "{samples} samples at {} ms; expecting the trigger to {}; trigger: {}",
+            SAMPLE_CADENCE.as_millis(),
+            if expect_survival {
+                "leave the device alone"
+            } else {
+                "remove the device"
+            },
+            if inject {
+                format!("injected at sample {trigger_sample}")
+            } else {
+                "PRESS Ctrl+Win+Shift+B WHEN READY".to_owned()
+            }
+        ));
+
+        let mut backend = Some(
+            DxgiBackend::new_primary()
+                .expect("a duplication backend must exist before a device loss can be measured"),
+        );
+        let mut next_capture_id = 1_u64;
+        let mut successes = 0_u32;
+        let mut timeouts = 0_u32;
+        let mut losses = 0_u32;
+        let mut rebuild_attempts = 0_u32;
+        let mut total_rebuild_attempts = 0_u32;
+        let mut first_loss_at: Option<Duration> = None;
+        let mut recovered_at: Option<Duration> = None;
+        let mut surfaced_in: Vec<String> = Vec::new();
+        let mut misclassified: Vec<String> = Vec::new();
+        let mut unexplained: Vec<String> = Vec::new();
+        // Aggregate capture cost, kept because the first run could report only that the whole
+        // sweep took 194 s - enough to bound a stall, not enough to find one.
+        let mut capture_cost = Duration::ZERO;
+        let mut slowest = Duration::ZERO;
+        let mut slow_samples = 0_u32;
+
+        for sample in 0..samples {
+            if inject && sample == trigger_sample {
+                record(format!(
+                    "t={:7.3}s sample={sample} injecting Ctrl+Win+Shift+B",
+                    started.elapsed().as_secs_f64()
+                ));
+                send_display_driver_reset_chord();
+            }
+            let Some(active) = backend.as_mut() else {
+                // The backend is gone, so this sample's work is the daemon's: wait out the
+                // back-off, then try to build a replacement. Rebuild attempts are samples too,
+                // which is what keeps the loop counted rather than timed.
+                rebuild_attempts = rebuild_attempts.saturating_add(1);
+                total_rebuild_attempts = total_rebuild_attempts.saturating_add(1);
+                std::thread::sleep(recovery_delay(rebuild_attempts));
+                match DxgiBackend::new_primary() {
+                    Ok(replacement) => {
+                        record(format!(
+                            "t={:7.3}s sample={sample} REBUILT on attempt {rebuild_attempts}",
+                            started.elapsed().as_secs_f64()
+                        ));
+                        backend = Some(replacement);
+                    }
+                    Err(error) => {
+                        record(format!(
+                            "t={:7.3}s sample={sample} rebuild {rebuild_attempts} refused kind={:?} op={} retryable={}: {}",
+                            started.elapsed().as_secs_f64(),
+                            error.kind,
+                            error.operation,
+                            error.retryable,
+                            error.message
+                        ));
+                    }
+                }
+                continue;
+            };
+
+            let reason_before = removal_reason(&active.device);
+            let request = CaptureRequest {
+                id: CaptureId(next_capture_id),
+                triggered_at: Instant::now(),
+                source: CaptureSource::Display(active.selected.id.clone()),
+                mode: CaptureMode::Latest { max_age_ms: None },
+                // The daemon's own default, and it matters: the CPU readback is where a lost
+                // device reports itself through `Map`, so skipping it would move the seam under
+                // test somewhere else.
+                cpu_frame: true,
+                retain_native_frame: false,
+                cursor: CursorMode::Exclude,
+            };
+            next_capture_id = next_capture_id.saturating_add(1);
+            let mut recorder = EventRecorder::with_capacity(16);
+            let attempt_started = Instant::now();
+            let outcome = active.capture(&request, &mut recorder);
+            let took = attempt_started.elapsed();
+            let reason_after = removal_reason(&active.device);
+            let at = started.elapsed();
+            capture_cost = capture_cost.saturating_add(took);
+            slowest = slowest.max(took);
+            if took >= SLOW_SAMPLE {
+                slow_samples = slow_samples.saturating_add(1);
+                record(format!(
+                    "t={:7.3}s sample={sample} SLOW {:.0} ms; device {} -> {}",
+                    at.as_secs_f64(),
+                    took.as_secs_f64() * 1_000.0,
+                    describe_reason(reason_before),
+                    describe_reason(reason_after)
+                ));
+            }
+
+            match outcome {
+                Ok(_) => {
+                    successes = successes.saturating_add(1);
+                    if reason_after.is_some() {
+                        // Possible, and not a fault: the readback finished before the device died.
+                        // Recorded rather than judged, because the sample straddles a transition.
+                        record(format!(
+                            "t={:7.3}s sample={sample} ok across a transition; device now {}",
+                            at.as_secs_f64(),
+                            describe_reason(reason_after)
+                        ));
+                    }
+                    if first_loss_at.is_some() && recovered_at.is_none() {
+                        recovered_at = Some(at);
+                        record(format!(
+                            "t={:7.3}s sample={sample} RECOVERED: first capture to succeed after the loss, {:.0} ms and {total_rebuild_attempts} rebuild attempt(s) later",
+                            at.as_secs_f64(),
+                            at.saturating_sub(first_loss_at.unwrap_or_default())
+                                .as_secs_f64()
+                                * 1_000.0
+                        ));
+                    }
+                }
+                Err(error) => {
+                    let line = format!(
+                        "t={:7.3}s sample={sample} FAIL kind={:?} op={} retryable={} hr={} device_before={} device_after={} took={:.1}ms: {}",
+                        at.as_secs_f64(),
+                        error.kind,
+                        error.operation,
+                        error.retryable,
+                        error
+                            .native_code
+                            .map_or_else(|| "none".to_owned(), |code| format!("{code:#X}")),
+                        describe_reason(reason_before),
+                        describe_reason(reason_after),
+                        took.as_secs_f64() * 1_000.0,
+                        error.message
+                    );
+                    record(line.clone());
+                    if error.kind == CaptureErrorKind::Timeout && reason_after.is_none() {
+                        // An idle desktop presents nothing, so duplication has nothing to hand
+                        // over. Ordinary, and evidence of nothing either way.
+                        timeouts = timeouts.saturating_add(1);
+                    } else if reason_after.is_some() {
+                        losses = losses.saturating_add(1);
+                        if first_loss_at.is_none() {
+                            first_loss_at = Some(at);
+                        }
+                        if reason_before.is_none() {
+                            surfaced_in.push(format!(
+                                "{} (kind {:?}, reason {})",
+                                error.operation,
+                                error.kind,
+                                describe_reason(reason_after)
+                            ));
+                        }
+                        if !REBUILDABLE.contains(&error.kind) {
+                            misclassified.push(line.clone());
+                        }
+                    } else {
+                        // Healthy on both sides of its own failure: whatever this was, it was not
+                        // the device going away, and calling it one would be the mistake the
+                        // bracketing exists to prevent.
+                        unexplained.push(line);
+                    }
+                    if REBUILDABLE.contains(&error.kind) {
+                        backend = None;
+                        rebuild_attempts = 0;
+                    }
+                }
+            }
+            std::thread::sleep(SAMPLE_CADENCE);
+        }
+
+        record(format!(
+            "{samples} samples over {:.0}s: {successes} captured, {losses} failed with a lost device, {timeouts} idle timeouts, {total_rebuild_attempts} rebuild attempt(s), {} unexplained",
+            started.elapsed().as_secs_f64(),
+            unexplained.len()
+        ));
+        record(format!(
+            "capture cost: {:.1}s total, {:.1} ms mean, {:.0} ms slowest, {slow_samples} over {} ms",
+            capture_cost.as_secs_f64(),
+            capture_cost.as_secs_f64() * 1_000.0 / f64::from(successes.max(1)),
+            slowest.as_secs_f64() * 1_000.0,
+            SLOW_SAMPLE.as_millis()
+        ));
+        for surfaced in &surfaced_in {
+            record(format!("the loss surfaced in {surfaced}"));
+        }
+        for line in &unexplained {
+            record(format!("unexplained: {line}"));
+        }
+
+        if expect_survival {
+            // The trigger is one already measured not to take the device away, so the finding is
+            // the survival itself and the run is a guard against that changing. A loss here would
+            // not fail the run - it would mean the trigger became a `loss` trigger, which the
+            // classification and recovery assertions below then judge on their own terms.
+            assert_eq!(
+                successes,
+                samples,
+                "the trigger was expected to leave duplication alone and {} of {samples} samples \
+                 did not capture. Before calling that a regression, note that the daemon's three \
+                 retained sessions did lose access to this same chord on 2026-08-20 while this \
+                 harness's single duplication did not, and nothing explains the difference yet; \
+                 see the GPU device loss section of docs/windows-backend.md. The log is at {}",
+                samples.saturating_sub(successes),
+                log_path.display()
+            );
+            record(format!(
+                "expected survival and got it: {successes}/{samples} samples captured, {losses} lost devices"
+            ));
+        } else {
+            assert!(
+                losses > 0,
+                "no duplication call ever saw a removed device, so this trigger measured nothing \
+                 about the recovery path. Either it never fired, or it does not remove the device \
+                 this backend holds - which is what Ctrl+Win+Shift+B was measured to do on \
+                 2026-08-20, and why that chord wants CAPTASTIC_GPU_RESET_EXPECT=survival rather \
+                 than this branch. The log is at {}",
+                log_path.display()
+            );
+        }
+        assert!(
+            misclassified.is_empty(),
+            "the device was gone and the error said something the daemon does not rebuild for, \
+             which is exactly the demotion `device_removed_error` exists to prevent:\n{}",
+            misclassified.join("\n")
+        );
+        // Conditional on there having been something to recover from. Unconditional, this would
+        // report a trigger that never removed the device as a failure to recover from a loss that
+        // never happened, which is the wrong finding written over the right one.
+        assert!(
+            losses == 0 || recovered_at.is_some(),
+            "duplication never came back on its own after the loss, so the daemon would not have \
+             either. The log is at {}",
+            log_path.display()
+        );
+    }
+
     #[test]
     fn gpu_region_coordinates_are_normalized_against_the_display() {
         assert_eq!(
