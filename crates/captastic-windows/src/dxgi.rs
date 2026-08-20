@@ -112,6 +112,42 @@ pub(crate) fn desktop_obstacle(operation: &'static str) -> Option<CaptureError> 
 /// The backend name every DXGI failure reports itself under, in the log and in these tests.
 const DXGI_BACKEND: &str = "dxgi";
 
+/// The operation a failed D3D11 device creation is reported under, in the log and in these tests.
+const CREATE_DEVICE: &str = "create_d3d11_device";
+
+/// Explains a refused D3D11 device creation, asking the session about it only when it was refused.
+///
+/// This is the first call a duplication session makes after enumerating, and it is deniable for the
+/// same reasons the calls after it are: `docs/windows-backend.md` records that Desktop Duplication
+/// access can be denied from an isolated sandbox even where the same executable succeeds in the
+/// user's interactive session, and a session that has handed its desktop to the lock screen is the
+/// same shape of refusal. Routed through the generic `map_windows_error` that refusal arrived as
+/// `NativeFailure in dxgi/create_d3d11_device: Access is denied.`, with nothing on it to say the
+/// desktop was the reason.
+///
+/// The kind is what the daemon reads, and it changes what the daemon *does*. A `NativeFailure` here
+/// is neither a desktop wait nor a recoverable engine, so a locked session at daemon start reached
+/// `ready_sender.send(Err(..))` and the daemon exited — the resident tool that is missing when the
+/// user comes back, which is the failure issue #51 was filed about — and a locked session during a
+/// rebuild was paced by `recovery_delay`, building a fresh D3D device against a lock screen on an
+/// exponential back-off and warning once per attempt. `DesktopUnavailable` puts both on the path
+/// `duplicate_output` denials already take: the daemon keeps its hotkeys and waits, polling the
+/// two-syscall session probe every 500 ms instead of building devices, and builds the engine once
+/// there is a desktop for it to duplicate.
+///
+/// The same guard exists one layer up, in `display_manager`'s `initialize`, but only for the
+/// `pointer` and `virtual-desktop` policies and only once *every* display has failed; a
+/// `display = primary` daemon never reaches it, and the per-display warn line it does reach quotes
+/// the bare denial. As everywhere else, a denial the session cannot account for keeps its original
+/// kind, message and native code, and the operation string is unchanged.
+fn device_creation_error(
+    error: WindowsError,
+    probe_session: impl FnOnce() -> crate::session::DesktopState,
+) -> CaptureError {
+    crate::session::denied_by_session(DXGI_BACKEND, CREATE_DEVICE, error.code().0, probe_session)
+        .unwrap_or_else(|| map_windows_error(CREATE_DEVICE, error))
+}
+
 pub(crate) fn enumerate_display_adapters() -> Result<Vec<(DisplayInfo, i64)>, CaptureError> {
     enumerate_outputs().map(|outputs| {
         outputs
@@ -204,11 +240,11 @@ impl DxgiBackend {
                 Some(&mut context),
             )
         }
-        .map_err(|error| map_windows_error("create_d3d11_device", error))?;
+        .map_err(|error| device_creation_error(error, crate::session::desktop_state))?;
         let device = device.ok_or_else(|| {
             capture_error(
                 CaptureErrorKind::NativeFailure,
-                "create_d3d11_device",
+                CREATE_DEVICE,
                 "D3D11CreateDevice returned no device",
                 false,
                 None,
@@ -217,7 +253,7 @@ impl DxgiBackend {
         let context = context.ok_or_else(|| {
             capture_error(
                 CaptureErrorKind::NativeFailure,
-                "create_d3d11_device",
+                CREATE_DEVICE,
                 "D3D11CreateDevice returned no immediate context",
                 false,
                 None,
@@ -2683,6 +2719,119 @@ mod tests {
     /// The denial a locked or disconnected session gives this query, as Windows reports it.
     fn access_denied() -> WindowsError {
         WindowsError::from(HRESULT(HRESULT_ACCESS_DENIED))
+    }
+
+    /// A lock refuses the device the duplication is built on, and the report has to say so.
+    ///
+    /// This is the first call `DxgiBackend::new` makes after enumerating, and until now a refusal
+    /// arrived as `NativeFailure in dxgi/create_d3d11_device: Access is denied.` — a kind the daemon
+    /// reads as neither a desktop wait nor a recoverable engine, which under `display = primary`
+    /// meant a daemon that exited at a lock screen rather than waiting at one.
+    #[test]
+    fn a_locked_session_explains_a_refused_d3d11_device() {
+        let denied =
+            device_creation_error(access_denied(), || crate::session::DesktopState::Locked {
+                desktop: Some("Winlogon".to_owned()),
+            });
+        assert_eq!(denied.kind, CaptureErrorKind::DesktopUnavailable);
+        assert!(
+            denied.message.contains("locked"),
+            "the whole point is that the message says so: {denied}"
+        );
+        assert!(denied.message.contains("Winlogon"), "{denied}");
+        assert_eq!(denied.backend, DXGI_BACKEND);
+        assert_eq!(denied.operation, CREATE_DEVICE);
+        assert!(
+            denied.retryable,
+            "a lock ends when a person comes back, so the daemon must be allowed to wait it out"
+        );
+    }
+
+    /// Every other temporary session state explains it too, because every one of them refuses.
+    ///
+    /// An isolated sandbox showing up as a detached session, a secure desktop, and a Remote Desktop
+    /// session composed onto a virtual adapter all refuse this device for reasons that are no more
+    /// a permissions problem than a lock is, and all of them end the same way.
+    #[test]
+    fn any_session_that_owns_no_desktop_explains_a_refused_d3d11_device() {
+        for state in [
+            crate::session::DesktopState::Locked { desktop: None },
+            crate::session::DesktopState::NotOurs {
+                desktop: Some("Winlogon".to_owned()),
+            },
+            crate::session::DesktopState::Detached {
+                connect_state: "disconnected",
+            },
+            crate::session::DesktopState::Remote {
+                protocol: "Remote Desktop",
+            },
+        ] {
+            let denied = device_creation_error(access_denied(), || state.clone());
+            assert_eq!(
+                denied.kind,
+                CaptureErrorKind::DesktopUnavailable,
+                "{state:?} should explain the refusal"
+            );
+            assert_eq!(denied.message, state.to_string());
+            assert_eq!(denied.operation, CREATE_DEVICE);
+        }
+    }
+
+    /// A refusal the session cannot account for stays exactly what it was.
+    ///
+    /// This is the half that makes the re-classification safe to make on a path that decides
+    /// whether the daemon starts. An unlocked, attached, console session refused a D3D11 device has
+    /// something genuinely wrong — the isolated sandbox in `docs/windows-backend.md` is precisely
+    /// that case — and turning it into a desktop wait would replace a daemon that says why it
+    /// failed with one that waits forever for a lock that was never on.
+    #[test]
+    fn an_unlocked_session_leaves_a_refused_d3d11_device_alone() {
+        for state in [
+            crate::session::DesktopState::Interactive,
+            crate::session::DesktopState::Unknown {
+                detail: "the input desktop could not be named".to_owned(),
+            },
+        ] {
+            let denied = device_creation_error(access_denied(), || state.clone());
+            assert_eq!(
+                denied.kind,
+                CaptureErrorKind::NativeFailure,
+                "{state:?} does not explain a refusal and must not hide one"
+            );
+            assert_eq!(denied.message, access_denied().to_string());
+            assert_eq!(denied.native_code, Some(i64::from(HRESULT_ACCESS_DENIED)));
+            assert_eq!(denied.backend, DXGI_BACKEND);
+            assert_eq!(denied.operation, CREATE_DEVICE);
+        }
+    }
+
+    /// A device that was lost rather than refused keeps the classification recovery depends on.
+    ///
+    /// `DXGI_ERROR_DEVICE_REMOVED` from this call is a GPU reset, and the daemon rebuilds for it.
+    /// Sending it to the session probe would cost four syscalls for an answer that cannot apply, and
+    /// re-classifying it as a desktop wait would stop the rebuild that fixes it — so the gate is on
+    /// the denial code, and the counter here is what proves the probe is never asked.
+    #[test]
+    fn only_a_refused_d3d11_device_pays_for_the_session_probe() {
+        let probes = std::cell::Cell::new(0_u32);
+        let probe = || {
+            probes.set(probes.get() + 1);
+            crate::session::DesktopState::Locked { desktop: None }
+        };
+        let removed = WindowsError::from(DXGI_ERROR_DEVICE_REMOVED);
+        let lost = device_creation_error(removed.clone(), probe);
+        assert_eq!(probes.get(), 0, "a non-denial must not ask the session");
+        assert_eq!(lost.kind, CaptureErrorKind::DeviceRemoved);
+        assert_eq!(lost.message, removed.to_string());
+        assert_eq!(lost.operation, CREATE_DEVICE);
+        assert!(lost.retryable);
+
+        let denied = device_creation_error(access_denied(), || {
+            probes.set(probes.get() + 1);
+            crate::session::DesktopState::Locked { desktop: None }
+        });
+        assert_eq!(probes.get(), 1, "a denial asks the session exactly once");
+        assert_eq!(denied.kind, CaptureErrorKind::DesktopUnavailable);
     }
 
     /// The line issue #51 was filed about, and what the fix has to turn it into.
