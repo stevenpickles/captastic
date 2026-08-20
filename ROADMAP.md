@@ -282,8 +282,17 @@ explicit, tested behavior.
   denial now goes through the same session check `duplicate_output` uses and comes out as
   `DesktopUnavailable` naming the lock, keeping the original error whenever the session cannot
   account for it — covered by unit tests, and not yet seen by a live lock run. The display-identity
-  query (`QueryDisplayConfig`) took the same route afterwards, which closes the last bare denial on
-  the #51 lineage; it degrades rather than failing, so what it changes is a warn line.
+  query (`QueryDisplayConfig`) took the same route afterwards; it degrades rather than failing, so
+  what it changes is a warn line. It was called the last bare denial on the #51 lineage, and a
+  survey of the crate then found three more: `create_d3d11_device`, and the two window-capture
+  backends, neither of which had a session check anywhere in it. All three now go through the same
+  check, which lives in `session.rs` with its "only on a denial" gate written once instead of at
+  five call sites. `create_d3d11_device` is the one that changes behaviour rather than wording: a
+  session that refused the capture device used to make a `display = primary` daemon exit at start-up
+  and, on a rebuild, build a fresh D3D11 device against a lock screen on an exponential back-off; it
+  now waits on the session probe like every other explained denial. Unit-tested; no live secure
+  desktop or sandbox has been watched producing the new messages, and none of the three denials has
+  been reproduced on this host.
   GPU-reset recovery is now measured against real hardware for one of its two limbs: a driver
   restart took all three of the daemon's retained DXGI sessions away with `DXGI_ERROR_ACCESS_LOST`,
   and the daemon classified it, rebuilt all three, and finished the capture unattended in one
@@ -565,7 +574,10 @@ still not been reproduced on demand. The denied `QueryDisplayConfig` half no lon
 a permissions problem when it does happen: it goes through the same session check as the other two
 denials and comes out as `DesktopUnavailable` naming the session state, keeping the original error
 whenever the session cannot account for it. That is unit-tested and unmeasured, for the same reason
-the condition is un-reproduced.
+the condition is un-reproduced. The same is now true of `create_d3d11_device` and of both
+window-capture backends, which had no session check at all; the check itself lives in `session.rs`,
+and its "ask the session only on `E_ACCESSDENIED`" gate is written once rather than at each call
+site.
 
 The first run of that test also had a fresh daemon build a duplication 0.3 s after the lock engaged,
 which led to the overly strong claim that a lock does not break DXGI at all. A later run with a
