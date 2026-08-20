@@ -276,15 +276,101 @@ well under the length of the blank itself, though that first run recorded no per
 so could not locate one. It records them now.
 
 The assumption this was hired to check — that Ctrl+Win+Shift+B raises `DXGI_ERROR_DEVICE_REMOVED`
-on a duplication device — is therefore false on this hardware. The chord restarts the driver stack
-underneath an existing duplication without invalidating it, so it cannot be used to exercise the
-recovery path, and the recovery path remains unmeasured against a real loss. Do not read this as
-"device loss recovery works"; read it as "this trigger does not produce a device loss".
+on a duplication device — is therefore false on this hardware. Nothing was ever removed: 3600
+`GetDeviceRemovedReason` calls, bracketing every sample, all returned success. Do not read this as
+"device loss recovery works"; read it as "this trigger did not remove the device".
 
 It is still worth running as a guard, with `CAPTASTIC_GPU_RESET_EXPECT=survival`, which asserts the
-survival instead of the loss. That direction matters: a future driver or Windows build that starts
-breaking duplication on a restart would fail the test loudly rather than quietly changing what the
-product does when a user hits the chord.
+survival instead of the loss. That direction matters: a driver or Windows build that starts breaking
+duplication on a restart would fail the test loudly rather than quietly changing what the product
+does when a user hits the chord. Read the next section before treating a `survival` failure as a
+regression, though — the second run of the day, against the daemon rather than against a single raw
+duplication, did not survive.
+
+### Measured: the same chord did take the daemon's sessions away, and they came back
+
+2026-08-20 14:23:50–14:28:01Z, same host, same chord, `scripts/measure-gpu-reset-recovery.ps1`.
+The daemon held **three** retained DXGI sessions (DELL U2723QE 3840×2160, internal SDC4196
+3840×2400, DELL U2723QE 2160×3840, `pointer` policy) and self-triggered every 500 ms to a limit of
+480 captures. The operator pressed Ctrl+Win+Shift+B once at about 14:24:06; the screen blanked and
+the machine beeped, so the restart genuinely happened. **480 of 480 captures succeeded and the
+daemon exited on its own.** The run's whole recovery story is five lines:
+
+```
+14:24:06.850783 WARN  capture 32 lost the capture engine; dropping it and retrying 1/3 in 50 ms:
+                      AccessLost in dxgi/acquire_next_frame: The keyed mutex was abandoned. (0x887A0026)
+14:24:06.873423 INFO  display configuration invalidated generation=2 reason=tray_display_changed
+14:24:07.927167 INFO  retained DXGI session initialized display=windows-monitor-DEL4279-dp8   3840x2160+0+0
+14:24:08.060463 INFO  retained DXGI session initialized display=windows-monitor-SDC4196-internal0 3840x2400+3840-255
+14:24:08.250508 INFO  retained DXGI session initialized display=windows-monitor-DEL4279-dp4   2160x3840-2160-728
+14:24:08.361031 INFO  capture engine recovered during capture 32 after 1 attempt(s)
+```
+
+What that measures, and what it does not:
+
+- **`AccessLost`, not `DeviceRemoved`.** `0x887A0026` is `DXGI_ERROR_ACCESS_LOST`, and
+  `map_windows_error` routed it to `AccessLost`, which `requires_backend_recovery` rebuilds for.
+  So the classification half of the seam is now measured against a real driver restart rather than
+  against an injected error. The message text is whatever the system message table returns for that
+  HRESULT; it is not evidence that a keyed mutex was involved, and the classification is taken from
+  the code, not the string.
+- **One attempt, ~1.5 s, unattended.** Capture 32 was resolved at 14:24:06.850638 and failed
+  145 µs later. It finished at 14:24:08.361082: **1510 ms end to end**, one retry of a budget of
+  three, never past the first 50 ms step of `recovery_delay`. Most of that is the rebuild, not the
+  back-off — after the 50 ms wait, the first session took about 1026 ms to come back (the driver was
+  still restarting) and the remaining two 323 ms between them. The longest the daemon went without a
+  delivered frame is capture 31 finishing at 14:24:06.346361 to capture 32 finishing at
+  14:24:08.361082: **2015 ms**.
+- **All three sessions came back**, with the same display ids and the same bounds as at startup —
+  six `retained DXGI session initialized` lines in the run, three at 14:23:50 and three at
+  14:24:07–08.
+- **The topology route was absorbed by the access-loss rebuild.** `WM_DISPLAYCHANGE` reached the
+  tray 22 ms after the failure and bumped the display generation to 2, which is the input that makes
+  the next capture return `TopologyChanged`. It never did: the rebuild that the `AccessLost` retry
+  had already started did not finish until 14:24:08.250, so the replacement backend was built after
+  the generation moved and satisfied it. One outage, one rebuild, not two.
+- **The desktop-wait cadence was never touched.** No `capture engine reinitialization failed` line,
+  so the single rebuild succeeded first time, so nothing ever reached `waiting_for_desktop` and its
+  slower 500 ms/2 s poll. No notification-area outage notice either: that needs
+  `BACKEND_OUTAGE_NOTICE_ATTEMPTS` (3) consecutive failed rebuilds and there was one successful one.
+- **One WARN in 980 log lines, no ERROR, and no second event** in the remaining three and a half
+  minutes. `self-trigger soak enqueued 479 trigger(s); 0 were refused by a full trigger queue`.
+- Captures 33 and 34 report `native 962 ms` and `native 409 ms` and are *not* slow captures. Both
+  finished within 9 ms of the line before them. `native_ready_offset_ns` is measured from
+  `triggered_at`, when the trigger was received, so those two figures are the two self-trigger ticks
+  that fired during the outage waiting their turn. The backlog drained in 18 ms and capture 36 was
+  back to 0.574 ms.
+
+### Why the two runs disagree, which is not settled
+
+The same chord, on the same host, on the same day, left one raw duplication of the primary output
+completely undisturbed and took all three of the daemon's sessions away. Both facts are measured;
+the reason for the difference is not, and this is the honest state of it:
+
+- The harness holds a single `DxgiBackend::new_primary()` across every sample. The daemon holds
+  three retained sessions, one of them on the internal panel. Whether the count, or that particular
+  output, is what makes the difference is untested.
+- The daemon's run recorded a display reconfiguration alongside the restart (generation 2,
+  `WM_DISPLAYCHANGE`). The harness has no message loop and no tray, so it cannot say whether its own
+  run reconfigured anything. A mode change is exactly what invalidates duplication with
+  `ACCESS_LOST`, so "the restart sometimes reconfigures the display and sometimes does not" fits
+  both runs — but nothing here demonstrates it.
+
+So: do not treat either outcome as the chord's defined behaviour. Choose
+`CAPTASTIC_GPU_RESET_EXPECT` to match the outcome the run is meant to guard, and read a failure of
+the `survival` branch as this ambiguity rather than as a regression, until something explains it.
+
+### Still unverified: `DEVICE_REMOVED` and `DEVICE_RESET`
+
+The `AccessLost` limb of `requires_backend_recovery` is now measured end to end against real
+hardware. The `DeviceRemoved` limb is not, and it is the limb that `device_removed_error` and the
+removal-reason mapping exist for. No trigger available without elevation removes the device on this
+host: the driver-restart chord is measured not to, and everything else on the list below either
+needs an elevated shell or a new artifact. The adapter cycle was written up, was available, and was
+deliberately not run — it takes every display to the basic display driver on a machine somebody
+works on, and it was not worth that to a run whose other half had already produced a real loss.
+Until it runs, `DEVICE_REMOVED`/`DEVICE_RESET` recovery rests on
+`every_device_removal_reason_triggers_recovery` and the injected-error tests, not on measurement.
 
 ### Triggers, and what each costs
 
@@ -292,8 +378,10 @@ Do not assume they are equivalent — see above for one that has now been measur
 it was assumed to do.
 
 **Ctrl+Win+Shift+B** restarts the display driver stack. The screen blanks for a second or two with
-a beep. Needs no elevation and no shell, which made it the one to try first — and it does not
-remove the device, so it is now a survival guard rather than a way to reach the recovery path.
+a beep. Needs no elevation and no shell, which made it the one to try first. It has never been seen
+to *remove* the device, so it is not a route to `DeviceRemoved`; whether it invalidates duplication
+at all depends on something the two runs above did not isolate, so it is a guard rather than a
+dependable trigger in either direction.
 Whether `SendInput` can inject it is still unverified, and no longer worth verifying for this
 purpose: it is a win32k chord rather than a `RegisterHotKey` binding, and injected input carries
 `LLKHF_INJECTED`, so the harness waits for a human hand unless `CAPTASTIC_GPU_RESET_SENDINPUT=1`

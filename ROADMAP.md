@@ -269,8 +269,13 @@ explicit, tested behavior.
   preserved end to end. That needs the pixels, not the tag (ADR 0006).
 - Add recovery tests for display hot-plugging, sleep/wake, lock/unlock, GPU reset, Remote Desktop, and
   rapid session changes. Hot-plug, unplug and primary-promotion are covered deterministically
-  through the daemon's rebuild seam; the no-source path is covered end to end (#56). Sleep/wake,
-  GPU reset and Remote Desktop still need a machine rather than a fake.
+  through the daemon's rebuild seam; the no-source path is covered end to end (#56). GPU-reset
+  recovery is now measured against real hardware for one of its two limbs: a driver restart took all
+  three of the daemon's retained DXGI sessions away with `DXGI_ERROR_ACCESS_LOST`, and the daemon
+  classified it, rebuilt all three, and finished the capture unattended in one attempt and about
+  1.5 s. `DEVICE_REMOVED`/`DEVICE_RESET` recovery stays unverified: no trigger available without
+  elevation removes the device on this host, and the elevated adapter cycle that would has not been
+  run. Sleep/wake and Remote Desktop still need a machine rather than a fake.
 - Build the controlled sequence-marker workload for freshness, orientation, crop, and cursor tests.
 - Collect environment fingerprints and automate warm-up, raw artifacts, repeat runs, and compatible
   baseline comparison.

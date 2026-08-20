@@ -3030,10 +3030,20 @@ mod tests {
     ///
     /// Measured on 2026-08-20, Intel Arc iGPU, Windows 11 26200: a Ctrl+Win+Shift+B driver restart,
     /// screen blanked and machine beeped, confirmed by the operator at the keyboard, produced
-    /// **1800 captures out of 1800 samples and not one lost device**, over 194 s. So on this host
-    /// the chord is a `survival` trigger. The assumption it was hired to check, that
-    /// Ctrl+Win+Shift+B raises `DXGI_ERROR_DEVICE_REMOVED` on a duplication device, is measured
-    /// false; the driver stack restarts underneath duplication without disturbing it.
+    /// **1800 captures out of 1800 samples and not one lost device**, over 194 s. The assumption it
+    /// was hired to check, that Ctrl+Win+Shift+B raises `DXGI_ERROR_DEVICE_REMOVED` on a duplication
+    /// device, is measured false: 3600 bracketing `GetDeviceRemovedReason` calls all returned
+    /// success.
+    ///
+    /// It does not follow that the chord leaves duplication alone. Later the same day, the same
+    /// chord on the same host took all three of the daemon's retained sessions away with
+    /// `DXGI_ERROR_ACCESS_LOST` - a different failure from the one this test looks for, and one the
+    /// daemon recovered from in a single rebuild. This test holds *one* `new_primary()` duplication
+    /// and has no message loop, so it cannot see a display reconfiguration and cannot say whether
+    /// its run had one. Nothing yet explains the difference; `docs/windows-backend.md` keeps both
+    /// results and the candidate explanations. Pick `CAPTASTIC_GPU_RESET_EXPECT` for the outcome
+    /// the run is meant to guard, and read a `survival` failure as that open question rather than
+    /// as a regression until it is closed.
     ///
     /// Every sample is written to `%TEMP%\captastic-gpu-reset.log`, overridable with
     /// `CAPTASTIC_GPU_RESET_LOG`, and flushed line by line so a run that hangs still leaves its
@@ -3342,8 +3352,10 @@ mod tests {
                 successes,
                 samples,
                 "the trigger was expected to leave duplication alone and {} of {samples} samples \
-                 did not capture. That is the interesting direction: something now breaks \
-                 duplication that did not before. The log is at {}",
+                 did not capture. Before calling that a regression, note that the daemon's three \
+                 retained sessions did lose access to this same chord on 2026-08-20 while this \
+                 harness's single duplication did not, and nothing explains the difference yet; \
+                 see the GPU device loss section of docs/windows-backend.md. The log is at {}",
                 samples.saturating_sub(successes),
                 log_path.display()
             );
