@@ -160,7 +160,10 @@ display the user intends without initializing a capture engine after the hotkey 
   virtual-desktop bounds.
 - Exercise 1080p and 4K displays where available, 100/125/150/200 percent scaling, negative desktop
   coordinates, portrait rotation, mixed-DPI layouts, and hot-plugging.
-- Verify pointer-display selection at boundaries and while the topology changes.
+- Verify pointer-display selection at boundaries and while the topology changes. Live selection now
+  validates the capture engine's display list against the display-configuration generation and
+  rebuilds before placing the overlay, so this reduces to confirming pointer-boundary behavior; a
+  stale arrangement can no longer reach the overlay.
 - Run lock/unlock, sleep/wake, Explorer restart, GPU-reset, Remote Desktop, and KVM/Synergy checks.
 
 ### Exit criteria
