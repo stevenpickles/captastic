@@ -50,11 +50,14 @@ to end and to describe honestly what Captastic is and is not. It is not gated on
 milestones below, and it makes no performance claim.
 
 **Branch model for every formal release.** Cut a `release/v<version>` branch from `dev`, merge it
-to `main`, tag `v<version>` on `main`, and then merge the release branch back to `dev`. `main`
-does not exist yet; v0.1.0 creates it. Fast-forward `main` to the release branch head rather than
-merging with a merge commit: `scripts/build-packages.ps1` derives the revision count from the
-newest `v*` tag reachable from `HEAD`, and a tag on a `main`-only merge commit is never an
-ancestor of `dev`, so every later `dev` build would count revisions from the wrong baseline.
+to `main` by pull request, tag `v<version>` on `main`, and then merge the release branch back to
+`dev` by pull request. Nothing is pushed to `main` or `dev` directly; both are covered by the
+repository ruleset that requires pull requests. `main` does not exist before v0.1.0. One
+consequence to know about: `build.rs` and `scripts/build-packages.ps1` measure the revision count
+from the newest `v*` tag reachable from `HEAD`, and the tag sits on a merge commit that only
+`main` contains, so `dev` builds keep counting from the previous reachable tag or the repository
+root. That is cosmetic; if it ever matters, open the back-merge pull request from `main` instead
+of from the release branch.
 
 ### Gates — before the tag
 
@@ -626,9 +629,9 @@ against a real driver restart, so those three are what is left, and all three ar
 machine — unlike the multi-adapter work, and unlike HDR tone mapping, which needs an HDR display to
 judge rather than merely to compile.
 
-Then the release itself: the release branch to `main`, the tag on `main`, the disposable-VM
-checklist, the manual `choco push` once the release URLs and hashes verify, the merge back to
-`dev`, and the version bump.
+Then the release itself: the release branch to `main` by pull request, the tag on `main`, the
+disposable-VM checklist, the manual `choco push` once the release URLs and hashes verify, the
+pull request merging the release branch back to `dev`, and the version bump.
 
 FakeBackend fidelity keeps its leverage beyond this milestone and is worth extending as gaps appear:
 much of Milestone 4 shipped with daemon-side behaviour verified only by unit tests, because a second
