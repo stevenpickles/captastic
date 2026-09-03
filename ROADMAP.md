@@ -43,10 +43,11 @@ public release, but it gates neither v0.1.0 nor the capture milestones below.
 
 ## Release readiness — v0.1.0
 
-**Status:** In progress on `feature/release-readiness`. v0.1.0 is a deliberately unsigned first
-tag whose purpose is to exercise the release mechanics end to end and to describe honestly what
-Captastic is and is not. It is not gated on the capture milestones below, and it makes no
-performance claim.
+**Status:** Documentation gates complete on `dev` (PR #77); the tag is next. What remains is the
+live release mechanics listed below, none of which has yet run against a real tag. v0.1.0 is a
+deliberately unsigned first tag whose purpose is to exercise the release mechanics end to end and to
+describe honestly what Captastic is and is not. It is not gated on the capture milestones below,
+and it makes no performance claim.
 
 ### Gates — before the tag
 
