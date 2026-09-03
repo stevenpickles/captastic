@@ -87,6 +87,19 @@ pub trait CaptureBackend {
     fn name(&self) -> &'static str;
     fn capabilities(&self) -> &BackendCapabilities;
     fn displays(&self) -> &[DisplayInfo];
+    /// Reports whether [`displays`](Self::displays) still describes the desktop.
+    ///
+    /// A backend enumerates its displays once, when it is built, and a monitor change after that
+    /// leaves the list describing an arrangement that no longer exists. `capture` already refuses
+    /// to run against such a list with `TopologyChanged`; this is the same refusal for callers
+    /// that consume the list *without* capturing — a live selection, which places its overlay from
+    /// these bounds and only captures once the user confirms. Those callers must ask before they
+    /// trust the list, and rebuild the backend when the answer is `TopologyChanged`.
+    ///
+    /// Backends whose topology cannot move underneath them answer `Ok(())`.
+    fn validate_display_configuration(&self) -> Result<(), CaptureError> {
+        Ok(())
+    }
     fn capture(
         &mut self,
         request: &CaptureRequest,

@@ -64,8 +64,26 @@ pub(crate) fn mark_display_configuration_changed(reason: &'static str) {
     log::info!("display configuration invalidated generation={generation} reason={reason}");
 }
 
-fn display_configuration_generation() -> u64 {
+pub(crate) fn display_configuration_generation() -> u64 {
     DISPLAY_CONFIGURATION_GENERATION.load(Ordering::Acquire)
+}
+
+/// The refusal every generation-carrying backend gives once the counter has moved past the value
+/// it enumerated under. Retryable, because the fix is a rebuild and the daemon performs one.
+pub(crate) fn stale_display_configuration_error(
+    operation: &'static str,
+    enumerated_generation: u64,
+    current_generation: u64,
+) -> CaptureError {
+    capture_error(
+        CaptureErrorKind::TopologyChanged,
+        operation,
+        format!(
+            "display configuration changed from generation {enumerated_generation} to {current_generation}; recreate the capture backend"
+        ),
+        true,
+        None,
+    )
 }
 
 pub fn enumerate_displays() -> Result<Vec<DisplayInfo>, CaptureError> {
@@ -310,6 +328,21 @@ impl DxgiBackend {
         };
         Ok(backend)
     }
+
+    /// Refuses with `TopologyChanged` once a display change has been marked since this backend
+    /// enumerated. Its very first act on both the capture and the validation path, and made
+    /// without consulting the display list, because that list is the thing that may be stale.
+    fn check_display_configuration(&self, operation: &'static str) -> Result<(), CaptureError> {
+        let current_generation = display_configuration_generation();
+        if self.display_configuration_generation == current_generation {
+            return Ok(());
+        }
+        Err(stale_display_configuration_error(
+            operation,
+            self.display_configuration_generation,
+            current_generation,
+        ))
+    }
 }
 
 impl CaptureBackend for DxgiBackend {
@@ -325,24 +358,16 @@ impl CaptureBackend for DxgiBackend {
         &self.displays
     }
 
+    fn validate_display_configuration(&self) -> Result<(), CaptureError> {
+        self.check_display_configuration("validate_display_configuration")
+    }
+
     fn capture(
         &mut self,
         request: &CaptureRequest,
         recorder: &mut EventRecorder,
     ) -> Result<CaptureOutcome, CaptureError> {
-        let current_generation = display_configuration_generation();
-        if self.display_configuration_generation != current_generation {
-            return Err(capture_error(
-                CaptureErrorKind::TopologyChanged,
-                "capture",
-                format!(
-                    "display configuration changed from generation {} to {}; recreate the capture backend",
-                    self.display_configuration_generation, current_generation
-                ),
-                true,
-                None,
-            ));
-        }
+        self.check_display_configuration("capture")?;
         match &request.source {
             CaptureSource::Display(id)
                 if *id == self.selected.id || (id.0 == "primary" && self.selected.is_primary) => {}

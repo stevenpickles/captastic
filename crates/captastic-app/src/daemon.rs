@@ -473,9 +473,62 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                     && selection_preview != PreviewMode::Frozen
                     && matches!(action_route(trigger.action), ActionRoute::Overlay(_))
                 {
-                    let active_backend = backend
-                        .as_ref()
-                        .expect("backend availability was checked above");
+                    // The overlay is placed from the engine's display list and nothing captures
+                    // until the user confirms, so this is the only chance to notice that a
+                    // monitor change has left the list stale. Rebuild first; the frozen path gets
+                    // the same protection from its immediate capture.
+                    let (validation, recovery_attempts, reinitialize_error) =
+                        ensure_current_display_configuration(
+                            &mut backend,
+                            || super::create_backend(&backend_name, &display_policy),
+                            |delay| wait_for_backoff(delay, &worker_stop_requested),
+                            |attempt, delay, error| {
+                                crate::logging::warn(format_args!(
+                                    "live selection {} found the capture engine's display list stale; rebuilding it {}/{} in {:.0} ms: {error}",
+                                    capture_id.0,
+                                    attempt,
+                                    CAPTURE_RECOVERY_RETRIES,
+                                    delay.as_secs_f64() * 1_000.0
+                                ));
+                            },
+                        );
+                    if let Some(reinitialize_error) = reinitialize_error {
+                        crate::logging::warn(format_args!(
+                            "capture engine reinitialization failed before live selection {}: {reinitialize_error}",
+                            capture_id.0
+                        ));
+                        recovery = Some(BackendRecovery::after_failure(
+                            recovery_attempts,
+                            waiting_for_desktop(&reinitialize_error),
+                        ));
+                    }
+                    if let Err(error) = validation {
+                        if requires_backend_recovery(&error) && recovery.is_none() {
+                            backend.take();
+                            recovery = Some(BackendRecovery::immediate());
+                        }
+                        crate::logging::error(format_args!(
+                            "live selection {} could not verify the display configuration: {error}",
+                            capture_id.0
+                        ));
+                        // The hotkey was pressed and no overlay will appear. A dock event is a
+                        // burst of display changes, and three rebuilds can all land inside it;
+                        // an abandoned press that only the log knows about is the failure mode
+                        // this path exists to remove.
+                        let _ = capture_notices.try_send(DaemonNotice::DroppedSelection {
+                            capture_id,
+                            reason: ENGINE_NOT_REBUILT_FOR_LAYOUT_REASON,
+                        });
+                        continue;
+                    }
+                    if recovery_attempts > 0 {
+                        log::info!(
+                            "capture engine rebuilt for live selection {} after {} attempt(s)",
+                            capture_id.0,
+                            recovery_attempts
+                        );
+                    }
+                    let active_backend = backend.as_ref().expect("a validated backend is present");
                     let source = match super::resolve_capture_source(
                         &display_policy,
                         active_backend.displays(),
@@ -761,19 +814,34 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                 }
                 match capture_result {
                     Ok(outcome) => {
-                        request.job.cpu_ready_offset_ns =
-                            Some(duration_ns(request.job.triggered_at, Instant::now()));
-                        request.job.metadata = outcome.metadata;
-                        // Distinguished from a user who never asked: the request was refused by
-                        // this path rather than never made.
-                        if matches!(cursor, CursorMode::Include) {
-                            request.job.metadata.cursor = Some(CursorCapture::Absent {
-                                reason: CursorAbsence::SuppressedForSelection,
+                        if let Some(mismatch) =
+                            confirmation_geometry_mismatch(&request.job.metadata, &outcome.metadata)
+                        {
+                            // Recovered onto a different arrangement than the one the overlay
+                            // covered. The selection worker ends the attempt from the terminal
+                            // error and logs it; the balloon is raised here, because that
+                            // worker's failures otherwise reach only the log.
+                            let _ = capture_notices.try_send(DaemonNotice::DroppedSelection {
+                                capture_id,
+                                reason: DISPLAY_LAYOUT_CHANGED_REASON,
                             });
+                            request.job.terminal_error = Some(mismatch);
+                            request.job.confirmed_selection = Some(request.selection);
+                        } else {
+                            request.job.cpu_ready_offset_ns =
+                                Some(duration_ns(request.job.triggered_at, Instant::now()));
+                            request.job.metadata = outcome.metadata;
+                            // Distinguished from a user who never asked: the request was refused
+                            // by this path rather than never made.
+                            if matches!(cursor, CursorMode::Include) {
+                                request.job.metadata.cursor = Some(CursorCapture::Absent {
+                                    reason: CursorAbsence::SuppressedForSelection,
+                                });
+                            }
+                            request.job.frame = outcome.frame;
+                            request.job.native_frame = outcome.native_frame;
+                            request.job.confirmed_selection = Some(request.selection);
                         }
-                        request.job.frame = outcome.frame;
-                        request.job.native_frame = outcome.native_frame;
-                        request.job.confirmed_selection = Some(request.selection);
                     }
                     Err(error) => {
                         if requires_backend_recovery(&error) && recovery.is_none() {
@@ -2054,6 +2122,89 @@ fn capture_with_backend_recovery<T, R>(
         }
     }
 }
+
+/// Makes sure the capture engine's display list is current before a live selection is placed
+/// from it, rebuilding the engine through the same recovery seam a failed capture uses.
+///
+/// A live selection is the one path that consumes `displays()` without capturing first: the
+/// overlay is positioned and sized from those bounds, and pixels are only requested when the user
+/// confirms. Every other path captures immediately, which is where a stale engine used to be
+/// caught. Without this check, a monitor change between two hotkey presses opened the overlay on
+/// the previous arrangement, and the confirmation capture — taken by a freshly rebuilt engine
+/// against the real one — described bounds the drawn region no longer fit inside. The crop then
+/// failed and the capture reached nothing but the log.
+///
+/// Returns the validation outcome, how many rebuilds it took, and any rebuild error, in the same
+/// shape as the capture path so callers treat both the same way.
+#[cfg(windows)]
+fn ensure_current_display_configuration(
+    backend: &mut Option<Box<dyn CaptureBackend>>,
+    rebuild_backend: impl FnMut() -> Result<Box<dyn CaptureBackend>, AppError>,
+    wait: impl FnMut(Duration) -> BackoffOutcome,
+    on_retry: impl FnMut(u32, Duration, &CaptureError),
+) -> (Result<(), CaptureError>, u32, Option<AppError>) {
+    let (validation, (), recovery_attempts, reinitialize_error) = capture_with_backend_recovery(
+        backend,
+        |active_backend| (active_backend.validate_display_configuration(), ()),
+        rebuild_backend,
+        wait,
+        on_retry,
+    );
+    (validation, recovery_attempts, reinitialize_error)
+}
+
+/// Explains why a confirmation capture cannot honour the selection made over `overlay`, or
+/// `None` when it can.
+///
+/// The overlay's region is expressed in the desktop coordinates of the display it was shown on,
+/// and a live overlay shows whatever is on screen at those coordinates. A confirmation capture
+/// that comes back describing different bounds or a different rotation — which a rebuild after a
+/// monitor change produces — means the pixels are no longer the ones the user selected from.
+/// Cropping anyway would either fail on the bounds or, worse, quietly photograph the wrong part
+/// of the wrong screen; naming the change and asking for the capture again is the honest outcome.
+///
+/// Bounds and rotation are the comparison, not the display id: a display that moved has new
+/// bounds under its old id, and a display swapped into the same position at the same rotation
+/// is showing exactly what the overlay showed. The ids are reported for the log either way.
+#[cfg(windows)]
+fn confirmation_geometry_mismatch(
+    overlay: &FrameMetadata,
+    captured: &FrameMetadata,
+) -> Option<String> {
+    let unchanged = overlay.source_rect == captured.source_rect
+        && overlay.rotation_degrees == captured.rotation_degrees;
+    (!unchanged).then(|| {
+        format!(
+            "the display layout changed between the selection and its capture: the overlay covered {} at {}x{}{:+}{:+} rotated {}°, but the capture describes {} at {}x{}{:+}{:+} rotated {}°",
+            overlay.display_id.0,
+            overlay.source_rect.width,
+            overlay.source_rect.height,
+            overlay.source_rect.x,
+            overlay.source_rect.y,
+            overlay.rotation_degrees,
+            captured.display_id.0,
+            captured.source_rect.width,
+            captured.source_rect.height,
+            captured.source_rect.x,
+            captured.source_rect.y,
+            captured.rotation_degrees,
+        )
+    })
+}
+
+/// The notification-area clause for a confirmation the display layout invalidated. A pure
+/// because-clause, as [`DaemonNotice::DroppedSelection`] documents; the balloon's title already
+/// tells the user the capture did not happen, and pressing the hotkey again is the only remedy.
+#[cfg(windows)]
+const DISPLAY_LAYOUT_CHANGED_REASON: &str =
+    "the display layout changed after the selection was made";
+
+/// The clause for a hotkey press abandoned because the capture engine could not be rebuilt for
+/// the display layout the press found. Distinct from the confirmation-time clause: here no
+/// overlay ever appeared.
+#[cfg(windows)]
+const ENGINE_NOT_REBUILT_FOR_LAYOUT_REASON: &str =
+    "the capture engine could not be rebuilt for the current display layout";
 
 #[cfg(windows)]
 fn action_requires_selection(action: HotkeyAction) -> bool {
@@ -3554,6 +3705,132 @@ mod tests {
             |_, _, _| {},
         );
         (result, rebuilds)
+    }
+
+    /// Prepares a live selection against an engine that may be stale, with a rebuild that
+    /// enumerates `after`. Returns the validation outcome, the rebuild count, and the display
+    /// list the selection would be placed from.
+    fn prepare_live_selection_across_rebuild(
+        stale: bool,
+        before: Vec<DisplayInfo>,
+        after: Vec<DisplayInfo>,
+    ) -> (Result<(), CaptureError>, u32, Vec<DisplayInfo>) {
+        let mut backend: Option<Box<dyn CaptureBackend>> =
+            Some(Box::new(FakeBackend::with_displays(
+                FakeBackendConfig {
+                    stale_display_configuration: stale,
+                    ..FakeBackendConfig::default()
+                },
+                before,
+            )));
+        let mut rebuilds = 0_u32;
+        let (validation, _attempts, rebuild_error) = ensure_current_display_configuration(
+            &mut backend,
+            || {
+                rebuilds = rebuilds.saturating_add(1);
+                Ok(Box::new(FakeBackend::with_displays(
+                    FakeBackendConfig::default(),
+                    after.clone(),
+                )))
+            },
+            |_| BackoffOutcome::Elapsed,
+            |_, _, _| {},
+        );
+        assert!(rebuild_error.is_none(), "the fake rebuild cannot fail");
+        let displays = backend
+            .as_ref()
+            .map(|active| active.displays().to_vec())
+            .unwrap_or_default();
+        (validation, rebuilds, displays)
+    }
+
+    #[test]
+    fn a_live_selection_rebuilds_a_stale_engine_before_reading_its_displays() {
+        // The bug this guards against, from the daemon's log: monitors were re-docked between
+        // two hotkey presses, the overlay opened on the old arrangement because nothing captured
+        // before it was placed, and the confirmation capture — the first thing to notice — came
+        // back from a rebuilt engine describing bounds the drawn region no longer fit. The
+        // overlay must be placed from the arrangement the rebuild sees, not the one it replaces.
+        let moved = DisplayInfo {
+            bounds: Rect {
+                x: 3840,
+                y: -255,
+                width: 3840,
+                height: 2400,
+            },
+            ..lifecycle_display("built-in", true, 3840, 2400)
+        };
+        let (validation, rebuilds, displays) = prepare_live_selection_across_rebuild(
+            true,
+            vec![lifecycle_display("built-in", true, 3840, 2400)],
+            vec![moved.clone()],
+        );
+
+        validation.expect("a stale engine is replaced, not reported");
+        assert_eq!(rebuilds, 1);
+        assert_eq!(
+            displays,
+            vec![moved],
+            "the live selection is placed from the rebuilt engine's arrangement"
+        );
+    }
+
+    #[test]
+    fn a_current_engine_is_not_rebuilt_for_a_live_selection() {
+        // Every hotkey press asks; the answer must be free when nothing changed. A rebuild here
+        // would cost a D3D device and a fresh duplication session per capture.
+        let current = vec![lifecycle_display("built-in", true, 1920, 1080)];
+        let (validation, rebuilds, displays) =
+            prepare_live_selection_across_rebuild(false, current.clone(), Vec::new());
+
+        validation.expect("a current engine passes");
+        assert_eq!(rebuilds, 0);
+        assert_eq!(displays, current);
+    }
+
+    #[test]
+    fn a_confirmation_capture_of_the_overlay_geometry_is_honoured() {
+        let overlay = repeat_metadata(Rect {
+            x: 3840,
+            y: -255,
+            width: 3840,
+            height: 2400,
+        });
+        assert_eq!(confirmation_geometry_mismatch(&overlay, &overlay), None);
+    }
+
+    #[test]
+    fn a_confirmation_capture_of_moved_or_rotated_bounds_is_refused_by_name() {
+        // What capture 3 in the daemon's log looked like: the overlay covered the internal panel
+        // where it used to sit, the rebuilt engine found it at the origin. The refusal names both
+        // so the log explains itself without a display inventory to hand.
+        let overlay = repeat_metadata(Rect {
+            x: 3840,
+            y: -255,
+            width: 3840,
+            height: 2400,
+        });
+        let moved = repeat_metadata(Rect {
+            x: 0,
+            y: 0,
+            width: 3840,
+            height: 2400,
+        });
+        let mismatch = confirmation_geometry_mismatch(&overlay, &moved)
+            .expect("moved bounds cannot host the selection");
+        assert!(mismatch.contains("3840x2400+3840-255"), "{mismatch}");
+        assert!(mismatch.contains("3840x2400+0+0"), "{mismatch}");
+
+        // Same bounds, rotated: the pixels under the region are different pixels.
+        let mut rotated = overlay.clone();
+        rotated.rotation_degrees = 90;
+        assert!(confirmation_geometry_mismatch(&overlay, &rotated).is_some());
+
+        // A different id at the same bounds and rotation is the same picture. A live overlay
+        // showed whatever was on screen there, so the capture is of what the user selected.
+        let mut renamed = overlay.clone();
+        renamed.display_id = DisplayId("swapped-in".to_owned());
+        assert_eq!(confirmation_geometry_mismatch(&overlay, &renamed), None);
     }
 
     #[test]

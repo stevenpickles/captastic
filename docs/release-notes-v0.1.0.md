@@ -69,6 +69,11 @@ implementations rather than a portable abstraction.
   conflicting chord and action on failure.
 - Bounded topology recovery: display addition, removal, resolution, rotation, scaling, adapter, and
   session changes rebuild only the affected state.
+- A live selection validates the capture engine's display list against the display-configuration
+  generation and rebuilds the engine before the overlay opens, so a dock, undock, or arrangement
+  change between two hotkey presses cannot place the overlay on the previous layout. A confirmation
+  capture whose display bounds or rotation no longer match the overlay is refused with a
+  notification-area balloon rather than cropped.
 
 ## Desktop experience and operations
 

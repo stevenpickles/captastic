@@ -18,6 +18,10 @@ pub struct FakeBackendConfig {
     pub frame_age: Duration,
     pub fail_every: Option<u64>,
     pub failure_script: Vec<FakeFailure>,
+    /// Models a backend whose display list has gone stale: a monitor change landed after it
+    /// enumerated. Like the real backend it answers `TopologyChanged` from both
+    /// `validate_display_configuration` and `capture`, until it is rebuilt.
+    pub stale_display_configuration: bool,
     pub capabilities: BackendCapabilities,
 }
 
@@ -52,6 +56,7 @@ impl Default for FakeBackendConfig {
             frame_age: Duration::from_millis(1),
             fail_every: None,
             failure_script: Vec::new(),
+            stale_display_configuration: false,
             capabilities: default_capabilities(),
         }
     }
@@ -211,6 +216,21 @@ impl FakeBackend {
             native_code: None,
         }
     }
+
+    /// The refusal a stale display list earns, worded like the real backend's so a daemon test
+    /// exercises the same recovery classification the product performs.
+    fn stale_display_configuration_error(&self, operation: &'static str) -> Option<CaptureError> {
+        self.config
+            .stale_display_configuration
+            .then(|| CaptureError {
+                kind: CaptureErrorKind::TopologyChanged,
+                backend: "fake",
+                operation,
+                message: "display configuration changed; recreate the capture backend".to_owned(),
+                retryable: true,
+                native_code: None,
+            })
+    }
 }
 
 fn default_capabilities() -> BackendCapabilities {
@@ -240,11 +260,21 @@ impl CaptureBackend for FakeBackend {
         &self.displays
     }
 
+    fn validate_display_configuration(&self) -> Result<(), CaptureError> {
+        self.stale_display_configuration_error("validate_display_configuration")
+            .map_or(Ok(()), Err)
+    }
+
     fn capture(
         &mut self,
         request: &CaptureRequest,
         recorder: &mut EventRecorder,
     ) -> Result<CaptureOutcome, CaptureError> {
+        // First, before the display list is consulted, for the reason given below: the list is
+        // the thing that may have gone stale.
+        if let Some(error) = self.stale_display_configuration_error("capture") {
+            return Err(error);
+        }
         if !self.capabilities.display_capture {
             return Err(self.unsupported(
                 "capture_display",
@@ -694,6 +724,48 @@ mod tests {
             .expect_err("missing display must fail");
         assert_eq!(error.kind, CaptureErrorKind::SourceUnavailable);
         assert_eq!(error.operation, "resolve_display");
+    }
+
+    #[test]
+    fn a_stale_display_configuration_is_refused_before_any_capture_and_by_every_capture() {
+        // The real backend answers the daemon's "may I trust your display list?" the same way it
+        // answers a capture against that list: TopologyChanged, retryable, rebuild me. A fake that
+        // validated but then captured (or the reverse) would let the daemon's live-selection path
+        // be tested against a backend the product does not have.
+        let mut backend = FakeBackend::with_displays(
+            FakeBackendConfig {
+                stale_display_configuration: true,
+                ..FakeBackendConfig::default()
+            },
+            vec![display("built-in", true)],
+        );
+
+        let error = backend
+            .validate_display_configuration()
+            .expect_err("a stale list must not be trusted");
+        assert_eq!(error.kind, CaptureErrorKind::TopologyChanged);
+        assert!(error.retryable, "a rebuild fixes it, so the daemon retries");
+
+        let mut recorder = EventRecorder::with_capacity(8);
+        let error = backend
+            .capture(
+                &request_for(
+                    DisplayId("built-in".to_owned()),
+                    CaptureMode::Latest { max_age_ms: None },
+                ),
+                &mut recorder,
+            )
+            .expect_err("captures against the stale list are refused too");
+        assert_eq!(error.kind, CaptureErrorKind::TopologyChanged);
+        // Refused before the attempt counted: the real backend checks its generation before it
+        // does anything else, so a scripted failure keyed to attempt 1 must still be reachable
+        // by the rebuilt backend's first capture, not consumed by this refusal.
+        assert_eq!(backend.attempts, 0);
+
+        // The default configuration is current, which is what every rebuild produces.
+        assert!(FakeBackend::new(FakeBackendConfig::default())
+            .validate_display_configuration()
+            .is_ok());
     }
 
     #[test]

@@ -9,7 +9,10 @@ use captastic_core::{
 use windows::Win32::Foundation::POINT;
 use windows::Win32::UI::WindowsAndMessaging::GetPhysicalCursorPos;
 
-use crate::dxgi::{enumerate_display_adapters, DxgiBackend};
+use crate::dxgi::{
+    display_configuration_generation, enumerate_display_adapters,
+    stale_display_configuration_error, DxgiBackend,
+};
 use crate::session::HRESULT_ACCESS_DENIED;
 
 const COMPOSITE_BUFFER_SLOTS: usize = 3;
@@ -30,10 +33,23 @@ pub struct DxgiDisplayManager {
     virtual_bounds: Rect,
     virtual_topology_error: Option<CaptureError>,
     composite_pool: CompositeBufferPool,
+    /// The display-configuration generation `displays` was enumerated under. The per-display
+    /// sessions carry their own copies for their captures; this one answers for the list itself,
+    /// which the daemon reads to place a live selection overlay before any capture happens.
+    display_configuration_generation: u64,
 }
 
 impl DxgiDisplayManager {
     pub fn new() -> Result<Self, CaptureError> {
+        // Sampled before enumerating so a change that lands mid-build surfaces as TopologyChanged
+        // rather than being trusted. The window is wider than `DxgiBackend::new`'s: it spans the
+        // enumeration *and* one session build per display below, each of which samples the
+        // counter again. A change inside it leaves this value behind every session's, and the
+        // next live selection rebuilds a manager whose captures would have succeeded. That is
+        // the safe side of the trade — `displays` is what this generation vouches for, and it is
+        // the list the daemon places an overlay from — and one rebuild converges once the burst
+        // of change notifications a dock event produces has settled.
+        let generation_before_enumeration = display_configuration_generation();
         let enumerated = enumerate_display_adapters()?;
         let displays: Vec<_> = enumerated
             .iter()
@@ -135,6 +151,7 @@ impl DxgiDisplayManager {
             virtual_bounds,
             virtual_topology_error,
             composite_pool: CompositeBufferPool::new(COMPOSITE_BUFFER_SLOTS),
+            display_configuration_generation: generation_before_enumeration,
         })
     }
 
@@ -208,6 +225,18 @@ impl CaptureBackend for DxgiDisplayManager {
 
     fn displays(&self) -> &[DisplayInfo] {
         &self.displays
+    }
+
+    fn validate_display_configuration(&self) -> Result<(), CaptureError> {
+        let current_generation = display_configuration_generation();
+        if self.display_configuration_generation == current_generation {
+            return Ok(());
+        }
+        Err(stale_display_configuration_error(
+            "validate_display_configuration",
+            self.display_configuration_generation,
+            current_generation,
+        ))
     }
 
     fn capture(
