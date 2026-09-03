@@ -50,11 +50,12 @@ binaries already built by CI, but rejects them when their embedded commit differ
 being packaged. Portable ARM64 archives can be built with `-Architecture arm64`, but the Chocolatey
 package is intentionally restricted to x86_64 until its multi-architecture contract is defined.
 
-Formal releases follow one branch model: a `release/v<version>` branch is cut from `dev`, `main`
-is fast-forwarded to it, the `v<version>` tag is created on `main`, and the release branch is then
-merged back to `dev`. Fast-forwarding matters because the revision count above is measured from the
-newest `v*` tag reachable from `HEAD`; a tag on a `main`-only merge commit would never be reachable
-from `dev`.
+Formal releases follow one branch model: a `release/v<version>` branch is cut from `dev`, merged
+to `main` by pull request, the `v<version>` tag is created on `main`, and the release branch is
+then merged back to `dev` by pull request. The revision count above is measured from the newest
+`v*` tag reachable from `HEAD`, and the tag sits on a merge commit only `main` contains, so `dev`
+builds keep counting from the previous reachable tag or the repository root; open the back-merge
+pull request from `main` instead if that ever matters.
 
 The workspace version represents the next formal release. Advance it on `dev` immediately after the
 release branch is merged back—for example, move from `0.1.0` to the intended `0.2.0` or `1.0.0` line—so subsequent `dev` and
