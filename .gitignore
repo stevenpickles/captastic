@@ -1,0 +1,7 @@
+/target
+/work
+/coverage
+/dist/
+*.jsonl
+benchmark-results/
+/outputs/

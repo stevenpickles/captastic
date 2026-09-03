@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>captastic</id>
+    <version>$version$</version>
+    <title>Captastic</title>
+    <authors>Captastic contributors</authors>
+    <owners>stevenpickles</owners>
+    <projectUrl>https://github.com/stevenpickles/captastic</projectUrl>
+    <packageSourceUrl>https://github.com/stevenpickles/captastic/tree/v$version$/packaging/chocolatey</packageSourceUrl>
+    <bugTrackerUrl>https://github.com/stevenpickles/captastic/issues</bugTrackerUrl>
+    <licenseUrl>https://github.com/stevenpickles/captastic/blob/v$version$/LICENSE-MIT</licenseUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <projectSourceUrl>https://github.com/stevenpickles/captastic</projectSourceUrl>
+    <docsUrl>https://github.com/stevenpickles/captastic#readme</docsUrl>
+    <mailingListUrl>https://github.com/stevenpickles/captastic/discussions</mailingListUrl>
+    <iconUrl>https://cdn.jsdelivr.net/gh/stevenpickles/captastic@5b85094c095237d31ae7f78e35c02525cd85a0d0/assets/branding/captastic-logo.png</iconUrl>
+    <copyright>Copyright (c) 2026 Captastic contributors</copyright>
+    <description>Captastic is a fast, native Windows screenshot tool with display, window, and resizable-region capture workflows. It keeps a persistent GPU capture engine ready, copies captures directly to the clipboard, and provides a native tray and overlay experience.</description>
+    <summary>Fast native screenshot capture for Windows.</summary>
+    <releaseNotes>https://github.com/stevenpickles/captastic/releases</releaseNotes>
+    <tags>captastic screenshot screen-capture clipboard productivity windows foss admin 64bit</tags>
+  </metadata>
+  <files>
+    <file src="tools\**" target="tools" />
+  </files>
+</package>

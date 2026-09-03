@@ -1,0 +1,39 @@
+[package]
+name = "captastic-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+build = "build.rs"
+default-run = "captastic"
+
+[[bin]]
+name = "captastic"
+path = "src/main.rs"
+
+[[bin]]
+name = "captastic-desktop"
+path = "src/bin/captastic-desktop.rs"
+
+[dependencies]
+anstream.workspace = true
+clap.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Budget files are TOML for the same reason the configuration is: they are hand-written and
+# hand-reviewed, and a threshold nobody can read is a threshold nobody maintains.
+toml.workspace = true
+captastic-config = { path = "../captastic-config" }
+captastic-core = { path = "../captastic-core" }
+thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+captastic-windows = { path = "../captastic-windows" }
+windows = { workspace = true, features = ["Win32_System_Threading"] }
+
+[build-dependencies]
+winresource = { version = "=0.1.31", default-features = false }
+
+[lints]
+workspace = true

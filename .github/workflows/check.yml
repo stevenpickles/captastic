@@ -1,0 +1,156 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  security-audit:
+    name: RustSec dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install cargo-audit 0.22.2
+        uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2
+        with:
+          tool: cargo-audit@0.22.2
+          fallback: none
+
+      - name: Reject vulnerable locked dependencies
+        run: cargo audit
+
+  build:
+    name: Build and test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust 1.97.1
+        uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
+        with:
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Reject compiler and Clippy warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Run workspace tests
+        run: cargo test --locked --workspace
+
+      - name: Build distribution workspace
+        run: cargo build --locked --profile dist --workspace
+
+      - name: Report distribution build identity
+        run: |
+          cargo run --locked --profile dist -p captastic-app -- --version
+          cargo run --locked --profile dist -p captastic-app -- version --json
+
+      - name: Run packaging tests
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/test-packaging.ps1
+
+      - name: Test Chocolatey hooks under Windows PowerShell
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./scripts/test-chocolatey-hooks.ps1
+
+      - name: Build lifecycle package versions
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $sourceUrl = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          ./scripts/build-packages.ps1 `
+            -PrereleaseLabel 'ci.${{ github.run_number }}.0' `
+            -BinariesDirectory target/dist `
+            -OutputDirectory dist/lifecycle-initial `
+            -SourceUrl $sourceUrl `
+            -SkipBuild
+          ./scripts/test-artifact-manifest.ps1 `
+            -ManifestPath dist/lifecycle-initial/artifacts.json | Out-Null
+          ./scripts/build-packages.ps1 `
+            -PrereleaseLabel 'ci.${{ github.run_number }}.1' `
+            -BinariesDirectory target/dist `
+            -OutputDirectory dist/lifecycle-upgrade `
+            -SourceUrl $sourceUrl `
+            -SkipBuild
+          ./scripts/test-artifact-manifest.ps1 `
+            -ManifestPath dist/lifecycle-upgrade/artifacts.json | Out-Null
+
+      - name: Test Chocolatey package lifecycle
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./scripts/test-chocolatey-lifecycle.ps1 `
+            -InitialManifestPath dist/lifecycle-initial/artifacts.json `
+            -UpgradeManifestPath dist/lifecycle-upgrade/artifacts.json `
+            -AllowSystemChanges
+
+  coverage:
+    name: Windows HTML coverage
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust 1.97.1 with LLVM coverage tools
+        uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
+        with:
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2
+        with:
+          tool: cargo-llvm-cov
+          fallback: none
+
+      - name: Generate HTML coverage
+        run: cargo llvm-cov --locked --workspace --html --output-dir coverage
+
+      - name: Upload HTML coverage
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: captastic-coverage-html
+          path: coverage/html
+          if-no-files-found: error
+          retention-days: 14
+
+  windows-arm64-check:
+    name: Windows ARM64 compile check
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust 1.97.1 with ARM64 target
+        uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
+        with:
+          targets: aarch64-pc-windows-msvc
+
+      - name: Check ARM64 workspace
+        run: cargo check --locked --workspace --all-targets --target aarch64-pc-windows-msvc

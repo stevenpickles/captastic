@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows-package:
+    name: Windows release package
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust 1.97.1
+        uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
+
+      - name: Run workspace tests
+        run: cargo test --locked --workspace
+
+      - name: Build distribution binaries
+        run: cargo build --locked --profile dist --workspace
+
+      - name: Report distribution build identity
+        run: |
+          cargo run --locked --profile dist -p captastic-app -- --version
+          cargo run --locked --profile dist -p captastic-app -- version --json
+
+      - name: Run packaging tests
+        shell: pwsh
+        run: ./scripts/test-packaging.ps1
+
+      - name: Build and validate release packages
+        id: packages
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $result = ./scripts/build-packages.ps1 `
+              -ReleaseTag $env:GITHUB_REF_NAME `
+              -BinariesDirectory target/dist `
+              -SkipBuild
+          } else {
+            $sourceUrl = "https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            $shortSha = $env:GITHUB_SHA.Substring(0, 9).ToLowerInvariant()
+            $result = ./scripts/build-packages.ps1 `
+              -PrereleaseLabel "ci.$env:GITHUB_RUN_NUMBER.$env:GITHUB_RUN_ATTEMPT.g$shortSha" `
+              -BinariesDirectory target/dist `
+              -SourceUrl $sourceUrl `
+              -SkipBuild
+          }
+          $manifest = ./scripts/test-artifact-manifest.ps1 `
+            -ManifestPath $result.ManifestPath
+          $outputDirectory = Split-Path -Parent $result.ManifestPath
+          $artifactPaths = @{}
+          foreach ($artifact in $manifest.artifacts) {
+            $artifactPaths[$artifact.kind] = Join-Path $outputDirectory $artifact.file
+          }
+          "archive=$($artifactPaths['portable-archive'])" >> $env:GITHUB_OUTPUT
+          "checksum=$($artifactPaths['portable-checksum'])" >> $env:GITHUB_OUTPUT
+          "chocolatey=$($artifactPaths['chocolatey-package'])" >> $env:GITHUB_OUTPUT
+          "manifest=$($result.ManifestPath)" >> $env:GITHUB_OUTPUT
+
+      - name: Upload release packages
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: captastic-windows-x86_64
+          path: |
+            ${{ steps.packages.outputs.archive }}
+            ${{ steps.packages.outputs.checksum }}
+            ${{ steps.packages.outputs.chocolatey }}
+            ${{ steps.packages.outputs.manifest }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish tagged GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          generate_release_notes: true
+          files: |
+            ${{ steps.packages.outputs.archive }}
+            ${{ steps.packages.outputs.checksum }}
+            ${{ steps.packages.outputs.chocolatey }}
+            ${{ steps.packages.outputs.manifest }}

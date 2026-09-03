@@ -1,0 +1,1260 @@
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use captastic_config::{
+    CaptureRegion, CaptureRegionSource, ConfirmedRegion, HotkeyAction, HotkeyChord, PreviewMode,
+};
+use captastic_core::{
+    validate_event_order, CaptureId, CpuFrame, EventRecorder, FrameMetadata, NativeFrame,
+    PerfEventKind,
+};
+use serde_json::json;
+use std::sync::Mutex;
+
+use crate::error::AppError;
+
+const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(1);
+/// Slice of a stop budget held back from the selection join for the UI-state thread, whose final
+/// write is the only part of a selection that outlives the process.
+const UI_STATE_STOP_RESERVE: Duration = Duration::from_millis(250);
+const WORKER_STOP_POLL: Duration = Duration::from_millis(5);
+const WORKER_RECEIVE_POLL: Duration = Duration::from_millis(50);
+const RESOURCE_CACHE_IDLE: Duration = Duration::from_secs(30);
+
+pub type ConfirmedRegionCache = Arc<Mutex<BTreeMap<String, ConfirmedRegion>>>;
+
+pub struct OneShotUiStateWorker {
+    controller: Option<captastic_windows::OverlayController>,
+    failure_receiver: mpsc::Receiver<String>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl OneShotUiStateWorker {
+    pub fn start(store: captastic_config::UiStateStore) -> Result<Self, AppError> {
+        let (sender, receiver) = mpsc::channel();
+        let (failure_sender, failure_receiver) = mpsc::channel();
+        let controller = captastic_windows::OverlayController::with_ui_updates(sender);
+        let join = thread::Builder::new()
+            .name("captastic-ui-state-once".to_owned())
+            .spawn(move || persist_ui_state(receiver, store, Some(failure_sender)))
+            .map_err(|error| AppError::BackendUnavailable(error.to_string()))?;
+        Ok(Self {
+            controller: Some(controller),
+            failure_receiver,
+            join: Some(join),
+        })
+    }
+
+    pub fn controller(&self) -> &captastic_windows::OverlayController {
+        self.controller.as_ref().expect("UI-state worker is active")
+    }
+
+    pub fn finish(mut self) -> Result<(), AppError> {
+        self.controller.take();
+        let Some(join) = self.join.take() else {
+            return Ok(());
+        };
+        if !join_worker_with_timeout(join, "one-shot UI-state", WORKER_STOP_TIMEOUT) {
+            return Err(AppError::BackendUnavailable(format!(
+                "one-shot UI-state persistence did not finish within {} ms",
+                WORKER_STOP_TIMEOUT.as_millis()
+            )));
+        }
+        if let Some(failure) = self.failure_receiver.try_iter().next() {
+            return Err(AppError::BackendUnavailable(failure));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for OneShotUiStateWorker {
+    fn drop(&mut self) {
+        self.controller.take();
+        if let Some(join) = self.join.take() {
+            join_worker_with_timeout(join, "one-shot UI-state", WORKER_STOP_TIMEOUT);
+        }
+    }
+}
+
+fn join_worker_with_timeout(join: JoinHandle<()>, name: &str, timeout: Duration) -> bool {
+    join_worker_until(join, name, Instant::now() + timeout)
+}
+
+fn join_worker_until(join: JoinHandle<()>, name: &str, deadline: Instant) -> bool {
+    while !join.is_finished() && Instant::now() < deadline {
+        thread::sleep(WORKER_STOP_POLL);
+    }
+    if join.is_finished() {
+        let _ = join.join();
+        true
+    } else {
+        crate::logging::error(format_args!(
+            "{name} worker did not stop before its shutdown deadline; detaching it so shutdown can continue"
+        ));
+        false
+    }
+}
+
+/// Reports a selection attempt back to the capture worker when it reaches a terminal state.
+///
+/// The selection worker ends attempts on many paths - cancellation, materialization failures,
+/// rejected clipboard hand-offs - and most of them simply `continue`. Reporting from `Drop` covers
+/// all of them, so the capture worker can retire a `--max-captures` budget that would otherwise
+/// wait forever for a cancelled overlay. Attempts handed back to the capture worker are deferred
+/// instead: they return here later and report exactly once.
+struct AttemptCompletion<'a> {
+    capture_sender: &'a mpsc::SyncSender<crate::daemon::CaptureCommand>,
+    capture_id: CaptureId,
+    report: bool,
+}
+
+impl<'a> AttemptCompletion<'a> {
+    fn new(
+        capture_sender: &'a mpsc::SyncSender<crate::daemon::CaptureCommand>,
+        capture_id: CaptureId,
+    ) -> Self {
+        Self {
+            capture_sender,
+            capture_id,
+            report: true,
+        }
+    }
+
+    fn handed_back(&mut self) {
+        self.report = false;
+    }
+}
+
+impl Drop for AttemptCompletion<'_> {
+    fn drop(&mut self) {
+        if !self.report {
+            return;
+        }
+        // A blocking send could deadlock against the capture worker submitting into this worker's
+        // queue; a lost notification only costs a `--max-captures` daemon its early exit.
+        let _ = self
+            .capture_sender
+            .try_send(crate::daemon::CaptureCommand::SelectionFinished(
+                self.capture_id,
+            ));
+    }
+}
+
+/// Tells the daemon's main thread that a selection was abandoned, so the loss reaches the
+/// notification area instead of only the log. The job itself has already been closed out by its
+/// caller; this only carries the report.
+fn notify_dropped_selection(
+    notices: &mpsc::SyncSender<crate::daemon::DaemonNotice>,
+    capture_id: CaptureId,
+    reason: &'static str,
+) {
+    let _ = notices.try_send(crate::daemon::DaemonNotice::DroppedSelection { capture_id, reason });
+}
+
+pub struct SelectionWorker {
+    sender: Option<mpsc::SyncSender<SelectionJob>>,
+    controller: Option<captastic_windows::OverlayController>,
+    ui_sender: Option<mpsc::Sender<captastic_windows::OverlayUiUpdate>>,
+    failure_receiver: mpsc::Receiver<String>,
+    stop_requested: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+    ui_join: Option<JoinHandle<()>>,
+}
+
+impl SelectionWorker {
+    pub fn start(
+        output_sinks: Vec<Box<dyn crate::output::OutputSink>>,
+        capture_sender: mpsc::SyncSender<crate::daemon::CaptureCommand>,
+        notices: mpsc::SyncSender<crate::daemon::DaemonNotice>,
+        json_output: bool,
+        queue_capacity: usize,
+        confirmed_regions: ConfirmedRegionCache,
+        ui_state_store: captastic_config::UiStateStore,
+    ) -> Result<Self, AppError> {
+        let (sender, receiver) = mpsc::sync_channel::<SelectionJob>(queue_capacity);
+        let (ui_sender, ui_receiver) = mpsc::channel();
+        let (failure_sender, failure_receiver) = mpsc::channel();
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let worker_stop_requested = stop_requested.clone();
+        let ui_join = thread::Builder::new()
+            .name("captastic-ui-state".to_owned())
+            .spawn(move || persist_ui_state(ui_receiver, ui_state_store, Some(failure_sender)))
+            .map_err(|error| AppError::BackendUnavailable(error.to_string()))?;
+        let controller = captastic_windows::OverlayController::with_ui_updates(ui_sender.clone());
+        let worker_controller = controller.clone();
+        let join = match thread::Builder::new()
+            .name("captastic-selection".to_owned())
+            .spawn(move || {
+                let mut cache_idle_started = Instant::now();
+                // Worker-owned overlay resources (M24): reused across runs on this thread,
+                // released after RESOURCE_CACHE_IDLE below, dropped with the worker.
+                let mut overlay_resources = captastic_windows::OverlayResources::new();
+                loop {
+                    if worker_stop_requested.load(Ordering::Acquire) {
+                        break;
+                    }
+                let mut job = match receiver.recv_timeout(WORKER_RECEIVE_POLL) {
+                    Ok(job) => job,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if worker_stop_requested.load(Ordering::Acquire) {
+                            break;
+                        }
+                        if cache_idle_started.elapsed() >= RESOURCE_CACHE_IDLE {
+                            overlay_resources.clear();
+                            cache_idle_started = Instant::now();
+                        }
+                        continue;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+                cache_idle_started = Instant::now();
+                let mut attempt = AttemptCompletion::new(&capture_sender, job.capture_id);
+                if let Some(error) = job.terminal_error.take() {
+                    finish_without_clipboard(
+                        &mut job,
+                        json_output,
+                        "selection_failed",
+                        &error,
+                    );
+                    continue;
+                }
+                let remembered_ui = worker_controller.remembered_ui(
+                    &job.metadata.display_id.0,
+                    job.remembered_ui.unwrap_or_default(),
+                );
+                let mut selection_was_confirmed = job.confirmed_selection.is_some();
+                let selection = if let Some(selection) = job.confirmed_selection.take() {
+                    Ok(Some(selection))
+                } else {
+                    let preview_source = job.frame.as_ref().map_or_else(
+                        || captastic_windows::SelectionPreviewSource::live(&job.metadata),
+                        captastic_windows::SelectionPreviewSource::frozen,
+                    );
+                    captastic_windows::select_from_preview_source_with_initial_tool_and_ui(
+                        preview_source,
+                        &worker_controller,
+                        job.initial_tool,
+                        Some(remembered_ui),
+                        &mut overlay_resources,
+                    )
+                };
+                match selection {
+                    Ok(Some(selection)) => {
+                        if !selection_was_confirmed {
+                            job.recorder.record(
+                                job.capture_id,
+                                PerfEventKind::SelectionStarted,
+                                offset_after_cpu(&job),
+                            );
+                        }
+                        if !selection_was_confirmed
+                            && selection.kind == captastic_windows::SelectionKind::Region
+                        {
+                            remember_confirmed_region(
+                                &confirmed_regions,
+                                &worker_controller,
+                                &job.metadata,
+                                selection.rect,
+                            );
+                        }
+                        let selection_offset_ns = job
+                            .selection_offset_ns
+                            .unwrap_or_else(|| duration_ns(job.triggered_at.elapsed()));
+                        if job.frame.is_none()
+                            && selection.kind == captastic_windows::SelectionKind::Window
+                        {
+                            let Some(frame) = captastic_windows::captured_window_frame(&selection)
+                            else {
+                                finish_without_clipboard(
+                                    &mut job,
+                                    json_output,
+                                    "selection_failed",
+                                    "confirmed window selection did not retain its native frame",
+                                );
+                                continue;
+                            };
+                            job.recorder.record(
+                                job.capture_id,
+                                PerfEventKind::SelectionConfirmed,
+                                selection.selection_ns,
+                            );
+                            let ready_offset_ns = duration_ns(job.triggered_at.elapsed());
+                            job.recorder.record(
+                                job.capture_id,
+                                PerfEventKind::CaptureRequested,
+                                ready_offset_ns,
+                            );
+                            job.recorder.record(
+                                job.capture_id,
+                                PerfEventKind::NativeFrameReady,
+                                ready_offset_ns,
+                            );
+                            job.recorder.record(
+                                job.capture_id,
+                                PerfEventKind::CpuFrameReady,
+                                ready_offset_ns,
+                            );
+                            job.cpu_ready_offset_ns = Some(ready_offset_ns);
+                            job.metadata = frame.metadata.clone();
+                            job.frame = Some(frame);
+                            job.confirmation_anchored = true;
+                            selection_was_confirmed = true;
+                        }
+                        if job.frame.is_none() {
+                            job.recorder.record(
+                                job.capture_id,
+                                PerfEventKind::SelectionConfirmed,
+                                selection.selection_ns,
+                            );
+                            job.selection_offset_ns = Some(selection_offset_ns);
+                            if let Err(error) = captastic_windows::flush_desktop_composition() {
+                                log::warn!(
+                                    "selection {} could not synchronize overlay removal before capture: {error}",
+                                    job.capture_id.0
+                                );
+                            }
+                            let request = LiveSelectionRequest {
+                                job,
+                                selection,
+                                confirmed_at: Instant::now(),
+                            };
+                            match capture_sender.try_send(
+                                crate::daemon::CaptureCommand::LiveSelection(Box::new(request)),
+                            ) {
+                                Ok(()) => attempt.handed_back(),
+                                Err(error) => {
+                                    let command = match error {
+                                        mpsc::TrySendError::Full(command)
+                                        | mpsc::TrySendError::Disconnected(command) => command,
+                                    };
+                                    let crate::daemon::CaptureCommand::LiveSelection(request) =
+                                        command
+                                    else {
+                                        unreachable!("selection worker sends only live selections")
+                                    };
+                                    let mut job = request.job;
+                                    finish_without_clipboard(
+                                        &mut job,
+                                        json_output,
+                                        "selection_failed",
+                                        "capture command queue was unavailable after confirmation",
+                                    );
+                                    notify_dropped_selection(
+                                        &notices,
+                                        job.capture_id,
+                                        "the capture command queue was unavailable after its selection was confirmed",
+                                    );
+                                }
+                            }
+                            continue;
+                        }
+                        if !selection_was_confirmed {
+                            job.recorder.record(
+                                job.capture_id,
+                                PerfEventKind::SelectionConfirmed,
+                                selection.selection_ns,
+                            );
+                        }
+                        let frame = job
+                            .frame
+                            .as_ref()
+                            .expect("captured pixels exist after live selection resumes");
+                        let materialize_started = Instant::now();
+                        let mut materialization = selection_materialization(
+                            selection.kind,
+                            job.confirmation_anchored,
+                        );
+                        let mut gpu_materialization = None;
+                        let mut gpu_fallback_error = None;
+                        let gpu_result = if selection.kind == captastic_windows::SelectionKind::Region {
+                            job.native_frame.as_deref().map(|native_frame| {
+                                captastic_windows::materialize_native_region(
+                                    native_frame,
+                                    selection.rect,
+                                )
+                            })
+                        } else {
+                            None
+                        };
+                        let selected_frame = match gpu_result.transpose() {
+                            Ok(Some(Some(result))) => {
+                                materialization = "dxgi_gpu_region";
+                                gpu_materialization = Some(json!({
+                                    "gpu_copy_submit_ns": result.gpu_copy_submit_ns,
+                                    "map_wait_ns": result.map_wait_ns,
+                                    "cpu_copy_ns": result.cpu_copy_ns,
+                                    "total_ns": result.total_ns,
+                                    "bytes_read": result.bytes_read,
+                                    "full_frame_bytes": result.full_frame_bytes,
+                                    "bytes_avoided": result.bytes_avoided,
+                                    "contiguous_rows": result.contiguous_rows,
+                                }));
+                                result.frame
+                            }
+                            Ok(Some(None)) | Ok(None) => {
+                                match captastic_windows::materialize_selection(frame, &selection) {
+                                    Ok(frame) => frame,
+                                    Err(error) => {
+                                        finish_without_clipboard(
+                                            &mut job,
+                                            json_output,
+                                            "selection_failed",
+                                            &error.to_string(),
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                gpu_fallback_error = Some(error.to_string());
+                                crate::logging::warn(format_args!(
+                                    "selection {} GPU materialization failed; using CPU crop: {error}",
+                                    job.capture_id.0
+                                ));
+                                match captastic_windows::materialize_selection(frame, &selection) {
+                                    Ok(frame) => frame,
+                                    Err(error) => {
+                                        finish_without_clipboard(
+                                            &mut job,
+                                            json_output,
+                                            "selection_failed",
+                                            &error.to_string(),
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                        };
+                        let materialize_ns = duration_ns(materialize_started.elapsed());
+                        job.recorder.record(
+                            job.capture_id,
+                            PerfEventKind::CropFinished,
+                            materialize_ns,
+                        );
+                        log::info!(
+                            "selection {}: {} {}x{} at ({}, {}), output {:.3} ms materialization={}",
+                            job.capture_id.0,
+                            selection_kind(selection.kind),
+                            selection.rect.width,
+                            selection.rect.height,
+                            selection.rect.x,
+                            selection.rect.y,
+                            ns_to_ms(materialize_ns),
+                            materialization
+                        );
+                        if json_output {
+                            println!(
+                                "{}",
+                                json!({
+                                    "schema_version": 1,
+                                    "event": "selection_complete",
+                                    "capture_id": job.capture_id,
+                                    "source": job.source,
+                                    "kind": selection_kind(selection.kind),
+                                    "rect": selection.rect,
+                                    "selection_offset_ns": selection_offset_ns,
+                                    "action": job.action,
+                                    "chord": job.chord.map(|chord| chord.to_string()),
+                                    "selection_interaction_ns": selection.selection_ns,
+                                    "requested_preview_mode": preview_mode(job.preview_mode),
+                                    "preview_mode": if job.confirmation_anchored { "live" } else { "frozen" },
+                                    "preview_fallback_reason": job.preview_fallback_reason.as_deref(),
+                                    "capture_anchor": if job.confirmation_anchored {
+                                        "confirmation"
+                                    } else if job.preview_fallback_reason.is_some() {
+                                        "fallback"
+                                    } else {
+                                        "trigger"
+                                    },
+                                    "overlay_preparation_ns": selection.preparation_ns,
+                                        "window_overview_ns": selection.window_overview_ns,
+                                        "window_preview_count": selection.window_preview_count,
+                                        "window_live_preview_count": selection.window_live_preview_count,
+                                        "window_frozen_preview_count": selection.window_frozen_preview_count,
+                                        "window_preview_bytes": selection.window_preview_bytes,
+                                    "materialization": materialization,
+                                    "materialization_ns": materialize_ns,
+                                    "gpu_materialization": gpu_materialization,
+                                    "gpu_fallback_error": gpu_fallback_error,
+                                    "selected_frame_bytes": selected_frame.required_bytes(),
+                                })
+                            );
+                        }
+                        let cpu_ready_offset_ns = job
+                            .cpu_ready_offset_ns
+                            .unwrap_or_else(|| duration_ns(job.triggered_at.elapsed()));
+                        if output_sinks.is_empty() {
+                            // A selection with no destination configured. Previously impossible to
+                            // express: the worker held a clipboard sender and a `.expect` in the
+                            // daemon asserted one existed, restating at runtime a rule the
+                            // configuration validator had already enforced.
+                            report_clipboard_rejection(
+                                crate::output::OutputJob {
+                                    capture_id: job.capture_id,
+                                    triggered_at: job.triggered_at,
+                                    action: job.action,
+                                    chord: job.chord,
+                                    cpu_ready_offset_ns,
+                                    source: job.source,
+                                    frame: selected_frame,
+                                    recorder: job.recorder,
+                                    window_title: None,
+                                    window_application: None,
+                                },
+                                "no_destination",
+                                json_output,
+                            );
+                        } else {
+                            // Every destination, not just the first: a selection is a capture like
+                            // any other, and a region chosen in the overlay belongs on disk too if
+                            // the user asked for file output.
+                            for sink in &output_sinks {
+                                let destination_job = crate::output::OutputJob {
+                                    capture_id: job.capture_id,
+                                    triggered_at: job.triggered_at,
+                                    action: job.action,
+                                    chord: job.chord,
+                                    cpu_ready_offset_ns,
+                                    source: job.source,
+                                    frame: selected_frame.clone(),
+                                    // Forked per destination: they run concurrently and their
+                                    // events cannot be ordered against each other (ADR 0002).
+                                    recorder: job.recorder.clone(),
+                                    window_title: selection.window_title.clone(),
+                                    window_application: selection.window_application.clone(),
+                                };
+                                if let Err(rejection) = sink.submit(destination_job) {
+                                    let status = rejection.status();
+                                    report_clipboard_rejection(
+                                        *rejection.into_job(),
+                                        status,
+                                        json_output,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        if !selection_was_confirmed {
+                            job.recorder.record(
+                                job.capture_id,
+                                PerfEventKind::SelectionStarted,
+                                offset_after_cpu(&job),
+                            );
+                        }
+                        finish_without_clipboard(
+                            &mut job,
+                            json_output,
+                            "selection_cancelled",
+                            "selection was cancelled",
+                        );
+                    }
+                    Err(error) => {
+                        if job.frame.is_none()
+                            && job.preview_mode == PreviewMode::Auto
+                            && job.preview_fallback_reason.is_none()
+                        {
+                            crate::logging::warn(format_args!(
+                                "selection {} live presenter failed; reopening with a frozen preview: {error}",
+                                job.capture_id.0
+                            ));
+                            job.preview_fallback_reason = Some(error.to_string());
+                            let request = FrozenSelectionFallbackRequest {
+                                job,
+                                requested_at: Instant::now(),
+                            };
+                            match capture_sender.try_send(
+                                crate::daemon::CaptureCommand::FrozenSelectionFallback(Box::new(
+                                    request,
+                                )),
+                            ) {
+                                Ok(()) => attempt.handed_back(),
+                                Err(error) => {
+                                    let command = match error {
+                                        mpsc::TrySendError::Full(command)
+                                        | mpsc::TrySendError::Disconnected(command) => command,
+                                    };
+                                    let crate::daemon::CaptureCommand::FrozenSelectionFallback(
+                                        request,
+                                    ) = command
+                                    else {
+                                        unreachable!("selection worker sends only fallback captures")
+                                    };
+                                    let mut job = request.job;
+                                    finish_without_clipboard(
+                                        &mut job,
+                                        json_output,
+                                        "selection_failed",
+                                        "capture command queue was unavailable for automatic preview fallback",
+                                    );
+                                    notify_dropped_selection(
+                                        &notices,
+                                        job.capture_id,
+                                        "the capture command queue was unavailable for its automatic preview fallback",
+                                    );
+                                }
+                            }
+                            continue;
+                        }
+                        if !selection_was_confirmed {
+                            job.recorder.record(
+                                job.capture_id,
+                                PerfEventKind::SelectionStarted,
+                                offset_after_cpu(&job),
+                            );
+                        }
+                        finish_without_clipboard(
+                            &mut job,
+                            json_output,
+                            "selection_failed",
+                            &error.to_string(),
+                        );
+                    }
+                }
+            }
+            }) {
+            Ok(join) => join,
+            Err(error) => {
+                drop(controller);
+                drop(ui_sender);
+                join_worker_with_timeout(
+                    ui_join,
+                    "UI-state persistence startup rollback",
+                    WORKER_STOP_TIMEOUT,
+                );
+                return Err(AppError::BackendUnavailable(error.to_string()));
+            }
+        };
+        Ok(Self {
+            sender: Some(sender),
+            controller: Some(controller),
+            ui_sender: Some(ui_sender),
+            failure_receiver,
+            stop_requested,
+            join: Some(join),
+            ui_join: Some(ui_join),
+        })
+    }
+
+    pub fn submitter(&self) -> mpsc::SyncSender<SelectionJob> {
+        self.sender
+            .as_ref()
+            .expect("selection worker is running")
+            .clone()
+    }
+
+    pub fn try_recv_persistence_failure(&self) -> Option<String> {
+        self.failure_receiver.try_recv().ok()
+    }
+
+    #[cfg(test)]
+    pub fn stop(mut self) -> Vec<String> {
+        self.stop_inner(Instant::now() + WORKER_STOP_TIMEOUT);
+        self.failure_receiver.try_iter().collect()
+    }
+
+    pub fn stop_before(mut self, deadline: Instant) -> Vec<String> {
+        self.request_stop();
+        self.stop_inner(deadline);
+        self.failure_receiver.try_iter().collect()
+    }
+
+    pub fn request_stop(&mut self) {
+        self.stop_requested.store(true, Ordering::Release);
+        self.sender.take();
+        if let Some(controller) = self.controller.take() {
+            controller.cancel();
+        }
+        self.ui_sender.take();
+    }
+
+    fn stop_inner(&mut self, deadline: Instant) {
+        self.request_stop();
+        // `request_stop` already dropped this side's update sender, so the UI-state thread is
+        // winding down in parallel and only needs a moment to write once the selection thread
+        // releases its own sender. Joining the selection thread against the full deadline could
+        // spend all of it, so hold the last slice back for the write that must reach disk.
+        let selection_deadline = crate::worker_registry::reserved_deadline(
+            Instant::now(),
+            deadline,
+            UI_STATE_STOP_RESERVE,
+        );
+        let mut selection_stopped = true;
+        if let Some(join) = self.join.take() {
+            if !join_worker_until(join, "selection", selection_deadline) {
+                selection_stopped = false;
+            }
+        }
+        if let Some(join) = self.ui_join.take() {
+            if selection_stopped {
+                // Reserving is not enough on its own: an earlier teardown step may already have
+                // overrun the shared deadline. This is the only shutdown step that writes user
+                // state to disk, so it is guaranteed its slice, overrunning by at most the reserve
+                // and staying well inside the tray's session-shutdown drain window.
+                let ui_deadline = crate::worker_registry::guaranteed_deadline(
+                    Instant::now(),
+                    deadline,
+                    UI_STATE_STOP_RESERVE,
+                );
+                join_worker_until(join, "UI-state persistence", ui_deadline);
+            } else {
+                // The detached selection thread still owns an overlay-update sender, so the
+                // UI-state thread can never see its channel close and joining it would only burn
+                // what is left of the deadline. The loss is real, so it is stated rather than
+                // implied by the selection worker's own detach log.
+                crate::logging::warn(format_args!(
+                    "UI-state persistence was not joined because the selection worker had to be detached; unsaved toolbar and region updates are lost"
+                ));
+            }
+        }
+    }
+}
+
+impl Drop for SelectionWorker {
+    fn drop(&mut self) {
+        self.stop_inner(Instant::now() + WORKER_STOP_TIMEOUT);
+    }
+}
+
+pub struct SelectionJob {
+    pub capture_id: CaptureId,
+    pub triggered_at: Instant,
+    pub action: HotkeyAction,
+    pub chord: Option<HotkeyChord>,
+    pub initial_tool: captastic_windows::InitialSelectionTool,
+    pub cpu_ready_offset_ns: Option<u64>,
+    pub remembered_ui: Option<captastic_config::DisplayUiState>,
+    pub source: &'static str,
+    pub metadata: FrameMetadata,
+    pub frame: Option<CpuFrame>,
+    pub native_frame: Option<Arc<dyn NativeFrame>>,
+    pub recorder: EventRecorder,
+    pub confirmed_selection: Option<captastic_windows::OverlaySelection>,
+    pub terminal_error: Option<String>,
+    pub selection_offset_ns: Option<u64>,
+    pub confirmation_anchored: bool,
+    pub preview_mode: PreviewMode,
+    pub preview_fallback_reason: Option<String>,
+}
+
+pub struct LiveSelectionRequest {
+    pub job: SelectionJob,
+    pub selection: captastic_windows::OverlaySelection,
+    pub confirmed_at: Instant,
+}
+
+pub struct FrozenSelectionFallbackRequest {
+    pub job: SelectionJob,
+    pub requested_at: Instant,
+}
+
+pub enum SubmitError {
+    Full(Box<SelectionJob>),
+    Disconnected(Box<SelectionJob>),
+}
+
+pub fn try_submit(
+    sender: &mpsc::SyncSender<SelectionJob>,
+    job: SelectionJob,
+) -> Result<(), SubmitError> {
+    sender.try_send(job).map_err(|error| match error {
+        mpsc::TrySendError::Full(job) => SubmitError::Full(Box::new(job)),
+        mpsc::TrySendError::Disconnected(job) => SubmitError::Disconnected(Box::new(job)),
+    })
+}
+
+pub fn finish_rejected(mut job: SelectionJob) -> Result<CaptureId, AppError> {
+    job.recorder.record(
+        job.capture_id,
+        PerfEventKind::AttemptFinished,
+        duration_ns(job.triggered_at.elapsed()),
+    );
+    validate_event_order(job.recorder.events())?;
+    Ok(job.capture_id)
+}
+
+fn finish_without_clipboard(
+    job: &mut SelectionJob,
+    json_output: bool,
+    event: &'static str,
+    message: &str,
+) {
+    job.recorder.record(
+        job.capture_id,
+        PerfEventKind::AttemptFinished,
+        duration_ns(job.triggered_at.elapsed()),
+    );
+    if let Err(error) = validate_event_order(job.recorder.events()) {
+        crate::logging::error(format_args!(
+            "selection {} metrics failed validation: {error}",
+            job.capture_id.0
+        ));
+    }
+    if event == "selection_cancelled" {
+        log::info!("selection {} cancelled", job.capture_id.0);
+    } else {
+        crate::logging::error(format_args!(
+            "selection {} failed: {message}",
+            job.capture_id.0
+        ));
+    }
+    if json_output {
+        println!(
+            "{}",
+            json!({
+                "schema_version": 1,
+                "event": event,
+                "capture_id": job.capture_id,
+                "source": job.source,
+                "message": message,
+            })
+        );
+    }
+}
+
+fn report_clipboard_rejection(
+    job: crate::clipboard::ClipboardJob,
+    reason: &'static str,
+    json_output: bool,
+) {
+    let capture_id = job.capture_id;
+    let _ = crate::clipboard::finish_rejected(job);
+    crate::logging::warn(format_args!("clipboard {} skipped: {reason}", capture_id.0));
+    if json_output {
+        println!(
+            "{}",
+            json!({
+                "schema_version": 1,
+                "event": "clipboard_skipped",
+                "capture_id": capture_id,
+                "reason": reason,
+            })
+        );
+    }
+}
+
+fn selection_kind(kind: captastic_windows::SelectionKind) -> &'static str {
+    match kind {
+        captastic_windows::SelectionKind::Display => "display",
+        captastic_windows::SelectionKind::Region => "region",
+        captastic_windows::SelectionKind::Window => "window",
+    }
+}
+
+fn selection_materialization(
+    kind: captastic_windows::SelectionKind,
+    confirmation_anchored: bool,
+) -> &'static str {
+    match (kind, confirmation_anchored) {
+        (captastic_windows::SelectionKind::Display, true) => "confirmation_display",
+        (captastic_windows::SelectionKind::Region, true) => "confirmation_desktop_crop",
+        (captastic_windows::SelectionKind::Display, false) => "frozen_display",
+        (captastic_windows::SelectionKind::Region, false) => "frozen_desktop_crop",
+        (captastic_windows::SelectionKind::Window, _) => "native_window_render",
+    }
+}
+
+fn preview_mode(mode: PreviewMode) -> &'static str {
+    match mode {
+        PreviewMode::Auto => "auto",
+        PreviewMode::Live => "live",
+        PreviewMode::Frozen => "frozen",
+    }
+}
+
+fn offset_after_cpu(job: &SelectionJob) -> u64 {
+    job.cpu_ready_offset_ns.map_or(0, |cpu_ready_offset_ns| {
+        duration_ns(job.triggered_at.elapsed()).saturating_sub(cpu_ready_offset_ns)
+    })
+}
+
+fn duration_ns(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn ns_to_ms(ns: u64) -> f64 {
+    ns as f64 / 1_000_000.0
+}
+
+fn remember_confirmed_region(
+    cache: &ConfirmedRegionCache,
+    controller: &captastic_windows::OverlayController,
+    metadata: &captastic_core::FrameMetadata,
+    rect: captastic_core::Rect,
+) {
+    let source = metadata.source_rect;
+    let local_x = i64::from(rect.x) - i64::from(source.x);
+    let local_y = i64::from(rect.y) - i64::from(source.y);
+    let Some(local_x) = i32::try_from(local_x).ok() else {
+        crate::logging::warn(format_args!(
+            "confirmed region x coordinate is out of range"
+        ));
+        return;
+    };
+    let Some(local_y) = i32::try_from(local_y).ok() else {
+        crate::logging::warn(format_args!(
+            "confirmed region y coordinate is out of range"
+        ));
+        return;
+    };
+    let confirmed = ConfirmedRegion {
+        region: CaptureRegion {
+            x: local_x,
+            y: local_y,
+            width: rect.width,
+            height: rect.height,
+        },
+        source: CaptureRegionSource {
+            width: source.width,
+            height: source.height,
+            rotation_degrees: metadata.rotation_degrees,
+        },
+    };
+    {
+        let mut state = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.insert(metadata.display_id.0.clone(), confirmed);
+    }
+    controller.submit_ui_update(captastic_windows::OverlayUiUpdate::ConfirmedRegion {
+        display_id: metadata.display_id.0.clone(),
+        region: confirmed.region,
+        source: confirmed.source,
+    });
+}
+
+fn persist_ui_state(
+    receiver: mpsc::Receiver<captastic_windows::OverlayUiUpdate>,
+    store: captastic_config::UiStateStore,
+    failure_sender: Option<mpsc::Sender<String>>,
+) {
+    while let Ok(first) = receiver.recv() {
+        let mut latest = BTreeMap::<(String, u8), captastic_windows::OverlayUiUpdate>::new();
+        for update in std::iter::once(first).chain(receiver.try_iter()) {
+            let key = match &update {
+                captastic_windows::OverlayUiUpdate::Interaction { display_id, .. } => {
+                    (display_id.clone(), 0)
+                }
+                captastic_windows::OverlayUiUpdate::ToolbarCenter { display_id, .. } => {
+                    (display_id.clone(), 1)
+                }
+                captastic_windows::OverlayUiUpdate::ConfirmedRegion { display_id, .. } => {
+                    (display_id.clone(), 2)
+                }
+            };
+            coalesce_ui_update(&mut latest, key, update);
+        }
+        for update in latest.into_values() {
+            let result = match update {
+                captastic_windows::OverlayUiUpdate::Interaction {
+                    display_id,
+                    tool,
+                    region,
+                    source,
+                } => store.save_display_interaction_state(&display_id, tool, region, source),
+                captastic_windows::OverlayUiUpdate::ToolbarCenter {
+                    display_id,
+                    center_x,
+                    center_y,
+                } => store.save_display_overlay_center(&display_id, center_x, center_y),
+                captastic_windows::OverlayUiUpdate::ConfirmedRegion {
+                    display_id,
+                    region,
+                    source,
+                } => store.save_display_confirmed_region(&display_id, region, source),
+            };
+            if let Err(error) = result {
+                let message = format!("failed to persist UI state: {error}");
+                crate::logging::warn(format_args!("{message}"));
+                if let Some(sender) = failure_sender.as_ref() {
+                    let _ = sender.send(message);
+                }
+            }
+        }
+    }
+}
+
+fn coalesce_ui_update(
+    latest: &mut BTreeMap<(String, u8), captastic_windows::OverlayUiUpdate>,
+    key: (String, u8),
+    mut update: captastic_windows::OverlayUiUpdate,
+) {
+    if let (
+        Some(captastic_windows::OverlayUiUpdate::Interaction {
+            region: previous_region,
+            source: previous_source,
+            ..
+        }),
+        captastic_windows::OverlayUiUpdate::Interaction { region, source, .. },
+    ) = (latest.get(&key), &mut update)
+    {
+        if region.is_none() {
+            *region = *previous_region;
+            *source = *previous_source;
+        }
+    }
+    latest.insert(key, update);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    #[test]
+    fn worker_join_timeout_does_not_wait_for_a_stuck_thread() {
+        let (release_sender, release_receiver) = mpsc::channel();
+        let join = thread::spawn(move || {
+            let _ = release_receiver.recv();
+        });
+
+        let started = Instant::now();
+        assert!(!join_worker_with_timeout(
+            join,
+            "test",
+            Duration::from_millis(10)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        release_sender
+            .send(())
+            .expect("release detached test worker");
+    }
+
+    #[test]
+    fn the_selection_join_never_consumes_the_ui_state_flush_budget() {
+        let now = Instant::now();
+        let deadline = now + WORKER_STOP_TIMEOUT;
+
+        let selection_deadline =
+            crate::worker_registry::reserved_deadline(now, deadline, UI_STATE_STOP_RESERVE);
+
+        // Both stages must get a real slice: a reserve as large as the budget would starve the
+        // selection join instead, and no reserve would starve the flush that outlives the process.
+        assert!(UI_STATE_STOP_RESERVE < WORKER_STOP_TIMEOUT);
+        assert!(selection_deadline > now);
+        assert_eq!(
+            deadline.saturating_duration_since(selection_deadline),
+            UI_STATE_STOP_RESERVE
+        );
+    }
+
+    #[test]
+    fn the_ui_state_flush_still_gets_a_slice_after_the_budget_is_spent() {
+        let base = Instant::now();
+        // Everything before the flush overran the shared deadline by ten seconds.
+        let now = base + Duration::from_secs(10);
+
+        let ui_deadline =
+            crate::worker_registry::guaranteed_deadline(now, base, UI_STATE_STOP_RESERVE);
+
+        assert_eq!(
+            ui_deadline.saturating_duration_since(now),
+            UI_STATE_STOP_RESERVE
+        );
+        // A budget that is still healthy is left alone rather than shortened to the minimum.
+        let healthy = now + WORKER_STOP_TIMEOUT;
+        assert_eq!(
+            crate::worker_registry::guaranteed_deadline(now, healthy, UI_STATE_STOP_RESERVE),
+            healthy
+        );
+    }
+
+    #[test]
+    fn one_shot_worker_flushes_ui_state_before_drop_returns() {
+        let directory = std::env::temp_dir().join(format!(
+            "captastic-one-shot-ui-flush-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("create one-shot test directory");
+        let path = directory.join("captastic.toml");
+        let store = captastic_config::UiStateStore::for_config(&path);
+        let worker = OneShotUiStateWorker::start(store.clone()).expect("start one-shot worker");
+        worker
+            .controller()
+            .submit_ui_update(captastic_windows::OverlayUiUpdate::ToolbarCenter {
+                display_id: "display-1".to_owned(),
+                center_x: 0.25,
+                center_y: 0.75,
+            });
+
+        drop(worker);
+
+        assert_eq!(
+            store
+                .load_display_ui_state("display-1")
+                .expect("load flushed one-shot state")
+                .overlay_center,
+            Some((0.25, 0.75))
+        );
+        fs::remove_dir_all(directory).expect("remove one-shot test directory");
+    }
+
+    #[test]
+    fn one_shot_finish_reports_persistence_failure() {
+        let directory = std::env::temp_dir().join(format!(
+            "captastic-one-shot-ui-failure-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("create invalid config path");
+        let store = captastic_config::UiStateStore::at(&directory);
+        let worker = OneShotUiStateWorker::start(store).expect("start one-shot worker");
+        worker
+            .controller()
+            .submit_ui_update(captastic_windows::OverlayUiUpdate::ToolbarCenter {
+                display_id: "display-1".to_owned(),
+                center_x: 0.25,
+                center_y: 0.75,
+            });
+
+        let error = worker
+            .finish()
+            .expect_err("failed persistence must fail one-shot completion");
+
+        assert!(error.to_string().contains("failed to persist UI state"));
+        fs::remove_dir_all(directory).expect("remove invalid config path");
+    }
+
+    #[test]
+    fn persistence_failures_are_reported_after_the_update_channel_drains() {
+        let directory =
+            std::env::temp_dir().join(format!("captastic-ui-state-failure-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("create invalid config path");
+        let store = captastic_config::UiStateStore::at(&directory);
+        let (update_sender, update_receiver) = mpsc::channel();
+        let (failure_sender, failure_receiver) = mpsc::channel();
+        update_sender
+            .send(captastic_windows::OverlayUiUpdate::ToolbarCenter {
+                display_id: "display-1".to_owned(),
+                center_x: 0.25,
+                center_y: 0.75,
+            })
+            .expect("queue update");
+        drop(update_sender);
+
+        persist_ui_state(update_receiver, store, Some(failure_sender));
+
+        let failure = failure_receiver
+            .try_recv()
+            .expect("persistence failure must be surfaced");
+        assert!(failure.contains("failed to persist UI state"));
+        fs::remove_dir_all(directory).expect("remove invalid config path");
+    }
+
+    #[test]
+    fn stop_returns_persistence_failures_queued_during_teardown() {
+        let (failure_sender, failure_receiver) = mpsc::channel();
+        failure_sender
+            .send("scripted shutdown failure".to_owned())
+            .expect("queue teardown failure");
+        let worker = SelectionWorker {
+            sender: None,
+            controller: None,
+            ui_sender: None,
+            failure_receiver,
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            join: None,
+            ui_join: None,
+        };
+
+        assert_eq!(worker.stop(), vec!["scripted shutdown failure".to_owned()]);
+    }
+
+    #[test]
+    fn idle_selection_worker_observes_stop_without_sender_disconnect() {
+        let directory = std::env::temp_dir().join(format!(
+            "captastic-idle-selection-stop-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("create idle worker test directory");
+        let (clipboard_sender, _clipboard_receiver) = mpsc::sync_channel(1);
+        let (capture_sender, _capture_receiver) = mpsc::sync_channel(1);
+        let (dropped_sender, _dropped_receiver) = mpsc::sync_channel(1);
+        let mut worker = SelectionWorker::start(
+            vec![Box::new(crate::output::ChannelSink::new(
+                "clipboard",
+                clipboard_sender,
+            ))],
+            capture_sender,
+            dropped_sender,
+            false,
+            1,
+            Arc::new(Mutex::new(BTreeMap::new())),
+            captastic_config::UiStateStore::for_config(directory.join("captastic.toml")),
+        )
+        .expect("start idle selection worker");
+
+        let started = Instant::now();
+        worker.request_stop();
+        while !worker
+            .ui_join
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+            && started.elapsed() < Duration::from_millis(500)
+        {
+            thread::yield_now();
+        }
+        assert!(
+            worker
+                .ui_join
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished),
+            "request_stop should close and flush UI persistence before final teardown"
+        );
+        let failures = worker.stop_before(Instant::now() + Duration::from_secs(1));
+
+        assert!(failures.is_empty());
+        assert!(started.elapsed() < Duration::from_millis(500));
+        fs::remove_dir_all(directory).expect("remove idle worker test directory");
+    }
+
+    #[test]
+    fn coalescing_interactions_preserves_a_region_from_earlier_in_the_batch() {
+        let key = ("display-1".to_owned(), 0);
+        let region = CaptureRegion {
+            x: 1,
+            y: 2,
+            width: 30,
+            height: 40,
+        };
+        let mut latest = BTreeMap::new();
+        coalesce_ui_update(
+            &mut latest,
+            key.clone(),
+            captastic_windows::OverlayUiUpdate::Interaction {
+                display_id: "display-1".to_owned(),
+                tool: captastic_config::CaptureTool::Region,
+                region: Some(region),
+                source: None,
+            },
+        );
+        coalesce_ui_update(
+            &mut latest,
+            key.clone(),
+            captastic_windows::OverlayUiUpdate::Interaction {
+                display_id: "display-1".to_owned(),
+                tool: captastic_config::CaptureTool::Window,
+                region: None,
+                source: None,
+            },
+        );
+
+        let captastic_windows::OverlayUiUpdate::Interaction {
+            tool,
+            region: saved_region,
+            ..
+        } = latest.get(&key).expect("coalesced interaction")
+        else {
+            panic!("expected interaction update");
+        };
+        assert_eq!(*tool, captastic_config::CaptureTool::Window);
+        assert_eq!(*saved_region, Some(region));
+    }
+}

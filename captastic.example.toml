@@ -1,0 +1,146 @@
+schema_version = 1
+
+[daemon]
+backend = "dxgi"
+display = "pointer"
+# Use "primary" to always target the Windows primary monitor.
+# Use "virtual_desktop" to compose every display when they share one DXGI adapter.
+# To select one monitor, run `captastic displays --backend dxgi --json` and use:
+# display = "display:windows-monitor-0123456789abcdef"
+trigger_queue_capacity = 4
+
+[hotkey]
+# "coalesce" is not implemented yet (roadmap milestone 4); repeat must remain "ignore".
+repeat = "ignore"
+
+# Omit an action to leave it disabled. The default registers only last_workflow.
+[hotkey.bindings]
+last_workflow = "Ctrl+Shift+F9"
+# region = "Ctrl+Shift+R"
+# window = "Ctrl+Shift+W"
+# full_display = "Ctrl+Shift+F10"
+# repeat_last_region = "Ctrl+Shift+F11"
+
+[capture]
+mode = "latest"
+fresh_timeout_ms = 100
+max_frame_age_ms = 0
+cpu_frame = true
+# "include" composites the mouse pointer into the capture, shape and all. It is off by default
+# because a screenshot of a window is usually wanted without a cursor sitting in it.
+cursor = "exclude"
+# The CPU readback pool is currently fixed at three slots; buffer_slots must remain 3.
+buffer_slots = 3
+fake_width = 64
+fake_height = 64
+fake_native_delay_us = 250
+fake_readback_delay_us = 250
+fake_frame_age_us = 1000
+
+[selection]
+enabled = true
+queue_capacity = 1
+# "auto" prefers a live compositor preview and falls back to the frozen capture path.
+# Use "live" to require confirmation-time capture or "frozen" for trigger-time pixels.
+preview = "auto"
+
+[clipboard]
+enabled = true
+queue_capacity = 1
+# A capture is whatever was on screen, so by default Captastic asks Windows to keep it out of the
+# Win+V clipboard history and to leave it off the sync to your Microsoft account. Set either to
+# true to opt back in; an ordinary paste works the same either way.
+allow_history = false
+allow_cloud_sync = false
+
+[output]
+# Write every capture to disk, alongside the clipboard or instead of it.
+enabled = false
+# "png" is the only supported format today.
+format = "png"
+queue_capacity = 2
+# Absolute path. Omit to use <home>/Pictures/Captastic. A daemon's working directory is whatever
+# launched it, so a relative path would put captures somewhere you could not predict.
+# directory = 'C:\Users\you\Pictures\Captastic'
+# Names each capture, without the extension. Tokens: {timestamp} {date} {time} {display} {mode}
+# {width} {height} {application} {title}. Values coming from a window are sanitized, and a name can
+# never place a capture outside the directory above.
+#
+# The default leads with the timestamp so captures sort chronologically, then says what was
+# captured. Both window tokens expand to nothing for a display or region capture, leaving the
+# timestamp alone. A window title is content — document names, ticket titles, URLs — and a filename
+# shows up in file pickers, backup indexes, and directory listings. Use "{timestamp}" alone, or
+# "{timestamp}-{application}", if that is more than you want a name to say.
+filename_template = "{timestamp}-{application}-{title}"
+
+[history]
+# How many recent captures to remember, so they can be reopened later. Zero turns history off.
+max_items = 50
+# Forget captures older than this many days. Zero means age is not a reason to forget.
+max_age_days = 30
+# Forget the oldest once remembered captures exceed this many bytes. Zero disables the limit.
+max_total_bytes = 0
+
+[metrics]
+enabled = true
+ring_capacity = 10000
+raw_events = false
+
+[logging]
+level = "info"
+format = "compact"
+# file = "C:/Users/you/.captastic/logs/captastic.log"
+max_file_bytes = 5242880
+retained_files = 3
+
+# Legacy, and inert on any installation that has run since remembered state moved out of this file.
+#
+# Captastic keeps what it remembers about how you last used it - toolbar position, last tool, last
+# region, per display - in its own state.toml beside this file. This section is read exactly once,
+# to carry a pre-split installation's values across, and is ignored from then on. It is left in
+# place rather than deleted because this file is yours; it is safe to remove, and Captastic says so
+# at startup if it finds one that no longer does anything.
+#
+# Everything below is kept only to document what those pre-split values looked like.
+[ui]
+# overlay_x = 640
+# overlay_y = 920
+# last_capture_tool = "region"
+
+# [ui.last_region]
+# x = 480
+# y = 270
+# width = 960
+# height = 540
+
+# Captastic creates one of these tables for each monitor as the overlay is used. Toolbar and region
+# coordinates are local to the monitor, not the Windows virtual desktop. Toolbar center values are
+# normalized within the monitor work area so they survive DPI, taskbar, and resolution changes.
+# [ui.displays.windows-monitor-0123456789abcdef]
+# overlay_center_x = 0.5
+# overlay_center_y = 0.9
+# last_capture_tool = "region"
+
+# [ui.displays.windows-monitor-0123456789abcdef.last_region]
+# x = 480
+# y = 270
+# width = 960
+# height = 540
+
+# [ui.displays.windows-monitor-0123456789abcdef.last_region_source]
+# width = 1920
+# height = 1080
+# rotation_degrees = 0
+
+# Confirmed regions are separate from cancellation-restored interaction regions and are managed by
+# Captastic for repeat_last_region. Do not copy these values between displays.
+# [ui.displays.windows-monitor-0123456789abcdef.last_confirmed_region]
+# x = 480
+# y = 270
+# width = 960
+# height = 540
+#
+# [ui.displays.windows-monitor-0123456789abcdef.last_confirmed_region_source]
+# width = 1920
+# height = 1080
+# rotation_degrees = 0
