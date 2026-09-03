@@ -43,11 +43,18 @@ public release, but it gates neither v0.1.0 nor the capture milestones below.
 
 ## Release readiness — v0.1.0
 
-**Status:** Documentation gates complete on `dev` (PR #77); the tag is next. What remains is the
-live release mechanics listed below, none of which has yet run against a real tag. v0.1.0 is a
-deliberately unsigned first tag whose purpose is to exercise the release mechanics end to end and to
-describe honestly what Captastic is and is not. It is not gated on the capture milestones below,
-and it makes no performance claim.
+**Status:** Documentation gates complete on `dev` (PR #77); the release branch is next. What
+remains is the live release mechanics listed below, none of which has yet run against a real tag.
+v0.1.0 is a deliberately unsigned first tag whose purpose is to exercise the release mechanics end
+to end and to describe honestly what Captastic is and is not. It is not gated on the capture
+milestones below, and it makes no performance claim.
+
+**Branch model for every formal release.** Cut a `release/v<version>` branch from `dev`, merge it
+to `main`, tag `v<version>` on `main`, and then merge the release branch back to `dev`. `main`
+does not exist yet; v0.1.0 creates it. Fast-forward `main` to the release branch head rather than
+merging with a merge commit: `scripts/build-packages.ps1` derives the revision count from the
+newest `v*` tag reachable from `HEAD`, and a tag on a `main`-only merge commit is never an
+ancestor of `dev`, so every later `dev` build would count revisions from the wrong baseline.
 
 ### Gates — before the tag
 
@@ -82,8 +89,9 @@ and it makes no performance claim.
     URLs work, and its manifest hashes match. A first submission also has to pass Chocolatey
     community validation and moderation before `choco install captastic` works against the default
     source, so it is not finished when the push returns.
-  - The **immediate post-tag workspace version bump**, so subsequent `dev` and `ci` identifiers are
-    prereleases of the next release rather than of the one just published.
+  - The **immediate post-tag workspace version bump** on `dev`, once the release branch has been
+    merged back, so subsequent `dev` and `ci` identifiers are prereleases of the next release
+    rather than of the one just published.
 
 ### Operator-run verification — recommended before the tag, formally deferrable
 
@@ -605,11 +613,12 @@ not reproduced on demand, is in
 
 ## Recommended next branch
 
-This one: v0.1.0 release readiness (`feature/release-readiness`) — the unsigned-release
-documentation, the README repositioning, and the release-notes draft, which are what the tag is
-waiting on.
+`release/v0.1.0`, cut from `dev`. The unsigned-release documentation, the README repositioning,
+and the release-notes draft are merged (PR #77), so the branch exists to carry the release through
+`main`, the tag, and the merge back to `dev` as described under
+[Release readiness](#release-readiness--v010).
 
-After it, the operator-run live verifications are the work most likely to find something, because
+Before cutting it, the operator-run live verifications are the work most likely to find something, because
 they exercise the recovery paths that shipped with the least live verification: sleep/wake, Remote
 Desktop, and the `DEVICE_REMOVED`/`DEVICE_RESET` limb of GPU-reset recovery through the elevated
 adapter cycle. Lock/unlock is closed at both ends and GPU reset is closed for its `AccessLost` limb
@@ -617,8 +626,9 @@ against a real driver restart, so those three are what is left, and all three ar
 machine — unlike the multi-adapter work, and unlike HDR tone mapping, which needs an HDR display to
 judge rather than merely to compile.
 
-Then the release itself: the tag, the disposable-VM checklist, the manual `choco push` once the
-release URLs and hashes verify, and the version bump.
+Then the release itself: the release branch to `main`, the tag on `main`, the disposable-VM
+checklist, the manual `choco push` once the release URLs and hashes verify, the merge back to
+`dev`, and the version bump.
 
 FakeBackend fidelity keeps its leverage beyond this milestone and is worth extending as gaps appear:
 much of Milestone 4 shipped with daemon-side behaviour verified only by unit tests, because a second
