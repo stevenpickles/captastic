@@ -20,9 +20,14 @@ Captastic supports four display policies:
 
 A single-display overlay is locked to its resolved target for the lifetime of
 that capture action. Moving the pointer to another display does not move the
-active overlay or toolbar. A topology change while an overlay is open cancels
-the action without changing the clipboard, rebuilds the capture sessions, and
-allows the next action after the engine reports ready.
+active overlay or toolbar. A display-configuration change while an
+overlay is open ends the action without changing the clipboard, rebuilds the
+capture sessions, and allows the next action after the engine reports ready.
+That ending is not reported as a cancellation: the log line and the
+notification balloon name what changed — the display layout for a monitor
+arriving, leaving, or moving, and the display settings for a DPI or work-area
+change — because the press is lost and only pressing the hotkey again recovers
+it.
 
 ## Coordinate and image invariants
 
