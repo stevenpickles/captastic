@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -58,6 +59,10 @@ const GPU_MAP_RETRY_DELAY: Duration = Duration::from_millis(1);
 const BASE_DPI: u32 = 96;
 
 static DISPLAY_CONFIGURATION_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// The last identity each display source resolved to, keyed by GDI device name. Read and written
+/// only by [`display_identity_changed`], which explains why it exists.
+static DISPLAY_IDENTITIES: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
 
 pub(crate) fn mark_display_configuration_changed(reason: &'static str) {
     let generation = DISPLAY_CONFIGURATION_GENERATION
@@ -2509,30 +2514,83 @@ fn display_config_error(operation: &'static str, result: i32) -> CaptureError {
 /// what an entry for a monitor that is not attached has always been.
 fn display_identity(target: &DISPLAYCONFIG_TARGET_DEVICE_NAME, source_name: &str) -> DisplayId {
     if let Some(edid) = edid_identity(target) {
-        return DisplayId(format!("windows-monitor-{edid}"));
+        let id = format!("windows-monitor-{edid}");
+        // Recorded on the good path too, so that a panel which recovers its EDID and later falls
+        // back again warns again rather than being silenced by the memory of the last fallback.
+        display_identity_changed(source_name, &id);
+        return DisplayId(id);
     }
     // No EDID is not a rare edge. Windows binds the active path to a generic `Default_Monitor`
     // device when it re-enumerates a display without reading EDID — a DisplayPort link event is
-    // enough — and reports a blank manufacturer, a blank friendly name and an output technology of
-    // -1 while it lasts. The real monitor's device node, EDID and serial can still be sitting in
-    // the device tree beside it; the *active path* simply is not attached to them, so no amount of
-    // care here can recover an identity Windows itself has lost. Logged at debug because it says
-    // something true about the machine rather than about this capture.
+    // enough, which makes the seconds after a dock event the likeliest time to be here — and
+    // reports a blank manufacturer, a blank friendly name and an output technology of -1 while it
+    // lasts. The real monitor's device node, EDID and serial can still be sitting in the device
+    // tree beside it; the *active path* simply is not attached to them, so no amount of care here
+    // can recover an identity Windows itself has lost.
+    //
+    // Both fallbacks warn, and the wording carries the whole of what the user can do about it.
+    // This is a persistence key: under a fallback id the tool, region and toolbar position
+    // remembered for that panel are not found, and whatever the user adjusts in this session is
+    // saved under an id that will not be there next time. That is a visible loss — a monitor that
+    // "forgot" its settings — with no visible cause. Said once per change rather than once per
+    // enumeration, for the reason [`display_identity_changed`] gives.
     let monitor_path = wide_array_to_string(&target.monitorDevicePath);
     if !monitor_path.is_empty() {
-        log::debug!(
-            "display {source_name} reports no EDID; identifying it by device path, which changes when it reconnects"
-        );
         let DisplayId(hashed) = persistent_display_id(&monitor_path);
-        return DisplayId(hashed.replace("windows-monitor-", "windows-monitor-path-"));
+        let fallback = hashed.replace("windows-monitor-", "windows-monitor-path-");
+        if display_identity_changed(source_name, &fallback) {
+            log::warn!(
+                "display {source_name} reports no EDID and is being identified as {fallback} from its device path; the tool, region and toolbar position remembered for this panel are stored under its EDID id and will not be found, and anything adjusted now is saved under this id, which changes when the display reconnects. The next enumeration that reads EDID restores the panel's own id."
+            );
+        } else {
+            log::debug!("display {source_name} is still identified as {fallback} without EDID");
+        }
+        return DisplayId(fallback);
     }
-    log::debug!(
-        "display {source_name} reports neither EDID nor a device path; identifying it by session-local name"
-    );
-    DisplayId(format!(
+    let fallback = format!(
         "windows-monitor-session-{}",
         sanitize_identity_fragment(source_name)
-    ))
+    );
+    if display_identity_changed(source_name, &fallback) {
+        log::warn!(
+            "display {source_name} reports neither EDID nor a device path and is being identified as {fallback} from its session-local name; the tool, region and toolbar position remembered for this panel will not be found, and anything adjusted now is saved under an id that does not survive this session. The next enumeration that reads EDID restores the panel's own id."
+        );
+    } else {
+        log::debug!(
+            "display {source_name} is still identified as {fallback} without EDID or a device path"
+        );
+    }
+    DisplayId(fallback)
+}
+
+/// Remembers what a display source was last identified as, and reports whether that answer has
+/// changed.
+///
+/// The fallback warnings above describe a *condition*, not an event: it holds until Windows reads
+/// EDID for that panel again, and everything that enumerates displays meets it. Enumeration is not
+/// rare. One rebuild under the daemon's default pointer policy enumerates once for the manager's
+/// display list and once more per display for each retained session; the daemon re-enumerates
+/// every two seconds for as long as it is waiting for a desktop; the overlay enumerates when
+/// Window mode is picked. A three-monitor desk with one panel in this state would print the same
+/// paragraph a dozen times through a single dock burst, which is how a line that matters becomes
+/// a line people filter out.
+///
+/// So it is said when the answer changes — including the first time, and again when a panel that
+/// had recovered its EDID falls back once more — and at debug while it stands unchanged.
+fn display_identity_changed(source_name: &str, id: &str) -> bool {
+    let mut identities = match DISPLAY_IDENTITIES.lock() {
+        Ok(identities) => identities,
+        // A poisoned map costs a repeated warning, never a missing one.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if identities
+        .get(source_name)
+        .is_some_and(|previous| previous == id)
+    {
+        return false;
+    }
+    identities.insert(source_name.to_owned(), id.to_owned());
+    true
 }
 
 /// Builds the EDID half of an identity, or nothing when the panel did not supply one.
@@ -3068,6 +3126,37 @@ mod tests {
             error.message.contains("2560x1440+3840-255"),
             "{}",
             error.message
+        );
+    }
+
+    #[test]
+    fn a_display_identified_without_edid_is_reported_when_the_answer_changes_and_not_again() {
+        // The condition lasts as long as Windows keeps handing back a Default_Monitor path, and
+        // every enumeration meets it again: the manager's list, one session per display, a
+        // two-second desktop wait, an overlay entering Window mode. The user needs to be told
+        // once, not once per enumeration, or the line that explains a monitor forgetting its
+        // settings is the line they learn to scroll past.
+        let source = "TEST-DISPLAY-identity-warning";
+        let fallback = "windows-monitor-path-0123456789abcdef";
+
+        assert!(display_identity_changed(source, fallback), "first answer");
+        assert!(!display_identity_changed(source, fallback), "unchanged");
+        assert!(
+            !display_identity_changed(source, fallback),
+            "still unchanged"
+        );
+
+        // EDID came back: the panel's own id is recorded, so the state that made the warning true
+        // is no longer remembered as current.
+        assert!(display_identity_changed(
+            source,
+            "windows-monitor-DEL41B4-dp1"
+        ));
+        // ... and a later fallback is worth saying again, because it costs the user their
+        // remembered state a second time.
+        assert!(
+            display_identity_changed(source, fallback),
+            "fell back again"
         );
     }
 
