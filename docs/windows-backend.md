@@ -459,8 +459,25 @@ DXGI only ever produces two of those three. `map_windows_error` (`dxgi.rs:2561`)
 device-removed HRESULT is usually `DEVICE_HUNG` or `DRIVER_INTERNAL_ERROR`, neither of which the
 generic mapping recovers from — so reasons are routed through `device_removed_error`
 (`dxgi.rs:2588`) instead, which reports every non-success reason as `DeviceRemoved` and keeps the
-reason as the native code. `TopologyChanged` comes from the display-configuration generation and
-from a readback whose dimensions disagree with the display, not from an HRESULT.
+reason as the native code. `TopologyChanged` comes from the display-configuration generation, from the
+monitor-arrangement fingerprint described below, and from a readback whose dimensions disagree with
+the display, not from an HRESULT.
+
+The generation counter only moves when a window of ours receives `WM_DISPLAYCHANGE`, and the daemon
+is not guaranteed to have one: a tray icon that fails to start is non-fatal, and at startup the
+capture engine is built on its worker thread before the tray window exists. A dock event in either
+gap moves nothing. So a backend also records the desktop arrangement it enumerated against —
+every monitor's rectangle and the primary flag, from `EnumDisplayMonitors` and `GetMonitorInfoW` —
+and `validate_display_configuration` re-samples it and reports `TopologyChanged` when it differs.
+It is a second line rather than a replacement: with a window listening, the generation catches
+changes a rectangle cannot see — a 180° rotation, a rotated square panel, a refresh-rate change, a
+monitor swapped for another of the same size in the same place. In the window where no window is
+listening, those are not caught by anything before the capture happens; the confirmation-time
+geometry check, which compares rotation as well as bounds, is what refuses them afterwards. The sample is
+taken once per hotkey press, never per frame, and a sample that could not be taken in full — a
+failed query, or a session with no desktop at all — is treated as unknown and compares equal to
+everything, because rebuilding the engine against a desktop that is not there is worse than waiting
+for the next press.
 
 The daemon is idle between hotkeys, so a device lost while nothing is capturing is not noticed until
 the next trigger; the first capture after a loss is the one that pays for it.

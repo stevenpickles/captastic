@@ -118,7 +118,10 @@ ephemeral and are never persisted.
 6. **Rotation normalization**: normalize all supported DXGI rotations and record
    transform timing independently from native acquisition and readback.
 7. **Topology recovery**: handle attach, removal, primary, resolution, work-area,
-   and DPI changes with generation-based cancellation and resource rebuilds.
+   and DPI changes with generation-based cancellation and resource rebuilds,
+   backed by a monitor-arrangement fingerprint that a live selection re-samples
+   on each press so a change no window of Captastic's was running to be told
+   about is still caught.
 8. **Virtual desktop**: compose normalized per-display frames, report frame age
    and maximum timestamp skew, and expose full-virtual-desktop capture.
 

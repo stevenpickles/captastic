@@ -23,7 +23,7 @@ use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME,
     DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY, QDC_ONLY_ACTIVE_PATHS,
 };
-use windows::Win32::Foundation::HMODULE;
+use windows::Win32::Foundation::{BOOL, HMODULE, LPARAM, RECT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BOX,
@@ -45,7 +45,9 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR,
     DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME, DXGI_OUTPUT_DESC,
 };
-use windows::Win32::Graphics::Gdi::HMONITOR;
+use windows::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
@@ -80,6 +82,188 @@ pub(crate) fn stale_display_configuration_error(
         operation,
         format!(
             "display configuration changed from generation {enumerated_generation} to {current_generation}; recreate the capture backend"
+        ),
+        true,
+        None,
+    )
+}
+
+/// `MONITORINFOF_PRIMARY`, which the `windows` crate does not export at this version.
+const MONITOR_IS_PRIMARY: u32 = 0x0000_0001;
+
+/// One monitor's place on the desktop, as the window manager describes it.
+///
+/// Physical desktop coordinates and the primary flag, and nothing else: this exists to be compared
+/// with itself, so every field has to be one Windows reports identically on both samples. Names,
+/// handles, adapter order and DPI are all excluded for that reason — they move for reasons that
+/// are not a topology change, and a fingerprint that false-positives costs a device rebuild per
+/// hotkey press.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct MonitorPlacement {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    is_primary: bool,
+}
+
+impl MonitorPlacement {
+    fn describe(&self) -> String {
+        format!(
+            "{}x{}{:+}{:+}{}",
+            self.right.saturating_sub(self.left),
+            self.bottom.saturating_sub(self.top),
+            self.left,
+            self.top,
+            if self.is_primary { "*" } else { "" }
+        )
+    }
+}
+
+/// The desktop arrangement, cheap enough to sample on every hotkey press and comparable with
+/// itself.
+///
+/// The display-configuration generation this backs up is only ever moved by a window receiving
+/// `WM_DISPLAYCHANGE`, and the daemon has exactly two windows that can: the tray icon and an open
+/// overlay. A tray that failed to start is deliberately non-fatal, and at startup the capture
+/// engine is built on its worker thread before the tray window exists — a dock event landing in
+/// either gap reaches no window, moves no counter, and leaves the generation check vouching for an
+/// arrangement that is gone. That is precisely the moment a user who starts the daemon by hand at a
+/// still-settling dock is in.
+///
+/// So the arrangement is also recorded directly, from a source that needs no window and no message
+/// pump, and compared when a live selection asks whether the display list can be trusted.
+///
+/// What it does not catch, and what nothing catches in that window: a change that leaves every
+/// monitor rectangle and the primary flag where they were. A 180° rotation, a 90° rotation of a
+/// square panel, a refresh-rate change, and a monitor swapped for another of the same size in the
+/// same position are all invisible here. With a tray window listening they are caught by the
+/// generation, which is why that check stays — it is an atomic load and it sees changes a
+/// rectangle cannot. Without one they are missed, and the confirmation-time geometry check is the
+/// backstop: rotation is part of the metadata it compares, so a rotated capture is refused by name
+/// rather than cropped wrongly. Rotation is deliberately not added to this fingerprint; it is not
+/// available from the same cheap source, and a fingerprint assembled from two sources can disagree
+/// with itself for reasons that are not a display change.
+///
+/// An empty topology means *unknown*, not "no monitors": see [`Self::differs_from`].
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DisplayArrangement {
+    /// Sorted, so that the order Windows happens to enumerate monitors in is not mistaken for a
+    /// change in where they are.
+    monitors: Vec<MonitorPlacement>,
+}
+
+impl DisplayArrangement {
+    fn is_unknown(&self) -> bool {
+        self.monitors.is_empty()
+    }
+
+    /// Whether `current` is evidence that the desktop moved since `self` was recorded.
+    ///
+    /// Abstains when either side is unknown. A sample can be unknown because the query failed, but
+    /// also because the session genuinely has no desktop right now — locked, disconnected, or
+    /// asleep — and those are the conditions under which the daemon is already waiting rather than
+    /// rebuilding. Reporting a change there would trade a silent failure for a rebuild storm
+    /// against a desktop that is not there, which is a worse bargain than waiting for the next
+    /// press: the sample that follows the desktop's return is a real one and catches the change.
+    pub(crate) fn differs_from(&self, current: &Self) -> bool {
+        if self.is_unknown() || current.is_unknown() {
+            return false;
+        }
+        self != current
+    }
+
+    /// The arrangement as one line of a log message: `3840x2400+0+0*, 2560x1440+3840+0`.
+    fn describe(&self) -> String {
+        if self.is_unknown() {
+            return "unknown".to_owned();
+        }
+        self.monitors
+            .iter()
+            .map(MonitorPlacement::describe)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// What the window manager currently says the desktop looks like.
+///
+/// `EnumDisplayMonitors` needs no window, no message pump and no DXGI factory, which is the whole
+/// point: it answers in the gaps where the generation counter cannot. One partial answer is no
+/// answer — a monitor whose information could not be read would look exactly like a monitor that
+/// had been unplugged — so any failure reports an unknown topology and the comparison abstains.
+pub(crate) fn display_arrangement() -> DisplayArrangement {
+    let mut collector = MonitorCollector::default();
+    // SAFETY: the callback receives the pointer passed here and this frame outlives the call.
+    let enumerated = unsafe {
+        EnumDisplayMonitors(
+            HDC(0),
+            None,
+            Some(collect_monitor_placement),
+            LPARAM((&mut collector as *mut MonitorCollector) as isize),
+        )
+    };
+    if !enumerated.as_bool() || collector.incomplete {
+        log::debug!("display topology could not be sampled; the generation check stands alone");
+        return DisplayArrangement::default();
+    }
+    collector.monitors.sort_unstable();
+    DisplayArrangement {
+        monitors: collector.monitors,
+    }
+}
+
+#[derive(Default)]
+struct MonitorCollector {
+    monitors: Vec<MonitorPlacement>,
+    incomplete: bool,
+}
+
+/// Collects one monitor's placement. Nothing here can panic across the FFI boundary: the callback
+/// reads a fixed-size structure and pushes it.
+unsafe extern "system" fn collect_monitor_placement(
+    monitor: HMONITOR,
+    _device: HDC,
+    _clip: *mut RECT,
+    data: LPARAM,
+) -> BOOL {
+    // SAFETY: EnumDisplayMonitors passes back the live collector pointer supplied by the caller.
+    let collector = unsafe { &mut *(data.0 as *mut MonitorCollector) };
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..MONITORINFO::default()
+    };
+    // SAFETY: info is writable storage of the size declared in cbSize, and monitor is live for
+    // the duration of this callback.
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        collector.incomplete = true;
+        // Enumeration continues; the sample is discarded whole by the caller.
+        return BOOL(1);
+    }
+    collector.monitors.push(MonitorPlacement {
+        left: info.rcMonitor.left,
+        top: info.rcMonitor.top,
+        right: info.rcMonitor.right,
+        bottom: info.rcMonitor.bottom,
+        is_primary: info.dwFlags & MONITOR_IS_PRIMARY != 0,
+    });
+    BOOL(1)
+}
+
+/// The refusal a backend gives when the desktop it enumerated is not the desktop that is there
+/// now. Retryable and worded like the generation refusal, because the remedy is the same rebuild.
+pub(crate) fn stale_display_arrangement_error(
+    operation: &'static str,
+    enumerated: &DisplayArrangement,
+    current: &DisplayArrangement,
+) -> CaptureError {
+    capture_error(
+        CaptureErrorKind::TopologyChanged,
+        operation,
+        format!(
+            "display topology changed from [{}] to [{}]; recreate the capture backend",
+            enumerated.describe(),
+            current.describe()
         ),
         true,
         None,
@@ -194,6 +378,10 @@ pub struct DxgiBackend {
     capabilities: BackendCapabilities,
     qpc_frequency: i64,
     display_configuration_generation: u64,
+    /// The desktop arrangement `displays` was enumerated against, for the changes no window was
+    /// listening when they happened. Replaced with every rebuild, because every rebuild goes
+    /// through `new`.
+    display_arrangement: DisplayArrangement,
     _thread_affine: PhantomData<Rc<()>>,
 }
 
@@ -208,6 +396,10 @@ impl DxgiBackend {
         // building the backend cannot be swallowed: the stored value stays behind the counter and
         // the first capture reports TopologyChanged instead of trusting stale DisplayInfo.
         let generation_before_enumeration = display_configuration_generation();
+        // Sampled here for the same reason and with the same bias: taken before the enumeration
+        // it vouches for, so a change that lands mid-build leaves this value behind the desktop
+        // rather than ahead of it.
+        let arrangement_before_enumeration = display_arrangement();
         let outputs = enumerate_outputs()?;
         let displays: Vec<_> = outputs.iter().map(|output| output.info.clone()).collect();
         let selected_output = select_display_index(&displays, display_id).ok_or_else(|| {
@@ -324,6 +516,7 @@ impl DxgiBackend {
             },
             qpc_frequency,
             display_configuration_generation: generation_before_enumeration,
+            display_arrangement: arrangement_before_enumeration,
             _thread_affine: PhantomData,
         };
         Ok(backend)
@@ -343,6 +536,24 @@ impl DxgiBackend {
             current_generation,
         ))
     }
+
+    /// Refuses with `TopologyChanged` when the desktop no longer looks the way it did when this
+    /// backend enumerated, whether or not any window was there to be told about it.
+    ///
+    /// Asked only on the validation path, which runs once per hotkey press, and not on the capture
+    /// path, which runs per frame: the generation check is an atomic load and this is an
+    /// enumeration, cheap but not free.
+    fn check_display_arrangement(&self, operation: &'static str) -> Result<(), CaptureError> {
+        let current = display_arrangement();
+        if !self.display_arrangement.differs_from(&current) {
+            return Ok(());
+        }
+        Err(stale_display_arrangement_error(
+            operation,
+            &self.display_arrangement,
+            &current,
+        ))
+    }
 }
 
 impl CaptureBackend for DxgiBackend {
@@ -359,7 +570,8 @@ impl CaptureBackend for DxgiBackend {
     }
 
     fn validate_display_configuration(&self) -> Result<(), CaptureError> {
-        self.check_display_configuration("validate_display_configuration")
+        self.check_display_configuration("validate_display_configuration")?;
+        self.check_display_arrangement("validate_display_configuration")
     }
 
     fn capture(
@@ -2744,6 +2956,120 @@ mod tests {
     use crate::session::HRESULT_ACCESS_DENIED;
     use captastic_core::{CaptureId, CaptureSource, CursorMode};
     use windows::core::HRESULT;
+
+    fn monitor(left: i32, top: i32, width: i32, height: i32, is_primary: bool) -> MonitorPlacement {
+        MonitorPlacement {
+            left,
+            top,
+            right: left + width,
+            bottom: top + height,
+            is_primary,
+        }
+    }
+
+    /// An arrangement as the sampler would build it: whatever order the monitors arrived in,
+    /// sorted.
+    fn arrangement(monitors: &[MonitorPlacement]) -> DisplayArrangement {
+        let mut monitors = monitors.to_vec();
+        monitors.sort_unstable();
+        DisplayArrangement { monitors }
+    }
+
+    #[test]
+    fn a_desktop_that_did_not_move_is_not_a_display_change() {
+        // Every hotkey press asks this. A yes costs a D3D device and a fresh duplication session,
+        // so the answer for an unchanged desktop has to be no - including when the window manager
+        // hands the same monitors back in a different order, which is not a change in anything.
+        let docked = [
+            monitor(0, 0, 3840, 2400, true),
+            monitor(3840, -255, 2560, 1440, false),
+        ];
+        let reversed = [docked[1], docked[0]];
+
+        assert!(!arrangement(&docked).differs_from(&arrangement(&docked)));
+        assert!(!arrangement(&docked).differs_from(&arrangement(&reversed)));
+    }
+
+    #[test]
+    fn a_monitor_that_moved_arrived_left_or_became_primary_is_a_display_change() {
+        // The dock event, in the four shapes it reaches the daemon as. None of these move the
+        // display-configuration generation unless a window of ours was there to be told.
+        let docked = arrangement(&[
+            monitor(0, 0, 3840, 2400, true),
+            monitor(3840, -255, 2560, 1440, false),
+        ]);
+
+        let undocked = arrangement(&[monitor(0, 0, 3840, 2400, true)]);
+        assert!(docked.differs_from(&undocked), "a monitor left");
+        assert!(undocked.differs_from(&docked), "a monitor arrived");
+
+        let rearranged = arrangement(&[
+            monitor(0, 0, 3840, 2400, true),
+            monitor(-2560, 0, 2560, 1440, false),
+        ]);
+        assert!(docked.differs_from(&rearranged), "a monitor moved");
+
+        let resized = arrangement(&[
+            monitor(0, 0, 3840, 2400, true),
+            monitor(3840, -255, 1920, 1080, false),
+        ]);
+        assert!(
+            docked.differs_from(&resized),
+            "a monitor changed resolution"
+        );
+
+        let promoted = arrangement(&[
+            monitor(0, 0, 3840, 2400, false),
+            monitor(3840, -255, 2560, 1440, true),
+        ]);
+        assert!(
+            docked.differs_from(&promoted),
+            "the primary display moved, which decides where `primary` captures from"
+        );
+    }
+
+    #[test]
+    fn an_unsampled_desktop_is_not_evidence_of_a_change() {
+        // A sample can be empty because the query failed, because one monitor's information could
+        // not be read, or because the session genuinely has no desktop right now - locked,
+        // disconnected, asleep. Only the last is a true empty desktop, and the daemon is already
+        // waiting that one out. Calling any of them a change would rebuild the capture engine
+        // against a desktop that is not there, once per hotkey press, for as long as it lasts.
+        let docked = arrangement(&[monitor(0, 0, 3840, 2400, true)]);
+        let unknown = DisplayArrangement::default();
+
+        assert!(!docked.differs_from(&unknown));
+        assert!(!unknown.differs_from(&docked));
+        assert!(!unknown.differs_from(&unknown));
+    }
+
+    #[test]
+    fn a_stale_arrangement_is_refused_the_way_a_stale_generation_is() {
+        // Same kind, same retryability, same remedy: the daemon's recovery path must not have to
+        // know which of the two checks caught the change. The message names both arrangements,
+        // because this line is all a user's log has to explain a rebuild they did not ask for.
+        let error = stale_display_arrangement_error(
+            "validate_display_configuration",
+            &arrangement(&[monitor(0, 0, 3840, 2400, true)]),
+            &arrangement(&[
+                monitor(0, 0, 3840, 2400, true),
+                monitor(3840, -255, 2560, 1440, false),
+            ]),
+        );
+
+        assert_eq!(error.kind, CaptureErrorKind::TopologyChanged);
+        assert!(error.retryable, "a rebuild fixes it, so the daemon retries");
+        assert!(
+            error.message.contains("3840x2400+0+0*"),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("2560x1440+3840-255"),
+            "{}",
+            error.message
+        );
+    }
 
     /// The denial a locked or disconnected session gives this query, as Windows reports it.
     fn access_denied() -> WindowsError {
