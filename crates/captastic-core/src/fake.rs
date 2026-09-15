@@ -122,7 +122,9 @@ impl FakeBackend {
         display.cloned().ok_or_else(|| CaptureError {
             kind: CaptureErrorKind::SourceUnavailable,
             backend: "fake",
-            operation: "resolve_display",
+            // The spelling the real backends use for the same refusal, so a daemon test exercises
+            // the classification the product performs.
+            operation: crate::DISPLAY_NOT_ATTACHED,
             message: format!("display {} is not attached", id.0),
             retryable: false,
             native_code: None,

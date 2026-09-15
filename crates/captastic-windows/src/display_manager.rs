@@ -162,6 +162,40 @@ impl DxgiDisplayManager {
             .position(|session| session.display_id == *resolved)
     }
 
+    /// Explains a capture this manager cannot route, distinguishing a display that is not here
+    /// from one that is here and has no capture session.
+    ///
+    /// Both are `SourceUnavailable` and they are not the same condition. A display missing from
+    /// the enumerated list means the request named something this engine does not have, which
+    /// after a live selection means the arrangement changed under the overlay; the daemon reports
+    /// that to the user and a fresh press finds the new layout. A display that enumerated but
+    /// whose duplication could not be created is still right there on the desk — a hybrid-graphics
+    /// external, a display another process holds a duplication of, a remote or virtual adapter —
+    /// and it fails this way on *every* press. Telling that user the display layout changed would
+    /// be both false and unending, so it keeps the operation it always had.
+    fn unroutable_display_error(&self, requested: &DisplayId) -> CaptureError {
+        if let Some((_, error)) = self.unavailable.iter().find(|(id, _)| id == requested) {
+            return manager_error(
+                CaptureErrorKind::SourceUnavailable,
+                "route_capture",
+                format!(
+                    "display {} has no retained capture session; initialization failed: {error}",
+                    requested.0
+                ),
+                true,
+            );
+        }
+        manager_error(
+            CaptureErrorKind::SourceUnavailable,
+            captastic_core::DISPLAY_NOT_ATTACHED,
+            format!(
+                "display {} is not attached to this capture engine",
+                requested.0
+            ),
+            true,
+        )
+    }
+
     fn capture_virtual_desktop(
         &mut self,
         request: &CaptureRequest,
@@ -247,23 +281,9 @@ impl CaptureBackend for DxgiDisplayManager {
         let CaptureSource::Display(requested) = &request.source else {
             return self.capture_virtual_desktop(request, recorder);
         };
-        let index = self.session_index(requested).ok_or_else(|| {
-            let unavailable = self
-                .unavailable
-                .iter()
-                .find(|(id, _)| id == requested)
-                .map(|(_, error)| format!("; initialization failed: {error}"))
-                .unwrap_or_default();
-            manager_error(
-                CaptureErrorKind::SourceUnavailable,
-                "route_capture",
-                format!(
-                    "display {} has no retained capture session{unavailable}",
-                    requested.0
-                ),
-                true,
-            )
-        })?;
+        let index = self
+            .session_index(requested)
+            .ok_or_else(|| self.unroutable_display_error(requested))?;
         self.sessions[index].backend.capture(request, recorder)
     }
 }

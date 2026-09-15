@@ -372,9 +372,13 @@ impl CaptureBackend for DxgiBackend {
             CaptureSource::Display(id)
                 if *id == self.selected.id || (id.0 == "primary" && self.selected.is_primary) => {}
             CaptureSource::Display(id) => {
+                // Named for what it is rather than for where it happens: a rebuild after a
+                // monitor change binds the replacement backend to whatever is primary now, and
+                // the daemon reads this refusal as evidence that the display a live selection was
+                // drawn on is gone.
                 return Err(capture_error(
                     CaptureErrorKind::SourceUnavailable,
-                    "capture",
+                    captastic_core::DISPLAY_BINDING_REFUSED,
                     format!(
                         "backend was initialized for {}, not {}",
                         self.selected.id.0, id.0

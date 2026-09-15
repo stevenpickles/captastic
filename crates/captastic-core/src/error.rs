@@ -43,6 +43,25 @@ pub enum CaptureErrorKind {
     ShuttingDown,
 }
 
+/// The `operation` a backend names when it refuses a capture because the display the request
+/// asked for is not one *this* backend can capture: a single-output backend bound to a different
+/// display.
+///
+/// The kind cannot carry this. `SourceUnavailable` is also what a backend says about a display it
+/// owns and could not capture from — a duplication that failed to initialize, a retained frame
+/// that does not exist yet — and those mean the capture pipeline had trouble, not that the desktop
+/// moved. Only this refusal and [`DISPLAY_NOT_ATTACHED`] say the request named a display the engine
+/// does not have, which after a live selection is evidence that the arrangement changed between
+/// the overlay and its confirmation. Named here rather than matched as a message substring,
+/// because the daemon that classifies them lives in another crate from the backends that raise
+/// them.
+pub const DISPLAY_BINDING_REFUSED: &str = "capture_display_binding";
+
+/// The `operation` a backend names when the display a request asked for is not attached to it at
+/// all — absent from the display list it enumerated. The multi-output manager and the fake backend
+/// both answer this way; see [`DISPLAY_BINDING_REFUSED`] for why the spelling is shared.
+pub const DISPLAY_NOT_ATTACHED: &str = "resolve_display";
+
 #[derive(Clone, Debug, Error)]
 #[error("{kind:?} in {backend}/{operation}: {message}")]
 pub struct CaptureError {
