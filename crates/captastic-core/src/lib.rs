@@ -15,7 +15,10 @@ pub use capture::{
 };
 pub use detach::{process_detach_ledger, DetachCount, DetachKind, DetachLedger, DetachSummary};
 pub use display::{DisplayId, DisplayInfo, DisplayTopology, DisplayTopologyError, Rect};
-pub use error::{CaptureError, CaptureErrorKind, FrameError, MetricsError};
+pub use error::{
+    CaptureError, CaptureErrorKind, FrameError, MetricsError, DISPLAY_BINDING_REFUSED,
+    DISPLAY_NOT_ATTACHED,
+};
 pub use fake::{FakeBackend, FakeBackendConfig, FakeFailure};
 pub use frame::{
     ColorSpace, CpuFrame, CursorAbsence, CursorCapture, FrameAlpha, FrameMetadata, FrameOrigin,

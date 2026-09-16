@@ -10,8 +10,9 @@ use windows::Win32::Foundation::POINT;
 use windows::Win32::UI::WindowsAndMessaging::GetPhysicalCursorPos;
 
 use crate::dxgi::{
-    display_configuration_generation, enumerate_display_adapters,
-    stale_display_configuration_error, DxgiBackend,
+    display_arrangement, display_configuration_generation, enumerate_display_adapters,
+    stale_display_arrangement_error, stale_display_configuration_error, DisplayArrangement,
+    DxgiBackend,
 };
 use crate::session::HRESULT_ACCESS_DENIED;
 
@@ -37,6 +38,11 @@ pub struct DxgiDisplayManager {
     /// sessions carry their own copies for their captures; this one answers for the list itself,
     /// which the daemon reads to place a live selection overlay before any capture happens.
     display_configuration_generation: u64,
+    /// The desktop arrangement `displays` was enumerated against. The generation above only moves
+    /// when a window is told about a display change, and the daemon can be running without one -
+    /// a tray that failed to start is non-fatal, and at startup this manager is built before the
+    /// tray window exists. This is sampled from the window manager and needs neither.
+    display_arrangement: DisplayArrangement,
 }
 
 impl DxgiDisplayManager {
@@ -50,6 +56,8 @@ impl DxgiDisplayManager {
         // the list the daemon places an overlay from — and one rebuild converges once the burst
         // of change notifications a dock event produces has settled.
         let generation_before_enumeration = display_configuration_generation();
+        // Same sample, same bias, same window: taken before the enumeration it vouches for.
+        let arrangement_before_enumeration = display_arrangement();
         let enumerated = enumerate_display_adapters()?;
         let displays: Vec<_> = enumerated
             .iter()
@@ -152,6 +160,7 @@ impl DxgiDisplayManager {
             virtual_topology_error,
             composite_pool: CompositeBufferPool::new(COMPOSITE_BUFFER_SLOTS),
             display_configuration_generation: generation_before_enumeration,
+            display_arrangement: arrangement_before_enumeration,
         })
     }
 
@@ -160,6 +169,40 @@ impl DxgiDisplayManager {
         self.sessions
             .iter()
             .position(|session| session.display_id == *resolved)
+    }
+
+    /// Explains a capture this manager cannot route, distinguishing a display that is not here
+    /// from one that is here and has no capture session.
+    ///
+    /// Both are `SourceUnavailable` and they are not the same condition. A display missing from
+    /// the enumerated list means the request named something this engine does not have, which
+    /// after a live selection means the arrangement changed under the overlay; the daemon reports
+    /// that to the user and a fresh press finds the new layout. A display that enumerated but
+    /// whose duplication could not be created is still right there on the desk — a hybrid-graphics
+    /// external, a display another process holds a duplication of, a remote or virtual adapter —
+    /// and it fails this way on *every* press. Telling that user the display layout changed would
+    /// be both false and unending, so it keeps the operation it always had.
+    fn unroutable_display_error(&self, requested: &DisplayId) -> CaptureError {
+        if let Some((_, error)) = self.unavailable.iter().find(|(id, _)| id == requested) {
+            return manager_error(
+                CaptureErrorKind::SourceUnavailable,
+                "route_capture",
+                format!(
+                    "display {} has no retained capture session; initialization failed: {error}",
+                    requested.0
+                ),
+                true,
+            );
+        }
+        manager_error(
+            CaptureErrorKind::SourceUnavailable,
+            captastic_core::DISPLAY_NOT_ATTACHED,
+            format!(
+                "display {} is not attached to this capture engine",
+                requested.0
+            ),
+            true,
+        )
     }
 
     fn capture_virtual_desktop(
@@ -229,14 +272,24 @@ impl CaptureBackend for DxgiDisplayManager {
 
     fn validate_display_configuration(&self) -> Result<(), CaptureError> {
         let current_generation = display_configuration_generation();
-        if self.display_configuration_generation == current_generation {
-            return Ok(());
+        if self.display_configuration_generation != current_generation {
+            return Err(stale_display_configuration_error(
+                "validate_display_configuration",
+                self.display_configuration_generation,
+                current_generation,
+            ));
         }
-        Err(stale_display_configuration_error(
-            "validate_display_configuration",
-            self.display_configuration_generation,
-            current_generation,
-        ))
+        // The second line, for the changes that reached no window. Once per hotkey press, on the
+        // path that reads `displays` without capturing from it.
+        let current_arrangement = display_arrangement();
+        if self.display_arrangement.differs_from(&current_arrangement) {
+            return Err(stale_display_arrangement_error(
+                "validate_display_configuration",
+                &self.display_arrangement,
+                &current_arrangement,
+            ));
+        }
+        Ok(())
     }
 
     fn capture(
@@ -247,23 +300,9 @@ impl CaptureBackend for DxgiDisplayManager {
         let CaptureSource::Display(requested) = &request.source else {
             return self.capture_virtual_desktop(request, recorder);
         };
-        let index = self.session_index(requested).ok_or_else(|| {
-            let unavailable = self
-                .unavailable
-                .iter()
-                .find(|(id, _)| id == requested)
-                .map(|(_, error)| format!("; initialization failed: {error}"))
-                .unwrap_or_default();
-            manager_error(
-                CaptureErrorKind::SourceUnavailable,
-                "route_capture",
-                format!(
-                    "display {} has no retained capture session{unavailable}",
-                    requested.0
-                ),
-                true,
-            )
-        })?;
+        let index = self
+            .session_index(requested)
+            .ok_or_else(|| self.unroutable_display_error(requested))?;
         self.sessions[index].backend.capture(request, recorder)
     }
 }

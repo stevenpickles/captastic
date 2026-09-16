@@ -143,6 +143,32 @@ impl Drop for AttemptCompletion<'_> {
     }
 }
 
+/// The structured event name for a selection the display configuration ended. Distinct from
+/// `selection_cancelled` because the user did not cancel anything: a script watching the JSON
+/// stream, like a user reading the log, has to be able to tell a refusal from a loss.
+const SELECTION_DISPLAY_CHANGED_EVENT: &str = "selection_display_changed";
+
+/// Why that selection ended, worded to complete both "selection N was abandoned because ..." in
+/// the log and "Capture N was not completed because ..." in the notification balloon.
+const DISPLAY_LAYOUT_CHANGED_DURING_SELECTION: &str =
+    "the display layout changed while the selection was open";
+
+/// The same clause for the changes that are not the monitors moving: a DPI change, or a work-area
+/// change such as a taskbar resizing, auto-hide being toggled, or an appbar registering itself.
+/// The overlay abandons its geometry for these too, and claiming the display layout changed would
+/// be a wrong explanation of a real loss.
+const DISPLAY_SETTINGS_CHANGED_DURING_SELECTION: &str =
+    "the display settings changed while the selection was open";
+
+/// Picks the clause for the reason the overlay closed on.
+pub(crate) fn display_change_clause(reason: &str) -> &'static str {
+    if reason == captastic_windows::DISPLAY_CHANGE_MONITORS {
+        DISPLAY_LAYOUT_CHANGED_DURING_SELECTION
+    } else {
+        DISPLAY_SETTINGS_CHANGED_DURING_SELECTION
+    }
+}
+
 /// Tells the daemon's main thread that a selection was abandoned, so the loss reaches the
 /// notification area instead of only the log. The job itself has already been closed out by its
 /// caller; this only carries the report.
@@ -227,7 +253,9 @@ impl SelectionWorker {
                 );
                 let mut selection_was_confirmed = job.confirmed_selection.is_some();
                 let selection = if let Some(selection) = job.confirmed_selection.take() {
-                    Ok(Some(selection))
+                    Ok(captastic_windows::SelectionOutcome::Selected(Box::new(
+                        selection,
+                    )))
                 } else {
                     let preview_source = job.frame.as_ref().map_or_else(
                         || captastic_windows::SelectionPreviewSource::live(&job.metadata),
@@ -242,7 +270,8 @@ impl SelectionWorker {
                     )
                 };
                 match selection {
-                    Ok(Some(selection)) => {
+                    Ok(captastic_windows::SelectionOutcome::Selected(selection)) => {
+                        let selection = *selection;
                         if !selection_was_confirmed {
                             job.recorder.record(
                                 job.capture_id,
@@ -537,7 +566,7 @@ impl SelectionWorker {
                             }
                         }
                     }
-                    Ok(None) => {
+                    Ok(captastic_windows::SelectionOutcome::Cancelled) => {
                         if !selection_was_confirmed {
                             job.recorder.record(
                                 job.capture_id,
@@ -551,6 +580,32 @@ impl SelectionWorker {
                             "selection_cancelled",
                             "selection was cancelled",
                         );
+                    }
+                    Ok(captastic_windows::SelectionOutcome::DisplayConfigurationChanged(
+                        reason,
+                    )) => {
+                        if !selection_was_confirmed {
+                            job.recorder.record(
+                                job.capture_id,
+                                PerfEventKind::SelectionStarted,
+                                offset_after_cpu(&job),
+                            );
+                        }
+                        // Not a cancellation, and told apart from one in both places the user can
+                        // look: the log names what changed, and the balloon says the press is
+                        // gone. The overlay closed itself because its geometry described a
+                        // configuration that had stopped existing - a dock switch mid-draw, or a
+                        // taskbar that moved - and nothing about that is visible from where the
+                        // user was standing. The raw reason goes in the log line only; it is the
+                        // word a support question needs and not one for a balloon.
+                        let clause = display_change_clause(reason);
+                        finish_without_clipboard(
+                            &mut job,
+                            json_output,
+                            SELECTION_DISPLAY_CHANGED_EVENT,
+                            &format!("{clause} (reason={reason})"),
+                        );
+                        notify_dropped_selection(&notices, job.capture_id, clause);
                     }
                     Err(error) => {
                         if job.frame.is_none()
@@ -793,13 +848,19 @@ fn finish_without_clipboard(
             job.capture_id.0
         ));
     }
-    if event == "selection_cancelled" {
-        log::info!("selection {} cancelled", job.capture_id.0);
-    } else {
-        crate::logging::error(format_args!(
+    match event {
+        "selection_cancelled" => log::info!("selection {} cancelled", job.capture_id.0),
+        // Its own line, at its own level: this is not the user's decision like a cancellation,
+        // and not the capture pipeline failing like the rest, so neither existing wording says
+        // what happened or invites the one remedy there is - press the hotkey again.
+        SELECTION_DISPLAY_CHANGED_EVENT => crate::logging::warn(format_args!(
+            "selection {} was abandoned because {message}",
+            job.capture_id.0
+        )),
+        _ => crate::logging::error(format_args!(
             "selection {} failed: {message}",
             job.capture_id.0
-        ));
+        )),
     }
     if json_output {
         println!(

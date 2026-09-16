@@ -1342,6 +1342,33 @@ mod tests {
     }
 
     #[test]
+    fn a_display_change_names_its_reason_so_the_shell_can_report_the_loss() {
+        // The reason is not decoration. It is the only thing separating this close from the
+        // Cancelled one above, and the shell carries the distinction out to the log line and the
+        // notification balloon that tell the user their press is gone. Every reason the window
+        // procedure maps - a DPI change, a monitor change, a work-area change - arrives here.
+        for reason in [
+            "overlay_dpi_changed",
+            crate::DISPLAY_CHANGE_MONITORS,
+            "overlay_display_setting_changed",
+        ] {
+            let mut model = region_model();
+            let effects = transition(
+                &mut model,
+                OverlayInput::DisplayConfigurationInvalidated { reason },
+            );
+            assert!(
+                matches!(
+                    close_outcome(&effects),
+                    Some(CloseOutcome::DisplayConfigurationInvalidated { reason: closed })
+                        if closed == reason
+                ),
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
     fn a_toolbar_drag_tracks_clamped_and_persists_only_on_release() {
         let mut model = region_model();
         model.toolbar_position = POINT { x: 300, y: 300 };

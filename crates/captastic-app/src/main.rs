@@ -345,21 +345,15 @@ fn capture_with_preview_fallback(
                 Some(remembered_ui),
                 &mut overlay_resources,
             )?;
-            let Some(selection) = selection else {
-                finish_one_shot_ui_state(Some(worker));
-                recorder.record(request.id, PerfEventKind::AttemptFinished, 0);
-                captastic_core::validate_event_order(recorder.events())?;
-                let value = json!({
-                    "schema_version": 1,
-                    "event": "selection_cancelled",
-                    "capture_id": request.id,
-                });
-                if args.json {
-                    println!("{}", serde_json::to_string_pretty(&value)?);
-                } else {
-                    log::info!("selection {} cancelled", request.id.0);
+            let selection = match selection {
+                captastic_windows::SelectionOutcome::Selected(selection) => *selection,
+                outcome => {
+                    finish_one_shot_ui_state(Some(worker));
+                    recorder.record(request.id, PerfEventKind::AttemptFinished, 0);
+                    captastic_core::validate_event_order(recorder.events())?;
+                    report_selection_without_capture(request.id, &outcome, args.json)?;
+                    return Ok(());
                 }
-                return Ok(());
             };
             ui_worker = Some(worker);
             recorder.record(
@@ -676,21 +670,15 @@ fn capture_with_live_selection(mut args: cli::CaptureArgs) -> Result<(), AppErro
         }
     };
     recorder.record(capture_id, PerfEventKind::SelectionStarted, 0);
-    let Some(selection) = selection else {
-        finish_one_shot_ui_state(Some(ui_worker));
-        recorder.record(capture_id, PerfEventKind::AttemptFinished, 0);
-        captastic_core::validate_event_order(recorder.events())?;
-        let value = json!({
-            "schema_version": 1,
-            "event": "selection_cancelled",
-            "capture_id": capture_id,
-        });
-        if args.json {
-            println!("{}", serde_json::to_string_pretty(&value)?);
-        } else {
-            log::info!("selection {} cancelled", capture_id.0);
+    let selection = match selection {
+        captastic_windows::SelectionOutcome::Selected(selection) => *selection,
+        outcome => {
+            finish_one_shot_ui_state(Some(ui_worker));
+            recorder.record(capture_id, PerfEventKind::AttemptFinished, 0);
+            captastic_core::validate_event_order(recorder.events())?;
+            report_selection_without_capture(capture_id, &outcome, args.json)?;
+            return Ok(());
         }
-        return Ok(());
     };
     recorder.record(
         capture_id,
@@ -845,6 +833,47 @@ fn capture_with_live_selection(mut args: cli::CaptureArgs) -> Result<(), AppErro
         log::info!("capture {} complete: {}", capture_id.0, value);
     }
     finish_one_shot_ui_state(Some(ui_worker));
+    Ok(())
+}
+
+/// Reports a one-shot selection that produced no capture, naming a display change as one.
+///
+/// The daemon tells the user through a notification balloon; a one-shot `capture --selection` has
+/// no notification area, so this line and this JSON event are the whole of what anybody sees. A
+/// press the display configuration took away is still reported as a success at the process level —
+/// nothing failed, the selection simply stopped being about a desktop that exists — but it is not
+/// filed as a cancellation, because the user cancelled nothing.
+#[cfg(windows)]
+fn report_selection_without_capture(
+    capture_id: CaptureId,
+    outcome: &captastic_windows::SelectionOutcome,
+    json: bool,
+) -> Result<(), AppError> {
+    let display_change = match outcome {
+        captastic_windows::SelectionOutcome::DisplayConfigurationChanged(reason) => Some(*reason),
+        _ => None,
+    };
+    let event = if display_change.is_some() {
+        "selection_display_changed"
+    } else {
+        "selection_cancelled"
+    };
+    if json {
+        let value = json!({
+            "schema_version": 1,
+            "event": event,
+            "capture_id": capture_id,
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else if let Some(reason) = display_change {
+        crate::logging::warn(format_args!(
+            "selection {} was abandoned because {} (reason={reason})",
+            capture_id.0,
+            selection::display_change_clause(reason)
+        ));
+    } else {
+        log::info!("selection {} cancelled", capture_id.0);
+    }
     Ok(())
 }
 

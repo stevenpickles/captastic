@@ -848,6 +848,15 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                             backend.take();
                             recovery = Some(BackendRecovery::immediate());
                         }
+                        if confirmation_failure_is_a_display_change(&error) {
+                            // The same loss as the geometry mismatch above, told the same way and
+                            // for the same reason: the selection worker ends the attempt from the
+                            // terminal error, and its failures reach only the log.
+                            let _ = capture_notices.try_send(DaemonNotice::DroppedSelection {
+                                capture_id,
+                                reason: DISPLAY_LAYOUT_CHANGED_REASON,
+                            });
+                        }
                         request.job.terminal_error = Some(error.to_string());
                         request.job.confirmed_selection = Some(request.selection);
                     }
@@ -2190,6 +2199,43 @@ fn confirmation_geometry_mismatch(
             captured.rotation_degrees,
         )
     })
+}
+
+/// True when a confirmation capture failed because the display arrangement moved out from under
+/// it, rather than for a reason of its own.
+///
+/// `TopologyChanged` says it outright: the engine refused to capture against a display list a
+/// monitor change has outdated. The rebuild that refusal triggers then produces the other half of
+/// the sequence, and that half arrives as `SourceUnavailable` — the replacement engine is asked
+/// for the display the overlay was drawn on and does not have it, either because a single-output
+/// backend bound itself to whatever is primary now, or because the display is absent from the
+/// arrangement the multi-output manager enumerated.
+///
+/// Which is why the kind alone is not the test. `SourceUnavailable` is also how a backend reports
+/// a display it *does* have and could not capture from: the daemon's default `pointer` policy runs
+/// the multi-output manager, which keeps a display whose duplication failed to initialize in its
+/// display list — a hybrid-graphics external, a display another process is duplicating, a remote
+/// or virtual adapter — so an overlay opens on that panel and every confirmation is refused, the
+/// same way, forever. So is a retained-frame request arriving before the first frame exists.
+/// Neither is a display change, and telling that user their layout moved would be false on every
+/// press. The two refusals that *are* about display identity name themselves
+/// ([`DISPLAY_BINDING_REFUSED`] and [`DISPLAY_NOT_ATTACHED`]) and only those count.
+///
+/// Every other kind is the capture pipeline failing for its own reasons — a lost device, a desktop
+/// that is not there, an unsupported request — and those paths already retry, recover, or report;
+/// a balloon per occurrence would be noise.
+#[cfg(windows)]
+fn confirmation_failure_is_a_display_change(error: &CaptureError) -> bool {
+    match error.kind {
+        CaptureErrorKind::TopologyChanged => true,
+        CaptureErrorKind::SourceUnavailable => {
+            matches!(
+                error.operation,
+                captastic_core::DISPLAY_BINDING_REFUSED | captastic_core::DISPLAY_NOT_ATTACHED
+            )
+        }
+        _ => false,
+    }
 }
 
 /// The notification-area clause for a confirmation the display layout invalidated. A pure
@@ -3831,6 +3877,103 @@ mod tests {
         let mut renamed = overlay.clone();
         renamed.display_id = DisplayId("swapped-in".to_owned());
         assert_eq!(confirmation_geometry_mismatch(&overlay, &renamed), None);
+    }
+
+    #[test]
+    fn a_confirmation_capture_bound_to_a_replaced_display_is_reported_to_the_user() {
+        // The 2026-08-29 log, in the order it happened: the topology changed while the region was
+        // being drawn, the confirmation capture was refused with TopologyChanged, the rebuilt
+        // single-output engine bound itself to the display that is primary now, and asking it for
+        // the panel the overlay covered earned SourceUnavailable. That kind is not retryable and
+        // does not ask for another rebuild, so the press ended — silently, before this.
+        let (result, rebuilds) = capture_across_rebuild(
+            CaptureSource::Display(DisplayId("built-in".to_owned())),
+            vec![lifecycle_display("built-in", true, 3840, 2400)],
+            vec![lifecycle_display("dock-left", true, 2560, 1440)],
+        );
+
+        let error = result.expect_err("the rebuilt engine does not have the overlay's display");
+        assert_eq!(rebuilds, 1);
+        assert_eq!(error.kind, CaptureErrorKind::SourceUnavailable);
+        assert!(
+            !requires_backend_recovery(&error),
+            "nothing further happens on this path, which is why it must be reported here"
+        );
+        assert!(
+            confirmation_failure_is_a_display_change(&error),
+            "the user asked for a capture and gets a balloon instead of a log line"
+        );
+    }
+
+    fn refusal(kind: CaptureErrorKind, operation: &'static str, message: &str) -> CaptureError {
+        CaptureError {
+            kind,
+            backend: "dxgi",
+            operation,
+            message: message.to_owned(),
+            retryable: false,
+            native_code: None,
+        }
+    }
+
+    #[test]
+    fn a_confirmation_capture_that_failed_on_its_own_terms_raises_no_balloon() {
+        // The narrowness is the point: these are the pipeline's own failures, already retried,
+        // recovered from, or reported elsewhere. A balloon each would train the user to ignore
+        // the one that means their capture is gone.
+        for kind in [
+            CaptureErrorKind::Timeout,
+            CaptureErrorKind::AccessLost,
+            CaptureErrorKind::DeviceRemoved,
+            CaptureErrorKind::BufferExhausted,
+            CaptureErrorKind::DesktopUnavailable,
+            CaptureErrorKind::PermissionDenied,
+            CaptureErrorKind::Unsupported,
+        ] {
+            assert!(
+                !confirmation_failure_is_a_display_change(&refusal(kind, "capture", "scripted")),
+                "{kind:?} is not a display change"
+            );
+        }
+    }
+
+    #[test]
+    fn a_display_that_is_present_but_cannot_be_captured_raises_no_balloon() {
+        // Both of these are SourceUnavailable about a display that is right there on the desk, and
+        // the kind alone cannot tell them from the refusal that means the overlay's display is
+        // gone. The first is the one that would have been unending: the daemon's default pointer
+        // policy runs the multi-output manager, which keeps a display whose duplication failed to
+        // initialize in the list the overlay is placed from, so it is offered, drawn on, and
+        // refused on every single press - a balloon claiming the display layout changed each time,
+        // while nothing changed at all.
+        assert!(!confirmation_failure_is_a_display_change(&refusal(
+            CaptureErrorKind::SourceUnavailable,
+            "route_capture",
+            "display windows-monitor-DEL41B4-dp1 has no retained capture session; initialization failed: PermissionDenied in dxgi/duplicate_output: Access is denied.",
+        )));
+        assert!(!confirmation_failure_is_a_display_change(&refusal(
+            CaptureErrorKind::SourceUnavailable,
+            "capture_latest",
+            "no retained desktop frame is available yet",
+        )));
+    }
+
+    #[test]
+    fn the_two_refusals_about_display_identity_raise_a_balloon() {
+        // The single-output backend rebuilt onto another display, and the manager asked for a
+        // display its enumeration does not contain. Both mean the display the overlay was drawn on
+        // is not one this engine can capture, which after a confirmed selection means the
+        // arrangement moved between the drawing and the capture.
+        for operation in [
+            captastic_core::DISPLAY_BINDING_REFUSED,
+            captastic_core::DISPLAY_NOT_ATTACHED,
+        ] {
+            assert!(confirmation_failure_is_a_display_change(&refusal(
+                CaptureErrorKind::SourceUnavailable,
+                operation,
+                "the display is not this engine's",
+            )));
+        }
     }
 
     #[test]
