@@ -20,9 +20,14 @@ Captastic supports four display policies:
 
 A single-display overlay is locked to its resolved target for the lifetime of
 that capture action. Moving the pointer to another display does not move the
-active overlay or toolbar. A topology change while an overlay is open cancels
-the action without changing the clipboard, rebuilds the capture sessions, and
-allows the next action after the engine reports ready.
+active overlay or toolbar. A display-configuration change while an
+overlay is open ends the action without changing the clipboard, rebuilds the
+capture sessions, and allows the next action after the engine reports ready.
+That ending is not reported as a cancellation: the log line and the
+notification balloon name what changed — the display layout for a monitor
+arriving, leaving, or moving, and the display settings for a DPI or work-area
+change — because the press is lost and only pressing the hotkey again recovers
+it.
 
 ## Coordinate and image invariants
 
@@ -113,7 +118,10 @@ ephemeral and are never persisted.
 6. **Rotation normalization**: normalize all supported DXGI rotations and record
    transform timing independently from native acquisition and readback.
 7. **Topology recovery**: handle attach, removal, primary, resolution, work-area,
-   and DPI changes with generation-based cancellation and resource rebuilds.
+   and DPI changes with generation-based cancellation and resource rebuilds,
+   backed by a monitor-arrangement fingerprint that a live selection re-samples
+   on each press so a change no window of Captastic's was running to be told
+   about is still caught.
 8. **Virtual desktop**: compose normalized per-display frames, report frame age
    and maximum timestamp skew, and expose full-virtual-desktop capture.
 

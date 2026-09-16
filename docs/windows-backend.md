@@ -349,6 +349,25 @@ name rather than from the panel (`persistent_display_id`), so while it is in for
 match what `state.toml` remembered under its persistent id, and a `display =` naming a persistent id
 does not select it.
 
+The same cost is paid one display at a time, without the query failing at all, when Windows
+re-enumerates a panel it did not read EDID from — the `Default_Monitor` case, which a DisplayPort
+link retrain right after a dock event is enough to produce. `display_identity` falls through to
+`windows-monitor-path-<hash>` or to a session-local name, and the effect on the user is the same:
+the tool, region and toolbar position remembered for that panel are filed under its EDID id and are
+not found, and whatever they adjust now is saved under the temporary id instead. Both fallbacks
+therefore log at **warn**, naming the id being used, what it costs, and that the next enumeration
+which reads EDID restores the panel's own id. They were `debug` until 2026-09-15, which meant a
+user whose display had quietly forgotten its settings had an info-level log with nothing in it.
+
+The warning is said when a source's identity *changes*, not on every enumeration, and at debug
+while it stands. The condition lasts until Windows reads that panel's EDID again, and enumeration
+is not rare: one rebuild under the `pointer` policy enumerates once for the manager's display list
+and once more per display for each retained session, `capture_source_wait` re-enumerates every two
+seconds while the daemon has no desktop, and the overlay enumerates when Window mode is picked.
+Repeating the paragraph a dozen times through one dock burst is how a line that matters becomes a
+line people filter out. A panel that recovers EDID and later falls back again warns again, because
+that second fallback costs the user their remembered state a second time.
+
 **Status: verified by unit tests, not measured live.** Six tests cover it — the locked case, the
 other temporary session states, the sizing call under its own name, the two states that must
 preserve the original error, the probe being paid only on a denial (a counter, as for the cursor
@@ -459,8 +478,25 @@ DXGI only ever produces two of those three. `map_windows_error` (`dxgi.rs:2561`)
 device-removed HRESULT is usually `DEVICE_HUNG` or `DRIVER_INTERNAL_ERROR`, neither of which the
 generic mapping recovers from — so reasons are routed through `device_removed_error`
 (`dxgi.rs:2588`) instead, which reports every non-success reason as `DeviceRemoved` and keeps the
-reason as the native code. `TopologyChanged` comes from the display-configuration generation and
-from a readback whose dimensions disagree with the display, not from an HRESULT.
+reason as the native code. `TopologyChanged` comes from the display-configuration generation, from the
+monitor-arrangement fingerprint described below, and from a readback whose dimensions disagree with
+the display, not from an HRESULT.
+
+The generation counter only moves when a window of ours receives `WM_DISPLAYCHANGE`, and the daemon
+is not guaranteed to have one: a tray icon that fails to start is non-fatal, and at startup the
+capture engine is built on its worker thread before the tray window exists. A dock event in either
+gap moves nothing. So a backend also records the desktop arrangement it enumerated against —
+every monitor's rectangle and the primary flag, from `EnumDisplayMonitors` and `GetMonitorInfoW` —
+and `validate_display_configuration` re-samples it and reports `TopologyChanged` when it differs.
+It is a second line rather than a replacement: with a window listening, the generation catches
+changes a rectangle cannot see — a 180° rotation, a rotated square panel, a refresh-rate change, a
+monitor swapped for another of the same size in the same place. In the window where no window is
+listening, those are not caught by anything before the capture happens; the confirmation-time
+geometry check, which compares rotation as well as bounds, is what refuses them afterwards. The sample is
+taken once per hotkey press, never per frame, and a sample that could not be taken in full — a
+failed query, or a session with no desktop at all — is treated as unknown and compares equal to
+everything, because rebuilding the engine against a desktop that is not there is worse than waiting
+for the next press.
 
 The daemon is idle between hotkeys, so a device lost while nothing is capturing is not noticed until
 the next trigger; the first capture after a loss is the one that pays for it.

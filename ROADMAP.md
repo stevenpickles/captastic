@@ -43,8 +43,12 @@ public release, but it gates neither v0.1.0 nor the capture milestones below.
 
 ## Release readiness — v0.1.0
 
-**Status:** Documentation gates complete on `dev` (PR #77); the release branch is next. What
-remains is the live release mechanics listed below, none of which has yet run against a real tag.
+**Status:** v0.1.0 shipped on 2026-09-03: `release/v0.1.0` merged to `main` by PR #81, the tag on
+that merge commit ran the tagged path of the release workflow, and the GitHub release carries the
+archive, checksum, Chocolatey package, and manifest. The manual Chocolatey community push has not
+been made. v0.1.1 is a patch release cut from `dev` after PR #83 (the dock-switch first-capture
+fixes), following the same branch model; its notes are `docs/release-notes-v0.1.1.md`. The gates
+below are kept as the record of what v0.1.0 had to satisfy.
 v0.1.0 is a deliberately unsigned first tag whose purpose is to exercise the release mechanics end
 to end and to describe honestly what Captastic is and is not. It is not gated on the capture
 milestones below, and it makes no performance claim.
@@ -173,9 +177,11 @@ display the user intends without initializing a capture engine after the hotkey 
 - Exercise 1080p and 4K displays where available, 100/125/150/200 percent scaling, negative desktop
   coordinates, portrait rotation, mixed-DPI layouts, and hot-plugging.
 - Verify pointer-display selection at boundaries and while the topology changes. Live selection now
-  validates the capture engine's display list against the display-configuration generation and
-  rebuilds before placing the overlay, so this reduces to confirming pointer-boundary behavior; a
-  stale arrangement can no longer reach the overlay.
+  validates the capture engine's display list against the display-configuration generation *and*
+  against a monitor-arrangement fingerprint that needs no window to notice a change, and rebuilds
+  before placing the overlay, so this reduces to confirming pointer-boundary behavior; a stale
+  arrangement can no longer reach the overlay, including on a daemon whose tray icon never started
+  and on the first press after a dock event that landed during startup.
 - Run lock/unlock, sleep/wake, Explorer restart, GPU-reset, Remote Desktop, and KVM/Synergy checks.
 
 ### Exit criteria
@@ -616,10 +622,10 @@ not reproduced on demand, is in
 
 ## Recommended next branch
 
-`release/v0.1.0`, cut from `dev`. The unsigned-release documentation, the README repositioning,
-and the release-notes draft are merged (PR #77), so the branch exists to carry the release through
-`main`, the tag, and the merge back to `dev` as described under
-[Release readiness](#release-readiness--v010).
+`release/v0.1.1`, cut from `dev` after PR #83. v0.1.0 is shipped, so the branch exists only to carry
+the patch release through `main`, the tag, and the merge back to `dev` as described under
+[Release readiness](#release-readiness--v010); the workspace version returns to the 0.2.0 line on
+`dev` once the back-merge lands.
 
 Before cutting it, the operator-run live verifications are the work most likely to find something, because
 they exercise the recovery paths that shipped with the least live verification: sleep/wake, Remote

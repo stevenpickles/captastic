@@ -153,6 +153,66 @@ pub struct OverlaySelection {
     pub(crate) window_frame: Option<CpuFrame>,
 }
 
+/// The close reason an overlay reports for `WM_DISPLAYCHANGE`: the monitors themselves changed —
+/// one arrived, one left, or the arrangement moved.
+///
+/// Public because it is the one reason of the three that means *the display layout changed*. The
+/// other two — a DPI change, and a work-area change such as a taskbar resizing, auto-hide being
+/// toggled, or an appbar registering itself — abandon the overlay's geometry just as surely and
+/// are not a layout change at all. A caller telling the user why their press was lost has to say
+/// which of those happened, and sharing this spelling is better than matching on it.
+pub const DISPLAY_CHANGE_MONITORS: &str = "overlay_display_changed";
+
+/// How a selection run ended.
+///
+/// A run that produced no selection used to be `Ok(None)`, which made an Escape and a display
+/// change under an open overlay the same event to everything downstream. They are not the same
+/// event. The first is the user saying no; the second is the user's press being taken away from
+/// them mid-draw, because the overlay's geometry belongs to an arrangement that has stopped
+/// existing and it closes rather than keep drawing over a desktop that moved. A caller that
+/// cannot tell them apart logs "selection cancelled" at info and says nothing to the user, which
+/// is precisely what the first hotkey press after a dock switch looked like.
+#[derive(Debug)]
+pub enum SelectionOutcome {
+    /// The user confirmed a region or a window. Boxed because a confirmed window selection
+    /// carries its captured frame and would otherwise make every outcome that size.
+    Selected(Box<OverlaySelection>),
+    /// Escape, right-click, or a cancel requested from outside the overlay.
+    Cancelled,
+    /// The display configuration changed while the overlay was open, so the run closed without a
+    /// selection and without persisting geometry from a configuration that is no longer current.
+    /// The press is lost; pressing the hotkey again is the only remedy.
+    ///
+    /// The payload is the reason the window procedure closed for, and it is carried rather than
+    /// flattened because these are not one event. A monitor arriving, leaving or moving is a
+    /// display layout change. A DPI change or a work-area change — a taskbar resized, auto-hide
+    /// toggled, an appbar registering itself — is not, and a caller that told the user their
+    /// displays had moved because their taskbar grew would be explaining a real loss wrongly.
+    DisplayConfigurationChanged(&'static str),
+}
+
+impl SelectionOutcome {
+    /// The outcome a finished run reports, from the selection it produced and the reason a display
+    /// change closed it, if one did.
+    ///
+    /// Separate from the window procedure that sets those two fields so the mapping can be tested
+    /// on its own: nothing else in this file's teardown path can run without a message pump.
+    fn from_run(
+        selection: Option<OverlaySelection>,
+        display_change_reason: Option<&'static str>,
+    ) -> Self {
+        match (selection, display_change_reason) {
+            // Defensive rather than observed: confirmation and a display change both destroy the
+            // window synchronously, so the procedure cannot reach this state. If it ever could,
+            // a selection in hand is one the user made against the arrangement they were looking
+            // at, and the confirmation capture validates the geometry it gets back.
+            (Some(selection), _) => Self::Selected(Box::new(selection)),
+            (None, Some(reason)) => Self::DisplayConfigurationChanged(reason),
+            (None, None) => Self::Cancelled,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum OverlayUiUpdate {
     Interaction {
@@ -269,7 +329,7 @@ fn overlay_window_is_current(handle: HWND) -> bool {
 pub fn select_from_frozen_frame(
     frame: &CpuFrame,
     resources: &mut OverlayResources,
-) -> Result<Option<OverlaySelection>, CaptureError> {
+) -> Result<SelectionOutcome, CaptureError> {
     select_from_frozen_frame_with_controller(frame, &OverlayController::new(), resources)
 }
 
@@ -277,7 +337,7 @@ pub fn select_from_frozen_frame_with_controller(
     frame: &CpuFrame,
     controller: &OverlayController,
     resources: &mut OverlayResources,
-) -> Result<Option<OverlaySelection>, CaptureError> {
+) -> Result<SelectionOutcome, CaptureError> {
     select_from_frozen_frame_with_initial_tool(
         frame,
         controller,
@@ -291,7 +351,7 @@ pub fn select_from_frozen_frame_with_initial_tool(
     controller: &OverlayController,
     initial_tool: InitialSelectionTool,
     resources: &mut OverlayResources,
-) -> Result<Option<OverlaySelection>, CaptureError> {
+) -> Result<SelectionOutcome, CaptureError> {
     select_from_frozen_frame_with_initial_tool_and_ui(
         frame,
         controller,
@@ -307,7 +367,7 @@ pub fn select_from_frozen_frame_with_initial_tool_and_ui(
     initial_tool: InitialSelectionTool,
     remembered_ui: Option<captastic_config::DisplayUiState>,
     resources: &mut OverlayResources,
-) -> Result<Option<OverlaySelection>, CaptureError> {
+) -> Result<SelectionOutcome, CaptureError> {
     select_from_preview_source_with_initial_tool_and_ui(
         SelectionPreviewSource::frozen(frame),
         controller,
@@ -353,10 +413,10 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
     initial_tool: InitialSelectionTool,
     remembered_ui: Option<captastic_config::DisplayUiState>,
     resources: &mut OverlayResources,
-) -> Result<Option<OverlaySelection>, CaptureError> {
+) -> Result<SelectionOutcome, CaptureError> {
     let preparation_started = Instant::now();
     if controller.inner.cancelled.load(Ordering::SeqCst) {
-        return Ok(None);
+        return Ok(SelectionOutcome::Cancelled);
     }
     let _dpi_context = ThreadDpiContext::enter_per_monitor_v2()?;
     if let Some(frame) = preview_source.frozen_frame {
@@ -508,6 +568,7 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
         _font_resource: font_resource,
         previous_foreground,
         result: None,
+        display_change_reason: None,
         started: Instant::now(),
         preparation_ns: duration_ns(preparation_started.elapsed()),
         window_overview_ns: None,
@@ -559,6 +620,10 @@ struct OverlayState {
     _font_resource: PrivateFontResource,
     previous_foreground: HWND,
     result: Option<OverlaySelection>,
+    /// Set when the run is ending because the display configuration changed under the overlay,
+    /// to the reason the window procedure closed for, so the outcome can name what happened
+    /// instead of reporting a cancellation the user never made.
+    display_change_reason: Option<&'static str>,
     started: Instant,
     preparation_ns: u64,
     window_overview_ns: Option<u64>,
@@ -609,9 +674,10 @@ impl OverlayResources {
 fn cache_overlay_state(
     state: Box<OverlayState>,
     resources: &mut OverlayResources,
-) -> Option<OverlaySelection> {
+) -> SelectionOutcome {
     let OverlayState {
         result,
+        display_change_reason,
         surface,
         back_buffer,
         dimmer,
@@ -637,7 +703,7 @@ fn cache_overlay_state(
         region_cursor,
         font_resource: _font_resource,
     });
-    result
+    SelectionOutcome::from_run(result, display_change_reason)
 }
 
 enum WindowPreviewState {
@@ -905,7 +971,7 @@ fn run_overlay(
     state: Box<OverlayState>,
     controller: &OverlayController,
     resources: &mut OverlayResources,
-) -> Result<Option<OverlaySelection>, CaptureError> {
+) -> Result<SelectionOutcome, CaptureError> {
     // Overlays run back to back on one long-lived selection thread. Start from a queue that cannot
     // already be quitting, so an earlier run's teardown can never end this loop before it pumps.
     drain_pending_quit();
@@ -1049,10 +1115,10 @@ fn run_overlay(
     let state = unsafe { Box::from_raw(state_pointer) };
     controller.inner.hwnd.store(0, Ordering::SeqCst);
     let previous_foreground = state.previous_foreground;
-    let result = cache_overlay_state(state, resources);
+    let outcome = cache_overlay_state(state, resources);
     restore_input_context(previous_foreground);
     drop(class_guard);
-    Ok(result)
+    Ok(outcome)
 }
 
 unsafe extern "system" fn overlay_window_proc(
@@ -1123,7 +1189,7 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             hwnd,
             state_pointer,
             OverlayInput::DisplayConfigurationInvalidated {
-                reason: "overlay_display_changed",
+                reason: DISPLAY_CHANGE_MONITORS,
             },
         ),
         WM_SETTINGCHANGE
@@ -1476,6 +1542,13 @@ fn apply_overlay_effects(
                     }
                     CloseOutcome::Cancelled => close_overlay(hwnd),
                     CloseOutcome::DisplayConfigurationInvalidated { reason } => {
+                        // Recorded before the window goes away, because it is the only difference
+                        // between this close and the Escape above: both leave `result` empty, and
+                        // a caller that cannot tell them apart reports a cancellation the user
+                        // never made.
+                        // SAFETY: The borrow ends before close dispatches destruction.
+                        let state = unsafe { &mut *state_pointer };
+                        state.display_change_reason = Some(reason);
                         display_configuration_changed_and_close(hwnd, reason);
                     }
                 }
@@ -3221,6 +3294,70 @@ mod tests {
     use captastic_core::PixelFormat;
 
     use super::*;
+
+    fn selection_for_tests() -> OverlaySelection {
+        OverlaySelection {
+            rect: Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+            kind: SelectionKind::Region,
+            window: None,
+            window_title: None,
+            window_application: None,
+            selection_ns: 0,
+            preparation_ns: 0,
+            window_overview_ns: None,
+            window_preview_count: 0,
+            window_live_preview_count: 0,
+            window_frozen_preview_count: 0,
+            window_preview_bytes: 0,
+            window_frame: None,
+        }
+    }
+
+    #[test]
+    fn a_display_change_under_the_overlay_is_not_reported_as_a_cancellation() {
+        // What the first hotkey press after a dock switch did: WM_DISPLAYCHANGE closed the
+        // overlay, the run produced no selection, and every caller downstream read that as the
+        // user pressing Escape - info-level "selection cancelled", no balloon, nothing to
+        // distinguish a press that was taken away from one that was declined.
+        assert!(matches!(
+            SelectionOutcome::from_run(None, Some(DISPLAY_CHANGE_MONITORS)),
+            SelectionOutcome::DisplayConfigurationChanged(DISPLAY_CHANGE_MONITORS)
+        ));
+        assert!(matches!(
+            SelectionOutcome::from_run(None, None),
+            SelectionOutcome::Cancelled
+        ));
+    }
+
+    #[test]
+    fn the_reason_an_overlay_abandoned_its_geometry_reaches_the_caller() {
+        // A DPI change and a work-area change close the overlay exactly as a monitor change does,
+        // and they are not a monitor change. The caller words the user's explanation from this,
+        // so the reason has to survive the trip rather than being flattened into one outcome.
+        for reason in ["overlay_dpi_changed", "overlay_display_setting_changed"] {
+            assert!(matches!(
+                SelectionOutcome::from_run(None, Some(reason)),
+                SelectionOutcome::DisplayConfigurationChanged(carried) if carried == reason
+            ));
+        }
+    }
+
+    #[test]
+    fn a_selection_in_hand_outranks_a_display_change() {
+        // Defensive, not observed: confirmation and a display change each destroy the window
+        // synchronously, so the window procedure cannot produce both. This pins what the mapping
+        // does if that ever stops being true - a selection the user made is not thrown away -
+        // rather than claiming the sequence happens.
+        assert!(matches!(
+            SelectionOutcome::from_run(Some(selection_for_tests()), Some(DISPLAY_CHANGE_MONITORS)),
+            SelectionOutcome::Selected(_)
+        ));
+    }
 
     /// The overlay presenter blits the frozen frame into a 32-bit top-down DIB and hit-tests
     /// against it at four bytes per pixel. A half-float frame reaching that code would be drawn as
