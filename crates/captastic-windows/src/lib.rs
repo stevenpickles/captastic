@@ -17,6 +17,8 @@ mod host;
 #[cfg(windows)]
 mod hotkey;
 #[cfg(windows)]
+mod known_folders;
+#[cfg(windows)]
 mod overlay;
 #[cfg(windows)]
 mod session;
@@ -49,6 +51,8 @@ pub use host::{
 };
 #[cfg(windows)]
 pub use hotkey::{HotkeyListener, HotkeySpec};
+#[cfg(windows)]
+pub use known_folders::known_pictures_folder;
 #[cfg(windows)]
 pub use overlay::{
     flush_desktop_composition, select_from_frozen_frame, select_from_frozen_frame_with_controller,
