@@ -291,35 +291,29 @@ pub(super) fn layout_loupe(
     let below = source.bottom.saturating_add(tokens.gap);
     let above = source.top.saturating_sub(tokens.gap).saturating_sub(height);
 
+    // Every branch clamps both axes. The chosen side already fits by construction, so the clamp
+    // is normally a no-op - but the pointer is not always on this monitor. A drag that holds
+    // capture keeps delivering pointer positions after the pointer has left the display, and an
+    // unclamped placement then puts the magnifier off-screen entirely (and, in the frozen view,
+    // samples black). Clamping cannot reintroduce an overlap with the source square, because a
+    // clamp only bites when the pointer is outside the monitor and the square has gone with it.
+    let horizontal =
+        |left: i32| clamp_coordinate(left, safe.left, safe.right.saturating_sub(width));
+    let vertical = |top: i32| clamp_coordinate(top, safe.top, safe.bottom.saturating_sub(height));
     let (left, top) = if right_of.saturating_add(width) <= safe.right {
         // Beside it on the right: the vertical position is then free to prefer "below" and clamp.
-        (
-            right_of,
-            clamp_coordinate(below, safe.top, safe.bottom.saturating_sub(height)),
-        )
+        (horizontal(right_of), vertical(below))
     } else if left_of >= safe.left {
-        (
-            left_of,
-            clamp_coordinate(below, safe.top, safe.bottom.saturating_sub(height)),
-        )
+        (horizontal(left_of), vertical(below))
     } else if below.saturating_add(height) <= safe.bottom {
         // No room either side: separate vertically instead and let x clamp where it likes.
-        (
-            clamp_coordinate(source.left, safe.left, safe.right.saturating_sub(width)),
-            below,
-        )
+        (horizontal(source.left), vertical(below))
     } else if above >= safe.top {
-        (
-            clamp_coordinate(source.left, safe.left, safe.right.saturating_sub(width)),
-            above,
-        )
+        (horizontal(source.left), vertical(above))
     } else {
         // A monitor smaller than the magnifier plus its source square. Stay on screen; there is
         // no placement left that also avoids the square.
-        (
-            clamp_coordinate(right_of, safe.left, safe.right.saturating_sub(width)),
-            clamp_coordinate(below, safe.top, safe.bottom.saturating_sub(height)),
-        )
+        (horizontal(right_of), vertical(below))
     };
 
     let bounds = UiRect {
@@ -1325,6 +1319,43 @@ mod tests {
     }
 
     #[test]
+    fn the_magnifier_stays_on_screen_when_the_pointer_does_not() {
+        // A drag that holds capture keeps delivering pointer positions after the pointer has left
+        // the display. Placing the magnifier relative to a source square that is off-screen put
+        // the whole thing off-screen too - and in the frozen view it then sampled black.
+        let monitor = UiRect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let tokens = UiMetrics::new(96).loupe_tokens();
+        for pointer in [
+            POINT { x: -500, y: 500 },
+            POINT { x: 2400, y: 500 },
+            POINT { x: 900, y: -500 },
+            POINT { x: 900, y: 1600 },
+            POINT { x: -500, y: -500 },
+        ] {
+            let layout = layout_loupe(monitor, pointer, tokens);
+            assert!(layout.bounds.left >= monitor.left, "{pointer:?} {layout:?}");
+            assert!(layout.bounds.top >= monitor.top, "{pointer:?} {layout:?}");
+            assert!(
+                layout.bounds.right <= monitor.right,
+                "{pointer:?} {layout:?}"
+            );
+            assert!(
+                layout.bounds.bottom <= monitor.bottom,
+                "{pointer:?} {layout:?}"
+            );
+            assert!(
+                !layout.bounds.intersects(layout.source),
+                "{pointer:?} {layout:?}"
+            );
+        }
+    }
+
+    #[test]
     fn the_magnifier_parts_tile_its_box() {
         let tokens = UiMetrics::new(144).loupe_tokens();
         let layout = layout_loupe(
@@ -1411,8 +1442,11 @@ mod tests {
             height in 600i32..=2160,
             origin_x in -3840i32..=3840,
             origin_y in -2160i32..=2160,
-            fraction_x in 0.0f64..=1.0,
-            fraction_y in 0.0f64..=1.0,
+            // Deliberately past both ends: a drag that holds capture keeps delivering pointer
+            // positions after the pointer has left the display, and those are exactly the ones
+            // an unclamped placement put the magnifier off-screen for.
+            fraction_x in -0.6f64..=1.6,
+            fraction_y in -0.6f64..=1.6,
         ) {
             let monitor = UiRect {
                 left: origin_x,
