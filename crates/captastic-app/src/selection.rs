@@ -426,10 +426,21 @@ impl SelectionWorker {
                         // One assignment, from the route, so the reported anchor and the
                         // materialization label can never describe different frames.
                         job.confirmation_anchored = route.confirmation_anchored();
-                        let frame = job
-                            .frame
-                            .as_ref()
-                            .expect("every route that reaches materialization carries its pixels");
+                        // Every route that reaches here is supposed to carry its pixels, and a
+                        // `.expect` would have been true of all four. But this runs on the
+                        // long-lived selection thread: if a resumed job ever came back without a
+                        // frame, panicking would take every future hotkey press with it. A
+                        // selection that cannot be materialized is a selection that failed, and
+                        // there is already a way to say so.
+                        let Some(frame) = job.frame.take() else {
+                            finish_without_clipboard(
+                                &mut job,
+                                json_output,
+                                "selection_failed",
+                                "the confirmed selection arrived without the pixels to crop",
+                            );
+                            continue;
+                        };
                         let materialize_started = Instant::now();
                         let mut materialization = selection_materialization(
                             selection.kind,
@@ -463,7 +474,7 @@ impl SelectionWorker {
                                 result.frame
                             }
                             Ok(Some(None)) | Ok(None) => {
-                                match captastic_windows::materialize_selection(frame, &selection) {
+                                match captastic_windows::materialize_selection(&frame, &selection) {
                                     Ok(frame) => frame,
                                     Err(error) => {
                                         finish_without_clipboard(
@@ -482,7 +493,7 @@ impl SelectionWorker {
                                     "selection {} GPU materialization failed; using CPU crop: {error}",
                                     job.capture_id.0
                                 ));
-                                match captastic_windows::materialize_selection(frame, &selection) {
+                                match captastic_windows::materialize_selection(&frame, &selection) {
                                     Ok(frame) => frame,
                                     Err(error) => {
                                         finish_without_clipboard(

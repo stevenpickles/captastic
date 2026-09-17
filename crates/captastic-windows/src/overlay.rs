@@ -1815,10 +1815,25 @@ fn run_machine(hwnd: HWND, state_pointer: *mut OverlayState, input: OverlayInput
     // before `apply_overlay_effects` derives its own.
     unsafe {
         let state = &mut *state_pointer;
-        state.view_switched |= state.model.view != view_before;
+        state.view_switched = latch_view_switch(state.view_switched, view_before, state.model.view);
     }
     apply_overlay_effects(hwnd, state_pointer, effects);
     LRESULT(0)
+}
+
+/// Whether the user has changed the view at any point in this run, given what it was before an
+/// input and what it is after.
+///
+/// Latched, never recomputed: a run switched to the frozen view and back ends in the view it
+/// opened in, and comparing the two at the end would report it as never switched - which is
+/// exactly the case the flag exists to tell apart.
+const fn latch_view_switch(switched: bool, before: PreviewView, after: PreviewView) -> bool {
+    // `PreviewView` is not `const`-comparable through `PartialEq`, so the match spells it out.
+    switched
+        || !matches!(
+            (before, after),
+            (PreviewView::Live, PreviewView::Live) | (PreviewView::Frozen, PreviewView::Frozen)
+        )
 }
 
 fn apply_overlay_effects(
@@ -4321,6 +4336,36 @@ mod tests {
             view_switched: false,
             presenter_fallback_reason: None,
             window_frame: None,
+        }
+    }
+
+    #[test]
+    fn switching_the_view_and_switching_back_still_counts_as_switched() {
+        // The whole reason this is latched in the shell rather than compared at the end. A run
+        // that ends in the view it opened in is otherwise indistinguishable from one the user
+        // never touched, and `view_switched` exists precisely to tell those two apart.
+        let mut switched = false;
+        switched = latch_view_switch(switched, PreviewView::Live, PreviewView::Live);
+        assert!(
+            !switched,
+            "an input that leaves the view alone changes nothing"
+        );
+
+        switched = latch_view_switch(switched, PreviewView::Live, PreviewView::Frozen);
+        assert!(switched);
+
+        switched = latch_view_switch(switched, PreviewView::Frozen, PreviewView::Live);
+        assert!(
+            switched,
+            "switching back does not unsay that it was switched"
+        );
+
+        // And every later input keeps it set, whatever it does.
+        for (before, after) in [
+            (PreviewView::Live, PreviewView::Live),
+            (PreviewView::Frozen, PreviewView::Frozen),
+        ] {
+            assert!(latch_view_switch(switched, before, after));
         }
     }
 

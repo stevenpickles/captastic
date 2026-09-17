@@ -2678,6 +2678,62 @@ mod tests {
     }
 
     #[test]
+    fn the_view_can_be_switched_mid_drag_and_with_modifiers_held() {
+        // Deliberately not guarded. A user half-way through drawing a region over a video is
+        // exactly the person who wants to stop it moving, and making them let go first would
+        // lose the rectangle they had. Switching changes which pixels are behind the selection,
+        // not the selection: the drag survives it, and the release commits the same geometry.
+        let mut model = region_model();
+        transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point: point(100, 100),
+                window_slot: None,
+                time_ms: 0,
+            },
+        );
+        transition(
+            &mut model,
+            OverlayInput::PointerMoved {
+                point: point(300, 250),
+                window_hover: None,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    shift: true,
+                },
+                time_ms: 10,
+            },
+        );
+        assert!(region_drag_active(&model));
+        let in_flight = model.selection;
+
+        let effects = transition(&mut model, OverlayInput::ToggleView);
+
+        assert_eq!(model.view, PreviewView::Frozen);
+        assert!(has_effect(&effects, |e| matches!(
+            e,
+            OverlayEffect::Invalidate
+        )));
+        assert!(
+            region_drag_active(&model),
+            "switching the view must not drop the drag in flight"
+        );
+        assert_eq!(model.selection, in_flight, "nor move what has been drawn");
+
+        // And the release still commits, in the view the user switched to.
+        transition(
+            &mut model,
+            OverlayInput::PointerUp {
+                point: point(300, 250),
+                modifiers: Modifiers::default(),
+            },
+        );
+        assert!(!region_drag_active(&model));
+        assert_eq!(model.selection_kind, Some(SelectionKind::Region));
+        assert_eq!(model.view, PreviewView::Frozen);
+    }
+
+    #[test]
     fn the_frozen_tag_yields_the_band_above_the_toolbar_to_the_tooltips() {
         let mut model = region_model();
         assert!(!view_tag_visible(&model), "the live view carries no tag");
