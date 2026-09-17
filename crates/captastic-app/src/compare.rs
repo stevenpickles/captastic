@@ -526,20 +526,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
 
         let options = instant_options(CursorMode::Exclude);
-        let runs = crate::benchmark::run_repeated(&options, 2, || {
-            Ok(
-                Box::new(captastic_core::FakeBackend::new(options.fake.clone()))
-                    as Box<dyn captastic_core::CaptureBackend>,
-            )
-        })
+        crate::benchmark::prepare_output_dir(&directory, false).expect("an empty directory");
+        let runs = crate::benchmark::run_repeated(
+            &options,
+            2,
+            || {
+                Ok(
+                    Box::new(captastic_core::FakeBackend::new(options.fake.clone()))
+                        as Box<dyn captastic_core::CaptureBackend>,
+                )
+            },
+            |number, run| crate::benchmark::write_run_artifacts(&directory, number, run, false),
+        )
         .expect("two runs");
         let file = crate::benchmark::RepeatedBenchmarkFile {
             schema_version: crate::benchmark::REPEATED_FILE_SCHEMA_VERSION,
-            repeated: runs.repeated,
+            repeated: runs,
             budgets: None,
         };
-        crate::benchmark::write_repeat_artifacts(&directory, &file, &runs.events, false)
-            .expect("artifacts written");
+        crate::benchmark::write_repeat_set(&directory, &file).expect("the set file is written");
 
         let single = load(&directory.join("run-1.json")).expect("a single report loads");
         assert_eq!(single.runs.len(), 1, "a single run is a one-run set");

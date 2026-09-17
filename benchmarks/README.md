@@ -85,8 +85,18 @@ captastic benchmark --backend dxgi --cpu-frame true --repeat 3 --iterations 200 
 ```
 
 Add `--raw-events events.jsonl` to keep the per-capture event streams as well; under `--repeat`
-they are written into the output directory as `run-N.events.jsonl`, one per run, and the command
-refuses the flag without `--output-dir` rather than quietly writing nothing.
+they are written into the output directory as `run-N.events.jsonl`, one per run — the path given to
+`--raw-events` is not used, and the run says so — and the command refuses the flag without
+`--output-dir` rather than quietly writing nothing.
+
+Each run's files are written the moment that run finishes, so a set that fails on its third run
+still leaves runs 1 and 2 on disk; only `repeated.json` waits for the whole set. **A directory that
+already holds artifacts is refused**, naming them, before a single capture is taken: two sets mixed
+in one directory read as one set that never ran — new `run-1.json` beside a stale
+`run-1.events.jsonl` and an orphaned `run-3.*` from a longer previous set, under a `repeated.json`
+describing neither. Give each cell a directory of its own, or pass `--overwrite` to replace the
+previous set (which removes only `run-*.json`, `run-*.events.jsonl` and `repeated.json`, so notes
+you left beside the evidence survive).
 
 For a cursor-on cell the pointer must be **visible over the primary display for the whole run**,
 which in practice means leaving the mouse alone somewhere on that display and not touching the

@@ -222,13 +222,26 @@ pub struct BenchmarkRunArgs {
     pub budgets: Option<PathBuf>,
     #[arg(long)]
     pub output_results: Option<PathBuf>,
+    /// Write the per-capture event stream to this path.
+    ///
+    /// Under `--repeat` with `--output-dir` the streams go to `run-N.events.jsonl` in that
+    /// directory instead, one per run, and this path is not used - a repeat set has one stream per
+    /// run and they cannot share a file. The run says so rather than leaving the path unwritten.
     #[arg(long)]
     pub raw_events: Option<PathBuf>,
+    /// Replace the artifacts already in `--output-dir` rather than refusing.
+    ///
+    /// Only the files a set owns are removed - `run-*.json`, `run-*.events.jsonl`, `repeated.json`
+    /// - so anything else in the directory survives.
+    #[arg(long, requires = "output_dir")]
+    pub overwrite: bool,
     /// Write every repeat's raw artifacts into this directory: `run-N.json` per run,
     /// `run-N.events.jsonl` when `--raw-events` is given, and a `repeated.json` set file.
     ///
     /// The directory is what a baseline is: `benchmark compare` reads it back, and a published
-    /// figure whose supporting runs went to a console and were lost cannot be checked again.
+    /// figure whose supporting runs went to a console and were lost cannot be checked again. A
+    /// directory that already holds a set is refused unless `--overwrite` is given, because two
+    /// sets mixed in one directory read as one set that never ran.
     #[arg(long)]
     pub output_dir: Option<PathBuf>,
     #[arg(long)]

@@ -1033,9 +1033,36 @@ fn benchmark_run(args: cli::BenchmarkRunArgs) -> Result<(), AppError> {
         drop(native_backend.take());
         let backend_name = args.backend.clone();
         let display_policy = display_policy.clone();
-        let runs = benchmark::run_repeated(&options, args.repeat, move || {
-            create_backend(&backend_name, &display_policy)
-        })?;
+        // Cleared before a single capture is taken. A set that cannot have its artifacts written
+        // should not cost the operator the minutes of held-still mouse and playing video it takes
+        // to produce one.
+        let output_dir = args.output_dir.clone();
+        let write_events = args.raw_events.is_some();
+        if let Some(directory) = output_dir.as_deref() {
+            benchmark::prepare_output_dir(directory, args.overwrite)?;
+            if let Some(path) = args.raw_events.as_deref() {
+                // Said out loud rather than left as a help-text footnote: the path was asked for
+                // and is not where the events land.
+                log::info!(
+                    "--repeat writes one event stream per run to {}\\run-N.events.jsonl; {} is not used",
+                    directory.display(),
+                    path.display()
+                );
+            }
+        }
+        // Written run by run rather than at the end, so a failure on run 3 leaves runs 1 and 2 on
+        // disk. They are evidence in their own right and cannot be reconstructed.
+        let repeated = benchmark::run_repeated(
+            &options,
+            args.repeat,
+            move || create_backend(&backend_name, &display_policy),
+            |number, run| match output_dir.as_deref() {
+                Some(directory) => {
+                    benchmark::write_run_artifacts(directory, number, run, write_events)
+                }
+                None => Ok(()),
+            },
+        )?;
         // Budgets apply to a repeat set too, and per run rather than to their average: a mean
         // hides one run in three breaching, and "usually under 2 ms" is not a latency figure worth
         // publishing. Silently ignoring --budgets here - which is what this did first - is the
@@ -1043,28 +1070,22 @@ fn benchmark_run(args: cli::BenchmarkRunArgs) -> Result<(), AppError> {
         let budget_outcomes = args
             .budgets
             .as_deref()
-            .map(|path| {
-                budget::load(path).map(|file| budget::evaluate_each(&file, &runs.repeated.runs))
-            })
+            .map(|path| budget::load(path).map(|file| budget::evaluate_each(&file, &repeated.runs)))
             .transpose()?;
         // One typed envelope, printed and written. The hand-built JSON object this replaced meant
         // the file an operator commits and the JSON the command prints were assembled separately,
         // so nothing stopped them drifting - and nothing could read either of them back.
         let combined = benchmark::RepeatedBenchmarkFile {
             schema_version: benchmark::REPEATED_FILE_SCHEMA_VERSION,
-            repeated: runs.repeated,
+            repeated,
             budgets: budget_outcomes,
         };
         if let Some(path) = args.output_results.as_deref() {
             benchmark::write_json(path, &combined)?;
         }
+        // The set file is the only artifact that cannot be written until every run is in.
         if let Some(directory) = args.output_dir.as_deref() {
-            benchmark::write_repeat_artifacts(
-                directory,
-                &combined,
-                &runs.events,
-                args.raw_events.is_some(),
-            )?;
+            benchmark::write_repeat_set(directory, &combined)?;
         }
         if args.json {
             println!("{}", serde_json::to_string_pretty(&combined)?);

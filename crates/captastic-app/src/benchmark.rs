@@ -366,16 +366,6 @@ pub(crate) fn spread_percent(samples: &[u64]) -> f64 {
     ((largest - smallest) as f64 / smallest as f64) * 100.0
 }
 
-/// A repeat set and the raw events each of its runs produced.
-///
-/// The events travel beside the reports rather than inside them because a report is a file on
-/// disk with a fixed shape, and an event stream is hundreds of thousands of lines. `events[i]`
-/// belongs to `repeated.runs[i]`.
-pub struct RepeatedBenchmarkRuns {
-    pub repeated: RepeatedBenchmark,
-    pub events: Vec<Vec<PerfEvent>>,
-}
-
 /// A repeat set as it is written to `repeated.json` and read back by `benchmark compare`.
 ///
 /// A typed envelope rather than the hand-built JSON object this used to print: the file an
@@ -393,19 +383,33 @@ pub struct RepeatedBenchmarkFile {
 pub const REPEATED_FILE_SCHEMA_VERSION: u32 = 1;
 
 /// Runs the benchmark `repeat` times and reports whether the results may be compared at all.
+///
+/// `on_run` sees each run, with its raw events, the moment that run finishes, and is where the
+/// artifacts are written. Run by run rather than at the end, because a 3×200-iteration DXGI set is
+/// minutes of an operator's time with a video playing and the mouse held still: failing on the
+/// last run used to discard the two that had already succeeded, and those two are perfectly good
+/// evidence that cannot be reconstructed without doing the whole thing again.
+///
+/// It is also why the events do not come back in the return value. Every run's stream held in
+/// memory until the set finished was a cost that grew with the set and bought nothing, once the
+/// only consumer had already seen each one.
+///
+/// A hook failure stops the set: a run whose artifacts could not be written is not a run whose
+/// numbers should be quoted, and continuing would produce a set whose files disagree with its
+/// summary.
 pub fn run_repeated(
     options: &BenchmarkOptions,
     repeat: usize,
     mut make_backend: impl FnMut() -> Result<Box<dyn CaptureBackend>, AppError>,
-) -> Result<RepeatedBenchmarkRuns, AppError> {
+    mut on_run: impl FnMut(usize, &BenchmarkRun) -> Result<(), AppError>,
+) -> Result<RepeatedBenchmark, AppError> {
     if repeat == 0 {
         return Err(AppError::InvalidArgument(
             "repeat must be greater than zero".to_owned(),
         ));
     }
     let mut runs = Vec::with_capacity(repeat);
-    let mut events = Vec::with_capacity(repeat);
-    for _ in 0..repeat {
+    for index in 0..repeat {
         // A fresh backend per run, because a warm one is a different measurement: the first
         // capture allocates a staging texture and a CPU slot, and reusing one across repeats
         // would hide that cost in every run but the first.
@@ -414,8 +418,8 @@ pub fn run_repeated(
         // silently do nothing under `--repeat`, which is the combination an operator collecting
         // evidence actually runs: the flag was accepted, no file appeared, and nothing said why.
         let run = run_with_backend(backend.as_mut(), options)?;
+        on_run(index + 1, &run)?;
         runs.push(run.report);
-        events.push(run.events);
     }
 
     let compatibility = RunCompatibility::of(&runs[0]);
@@ -447,46 +451,125 @@ pub fn run_repeated(
         }
     });
 
-    Ok(RepeatedBenchmarkRuns {
-        repeated: RepeatedBenchmark {
-            schema_version: 1,
-            runs,
-            compatibility,
-            incompatibilities,
-            agreement,
-        },
-        events,
+    Ok(RepeatedBenchmark {
+        schema_version: 1,
+        runs,
+        compatibility,
+        incompatibilities,
+        agreement,
     })
 }
 
-/// Writes every repeat's raw artifacts into one directory, plus the typed set file.
+/// The artifact files one repeat set owns in its output directory.
+///
+/// Named by pattern rather than by counting the runs about to be taken, because the files that
+/// have to be dealt with are the ones a *previous* set left, and that set may have had more runs.
+fn existing_artifacts(directory: &Path) -> Result<Vec<std::path::PathBuf>, AppError> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        // Nothing there yet is the ordinary case, not a problem to report.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(AppError::Write {
+                path: directory.display().to_string(),
+                source,
+            })
+        }
+    };
+    let mut found = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| AppError::Write {
+            path: directory.display().to_string(),
+            source,
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let owned = name == "repeated.json"
+            || (name.starts_with("run-")
+                && (name.ends_with(".events.jsonl") || name.ends_with(".json")));
+        if owned {
+            found.push(entry.path());
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// Makes an output directory ready for one set, or refuses to mix two sets in it.
+///
+/// Refusing is the default because the alternative silently manufactures a set that never ran.
+/// Three repeats with `--raw-events` followed by two without leaves `run-1.json` and `run-2.json`
+/// from the new set beside `run-1.events.jsonl` and `run-2.events.jsonl` from the old one and a
+/// wholly orphaned `run-3.*` — a directory that reads as a three-run set whose third run came from
+/// a different measurement, with a `repeated.json` that describes two. That is precisely the
+/// plausible-looking wrong evidence these artifacts exist to prevent, and it would be committed as
+/// a baseline.
+///
+/// `--overwrite` removes exactly the files a set owns — never anything else in the directory, so a
+/// stray note or a screenshot an operator left beside the evidence survives.
+pub fn prepare_output_dir(directory: &Path, overwrite: bool) -> Result<(), AppError> {
+    let existing = existing_artifacts(directory)?;
+    if !existing.is_empty() {
+        if !overwrite {
+            let names: Vec<String> = existing
+                .iter()
+                .map(|path| {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                })
+                .collect();
+            return Err(AppError::InvalidArgument(format!(
+                "{} already holds benchmark artifacts ({}); pass --overwrite to replace them, or \
+                 name a directory of its own - mixing two sets in one directory produces evidence \
+                 for a run that never happened",
+                directory.display(),
+                names.join(", ")
+            )));
+        }
+        for path in existing {
+            fs::remove_file(&path).map_err(|source| AppError::Write {
+                path: path.display().to_string(),
+                source,
+            })?;
+        }
+    }
+    fs::create_dir_all(directory).map_err(|source| AppError::Write {
+        path: directory.display().to_string(),
+        source,
+    })
+}
+
+/// Writes one finished run's artifacts, as soon as it has finished.
 ///
 /// One directory per set rather than one file per flag: the evidence for a published figure is the
 /// runs *and* their event streams *and* the budget verdict, and a baseline committed to the
 /// repository as three unrelated paths is one somebody reassembles by hand a year later.
 ///
 /// `run-N.json` is a whole `BenchmarkReport`, so any one run can be compared on its own.
-pub fn write_repeat_artifacts(
+pub fn write_run_artifacts(
     directory: &Path,
-    file: &RepeatedBenchmarkFile,
-    events: &[Vec<PerfEvent>],
+    run_number: usize,
+    run: &BenchmarkRun,
     write_events: bool,
 ) -> Result<(), AppError> {
-    fs::create_dir_all(directory).map_err(|source| AppError::Write {
-        path: directory.display().to_string(),
-        source,
-    })?;
-    for (index, report) in file.repeated.runs.iter().enumerate() {
-        write_json(&directory.join(format!("run-{}.json", index + 1)), report)?;
-        if write_events {
-            if let Some(events) = events.get(index) {
-                write_json_lines(
-                    &directory.join(format!("run-{}.events.jsonl", index + 1)),
-                    events,
-                )?;
-            }
-        }
+    write_json(
+        &directory.join(format!("run-{run_number}.json")),
+        &run.report,
+    )?;
+    if write_events {
+        write_json_lines(
+            &directory.join(format!("run-{run_number}.events.jsonl")),
+            &run.events,
+        )?;
     }
+    Ok(())
+}
+
+/// Writes the set file, which can only be written once every run is in.
+pub fn write_repeat_set(directory: &Path, file: &RepeatedBenchmarkFile) -> Result<(), AppError> {
     write_json(&directory.join("repeated.json"), file)
 }
 
@@ -761,11 +844,13 @@ mod tests {
         // Three runs of the same question. The spread is what a performance claim rests on: a
         // mean alone would look identical whether the runs agreed or disagreed wildly.
         let options = instant_options(CursorMode::Exclude);
-        let runs = run_repeated(&options, 3, || {
-            Ok(Box::new(FakeBackend::new(options.fake.clone())) as Box<dyn CaptureBackend>)
-        })
+        let repeated = run_repeated(
+            &options,
+            3,
+            || Ok(Box::new(FakeBackend::new(options.fake.clone())) as Box<dyn CaptureBackend>),
+            |_, _| Ok(()),
+        )
         .expect("three runs");
-        let repeated = runs.repeated;
 
         assert_eq!(repeated.runs.len(), 3);
         assert!(repeated.incompatibilities.is_empty());
@@ -816,14 +901,15 @@ mod tests {
             cpu_frame: false,
             ..instant_options(CursorMode::Exclude)
         };
-        let runs = run_repeated(&options, 2, || {
-            Ok(Box::new(FakeBackend::new(options.fake.clone())) as Box<dyn CaptureBackend>)
-        })
-        .expect("two runs");
-        let agreement = runs
-            .repeated
-            .agreement
-            .expect("compatible runs are summarised");
+        let agreement = run_repeated(
+            &options,
+            2,
+            || Ok(Box::new(FakeBackend::new(options.fake.clone())) as Box<dyn CaptureBackend>),
+            |_, _| Ok(()),
+        )
+        .expect("two runs")
+        .agreement
+        .expect("compatible runs are summarised");
         let stages: Vec<&str> = agreement
             .stages
             .iter()
@@ -832,13 +918,10 @@ mod tests {
         assert_eq!(stages, ["trigger_to_dequeue", "native_frame", "frame_age"]);
     }
 
-    #[test]
-    fn every_repeat_leaves_its_own_artifacts_behind() {
-        // `--raw-events` under `--repeat` wrote nothing at all: the events were dropped inside
-        // `run_repeated` before anything could ask for them. An operator collecting the evidence
-        // for a published figure got a silent no-op in the one combination they actually run.
+    /// A directory nothing else is using, named the way the existing tests name theirs.
+    fn scratch_directory(purpose: &str) -> std::path::PathBuf {
         let directory = std::env::temp_dir().join(format!(
-            "captastic-benchmark-artifacts-{}-{}",
+            "captastic-benchmark-{purpose}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -846,21 +929,38 @@ mod tests {
                 .unwrap_or_default()
         ));
         let _ = fs::remove_dir_all(&directory);
+        directory
+    }
+
+    #[test]
+    fn every_repeat_leaves_its_own_artifacts_behind() {
+        // `--raw-events` under `--repeat` wrote nothing at all: the events were dropped inside
+        // `run_repeated` before anything could ask for them. An operator collecting the evidence
+        // for a published figure got a silent no-op in the one combination they actually run.
+        let directory = scratch_directory("artifacts");
 
         let options = instant_options(CursorMode::Exclude);
-        let runs = run_repeated(&options, 3, || {
-            Ok(Box::new(FakeBackend::new(options.fake.clone())) as Box<dyn CaptureBackend>)
-        })
+        prepare_output_dir(&directory, false).expect("an empty directory is ready to use");
+        let mut event_counts = Vec::new();
+        let repeated = run_repeated(
+            &options,
+            3,
+            || Ok(Box::new(FakeBackend::new(options.fake.clone())) as Box<dyn CaptureBackend>),
+            |number, run| {
+                event_counts.push(run.events.len());
+                write_run_artifacts(&directory, number, run, true)
+            },
+        )
         .expect("three runs");
-        assert_eq!(runs.events.len(), 3);
-        assert!(runs.events.iter().all(|events| !events.is_empty()));
+        assert_eq!(event_counts.len(), 3);
+        assert!(event_counts.iter().all(|count| *count > 0));
 
         let file = RepeatedBenchmarkFile {
             schema_version: REPEATED_FILE_SCHEMA_VERSION,
-            repeated: runs.repeated,
+            repeated,
             budgets: None,
         };
-        write_repeat_artifacts(&directory, &file, &runs.events, true).expect("artifacts written");
+        write_repeat_set(&directory, &file).expect("the set file is written");
 
         for index in 1..=3 {
             // Each run file is a whole report, so any single repeat can be compared on its own.
@@ -1064,11 +1164,13 @@ mod tests {
         // `--repeat` is what an operator actually runs, and B2 compares whole repeat sets: the
         // envelope has to read back as well as the reports inside it.
         let options = instant_options(CursorMode::Exclude);
-        let repeated = run_repeated(&options, 2, || {
-            Ok(Box::new(FakeBackend::new(options.fake.clone())) as Box<dyn CaptureBackend>)
-        })
-        .expect("two runs")
-        .repeated;
+        let repeated = run_repeated(
+            &options,
+            2,
+            || Ok(Box::new(FakeBackend::new(options.fake.clone())) as Box<dyn CaptureBackend>),
+            |_, _| Ok(()),
+        )
+        .expect("two runs");
         let json = serde_json::to_string(&repeated).expect("the repeat set serializes");
         let parsed: RepeatedBenchmark =
             serde_json::from_str(&json).expect("the repeat set reads back");
@@ -1081,11 +1183,135 @@ mod tests {
     }
 
     #[test]
+    fn a_directory_that_already_holds_a_set_is_refused_rather_than_mixed() {
+        // Three repeats with events, then two without, used to leave run-1/2.json from the new set
+        // beside run-1/2.events.jsonl from the old one and an orphaned run-3.* from neither - a
+        // directory that reads as a three-run set whose third run came from another measurement,
+        // with a repeated.json describing two. It would have been committed as a baseline.
+        let directory = scratch_directory("mixed-sets");
+        let options = instant_options(CursorMode::Exclude);
+
+        prepare_output_dir(&directory, false).expect("an empty directory is ready");
+        let first = run_repeated(
+            &options,
+            3,
+            || Ok(Box::new(FakeBackend::new(options.fake.clone())) as Box<dyn CaptureBackend>),
+            |number, run| write_run_artifacts(&directory, number, run, true),
+        )
+        .expect("three runs");
+        write_repeat_set(
+            &directory,
+            &RepeatedBenchmarkFile {
+                schema_version: REPEATED_FILE_SCHEMA_VERSION,
+                repeated: first,
+                budgets: None,
+            },
+        )
+        .expect("the set file is written");
+
+        // A note the operator left beside the evidence, which is not ours to delete.
+        let note = directory.join("notes.txt");
+        fs::write(&note, b"video looping on the left display").expect("write the note");
+
+        let error = prepare_output_dir(&directory, false)
+            .expect_err("a second set into the same directory");
+        let message = error.to_string();
+        assert!(
+            message.contains(&directory.display().to_string()),
+            "{message}"
+        );
+        for name in ["run-1.json", "run-3.events.jsonl", "repeated.json"] {
+            assert!(message.contains(name), "{name} is not named in {message}");
+        }
+        assert!(message.contains("--overwrite"), "{message}");
+        assert!(!message.contains("notes.txt"), "{message}");
+        assert_eq!(error.exit_code(), 2);
+
+        // With --overwrite, exactly the set's own files go and nothing else does.
+        prepare_output_dir(&directory, true).expect("--overwrite clears the previous set");
+        assert!(note.exists(), "an unrelated file must survive --overwrite");
+        assert!(existing_artifacts(&directory)
+            .expect("the directory is readable")
+            .is_empty());
+
+        // And the shorter second set leaves nothing of the first behind.
+        let second = run_repeated(
+            &options,
+            2,
+            || Ok(Box::new(FakeBackend::new(options.fake.clone())) as Box<dyn CaptureBackend>),
+            |number, run| write_run_artifacts(&directory, number, run, false),
+        )
+        .expect("two runs");
+        write_repeat_set(
+            &directory,
+            &RepeatedBenchmarkFile {
+                schema_version: REPEATED_FILE_SCHEMA_VERSION,
+                repeated: second,
+                budgets: None,
+            },
+        )
+        .expect("the set file is written");
+        let names: Vec<String> = existing_artifacts(&directory)
+            .expect("the directory is readable")
+            .iter()
+            .filter_map(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .collect();
+        assert_eq!(names, ["repeated.json", "run-1.json", "run-2.json"]);
+
+        fs::remove_dir_all(&directory).expect("remove the artifact directory");
+    }
+
+    #[test]
+    fn a_set_that_fails_partway_keeps_the_runs_that_succeeded() {
+        // A 3x200 DXGI set is minutes of an operator's time with a video playing and the mouse
+        // held still. Failing on the last run used to discard the two that had already finished,
+        // and those two cannot be reconstructed without doing the whole thing again.
+        let directory = scratch_directory("partial-set");
+        let options = instant_options(CursorMode::Exclude);
+        prepare_output_dir(&directory, false).expect("an empty directory is ready");
+
+        let error = run_repeated(
+            &options,
+            3,
+            || Ok(Box::new(FakeBackend::new(options.fake.clone())) as Box<dyn CaptureBackend>),
+            |number, run| {
+                write_run_artifacts(&directory, number, run, true)?;
+                if number == 3 {
+                    // Standing in for the disk filling up, or the display configuration changing
+                    // under the last run.
+                    return Err(AppError::InvalidArgument("the third run failed".to_owned()));
+                }
+                Ok(())
+            },
+        )
+        .expect_err("the third run fails");
+        assert!(error.to_string().contains("the third run failed"));
+
+        for index in 1..=2 {
+            assert!(
+                directory.join(format!("run-{index}.json")).exists(),
+                "run {index} finished and its report must have survived"
+            );
+            assert!(directory.join(format!("run-{index}.events.jsonl")).exists());
+        }
+        // The set file is the one artifact that cannot be honest about an unfinished set.
+        assert!(!directory.join("repeated.json").exists());
+
+        fs::remove_dir_all(&directory).expect("remove the artifact directory");
+    }
+
+    #[test]
     fn repeating_zero_times_is_refused() {
         let options = instant_options(CursorMode::Exclude);
-        assert!(run_repeated(&options, 0, || {
-            Ok(Box::new(FakeBackend::new(options.fake.clone())) as Box<dyn CaptureBackend>)
-        })
+        assert!(run_repeated(
+            &options,
+            0,
+            || Ok(Box::new(FakeBackend::new(options.fake.clone())) as Box<dyn CaptureBackend>),
+            |_, _| Ok(()),
+        )
         .is_err());
     }
 
