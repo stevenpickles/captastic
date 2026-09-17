@@ -1027,12 +1027,15 @@ fn observe_pointer_motion(model: &mut OverlayModel, point: POINT, time_ms: u32) 
 /// where they want the edge, and a rule that pulled it somewhere else would make the keys useless
 /// for the one job they exist for. It clears any guide for the same reason.
 ///
-/// Inert unless the region tool has a region and no drag is in flight. A drag owns the geometry
-/// while it runs, and a key arriving mid-drag would move a rectangle the next mouse message is
-/// about to recompute from its own anchor anyway.
+/// Inert unless the region tool has a region, no drag is in flight, and the Options menu is
+/// closed. A drag owns the geometry while it runs, and a key arriving mid-drag would move a
+/// rectangle the next mouse message is about to recompute from its own anchor anyway. An open
+/// menu owns the keyboard's attention: the arrows there are the user navigating a list of
+/// settings, and moving the selection underneath it is not what they asked for.
 fn nudge(model: &mut OverlayModel, dx: i32, dy: i32, resize: bool) -> Vec<OverlayEffect> {
     if model.tool != CaptureTool::Region
         || model.selection_kind != Some(SelectionKind::Region)
+        || model.options_open
         || model.anchor.is_some()
         || model.resizing.is_some()
         || model.moving_region.is_some()
@@ -3412,6 +3415,14 @@ mod tests {
             assert!(transition(&mut model, nudge.clone()).is_empty(), "{tool:?}");
             assert_eq!(model.selection, Some(region));
         }
+
+        // With the Options menu open, the arrows belong to the menu rather than to the region.
+        let mut model = region_model();
+        model.selection = Some(region);
+        model.selection_kind = Some(SelectionKind::Region);
+        model.options_open = true;
+        assert!(transition(&mut model, nudge.clone()).is_empty());
+        assert_eq!(model.selection, Some(region));
 
         // Mid-drag: the next mouse message would recompute the rectangle from its own anchor
         // anyway, so a key arriving now could only make the overlay flicker.

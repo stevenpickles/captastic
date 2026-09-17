@@ -375,16 +375,21 @@ pub(super) fn loupe_edge_lines(
         tokens,
         ..
     } = layout;
+    // The trailing bound is exclusive. An edge exactly on `source.right` maps to `view.right`,
+    // which is one past the last magnified column, so a 2-px stroke centred there would be drawn
+    // half on the chrome outside the view - a line the user would read as a selection edge
+    // sitting a pixel further out than it is. The same edge at `source.left` is the correct
+    // boundary of the first magnified column and is kept.
     let vertical = [selection.left, selection.right]
         .into_iter()
-        .filter(move |edge| *edge >= source.left && *edge <= source.right)
+        .filter(move |edge| *edge >= source.left && *edge < source.right)
         .map(move |edge| LoupeEdgeLine {
             vertical: true,
             position: view.left + (edge - source.left) * tokens.zoom,
         });
     let horizontal = [selection.top, selection.bottom]
         .into_iter()
-        .filter(move |edge| *edge >= source.top && *edge <= source.bottom)
+        .filter(move |edge| *edge >= source.top && *edge < source.bottom)
         .map(move |edge| LoupeEdgeLine {
             vertical: false,
             position: view.top + (edge - source.top) * tokens.zoom,
@@ -1429,6 +1434,37 @@ mod tests {
             .count(),
             0
         );
+
+        // Every line that is drawn marks a boundary of a column the view actually shows. The
+        // trailing bound is the one that matters: an edge exactly on `source.right` maps to
+        // `view.right`, one past the last magnified column, and a stroke centred there straddles
+        // the chrome and reads as an edge a pixel further out than it is. (A line at
+        // `view.left` is the correct boundary of the first column; its stroke spills a pixel into
+        // the round box's own fill, which is chrome either way.)
+        for edge in [
+            layout.source.left,
+            layout.source.right,
+            layout.source.right - 1,
+        ] {
+            let spanning = UiRect {
+                left: edge,
+                top: edge,
+                right: edge + 1,
+                bottom: edge + 1,
+            };
+            for line in loupe_edge_lines(spanning, layout) {
+                let (low, high) = if line.vertical {
+                    (layout.view.left, layout.view.right)
+                } else {
+                    (layout.view.top, layout.view.bottom)
+                };
+                assert!(
+                    line.position >= low && line.position < high,
+                    "edge {edge} put a line at {} outside [{low}, {high})",
+                    line.position
+                );
+            }
+        }
     }
 
     proptest::proptest! {

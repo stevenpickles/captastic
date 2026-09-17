@@ -1921,9 +1921,12 @@ fn compose_overlay_state(state: &mut OverlayState) {
             DIM_ALPHA,
         );
     }
-    // Placed before anything is drawn so the dimension badge can avoid it, and painted after the
-    // selection chrome so it sits on top of the outline it is magnifying.
-    state.loupe_layout = plan_loupe(state);
+    // Laid out *and sampled* before anything is drawn, so the dimension badge can avoid it, and
+    // painted after the selection chrome so it sits on top of the outline it is magnifying. The
+    // sampling has to happen on this side of the badge: a sample that fails cancels the
+    // magnifier, and a badge that had already reserved space for one would sit off to the side
+    // avoiding nothing.
+    prepare_loupe(state);
     if state.model.tool != CaptureTool::Window {
         if let Some(rect) = state.model.selection {
             if !state.live_preview {
@@ -1944,6 +1947,25 @@ fn compose_overlay_state(state: &mut OverlayState) {
     }
     draw_loupe(state);
     draw_toolbar(state);
+}
+
+/// Decides where the magnifier goes this paint and gets its pixels, or settles that there is no
+/// magnifier this paint.
+///
+/// Both halves belong together, and ahead of every draw. `loupe_layout` is what the dimension
+/// badge treats as an obstacle, so it has to be final before the badge is placed — a sample that
+/// fails cancels the magnifier, and a badge that had already moved aside for one would be
+/// avoiding nothing.
+fn prepare_loupe(state: &mut OverlayState) {
+    state.loupe_layout = plan_loupe(state);
+    let Some(layout) = state.loupe_layout else {
+        return;
+    };
+    if !sample_loupe_source(state, layout) {
+        // Without pixels there is nothing honest to show, and the live presenter's alpha pass
+        // must not carve an opaque hole where a magnifier is not.
+        state.loupe_layout = None;
+    }
 }
 
 /// Where the magnifier goes this paint, or `None` when it is not showing.
@@ -3079,10 +3101,10 @@ fn draw_region_dimensions(state: &mut OverlayState, rect: Rect) {
     );
     let mut reserved = vec![toolbar.bounds];
     // The magnifier is drawn after the badge and would simply cover it; reserving it here moves
-    // the badge instead, which is the only one of the two that has anywhere else to go.
-    if let Some(loupe) = state.loupe_layout {
-        reserved.push(loupe.bounds);
-    }
+    // the badge instead, which is the only one of the two that has anywhere else to go. Read
+    // rather than computed, because `prepare_loupe` has already settled whether there will be
+    // one at all - a magnifier whose sample failed is not an obstacle.
+    reserved.extend(loupe_obstacle(state.loupe_layout));
     // The tooltip paints after the label and would occlude it; reserve its whole potential
     // band so the label's placement stays stable across hover changes.
     reserved.push(tooltip_band(state.model.display_environment, toolbar));
@@ -3138,20 +3160,14 @@ fn draw_region_dimensions(state: &mut OverlayState, rect: Rect) {
     );
 }
 
-/// Samples the pixels under the pointer and paints the magnifier over them.
+/// Paints the magnifier over the pixels [`prepare_loupe`] sampled.
 ///
-/// Nothing here decides *whether* to show it; that is the machine's, and it has already been
-/// asked by the time `loupe_layout` was set.
-fn draw_loupe(state: &mut OverlayState) {
+/// Takes a shared borrow on purpose: by this point `loupe_layout` is settled, the badge has
+/// already been placed against it, and nothing here is allowed to change its mind.
+fn draw_loupe(state: &OverlayState) {
     let Some(layout) = state.loupe_layout else {
         return;
     };
-    if !sample_loupe_source(state, layout) {
-        // Without pixels there is nothing honest to show. Drop the layout so the live presenter's
-        // alpha pass does not carve an opaque hole where a magnifier is not.
-        state.loupe_layout = None;
-        return;
-    }
     let device = state.back_buffer.device;
     let tokens = layout.tokens;
     draw_round_box(
@@ -3335,6 +3351,16 @@ fn sample_loupe_source(state: &mut OverlayState, layout: LoupeLayout) -> bool {
     // SAFETY: Balances the successful GetDC(None) above on this thread.
     unsafe { ReleaseDC(None, screen) };
     copied.is_ok()
+}
+
+/// What the dimension badge must avoid on account of the magnifier: its box, or nothing at all.
+///
+/// A named function so the "or nothing at all" half is testable. The badge is placed once per
+/// paint and cannot be moved afterwards, so reserving space for a magnifier that turns out not to
+/// be drawn pushes the badge aside for nothing - which is why this reads the settled layout
+/// rather than recomputing whether one was wanted.
+fn loupe_obstacle(layout: Option<LoupeLayout>) -> Option<UiRect> {
+    layout.map(|layout| layout.bounds)
 }
 
 fn draw_window_overview_static(destination: &FrozenSurface, state: &OverlayState) {
@@ -4508,6 +4534,25 @@ mod tests {
             live_pixel_alpha(CaptureTool::Region, false, false, false, false),
             LIVE_HIT_TEST_ALPHA
         );
+    }
+
+    #[test]
+    fn a_magnifier_that_was_not_drawn_is_not_an_obstacle_for_the_badge() {
+        // The badge is placed once per paint and cannot be moved afterwards. Sampling used to
+        // happen inside the draw, after the badge had already reserved space, so a sample that
+        // failed left the badge pushed aside to avoid a magnifier that was never painted.
+        assert_eq!(loupe_obstacle(None), None);
+        let layout = layout_loupe(
+            UiRect {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
+            POINT { x: 900, y: 500 },
+            UiMetrics::new(96).loupe_tokens(),
+        );
+        assert_eq!(loupe_obstacle(Some(layout)), Some(layout.bounds));
     }
 
     #[test]
