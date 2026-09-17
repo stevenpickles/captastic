@@ -292,7 +292,13 @@ fn capture(args: cli::CaptureArgs) -> Result<(), AppError> {
     }
     let config = one_shot_config(args.config.as_deref())?;
     let display_policy = resolve_display_policy(&args.display)?;
-    let mut backend = create_backend(&args.backend, &display_policy)?;
+    // A one-shot has no selection queue behind it: at most the snapshot the overlay is showing
+    // and the confirmation capture that may replace it.
+    let mut backend = create_backend(
+        &args.backend,
+        &display_policy,
+        cpu_slot_count(config.capture.buffer_slots, args.selection, 0),
+    )?;
     let source = resolve_capture_source(&display_policy, backend.displays())?;
     let mut recorder = EventRecorder::with_capacity(24);
     let request = CaptureRequest {
@@ -814,7 +820,11 @@ fn benchmark_run(args: cli::BenchmarkRunArgs) -> Result<(), AppError> {
     let mut native_backend = if args.backend == "fake" {
         None
     } else {
-        Some(create_backend(&args.backend, &display_policy)?)
+        Some(create_backend(
+            &args.backend,
+            &display_policy,
+            BASE_CPU_BUFFER_SLOTS,
+        )?)
     };
     let source = match native_backend.as_deref() {
         Some(backend) => resolve_capture_source(&display_policy, backend.displays())?,
@@ -894,7 +904,7 @@ fn benchmark_run(args: cli::BenchmarkRunArgs) -> Result<(), AppError> {
         let repeated = benchmark::run_repeated(
             &options,
             args.repeat,
-            move || create_backend(&backend_name, &display_policy),
+            move || create_backend(&backend_name, &display_policy, BASE_CPU_BUFFER_SLOTS),
             |number, run| match output_dir.as_deref() {
                 Some(directory) => {
                     benchmark::write_run_artifacts(directory, number, run, write_events)
@@ -1177,15 +1187,44 @@ fn enumerate_dxgi_displays() -> Result<Vec<captastic_core::DisplayInfo>, AppErro
     ))
 }
 
+/// The readback-pool base for the paths that never load a configuration: `benchmark` and
+/// `doctor`, neither of which opens a selection overlay. Pinned to `capture.buffer_slots`'s
+/// default by a test, so the two cannot drift apart.
+const BASE_CPU_BUFFER_SLOTS: usize = 3;
+
+/// How many CPU readback slots the capture engine needs for this configuration.
+///
+/// A pooled slot is recycled only when nothing else holds its `Arc`, so the pool has to cover
+/// every frame that can be pinned at the same time. `base` covers the capture pipeline itself: a
+/// capture in flight, a frame a destination worker is still writing, and one spare.
+///
+/// Selection adds to it, and that is new. Every overlay press now opens over the frame captured
+/// at that press and holds it for the whole interaction - seconds, not milliseconds - and the
+/// selection queue can hold `queue_capacity` more jobs each pinning their own. With the base
+/// three alone, a `full_display` capture still in the clipboard sink plus two selections open or
+/// queued left no slot, and the next capture - or the confirmation capture the open overlay was
+/// about to ask for - died with `BufferExhausted`.
+///
+/// Slots are allocated on first use, so the larger ceiling costs nothing until that many frames
+/// really are in flight.
+fn cpu_slot_count(base: usize, selection_enabled: bool, queue_capacity: usize) -> usize {
+    if !selection_enabled {
+        return base;
+    }
+    // One for the overlay the user is looking at, plus one per job the queue can hold behind it.
+    base.saturating_add(queue_capacity).saturating_add(1)
+}
+
 fn create_backend(
     name: &str,
     display_policy: &DisplayPolicy,
+    cpu_slots: usize,
 ) -> Result<Box<dyn CaptureBackend>, AppError> {
     match name {
         "fake" => Ok(Box::new(captastic_core::FakeBackend::new(
             Default::default(),
         ))),
-        "auto" | "dxgi" => create_dxgi_backend(display_policy),
+        "auto" | "dxgi" => create_dxgi_backend(display_policy, cpu_slots),
         other => Err(AppError::BackendUnavailable(format!(
             "unknown backend {other}; available backends: fake, dxgi"
         ))),
@@ -1195,22 +1234,29 @@ fn create_backend(
 #[cfg(windows)]
 fn create_dxgi_backend(
     display_policy: &DisplayPolicy,
+    cpu_slots: usize,
 ) -> Result<Box<dyn CaptureBackend>, AppError> {
     match display_policy {
-        DisplayPolicy::Pointer => Ok(Box::new(captastic_windows::DxgiDisplayManager::new()?)),
-        DisplayPolicy::Primary => Ok(Box::new(captastic_windows::DxgiBackend::new(
+        DisplayPolicy::Pointer => Ok(Box::new(
+            captastic_windows::DxgiDisplayManager::with_cpu_slots(cpu_slots)?,
+        )),
+        DisplayPolicy::Primary => Ok(Box::new(captastic_windows::DxgiBackend::with_cpu_slots(
             &DisplayId::primary(),
+            cpu_slots,
         )?)),
-        DisplayPolicy::Fixed(id) => Ok(Box::new(captastic_windows::DxgiBackend::new(id)?)),
-        DisplayPolicy::VirtualDesktop => {
-            Ok(Box::new(captastic_windows::DxgiDisplayManager::new()?))
-        }
+        DisplayPolicy::Fixed(id) => Ok(Box::new(captastic_windows::DxgiBackend::with_cpu_slots(
+            id, cpu_slots,
+        )?)),
+        DisplayPolicy::VirtualDesktop => Ok(Box::new(
+            captastic_windows::DxgiDisplayManager::with_cpu_slots(cpu_slots)?,
+        )),
     }
 }
 
 #[cfg(not(windows))]
 fn create_dxgi_backend(
     _display_policy: &DisplayPolicy,
+    _cpu_slots: usize,
 ) -> Result<Box<dyn CaptureBackend>, AppError> {
     Err(AppError::BackendUnavailable(
         "DXGI is available only on Windows".to_owned(),
@@ -1218,11 +1264,11 @@ fn create_dxgi_backend(
 }
 
 fn doctor(json_output: bool) -> Result<(), AppError> {
-    let (native_status, native_error, displays) = match create_dxgi_backend(&DisplayPolicy::Primary)
-    {
-        Ok(backend) => ("available", None, Some(backend.displays().to_vec())),
-        Err(error) => ("unavailable", Some(error.to_string()), None),
-    };
+    let (native_status, native_error, displays) =
+        match create_dxgi_backend(&DisplayPolicy::Primary, BASE_CPU_BUFFER_SLOTS) {
+            Ok(backend) => ("available", None, Some(backend.displays().to_vec())),
+            Err(error) => ("unavailable", Some(error.to_string()), None),
+        };
     let windows_clipboard = if cfg!(windows) {
         "available_as_uncompressed_dibv5"
     } else {
@@ -1350,6 +1396,30 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    #[test]
+    fn the_readback_pool_covers_every_frame_a_selection_can_pin() {
+        // The base is the capture pipeline's own: a capture in flight, a frame a destination
+        // worker is still writing, and one spare. Nothing about selection changes it.
+        assert_eq!(cpu_slot_count(3, false, 1), 3);
+        assert_eq!(cpu_slot_count(3, false, 4), 3);
+
+        // With selection on, every open overlay pins the frame from its own hotkey press for the
+        // length of a human interaction, and the queue can hold more behind it. Three slots plus
+        // a `full_display` capture still in the clipboard sink used to leave nothing for the next
+        // press, or for the confirmation capture the open overlay was about to ask for.
+        assert_eq!(cpu_slot_count(3, true, 1), 5);
+        assert_eq!(cpu_slot_count(3, true, 4), 8);
+        // A one-shot has no queue behind it, only the overlay itself.
+        assert_eq!(cpu_slot_count(3, true, 0), 4);
+
+        // The constant the configuration-free paths use must not drift from the default it
+        // stands in for.
+        assert_eq!(
+            BASE_CPU_BUFFER_SLOTS,
+            captastic_config::CaptureConfig::default().buffer_slots
+        );
+    }
 
     /// Every subcommand names itself in the line that marks it finishing.
     ///

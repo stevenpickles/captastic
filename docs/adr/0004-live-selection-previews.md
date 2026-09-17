@@ -123,10 +123,22 @@ overlay already holds the trigger snapshot, so it destroys its window, drains th
 re-creates opaque around the pixels it has, with the view locked and the toggle retracted. The
 `fallback` capture anchor goes with the capture it named.
 
-Memory is what the frozen path has always used: one CPU frame and, for a region selection, one
-retained GPU texture, for the life of the overlay. A live-view confirmation releases both before
-the job returns to the capture thread, so the snapshot and the confirmation capture are never
-resident at once.
+Per press, memory is what the frozen path has always used: one CPU frame, plus the retained GPU
+texture that every overlay press other than `full_display` asks for — `window` included, because a
+tool switch inside the overlay can still land on Region and need it — held for the life of the
+overlay. A live-view confirmation releases both before the job returns to the capture thread, so
+the snapshot and the confirmation capture are never resident at once.
+
+What did change is how long that frame is pinned, and therefore how many the capture engine's
+readback pool must cover. A pooled slot is recycled only when nothing else holds it, and an
+overlay now holds one for the length of a human interaction rather than the length of a capture.
+The pool is sized from `capture.buffer_slots` plus `selection.queue_capacity` plus one for the
+overlay on screen, instead of the fixed three that a `full_display` capture and two open or queued
+selections could exhaust between them. Slots are allocated on first use, so the larger ceiling
+costs nothing until that many frames really are in flight; at 4K each is about 32 MiB, and the
+default configuration raises the ceiling from three slots to five. Exhausting the pool on a press
+or a confirmation is now reported to the notification area and as `selection_failed`, rather than
+to the log alone: an overlay left open is something the user can see and close.
 
 ### JSON
 

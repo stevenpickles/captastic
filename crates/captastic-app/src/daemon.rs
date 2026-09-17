@@ -84,6 +84,8 @@ struct ResolvedDaemonArgs {
     history_retention: captastic_config::RetentionPolicy,
     selection: bool,
     selection_preview: PreviewMode,
+    /// Readback slots the capture engine is built with; see `crate::cpu_slot_count`.
+    cpu_slots: usize,
     trigger_queue_capacity: usize,
     hotkey_bindings: Vec<HotkeyBinding>,
     confirmed_regions: BTreeMap<String, ConfirmedRegion>,
@@ -214,6 +216,11 @@ fn resolve_daemon_args_with_default(
         history_retention: config.history.retention(),
         selection: args.selection.unwrap_or(config.selection.enabled),
         selection_preview: config.selection.preview,
+        cpu_slots: crate::cpu_slot_count(
+            config.capture.buffer_slots,
+            args.selection.unwrap_or(config.selection.enabled),
+            config.selection.queue_capacity,
+        ),
         trigger_queue_capacity: config.daemon.trigger_queue_capacity,
         clipboard_queue_capacity: config.clipboard.queue_capacity,
         clipboard_retention: captastic_windows::ClipboardRetention {
@@ -275,6 +282,7 @@ struct CaptureWorkerContext {
     cpu_frame: bool,
     selection_enabled: bool,
     selection_preview: PreviewMode,
+    cpu_slots: usize,
     max_captures: Option<usize>,
     json_output: bool,
     confirmed_regions: crate::selection::ConfirmedRegionCache,
@@ -300,6 +308,7 @@ fn run_capture_worker(context: CaptureWorkerContext) {
         cpu_frame,
         selection_enabled,
         selection_preview,
+        cpu_slots,
         max_captures,
         json_output,
         confirmed_regions: capture_confirmed_regions,
@@ -313,7 +322,7 @@ fn run_capture_worker(context: CaptureWorkerContext) {
         destinations,
     } = context;
     let mut recovery: Option<BackendRecovery> = None;
-    let mut backend = match super::create_backend(&backend_name, &display_policy) {
+    let mut backend = match super::create_backend(&backend_name, &display_policy, cpu_slots) {
         Ok(backend) => Some(backend),
         // A desktop that is not ours yet is not a reason to give up on the whole daemon. The user
         // is at a lock screen and will come back; a resident tool that exits because of that is
@@ -397,7 +406,7 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                 }
             } else {
                 backend.take();
-                match super::create_backend(&backend_name, &display_policy) {
+                match super::create_backend(&backend_name, &display_policy, cpu_slots) {
                     Ok(replacement) => {
                         let waited = recovery
                             .as_ref()
@@ -513,7 +522,7 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                     let (validation, recovery_attempts, reinitialize_error) =
                         ensure_current_display_configuration(
                             &mut backend,
-                            || super::create_backend(&backend_name, &display_policy),
+                            || super::create_backend(&backend_name, &display_policy, cpu_slots),
                             |delay| wait_for_backoff(delay, &worker_stop_requested),
                             |attempt, delay, error| {
                                 crate::logging::warn(format_args!(
@@ -591,7 +600,7 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                             });
                             (capture_result, recorder)
                         },
-                        || super::create_backend(&backend_name, &display_policy),
+                        || super::create_backend(&backend_name, &display_policy, cpu_slots),
                         |delay| wait_for_backoff(delay, &worker_stop_requested),
                         |attempt, delay, error| {
                             crate::logging::warn(format_args!(
@@ -700,6 +709,23 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                             "capture {} action={} failed: {error}",
                             capture_id.0, trigger.action
                         ));
+                        // A press that was going to open an overlay and instead opened nothing is
+                        // a loss the user is standing right there for, and the log is not where
+                        // they are looking. Narrow on purpose: the pipeline's own transient
+                        // failures are absorbed and retried, and a balloon for each would train
+                        // the user to ignore the one that means their capture is gone.
+                        if capture_failure_denies_an_overlay(&error)
+                            && trigger_may_open_an_overlay(selection_enabled, trigger.action)
+                        {
+                            report_selection_lost_before_the_overlay(
+                                &capture_notices,
+                                capture_id,
+                                trigger.source,
+                                CAPTURE_BUFFERS_EXHAUSTED_REASON,
+                                &error.to_string(),
+                                json_output,
+                            );
+                        }
                         if requires_backend_recovery(&error) && recovery.is_none() {
                             backend.take();
                             recovery = Some(BackendRecovery::immediate());
@@ -761,7 +787,7 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                                 active_backend.capture(&capture_request, &mut request.job.recorder);
                             (result, ())
                         },
-                        || super::create_backend(&backend_name, &display_policy),
+                        || super::create_backend(&backend_name, &display_policy, cpu_slots),
                         |delay| wait_for_backoff(delay, &worker_stop_requested),
                         |attempt, delay, error| {
                             crate::logging::warn(format_args!(
@@ -826,6 +852,16 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                             let _ = capture_notices.try_send(DaemonNotice::DroppedSelection {
                                 capture_id,
                                 reason: DISPLAY_LAYOUT_CHANGED_REASON,
+                            });
+                        } else if capture_failure_denies_an_overlay(&error) {
+                            // The user drew a region, pressed Capture, and got nothing. The
+                            // selection worker will file the `selection_failed` JSON from the
+                            // terminal error; the balloon is raised here because its failures
+                            // otherwise reach only the log, and this one is the user's own doing
+                            // and their own to fix.
+                            let _ = capture_notices.try_send(DaemonNotice::DroppedSelection {
+                                capture_id,
+                                reason: CAPTURE_BUFFERS_EXHAUSTED_REASON,
                             });
                         }
                         request.job.terminal_error = Some(error.to_string());
@@ -999,6 +1035,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         cpu_frame: args.cpu_frame,
         selection_enabled: args.selection,
         selection_preview: args.selection_preview,
+        cpu_slots: args.cpu_slots,
         max_captures: args.max_captures,
         json_output: args.json,
         confirmed_regions: confirmed_regions.clone(),
@@ -2338,6 +2375,55 @@ const DISPLAY_LAYOUT_CHANGED_REASON: &str =
 const ENGINE_NOT_REBUILT_FOR_LAYOUT_REASON: &str =
     "the capture engine could not be rebuilt for the current display layout";
 
+/// The clause for a press the capture engine had no free frame buffer for.
+///
+/// Every overlay press now pins a pooled frame for the length of a human interaction, so running
+/// out is a thing a user can cause by leaving overlays open rather than a pipeline hiccup they
+/// cannot see. The pool is sized to make it unlikely; when it happens anyway, the press is gone
+/// and saying so beats a log line nobody reads.
+#[cfg(windows)]
+const CAPTURE_BUFFERS_EXHAUSTED_REASON: &str =
+    "the capture engine had no free frame buffer; close any open selection and try again";
+
+/// Whether a capture failure denied the user the overlay they pressed a hotkey for.
+///
+/// Deliberately just the one kind. Everything else on this path is either retried, recovered
+/// from, or already reported where it belongs.
+#[cfg(windows)]
+fn capture_failure_denies_an_overlay(error: &CaptureError) -> bool {
+    error.kind == CaptureErrorKind::BufferExhausted
+}
+
+/// Tells the user, in the notification area and on the JSON stream, that a press which would have
+/// opened an overlay produced nothing.
+///
+/// The JSON event is `selection_failed`, the same one the selection worker emits for a selection
+/// that ends without pixels: from a script's point of view this is the same outcome, and it
+/// arrived earlier only because the overlay never got as far as opening.
+#[cfg(windows)]
+fn report_selection_lost_before_the_overlay(
+    notices: &mpsc::SyncSender<DaemonNotice>,
+    capture_id: CaptureId,
+    source: &'static str,
+    reason: &'static str,
+    message: &str,
+    json_output: bool,
+) {
+    let _ = notices.try_send(DaemonNotice::DroppedSelection { capture_id, reason });
+    if json_output {
+        println!(
+            "{}",
+            json!({
+                "schema_version": 1,
+                "event": "selection_failed",
+                "capture_id": capture_id,
+                "source": source,
+                "message": message,
+            })
+        );
+    }
+}
+
 #[cfg(windows)]
 fn action_requires_selection(action: HotkeyAction) -> bool {
     matches!(
@@ -3213,6 +3299,36 @@ mod tests {
             confirmation_anchored: true,
             preview_mode: PreviewMode::Live,
         })
+    }
+
+    #[test]
+    fn a_press_with_no_free_frame_buffer_reaches_the_user() {
+        // Every overlay press pins a pooled frame for the length of a human interaction, so
+        // running out is something a user can cause by leaving overlays open - not a pipeline
+        // hiccup they could not see. The press is simply gone, and a log line is not where the
+        // person who just pressed the hotkey is looking.
+        assert!(capture_failure_denies_an_overlay(&refusal(
+            CaptureErrorKind::BufferExhausted,
+            "readback",
+            "all preallocated CPU frame slots are still in use"
+        )));
+        // Everything else on this path is retried, recovered from, or reported where it belongs.
+        // A balloon for each would train the user to ignore the one that means something.
+        for kind in [
+            CaptureErrorKind::Timeout,
+            CaptureErrorKind::AccessLost,
+            CaptureErrorKind::DeviceRemoved,
+            CaptureErrorKind::TopologyChanged,
+            CaptureErrorKind::DesktopUnavailable,
+            CaptureErrorKind::PermissionDenied,
+            CaptureErrorKind::Unsupported,
+            CaptureErrorKind::SourceUnavailable,
+        ] {
+            assert!(
+                !capture_failure_denies_an_overlay(&refusal(kind, "capture", "scripted")),
+                "{kind:?} must not raise a balloon of its own"
+            );
+        }
     }
 
     #[test]

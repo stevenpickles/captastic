@@ -57,6 +57,11 @@ const INITIAL_LATEST_FRAME_TIMEOUT: Duration = Duration::from_millis(100);
 const GPU_MAP_TIMEOUT: Duration = Duration::from_millis(250);
 const GPU_MAP_RETRY_DELAY: Duration = Duration::from_millis(1);
 const BASE_DPI: u32 = 96;
+/// The CPU readback pool's floor: enough for a capture in flight, the frame a destination worker
+/// is still holding, and one spare. Callers that can pin a frame for longer than a capture ask
+/// for more; nobody gets fewer, because below three a single slow clipboard write stalls the
+/// next capture.
+pub(crate) const DEFAULT_CPU_BUFFER_SLOTS: usize = 3;
 
 static DISPLAY_CONFIGURATION_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -378,6 +383,10 @@ pub struct DxgiBackend {
     latest: Option<RetainedFrame>,
     staging: Option<StagingTexture>,
     cpu_pool: CpuBufferPool,
+    /// How many readback slots this backend's pool holds. Kept because the pool is rebuilt
+    /// whenever the staging texture's shape changes, and a rebuild that dropped back to the
+    /// default would silently undo whatever the caller asked for.
+    cpu_slots: usize,
     displays: Vec<DisplayInfo>,
     selected: DisplayInfo,
     capabilities: BackendCapabilities,
@@ -396,6 +405,17 @@ impl DxgiBackend {
     }
 
     pub fn new(display_id: &DisplayId) -> Result<Self, CaptureError> {
+        Self::with_cpu_slots(display_id, DEFAULT_CPU_BUFFER_SLOTS)
+    }
+
+    /// Builds a backend whose CPU readback pool holds `cpu_slots` frames.
+    ///
+    /// A slot is recycled only when nothing else holds its `Arc`, so the pool has to be as large
+    /// as the number of frames a caller can legitimately pin at once. The daemon's selection
+    /// overlay pins one for the length of a human interaction, which is why this is a parameter
+    /// rather than a constant. Slots are allocated on first use, so a larger pool costs nothing
+    /// until that many frames really are in flight.
+    pub fn with_cpu_slots(display_id: &DisplayId, cpu_slots: usize) -> Result<Self, CaptureError> {
         let com = ComApartment::initialize()?;
         // Sample the generation before enumerating so a display change that lands while we are
         // building the backend cannot be swallowed: the stored value stays behind the counter and
@@ -494,7 +514,8 @@ impl DxgiBackend {
                 },
             ),
         )?;
-        let cpu_pool = CpuBufferPool::new(3);
+        let cpu_slots = cpu_slots.max(DEFAULT_CPU_BUFFER_SLOTS);
+        let cpu_pool = CpuBufferPool::new(cpu_slots);
 
         let backend = Self {
             _com: com,
@@ -506,6 +527,7 @@ impl DxgiBackend {
             latest: None,
             staging,
             cpu_pool,
+            cpu_slots,
             displays,
             selected: selected_record.info.clone(),
             capabilities: BackendCapabilities {
@@ -1360,7 +1382,7 @@ impl DxgiBackend {
                     source_desc.SampleDesc,
                 ),
             )?);
-            self.cpu_pool = CpuBufferPool::new(3);
+            self.cpu_pool = CpuBufferPool::new(self.cpu_slots);
         }
         Ok(self
             .staging
@@ -3661,6 +3683,36 @@ mod tests {
             .as_ref()
             .expect("CPU slot is initialized")
             .clone()
+    }
+
+    #[test]
+    fn a_pool_holds_exactly_as_many_pinned_frames_as_it_has_slots() {
+        // The pool's whole contract, and the reason its size is now a parameter: a slot comes
+        // back only when nothing else holds its Arc, so the number of frames that can be pinned
+        // at once *is* the slot count. A selection overlay pins one for the length of a human
+        // interaction, which is what used to exhaust a fixed pool of three.
+        for slots in [DEFAULT_CPU_BUFFER_SLOTS, 5, 8] {
+            let mut pool = CpuBufferPool::new(slots);
+            let pinned: Vec<Arc<[u8]>> = (0..slots)
+                .map(|_| {
+                    let index = pool
+                        .available_index(64)
+                        .expect("a slot is free while any remain");
+                    lease_cpu_slot(&pool, index)
+                })
+                .collect();
+
+            assert!(
+                pool.available_index(64).is_none(),
+                "a pool of {slots} must refuse the {}th simultaneous frame",
+                slots + 1
+            );
+            drop(pinned);
+            assert!(
+                pool.available_index(64).is_some(),
+                "releasing a frame returns its slot"
+            );
+        }
     }
 
     #[test]
