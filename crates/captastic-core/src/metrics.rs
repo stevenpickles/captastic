@@ -250,12 +250,26 @@ pub fn validate_event_order(events: &[PerfEvent]) -> Result<(), MetricsError> {
         //
         // Nothing else re-anchors, and a second confirmation after this point is still a
         // regression - in the selection-first table it ranks behind the capture it would follow.
+        //
+        // The window is narrow on purpose. Rewinding the rank is the one operation in this
+        // validator that *undoes* progress, so it is allowed only from the confirmation itself:
+        // the trace must have got no further than `SelectionConfirmed`. Without that bound a
+        // `CaptureRequested` arriving after `AttemptFinished` would rewind an attempt that had
+        // already published, and a second capture, crop and publish for the same capture id -
+        // two `AttemptFinished` events - would validate.
+        //
+        // CPU readiness is rewound with it. The snapshot that satisfied the ADR 0002 boundary
+        // before the selection has been released by the time this second capture is requested,
+        // so it can no longer stand behind any output: only the confirmation capture's own frame
+        // can, and it has to say so.
         if event.kind == PerfEventKind::CaptureRequested
             && entry.order == Some(CaptureOrder::CaptureFirst)
             && entry.selection_confirmed
+            && entry.rank <= PerfEventKind::SelectionConfirmed.rank(CaptureOrder::CaptureFirst)
         {
             entry.order = Some(CaptureOrder::SelectionFirst);
             entry.rank = PerfEventKind::SelectionConfirmed.rank(CaptureOrder::SelectionFirst);
+            entry.cpu_frame_ready = false;
         }
         let rank = event
             .kind
@@ -390,6 +404,54 @@ mod tests {
         // out-of-order event it always was, and the validator must still say so.
         let mut recorder = snapshot_trace();
         recorder.record(CaptureId(1), PerfEventKind::SelectionConfirmed, 13);
+
+        assert!(matches!(
+            validate_event_order(recorder.events()),
+            Err(MetricsError::EventOrderRegression { .. })
+        ));
+    }
+
+    #[test]
+    fn the_confirmation_capture_must_ready_its_own_cpu_frame_before_any_output() {
+        // The snapshot's CPU frame satisfied the ADR 0002 boundary before the selection, and the
+        // selection worker releases it the moment the user confirms in the live view. Carrying
+        // that readiness across the re-anchor would leave the boundary unguarded on what is now
+        // the default path: an output event backed by pixels that had already been dropped.
+        let mut recorder = EventRecorder::with_capacity(32);
+        recorder.record(CaptureId(1), PerfEventKind::CaptureRequested, 1);
+        recorder.record(CaptureId(1), PerfEventKind::CpuFrameReady, 2);
+        recorder.record(CaptureId(1), PerfEventKind::SelectionStarted, 3);
+        recorder.record(CaptureId(1), PerfEventKind::SelectionConfirmed, 4);
+        recorder.record(CaptureId(1), PerfEventKind::CaptureRequested, 5);
+        // No second CpuFrameReady: the confirmation capture never produced pixels.
+        recorder.record(CaptureId(1), PerfEventKind::CropFinished, 6);
+        recorder.record(CaptureId(1), PerfEventKind::ClipboardStarted, 7);
+
+        assert!(matches!(
+            validate_event_order(recorder.events()),
+            Err(MetricsError::OutputBeforeCpuFrame { .. })
+        ));
+
+        // With the confirmation capture's own frame, the same trace is legal again.
+        let mut recorder = snapshot_trace();
+        recorder.record(CaptureId(1), PerfEventKind::CropFinished, 13);
+        recorder.record(CaptureId(1), PerfEventKind::ClipboardStarted, 14);
+        validate_event_order(recorder.events())
+            .expect("the confirmation capture's own CPU frame satisfies the boundary");
+    }
+
+    #[test]
+    fn a_capture_request_after_the_attempt_finished_cannot_rewind_it() {
+        // Rewinding the rank is the one operation here that undoes progress, and an attempt that
+        // has already published is exactly what it must not be able to undo. Unbounded, this
+        // sequence validated a second complete capture-crop-publish cycle for one capture id,
+        // two `AttemptFinished` events and all.
+        let mut recorder = snapshot_trace();
+        recorder.record(CaptureId(1), PerfEventKind::CropFinished, 13);
+        recorder.record(CaptureId(1), PerfEventKind::ClipboardStarted, 14);
+        recorder.record(CaptureId(1), PerfEventKind::ClipboardCommitted, 15);
+        recorder.record(CaptureId(1), PerfEventKind::AttemptFinished, 16);
+        recorder.record(CaptureId(1), PerfEventKind::CaptureRequested, 17);
 
         assert!(matches!(
             validate_event_order(recorder.events()),
