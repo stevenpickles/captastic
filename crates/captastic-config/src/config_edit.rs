@@ -243,6 +243,96 @@ mod tests {
     }
 
     #[test]
+    fn the_shipped_example_configuration_survives_a_round_trip_byte_for_byte() {
+        // The one document most likely to be someone's starting point, and the one with the most
+        // to lose: 100-odd lines of comments explaining every setting, and three `enabled` keys in
+        // different sections that a careless edit could confuse for one another. Enabling and
+        // disabling again has to leave it exactly as it shipped.
+        let example =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../captastic.example.toml");
+        let original = fs::read_to_string(&example).expect("read the shipped example");
+        let directory = temporary_directory("example");
+        let path = directory.join("captastic.toml");
+        fs::write(&path, &original).expect("seed from the example");
+
+        set_output_enabled(&path, true).expect("enable file output");
+        let enabled = crate::AppConfig::load(&path).expect("the edited example still loads");
+        assert!(enabled.output.enabled);
+        // The neighbours that also say `enabled` are untouched.
+        assert!(enabled.selection.enabled);
+        assert_eq!(enabled.clipboard.enabled, {
+            let shipped = crate::AppConfig::load(&example).expect("the example loads");
+            shipped.clipboard.enabled
+        });
+
+        set_output_enabled(&path, false).expect("disable file output");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read back"),
+            original,
+            "a round trip through the tray toggle must leave the document as it was"
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_setting_written_as_a_dotted_key_is_edited_in_place() {
+        // `output.enabled = false` at the top level is the same setting in a shape the writer
+        // preferred. Flipping it must not rewrite their document into a `[output]` section.
+        let directory = temporary_directory("dotted");
+        let path = directory.join("captastic.toml");
+        fs::write(
+            &path,
+            "schema_version = 1
+# Mine, written this way on purpose.
+output.enabled = false
+output.format = \"bmp\"
+",
+        )
+        .expect("seed configuration");
+
+        set_output_enabled(&path, true).expect("enable file output");
+
+        let updated = fs::read_to_string(&path).expect("read back");
+        assert!(updated.contains("output.enabled = true"), "{updated}");
+        assert!(
+            !updated.contains("[output]"),
+            "the dotted form is the user's choice, not something to normalize: {updated}"
+        );
+        assert!(updated.contains("# Mine, written this way on purpose."));
+        assert!(updated.contains("output.format = \"bmp\""));
+        let config = crate::AppConfig::load(&path).expect("the edited file still loads");
+        assert!(config.output.enabled);
+        assert_eq!(config.output.format, crate::OutputFormat::Bmp);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_setting_written_in_an_inline_table_is_edited_in_place() {
+        let directory = temporary_directory("inline");
+        let path = directory.join("captastic.toml");
+        fs::write(
+            &path,
+            "schema_version = 1
+output = { enabled = false, jpeg_quality = 55 }
+",
+        )
+        .expect("seed configuration");
+
+        set_output_enabled(&path, true).expect("enable file output");
+
+        let updated = fs::read_to_string(&path).expect("read back");
+        assert!(updated.contains("enabled = true"), "{updated}");
+        assert!(
+            updated.contains("jpeg_quality = 55"),
+            "the rest of the inline table is theirs: {updated}"
+        );
+        let config = crate::AppConfig::load(&path).expect("the edited file still loads");
+        assert!(config.output.enabled);
+        assert_eq!(config.output.jpeg_quality, 55);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
     fn a_damaged_configuration_is_reported_rather_than_replaced() {
         let directory = temporary_directory("damaged");
         let path = directory.join("captastic.toml");
