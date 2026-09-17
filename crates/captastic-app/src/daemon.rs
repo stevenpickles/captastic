@@ -501,16 +501,15 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                     }
                     continue;
                 }
-                if selection_enabled
-                    && matches!(action_route(trigger.action), ActionRoute::Overlay(_))
-                {
-                    // Runs for *every* overlay trigger now, not only the ones that would capture
-                    // after confirmation. The overlay is placed from the engine's display list,
-                    // and the confirmation capture a live-view confirm takes is asked for against
-                    // whatever list the engine holds by then; a monitor change between two presses
-                    // used to open the overlay on the previous arrangement and produce a capture
-                    // describing bounds the drawn region no longer fit inside. Since any press can
-                    // now end in a confirmation capture, any press needs this check.
+                if trigger_may_open_an_overlay(selection_enabled, trigger.action) {
+                    // Runs for *every* press that could open an overlay, not only the ones that
+                    // would capture after confirmation. The overlay is placed from the engine's
+                    // display list, and the confirmation capture a live-view confirm takes is
+                    // asked for against whatever list the engine holds by then; a monitor change
+                    // between two presses used to open the overlay on the previous arrangement
+                    // and produce a capture describing bounds the drawn region no longer fit
+                    // inside. Since any press can now end in a confirmation capture, any press
+                    // that can reach the overlay needs this check.
                     let (validation, recovery_attempts, reinitialize_error) =
                         ensure_current_display_configuration(
                             &mut backend,
@@ -2372,6 +2371,24 @@ fn action_route(action: HotkeyAction) -> ActionRoute {
     }
 }
 
+/// Whether this press could end up with an overlay on screen, and therefore needs the capture
+/// engine's display list verified before anything is placed from it.
+///
+/// `repeat_last_region` is included even though it usually publishes without an overlay at all.
+/// Missing, stale, or invalid confirmed state sends it to the overlay instead, and that overlay
+/// is now as capable of taking a confirmation capture as any other - the user can press `F`,
+/// switch to the live view, and confirm. A confirmation capture asked for against a display list
+/// a monitor change has outdated is exactly what this check exists to prevent, and the route that
+/// reaches the overlay by accident needs it just as much as the ones that mean to.
+#[cfg(windows)]
+fn trigger_may_open_an_overlay(selection_enabled: bool, action: HotkeyAction) -> bool {
+    selection_enabled
+        && matches!(
+            action_route(action),
+            ActionRoute::Overlay(_) | ActionRoute::RepeatLastRegion
+        )
+}
+
 /// Reports whether `--max-captures` has been satisfied. `attempts` counts triggers the capture
 /// worker has dequeued, so `maximum` attempts are permitted and the daemon stops once the last of
 /// them has finished; attempts the selection worker still owns are not finished yet.
@@ -2545,7 +2562,12 @@ fn dispatch_output(
                     frame,
                     native_frame,
                     recorder,
-                    PreviewMode::Frozen,
+                    // The configured mode, not a hard-coded `Frozen`. That literal meant "use the
+                    // frozen presenter, the frame is already in hand" back when the mode decided
+                    // which pixels got published; it now decides only which view the overlay
+                    // opens in, and a user who has asked for live selections should not get a
+                    // frozen one because their remembered region happened to be stale.
+                    preview_mode,
                 );
             }
         }
@@ -3191,6 +3213,34 @@ mod tests {
             confirmation_anchored: true,
             preview_mode: PreviewMode::Live,
         })
+    }
+
+    #[test]
+    fn every_press_that_can_reach_the_overlay_verifies_the_display_list() {
+        // `repeat_last_region` usually publishes without an overlay, but missing or stale
+        // confirmed state sends it to one - and that overlay can now take a confirmation capture,
+        // because the user can press F and confirm in the live view. A capture asked for against
+        // a display list a monitor change has outdated is exactly what this check prevents, so
+        // the route that reaches the overlay by accident needs it too.
+        for action in [
+            HotkeyAction::LastWorkflow,
+            HotkeyAction::Region,
+            HotkeyAction::Window,
+            HotkeyAction::RepeatLastRegion,
+        ] {
+            assert!(
+                trigger_may_open_an_overlay(true, action),
+                "{action} can reach the overlay"
+            );
+            // With no selection worker there is no overlay to place, and the immediate capture
+            // catches a stale engine for itself.
+            assert!(!trigger_may_open_an_overlay(false, action), "{action}");
+        }
+        // The only action that never constructs overlay resources at all.
+        assert!(!trigger_may_open_an_overlay(
+            true,
+            HotkeyAction::FullDisplay
+        ));
     }
 
     #[test]
