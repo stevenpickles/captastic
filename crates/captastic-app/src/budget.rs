@@ -311,14 +311,14 @@ fn host_mismatches(host: &HostMatch, report: &BenchmarkReport) -> Vec<String> {
         match report.environment.primary_adapter() {
             Some(adapter) if adapter.software != expected => {
                 mismatches.push(format!(
-                    "the adapter this run used ({}) {} a software rasterizer, budget describes                      software_adapter = {expected}",
+                    "the adapter this run used ({}) {} a software rasterizer, budget describes software_adapter = {expected}",
                     adapter.description,
                     if adapter.software { "is" } else { "is not" }
                 ));
             }
             Some(_) => {}
             None => mismatches.push(format!(
-                "this run named no graphics adapter, so software_adapter = {expected} cannot be                  checked"
+                "this run named no graphics adapter, so software_adapter = {expected} cannot be checked"
             )),
         }
     }
@@ -790,6 +790,61 @@ mod tests {
         assert_eq!(budget.host.software_adapter, Some(false));
         // The description is prose for the skip message; nothing is derived from it.
         assert!(budget.host.description.contains("RTX 3070"));
+    }
+
+    #[test]
+    fn the_software_adapter_reasons_read_as_sentences() {
+        // Asserted whole rather than by substring, because the defect this catches was invisible
+        // to a substring: a line-continuation in the source left a twenty-space gap mid-sentence,
+        // and every `contains` assertion around it passed. A skip reason is read by a person
+        // deciding whether a number may be published, so the text is the feature.
+        let budget = |host: HostMatch| BudgetFile {
+            host,
+            absolute: AbsoluteBudgets::default(),
+            relative: RelativeBudgets::default(),
+        };
+        let wants_a_gpu = HostMatch {
+            software_adapter: Some(false),
+            ..HostMatch::default()
+        };
+
+        let mut on_a_rasterizer = report_on_a_gpu();
+        on_a_rasterizer.environment.adapters.remove(0);
+        assert_eq!(
+            evaluate(&budget(wants_a_gpu.clone()), &on_a_rasterizer).skipped_because,
+            vec![
+                "the adapter this run used (Microsoft Basic Render Driver) is a software \
+                 rasterizer, budget describes software_adapter = false"
+                    .to_owned()
+            ]
+        );
+
+        let mut nameless = report_on_a_gpu();
+        nameless.environment.adapters.clear();
+        assert_eq!(
+            evaluate(&budget(wants_a_gpu), &nameless).skipped_because,
+            vec![
+                "this run named no graphics adapter, so software_adapter = false cannot be checked"
+                    .to_owned()
+            ]
+        );
+
+        // And the other direction: a budget that asks for a software adapter and finds a GPU.
+        assert_eq!(
+            evaluate(
+                &budget(HostMatch {
+                    software_adapter: Some(true),
+                    ..HostMatch::default()
+                }),
+                &report_on_a_gpu()
+            )
+            .skipped_because,
+            vec![
+                "the adapter this run used (NVIDIA GeForce RTX 3070) is not a software rasterizer, \
+                 budget describes software_adapter = true"
+                    .to_owned()
+            ]
+        );
     }
 
     #[test]
