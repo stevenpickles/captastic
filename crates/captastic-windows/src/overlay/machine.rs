@@ -12,7 +12,10 @@ use windows::Win32::Foundation::POINT;
 use captastic_core::Rect;
 
 use super::layout::{DisplayEnvironment, ToolbarControl, ToolbarLayout, UiMetrics};
-use super::snap::SnapTargets;
+use super::snap::{
+    guides_for, snap_coordinate, snap_point, snap_translation, ActiveSnaps, EdgeMask, RectEdges,
+    SnapAxis, SnapHit, SnapTargets, NO_SNAPS, SNAP_THRESHOLD_DIP,
+};
 use super::{NativeWindowHandle, SelectionKind, WindowCandidate};
 
 pub(super) const DRAG_THRESHOLD: i32 = 4;
@@ -116,6 +119,10 @@ pub(super) struct OverlayModel {
     /// window that moved while the overlay was up would cost far more than the staleness is worth.
     /// `None` means "not asked for yet", which is why it is not simply an empty inventory.
     pub(super) snap_targets: Option<SnapTargets>,
+    /// The guide lines the current selection's snapped edges justify, at most one per axis.
+    /// Purely a consequence of the last adjustment: cleared on release, on a stolen capture, and
+    /// on any tool change, because a line the selection is no longer sitting on is a lie.
+    pub(super) active_snaps: ActiveSnaps,
 }
 
 /// A translated window message. The shell decodes `LPARAM`/`WPARAM`/message identity; the
@@ -131,15 +138,24 @@ pub(super) enum OverlayInput {
     PointerMoved {
         point: POINT,
         window_hover: Option<WindowCandidate>,
+        modifiers: Modifiers,
     },
     /// Primary button pressed. Under the Window tool the shell resolves which thumbnail slot
     /// (if any) the press landed on.
+    ///
+    /// Deliberately carries no modifiers: a press commits no geometry, so there is nothing for
+    /// Ctrl to suppress yet. The anchor it records is snapped later, when the press becomes a
+    /// drag, using that move's modifier state.
     PointerDown {
         point: POINT,
         window_slot: Option<NativeWindowHandle>,
     },
     /// Primary button released. Fully modeled for every tool.
-    PointerUp { point: POINT },
+    ///
+    /// Carries the modifiers too, because the release recomputes the committed geometry from the
+    /// button-up point: without them a drag made with Ctrl held would snap at the last instant,
+    /// and the rectangle the user let go of would not be the one they got.
+    PointerUp { point: POINT, modifiers: Modifiers },
     /// Primary button double-clicked anywhere.
     DoubleClicked { point: POINT },
     /// Pointer capture was taken by another window. Self-initiated releases are consumed by the
@@ -156,6 +172,17 @@ pub(super) enum OverlayInput {
     CancelRequested,
     /// The display configuration changed under the overlay; its geometry is no longer current.
     DisplayConfigurationInvalidated { reason: &'static str },
+}
+
+/// Keyboard modifier state sampled by the shell at the moment a pointer message was posted.
+///
+/// Only Ctrl matters to the pointer path, and it means one thing: place this edge exactly where I
+/// am pointing. It is read through `GetKeyState` inside the window procedure rather than kept in
+/// the model, because the machine owns no clock and no input device.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct Modifiers {
+    /// Ctrl held: suppress snapping entirely for this message and clear any guide.
+    pub(super) ctrl: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -239,7 +266,8 @@ pub(super) fn transition(model: &mut OverlayModel, input: OverlayInput) -> Vec<O
         OverlayInput::PointerMoved {
             point,
             window_hover,
-        } => pointer_moved(model, point, window_hover),
+            modifiers,
+        } => pointer_moved(model, point, window_hover, modifiers),
         OverlayInput::PointerDown { point, window_slot } => pointer_down(model, point, window_slot),
         OverlayInput::WindowPreviewResolved { rect } => window_preview_resolved(model, rect),
         OverlayInput::SnapTargetsReady { targets } => {
@@ -248,7 +276,7 @@ pub(super) fn transition(model: &mut OverlayModel, input: OverlayInput) -> Vec<O
             // that could use it, and that move repaints on its own.
             Vec::new()
         }
-        OverlayInput::PointerUp { point } => pointer_up(model, point),
+        OverlayInput::PointerUp { point, modifiers } => pointer_up(model, point, modifiers),
         OverlayInput::DoubleClicked { point } => double_clicked(model, point),
         OverlayInput::PointerCaptureLost => pointer_capture_lost(model),
         OverlayInput::ConfirmRequested => confirm(model),
@@ -265,6 +293,7 @@ fn pointer_moved(
     model: &mut OverlayModel,
     point: POINT,
     window_hover: Option<WindowCandidate>,
+    modifiers: Modifiers,
 ) -> Vec<OverlayEffect> {
     let local = local_point(model.source, point);
     model.pointer_local = Some(local);
@@ -294,30 +323,35 @@ fn pointer_moved(
         model.hovered = None;
         effects.push(OverlayEffect::SetCursor(CursorIntent::Arrow));
     } else if let Some(resize) = model.resizing {
-        model.selection = Some(resize_region(
-            resize.original,
-            resize.handle,
-            point,
-            model.source,
-        ));
+        let (rect, snaps) = resize_region_snapped(model, resize, point, modifiers);
+        model.selection = Some(rect);
+        model.active_snaps = snaps;
         model.hovered_handle = Some(resize.handle);
         effects.push(OverlayEffect::SetCursor(CursorIntent::Resize(
             resize.handle,
         )));
     } else if let Some(moving) = model.moving_region {
-        model.selection = Some(move_region(
-            moving.original,
-            moving.pointer_origin,
-            point,
-            model.source,
-        ));
+        let (rect, snaps) = move_region_snapped(model, moving, point, modifiers);
+        model.selection = Some(rect);
+        model.active_snaps = snaps;
         model.hovered_handle = None;
         effects.push(OverlayEffect::SetCursor(CursorIntent::Move));
     } else if let Some(anchor) = model.anchor {
-        model.dragging |= (point.x - anchor.x).abs() >= DRAG_THRESHOLD
+        let latched = (point.x - anchor.x).abs() >= DRAG_THRESHOLD
             || (point.y - anchor.y).abs() >= DRAG_THRESHOLD;
+        if latched && !model.dragging {
+            // The anchor is snapped exactly once, here, at the moment the press becomes a drag.
+            // Snapping it at button-down instead would bias the drag threshold: the snap radius
+            // is wider than DRAG_THRESHOLD, so a press beside a window edge would have counted as
+            // a drag before the pointer had moved at all.
+            model.anchor = Some(snap_anchor(model, anchor, modifiers));
+            model.dragging = true;
+        }
         if model.dragging {
-            model.selection = rect_from_points(model.source, anchor, point);
+            let anchor = model.anchor.unwrap_or(anchor);
+            let (rect, snaps) = rect_from_points_snapped(model, anchor, point, modifiers);
+            model.selection = rect;
+            model.active_snaps = snaps;
             model.selection_kind = Some(SelectionKind::Region);
             model.selected_window = None;
             model.hovered = None;
@@ -374,6 +408,9 @@ fn pointer_down(
     if let Some(control) = layout.hit_test(local, model.options_open) {
         return toolbar_control_pressed(model, control, layout.bounds.contains(local), local);
     }
+    // Any press outside the toolbar starts a new adjustment; whatever the last one was snapped to
+    // is no longer being maintained.
+    model.active_snaps = NO_SNAPS;
     model.hovered_control = None;
     let options_were_open = model.options_open;
     model.options_open = false;
@@ -544,6 +581,7 @@ pub(super) fn activate_tool(model: &mut OverlayModel, tool: CaptureTool) -> Vec<
     model.dragging = false;
     model.resizing = None;
     model.moving_region = None;
+    model.active_snaps = NO_SNAPS;
     let tool_changed = model.tool != tool;
     let mut effects = Vec::new();
     if tool_changed {
@@ -584,7 +622,7 @@ pub(super) fn activate_tool(model: &mut OverlayModel, tool: CaptureTool) -> Vec<
     effects
 }
 
-fn pointer_up(model: &mut OverlayModel, point: POINT) -> Vec<OverlayEffect> {
+fn pointer_up(model: &mut OverlayModel, point: POINT, modifiers: Modifiers) -> Vec<OverlayEffect> {
     // The release always comes first so the shell's protocol flag is armed before any
     // reentrant WM_CAPTURECHANGED can arrive — the commit below is already in the model by
     // then, and a self-generated capture change must not erase it.
@@ -604,31 +642,28 @@ fn pointer_up(model: &mut OverlayModel, point: POINT) -> Vec<OverlayEffect> {
     if model.tool != CaptureTool::Region {
         return effects;
     }
+    // The release recomputes the geometry from the button-up point with the same snapping the
+    // last move applied, so what is committed is what was on screen. The guides then go: the
+    // pointer has come to rest and there is no adjustment left for them to explain.
     if let Some(resize) = model.resizing.take() {
-        model.selection = Some(resize_region(
-            resize.original,
-            resize.handle,
-            point,
-            model.source,
-        ));
+        let (rect, _) = resize_region_snapped(model, resize, point, modifiers);
+        model.selection = Some(rect);
         model.selection_kind = Some(SelectionKind::Region);
         model.selected_window = None;
     } else if let Some(moving) = model.moving_region.take() {
-        model.selection = Some(move_region(
-            moving.original,
-            moving.pointer_origin,
-            point,
-            model.source,
-        ));
+        let (rect, _) = move_region_snapped(model, moving, point, modifiers);
+        model.selection = Some(rect);
         model.selection_kind = Some(SelectionKind::Region);
         model.selected_window = None;
     } else if let Some(anchor) = model.anchor.take() {
         if model.dragging {
-            model.selection = rect_from_points(model.source, anchor, point);
+            let (rect, _) = rect_from_points_snapped(model, anchor, point, modifiers);
+            model.selection = rect;
             model.selection_kind = Some(SelectionKind::Region);
             model.selected_window = None;
         }
     }
+    model.active_snaps = NO_SNAPS;
     model.dragging = false;
     model.hovered_handle = if model.selection_kind == Some(SelectionKind::Region) {
         model.selection.and_then(|selection| {
@@ -684,6 +719,7 @@ fn pointer_capture_lost(model: &mut OverlayModel) -> Vec<OverlayEffect> {
     model.anchor = None;
     model.dragging = false;
     model.hovered_handle = None;
+    model.active_snaps = NO_SNAPS;
     let mut effects = Vec::new();
     // An abandoned toolbar drag deliberately does not persist the position: the pointer never
     // came to rest, so the last committed position stays authoritative.
@@ -924,9 +960,141 @@ pub(super) fn move_region(
     }
 }
 
+/// The snap radius in physical pixels for the display this overlay covers.
+fn snap_threshold(model: &OverlayModel) -> i64 {
+    i64::from(model.display_environment.metrics.px(SNAP_THRESHOLD_DIP))
+}
+
+/// The inventory to snap against for this message, or `None` when nothing should snap.
+///
+/// Three ways to get nothing: the option is off, Ctrl is held (place the edge exactly here), or
+/// the shell has not answered the enumeration request yet — which is the normal state for the
+/// first few messages of a run and must behave exactly like an empty desktop rather than stall.
+fn active_targets(model: &OverlayModel, modifiers: Modifiers) -> Option<&SnapTargets> {
+    (model.snap_to_windows && !modifiers.ctrl)
+        .then_some(model.snap_targets.as_ref())
+        .flatten()
+}
+
+fn as_point(x: i64, y: i64) -> POINT {
+    POINT {
+        x: i32::try_from(x).unwrap_or(if x < 0 { i32::MIN } else { i32::MAX }),
+        y: i32::try_from(y).unwrap_or(if y < 0 { i32::MIN } else { i32::MAX }),
+    }
+}
+
+/// The anchor corner of a new region, pulled onto a nearby edge once as the drag latches.
+fn snap_anchor(model: &OverlayModel, anchor: POINT, modifiers: Modifiers) -> POINT {
+    let Some(targets) = active_targets(model, modifiers) else {
+        return anchor;
+    };
+    let ((x, y), _) = snap_point(
+        i64::from(anchor.x),
+        i64::from(anchor.y),
+        targets,
+        snap_threshold(model),
+    );
+    as_point(x, y)
+}
+
+/// A rubber-band drag's rectangle with its free corner snapped, and the guides that justifies.
+pub(super) fn rect_from_points_snapped(
+    model: &OverlayModel,
+    anchor: POINT,
+    pointer: POINT,
+    modifiers: Modifiers,
+) -> (Option<Rect>, ActiveSnaps) {
+    let Some(targets) = active_targets(model, modifiers) else {
+        return (rect_from_points(model.source, anchor, pointer), NO_SNAPS);
+    };
+    let ((x, y), hits) = snap_point(
+        i64::from(pointer.x),
+        i64::from(pointer.y),
+        targets,
+        snap_threshold(model),
+    );
+    // Snap first, clamp second: `rect_from_points` is what keeps the band inside the display, and
+    // an edge it pulls back in is an edge no longer sitting on a target, which `guides_for` then
+    // refuses to draw a line for.
+    let rect = rect_from_points(model.source, anchor, as_point(x, y));
+    (rect, rect.map_or(NO_SNAPS, |rect| guides_for(rect, hits)))
+}
+
+/// A resize with the handle's own edges snapped, and the guides that justifies.
+///
+/// The pointer is snapped on the axes the handle moves and then fed through the ordinary
+/// [`resize_region`], so the display clamp and `MIN_REGION_SIZE` still have the last word — and a
+/// guide whose edge those rules pulled back is dropped.
+pub(super) fn resize_region_snapped(
+    model: &OverlayModel,
+    resize: ResizeDrag,
+    pointer: POINT,
+    modifiers: Modifiers,
+) -> (Rect, ActiveSnaps) {
+    let Some(targets) = active_targets(model, modifiers) else {
+        return (
+            resize_region(resize.original, resize.handle, pointer, model.source),
+            NO_SNAPS,
+        );
+    };
+    let threshold = snap_threshold(model);
+    let mask = EdgeMask::for_handle(resize.handle);
+    let mut snapped = [i64::from(pointer.x), i64::from(pointer.y)];
+    let mut hits: [Option<SnapHit>; 2] = [None, None];
+    for axis in [SnapAxis::X, SnapAxis::Y] {
+        if !mask.covers(axis) {
+            continue;
+        }
+        if let Some(hit) = snap_coordinate(snapped[axis.index()], targets, axis, threshold) {
+            snapped[axis.index()] = hit.position;
+            hits[axis.index()] = Some(hit);
+        }
+    }
+    let rect = resize_region(
+        resize.original,
+        resize.handle,
+        as_point(snapped[SnapAxis::X.index()], snapped[SnapAxis::Y.index()]),
+        model.source,
+    );
+    (rect, guides_for(rect, hits))
+}
+
+/// A move with whichever side of the region is nearest a target pulled onto it, size preserved.
+pub(super) fn move_region_snapped(
+    model: &OverlayModel,
+    moving: MoveDrag,
+    pointer: POINT,
+    modifiers: Modifiers,
+) -> (Rect, ActiveSnaps) {
+    let moved = move_region(
+        moving.original,
+        moving.pointer_origin,
+        pointer,
+        model.source,
+    );
+    let Some(targets) = active_targets(model, modifiers) else {
+        return (moved, NO_SNAPS);
+    };
+    let translations = snap_translation(RectEdges::of(moved), targets, snap_threshold(model));
+    let snapped = moved
+        .translated(
+            translations[SnapAxis::X.index()].map_or(0, |(delta, _)| delta),
+            translations[SnapAxis::Y.index()].map_or(0, |(delta, _)| delta),
+        )
+        // A move never resizes, so the region is pushed back inside the display rather than
+        // trimmed by it — which can undo the snap, hence the guide check below.
+        .clamp_within(model.source);
+    let hits = [
+        translations[SnapAxis::X.index()].map(|(_, hit)| hit),
+        translations[SnapAxis::Y.index()].map(|(_, hit)| hit),
+    ];
+    (snapped, guides_for(snapped, hits))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::layout::UiRect;
+    use super::super::snap::{SnapGuide, SnapTarget, SnapTargetKind};
     use super::*;
 
     const SOURCE: Rect = Rect {
@@ -972,6 +1140,7 @@ mod tests {
             hovered: None,
             snap_to_windows: true,
             snap_targets: Some(SnapTargets::default()),
+            active_snaps: NO_SNAPS,
         }
     }
 
@@ -1024,6 +1193,7 @@ mod tests {
             OverlayInput::PointerMoved {
                 point: point(103, 100),
                 window_hover: None,
+                modifiers: Modifiers::default(),
             },
         );
         assert!(!model.dragging);
@@ -1035,6 +1205,7 @@ mod tests {
             OverlayInput::PointerMoved {
                 point: point(104, 100),
                 window_hover: None,
+                modifiers: Modifiers::default(),
             },
         );
         assert!(model.dragging);
@@ -1043,6 +1214,7 @@ mod tests {
             OverlayInput::PointerMoved {
                 point: point(300, 240),
                 window_hover: None,
+                modifiers: Modifiers::default(),
             },
         );
         assert_eq!(model.selection_kind, Some(SelectionKind::Region));
@@ -1051,6 +1223,7 @@ mod tests {
             &mut model,
             OverlayInput::PointerUp {
                 point: point(300, 240),
+                modifiers: Modifiers::default(),
             },
         );
         assert!(matches!(effects[0], OverlayEffect::ReleasePointer));
@@ -1084,12 +1257,14 @@ mod tests {
             OverlayInput::PointerMoved {
                 point: point(102, 101),
                 window_hover: None,
+                modifiers: Modifiers::default(),
             },
         );
         let effects = transition(
             &mut model,
             OverlayInput::PointerUp {
                 point: point(102, 101),
+                modifiers: Modifiers::default(),
             },
         );
         assert!(matches!(effects[0], OverlayEffect::ReleasePointer));
@@ -1135,6 +1310,7 @@ mod tests {
             OverlayInput::PointerMoved {
                 point: point(340, 360),
                 window_hover: None,
+                modifiers: Modifiers::default(),
             },
         );
         assert_eq!(
@@ -1151,6 +1327,7 @@ mod tests {
             &mut model,
             OverlayInput::PointerUp {
                 point: point(340, 360),
+                modifiers: Modifiers::default(),
             },
         );
         assert_eq!(model.resizing.map(|drag| drag.handle), None);
@@ -1192,12 +1369,14 @@ mod tests {
             OverlayInput::PointerMoved {
                 point: point(230, 200),
                 window_hover: None,
+                modifiers: Modifiers::default(),
             },
         );
         transition(
             &mut model,
             OverlayInput::PointerUp {
                 point: point(230, 200),
+                modifiers: Modifiers::default(),
             },
         );
         assert_eq!(model.moving_region.map(|drag| drag.original), None);
@@ -1227,6 +1406,7 @@ mod tests {
             OverlayInput::PointerMoved {
                 point: point(200, 200),
                 window_hover: None,
+                modifiers: Modifiers::default(),
             },
         );
         assert!(model.dragging);
@@ -1264,12 +1444,14 @@ mod tests {
             OverlayInput::PointerMoved {
                 point: point(90, 60),
                 window_hover: None,
+                modifiers: Modifiers::default(),
             },
         );
         let effects = transition(
             &mut model,
             OverlayInput::PointerUp {
                 point: point(90, 60),
+                modifiers: Modifiers::default(),
             },
         );
         assert!(matches!(effects[0], OverlayEffect::ReleasePointer));
@@ -1414,6 +1596,7 @@ mod tests {
             OverlayInput::PointerMoved {
                 point: point(500, 400),
                 window_hover: None,
+                modifiers: Modifiers::default(),
             },
         );
         assert_eq!(model.hovered_control, Some(ToolbarControl::Background));
@@ -1434,6 +1617,7 @@ mod tests {
             &mut model,
             OverlayInput::PointerUp {
                 point: point(500, 400),
+                modifiers: Modifiers::default(),
             },
         );
         assert!(matches!(effects[0], OverlayEffect::ReleasePointer));
@@ -1479,6 +1663,7 @@ mod tests {
                 &mut model,
                 OverlayInput::PointerUp {
                     point: point(50, 50),
+                    modifiers: Modifiers::default(),
                 },
             );
             assert_eq!(effects.len(), 1, "tool {tool:?}");
@@ -1991,6 +2176,7 @@ mod tests {
             OverlayInput::PointerMoved {
                 point: point(400, 300),
                 window_hover: Some(candidate(0x77)),
+                modifiers: Modifiers::default(),
             },
         );
         assert_eq!(
@@ -2015,6 +2201,7 @@ mod tests {
             OverlayInput::PointerMoved {
                 point: center(layout.capture),
                 window_hover: Some(candidate(0x77)),
+                modifiers: Modifiers::default(),
             },
         );
         assert_eq!(model.hovered_control, Some(ToolbarControl::Capture));
@@ -2030,6 +2217,7 @@ mod tests {
             OverlayInput::PointerMoved {
                 point: point(10, 10),
                 window_hover: None,
+                modifiers: Modifiers::default(),
             },
         );
         assert!(model.hovered.is_none());
@@ -2091,6 +2279,415 @@ mod tests {
         assert_eq!(model.selected_window, Some(alive));
         assert_eq!(model.hovered.map(|c| c.handle), Some(alive));
         assert!(effects.is_empty());
+    }
+
+    /// A window at (400,300) 200x200: columns 400..=599, rows 300..=499.
+    const WINDOW: Rect = Rect {
+        x: 400,
+        y: 300,
+        width: 200,
+        height: 200,
+    };
+
+    const CTRL: Modifiers = Modifiers { ctrl: true };
+
+    fn snapping_model() -> OverlayModel {
+        let mut model = region_model();
+        model.snap_targets = Some(SnapTargets::new(vec![
+            SnapTarget {
+                rect: WINDOW,
+                kind: SnapTargetKind::Window,
+            },
+            SnapTarget {
+                rect: SOURCE,
+                kind: SnapTargetKind::Display,
+            },
+        ]));
+        model
+    }
+
+    fn drag(model: &mut OverlayModel, from: POINT, to: POINT, modifiers: Modifiers) {
+        transition(
+            model,
+            OverlayInput::PointerDown {
+                point: from,
+                window_slot: None,
+            },
+        );
+        transition(
+            model,
+            OverlayInput::PointerMoved {
+                point: to,
+                window_hover: None,
+                modifiers,
+            },
+        );
+    }
+
+    fn guide(model: &OverlayModel, axis: SnapAxis) -> Option<SnapGuide> {
+        model.active_snaps[axis.index()]
+    }
+
+    #[test]
+    fn a_drawn_region_lands_on_the_exclusive_window_edge_and_shows_why() {
+        let mut model = snapping_model();
+        // Released four pixels short of the window's bottom-right corner (600, 500).
+        drag(
+            &mut model,
+            point(100, 100),
+            point(596, 496),
+            Modifiers::default(),
+        );
+        let region = model.selection.expect("a region");
+        assert_eq!(
+            (region.right(), region.bottom()),
+            (600, 500),
+            "x + width is the window's right edge exactly, never one less"
+        );
+        let horizontal = guide(&model, SnapAxis::X).expect("a vertical guide");
+        assert_eq!(horizontal.position, 600);
+        assert!(horizontal.trailing);
+        assert_eq!(horizontal.span, (300, 500));
+        assert!(guide(&model, SnapAxis::Y).is_some());
+
+        // Releasing commits exactly what was shown and then drops the guides: nothing is being
+        // adjusted any more, so there is nothing left for them to explain.
+        transition(
+            &mut model,
+            OverlayInput::PointerUp {
+                point: point(596, 496),
+                modifiers: Modifiers::default(),
+            },
+        );
+        assert_eq!(model.selection, Some(region));
+        assert_eq!(model.active_snaps, NO_SNAPS);
+    }
+
+    #[test]
+    fn the_anchor_snaps_once_the_press_becomes_a_drag_and_not_before() {
+        let mut model = snapping_model();
+        // Press three pixels inside the window's top-left corner: within the snap radius, but a
+        // press is not yet a drag and the threshold must be measured from where the user pressed.
+        transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point: point(403, 303),
+                window_slot: None,
+            },
+        );
+        assert_eq!(model.anchor, Some(point(403, 303)));
+        transition(
+            &mut model,
+            OverlayInput::PointerMoved {
+                point: point(405, 304),
+                window_hover: None,
+                modifiers: Modifiers::default(),
+            },
+        );
+        assert!(
+            !model.dragging,
+            "a two-pixel move is still a click; snapping the anchor at press would have made it a drag"
+        );
+        assert_eq!(model.anchor, Some(point(403, 303)));
+
+        // Crossing the threshold latches the drag and pulls the anchor onto the window corner.
+        transition(
+            &mut model,
+            OverlayInput::PointerMoved {
+                point: point(450, 350),
+                window_hover: None,
+                modifiers: Modifiers::default(),
+            },
+        );
+        assert!(model.dragging);
+        assert_eq!(model.anchor, Some(point(400, 300)));
+        assert_eq!(
+            model.selection,
+            Some(Rect {
+                x: 400,
+                y: 300,
+                width: 50,
+                height: 50,
+            })
+        );
+    }
+
+    #[test]
+    fn ctrl_places_the_edge_exactly_where_the_pointer_is_and_clears_the_guides() {
+        let mut model = snapping_model();
+        drag(
+            &mut model,
+            point(100, 100),
+            point(596, 496),
+            Modifiers::default(),
+        );
+        assert!(model.active_snaps.iter().any(Option::is_some));
+
+        // Same pointer position, Ctrl down: the region keeps the pixel the user asked for.
+        transition(
+            &mut model,
+            OverlayInput::PointerMoved {
+                point: point(596, 496),
+                window_hover: None,
+                modifiers: CTRL,
+            },
+        );
+        let region = model.selection.expect("a region");
+        assert_eq!((region.right(), region.bottom()), (596, 496));
+        assert_eq!(model.active_snaps, NO_SNAPS);
+
+        // The option being off behaves identically without Ctrl being held at all.
+        let mut off = snapping_model();
+        off.snap_to_windows = false;
+        drag(
+            &mut off,
+            point(100, 100),
+            point(596, 496),
+            Modifiers::default(),
+        );
+        let region = off.selection.expect("a region");
+        assert_eq!((region.right(), region.bottom()), (596, 496));
+        assert_eq!(off.active_snaps, NO_SNAPS);
+    }
+
+    #[test]
+    fn an_east_resize_snaps_only_the_edge_it_is_dragging() {
+        let mut model = snapping_model();
+        model.selection = Some(Rect {
+            x: 405,
+            y: 305,
+            width: 191,
+            height: 191,
+        });
+        model.selection_kind = Some(SelectionKind::Region);
+        // Grab the east handle: the midpoint of the right edge.
+        transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point: point(596, 400),
+                window_slot: None,
+            },
+        );
+        assert_eq!(
+            model.resizing.map(|drag| drag.handle),
+            Some(ResizeHandle::East)
+        );
+        transition(
+            &mut model,
+            OverlayInput::PointerMoved {
+                point: point(597, 400),
+                window_hover: None,
+                modifiers: Modifiers::default(),
+            },
+        );
+        let region = model.selection.expect("a region");
+        assert_eq!(region.right(), 600, "the dragged edge snapped");
+        assert_eq!(
+            region.x, 405,
+            "the left edge is not being dragged and must not move, however close it is to 400"
+        );
+        assert!(guide(&model, SnapAxis::X).is_some());
+        assert!(
+            guide(&model, SnapAxis::Y).is_none(),
+            "the east handle moves nothing vertically"
+        );
+    }
+
+    #[test]
+    fn a_move_snaps_the_nearest_side_and_keeps_the_regions_size() {
+        let mut model = snapping_model();
+        let original = Rect {
+            x: 100,
+            y: 100,
+            width: 100,
+            height: 100,
+        };
+        model.selection = Some(original);
+        model.selection_kind = Some(SelectionKind::Region);
+        transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point: point(150, 150),
+                window_slot: None,
+            },
+        );
+        assert!(model.moving_region.is_some());
+        // Drag so the region's top-left lands three pixels short of the window's top-left.
+        transition(
+            &mut model,
+            OverlayInput::PointerMoved {
+                point: point(453, 353),
+                window_hover: None,
+                modifiers: Modifiers::default(),
+            },
+        );
+        let region = model.selection.expect("a region");
+        assert_eq!(
+            (region.width, region.height),
+            (100, 100),
+            "a move never resizes"
+        );
+        assert_eq!((region.x, region.y), (400, 300));
+        assert_eq!(
+            guide(&model, SnapAxis::X).map(|guide| (guide.position, guide.trailing)),
+            Some((400, false))
+        );
+    }
+
+    #[test]
+    fn the_minimum_size_wins_over_a_snap_and_takes_the_guide_with_it() {
+        // A target edge at 104, inside the minimum-size floor of a region anchored at 100: the
+        // resize clamp pulls the edge back to 108, so a guide would be pointing at a coordinate
+        // the selection does not reach.
+        let mut model = region_model();
+        model.snap_targets = Some(SnapTargets::new(vec![SnapTarget {
+            rect: Rect {
+                x: 104,
+                y: 100,
+                width: 100,
+                height: 200,
+            },
+            kind: SnapTargetKind::Window,
+        }]));
+        model.selection = Some(Rect {
+            x: 100,
+            y: 100,
+            width: 40,
+            height: 40,
+        });
+        model.selection_kind = Some(SelectionKind::Region);
+        transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point: point(140, 120),
+                window_slot: None,
+            },
+        );
+        assert_eq!(
+            model.resizing.map(|drag| drag.handle),
+            Some(ResizeHandle::East)
+        );
+        transition(
+            &mut model,
+            OverlayInput::PointerMoved {
+                point: point(102, 120),
+                window_hover: None,
+                modifiers: Modifiers::default(),
+            },
+        );
+        let region = model.selection.expect("a region");
+        assert_eq!(
+            (region.x, region.width),
+            (100, MIN_REGION_SIZE as u32),
+            "the floor wins over the snap"
+        );
+        assert_eq!(guide(&model, SnapAxis::X), None);
+    }
+
+    #[test]
+    fn guides_do_not_survive_a_stolen_capture_or_a_tool_switch() {
+        for steal in [true, false] {
+            let mut model = snapping_model();
+            drag(
+                &mut model,
+                point(100, 100),
+                point(596, 496),
+                Modifiers::default(),
+            );
+            assert!(model.active_snaps.iter().any(Option::is_some));
+            if steal {
+                transition(&mut model, OverlayInput::PointerCaptureLost);
+            } else {
+                activate_tool(&mut model, CaptureTool::FullDisplay);
+            }
+            assert_eq!(model.active_snaps, NO_SNAPS, "steal={steal}");
+        }
+    }
+
+    mod snap_properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn any_point() -> impl Strategy<Value = POINT> {
+            (0i32..=1_919, 0i32..=1_079).prop_map(|(x, y)| POINT { x, y })
+        }
+
+        proptest! {
+            /// However a region is drawn against the inventory it stays a legal selection: inside
+            /// the captured display, and committed as what was on screen. Snapping runs before
+            /// the display clamp and must never be able to overrule it.
+            #[test]
+            fn a_drawn_region_stays_inside_the_display(
+                from in any_point(),
+                to in any_point(),
+                ctrl in proptest::bool::ANY,
+            ) {
+                let modifiers = Modifiers { ctrl };
+                let mut model = snapping_model();
+                drag(&mut model, from, to, modifiers);
+                let shown = model.selection;
+                transition(
+                    &mut model,
+                    OverlayInput::PointerUp { point: to, modifiers },
+                );
+                prop_assert_eq!(model.selection, shown, "the release commits what was shown");
+                if let Some(region) = model.selection {
+                    prop_assert_eq!(region.intersection(SOURCE), Some(region));
+                }
+                if ctrl {
+                    prop_assert_eq!(model.active_snaps, NO_SNAPS);
+                }
+            }
+
+            /// Moving a region preserves its size exactly, wherever it is dragged to and whatever
+            /// it snaps against on the way.
+            #[test]
+            fn a_moved_region_keeps_its_size_and_stays_inside(
+                to in any_point(),
+                ctrl in proptest::bool::ANY,
+            ) {
+                let original = Rect { x: 100, y: 100, width: 300, height: 200 };
+                let mut model = snapping_model();
+                model.selection = Some(original);
+                model.selection_kind = Some(SelectionKind::Region);
+                transition(
+                    &mut model,
+                    OverlayInput::PointerDown { point: point(200, 150), window_slot: None },
+                );
+                transition(
+                    &mut model,
+                    OverlayInput::PointerMoved {
+                        point: to,
+                        window_hover: None,
+                        modifiers: Modifiers { ctrl },
+                    },
+                );
+                let moved = model.selection.expect("a moved region");
+                prop_assert_eq!((moved.width, moved.height), (original.width, original.height));
+                prop_assert_eq!(moved.intersection(SOURCE), Some(moved));
+            }
+
+            /// Re-delivering the same pointer position is a no-op. Windows coalesces and repeats
+            /// mouse messages freely, and a snap that crept would walk a still region.
+            #[test]
+            fn repeating_a_pointer_position_changes_nothing(
+                from in any_point(),
+                to in any_point(),
+            ) {
+                let mut model = snapping_model();
+                drag(&mut model, from, to, Modifiers::default());
+                let once = (model.selection, model.active_snaps);
+                transition(
+                    &mut model,
+                    OverlayInput::PointerMoved {
+                        point: to,
+                        window_hover: None,
+                        modifiers: Modifiers::default(),
+                    },
+                );
+                prop_assert_eq!((model.selection, model.active_snaps), once);
+            }
+        }
     }
 
     #[test]

@@ -29,12 +29,12 @@ use raster::{
 pub use shell::flush_desktop_composition;
 use shell::{
     capture_pointer, consume_self_initiated_capture_change, drain_pending_quit, duration_ns,
-    invalid_frame, invalidate, last_error, overlay_error, query_display_environment,
+    invalid_frame, invalidate, last_error, modifiers, overlay_error, query_display_environment,
     release_pointer_capture, restore_input_context, screen_point, set_arrow_cursor,
     set_move_cursor, ClassRegistration, FrozenSurface, PrivateFontResource, RegionCursor,
     ThreadDpiContext, REGION_CURSOR_CENTER,
 };
-use snap::{SnapTarget, SnapTargetKind, SnapTargets};
+use snap::{SnapAxis, SnapTarget, SnapTargetKind, SnapTargets, NO_SNAPS};
 use window_enumeration::{enumerate_visible_windows, WindowCandidate};
 
 #[cfg(test)]
@@ -543,6 +543,7 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
             hovered: None,
             snap_to_windows: true,
             snap_targets: None,
+            active_snaps: NO_SNAPS,
         },
         overlay_hwnd: HWND(0),
         live_preview: preview_source.is_live(),
@@ -1224,6 +1225,7 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                     OverlayInput::PointerMoved {
                         point,
                         window_hover: None,
+                        modifiers: modifiers(),
                     },
                 );
             }
@@ -1246,6 +1248,7 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                     OverlayInput::PointerMoved {
                         point,
                         window_hover,
+                        modifiers: modifiers(),
                     },
                     (
                         state.model.hovered.map(|candidate| candidate.handle),
@@ -1290,7 +1293,14 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                 let state = unsafe { &*state_pointer };
                 screen_point(state.model.source, lparam)
             };
-            run_machine(hwnd, state_pointer, OverlayInput::PointerUp { point })
+            run_machine(
+                hwnd,
+                state_pointer,
+                OverlayInput::PointerUp {
+                    point,
+                    modifiers: modifiers(),
+                },
+            )
         }
         WM_LBUTTONDBLCLK => {
             let point = {
@@ -1733,6 +1743,7 @@ fn compose_overlay_state(state: &mut OverlayState) {
                 restore_highlight(state, rect);
             }
             draw_outline(state.back_buffer.device, state.model.source, rect);
+            draw_snap_guides(state);
             if state.model.selection_kind == Some(SelectionKind::Region) {
                 draw_resize_handles(
                     state.back_buffer.device,
@@ -1745,6 +1756,37 @@ fn compose_overlay_state(state: &mut OverlayState) {
         }
     }
     draw_toolbar(state);
+}
+
+/// Draws the guide line for each snapped axis: a hairline in the accent colour running the full
+/// length of the target edge the selection landed on, so it is obvious *what* it snapped to.
+///
+/// A trailing guide is painted at `position - 1`. `position` is the selection's exclusive right or
+/// bottom edge, so the last pixel it actually covers is the one before it; drawing at `position`
+/// would put the line outside the very selection it is explaining. `draw_lines` uses `LineTo`,
+/// which excludes its end point, so the span is painted half-open exactly as it is stored.
+fn draw_snap_guides(state: &OverlayState) {
+    let source = state.model.source;
+    for guide in state.model.active_snaps.iter().flatten() {
+        let position = guide.position - if guide.trailing { 1 } else { 0 };
+        let points = match guide.axis {
+            SnapAxis::X => {
+                let x = position.saturating_sub(source.x);
+                [
+                    (x, guide.span.0.saturating_sub(source.y)),
+                    (x, guide.span.1.saturating_sub(source.y)),
+                ]
+            }
+            SnapAxis::Y => {
+                let y = position.saturating_sub(source.y);
+                [
+                    (guide.span.0.saturating_sub(source.x), y),
+                    (guide.span.1.saturating_sub(source.x), y),
+                ]
+            }
+        };
+        draw_lines(state.back_buffer.device, &points, rgb(86, 156, 255), 1);
+    }
 }
 
 fn copy_overlay_to_paint_device(device: HDC, state: &OverlayState) {

@@ -16,7 +16,9 @@ use windows::Win32::UI::HiDpi::{
     GetDpiForMonitor, SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT,
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, MDT_EFFECTIVE_DPI,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateIconIndirect, DestroyCursor, IsWindow, LoadCursorW, PeekMessageW, SetCursor,
     SetForegroundWindow, UnregisterClassW, HCURSOR, ICONINFO, IDC_ARROW, IDC_CROSS, IDC_SIZEALL,
@@ -24,6 +26,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::layout::{DisplayEnvironment, UiMetrics, UiRect};
+use super::machine::Modifiers;
 use super::raster::{high_contrast_cursor_pixels, top_down_bitmap_info};
 
 pub(super) const REGION_CURSOR_SIZE: u32 = 64;
@@ -425,6 +428,23 @@ pub(super) fn release_pointer_capture() {
 
 pub(super) fn consume_self_initiated_capture_change(releasing_pointer_capture: &mut bool) -> bool {
     std::mem::take(releasing_pointer_capture)
+}
+
+/// The modifier keys held as this message is being handled.
+///
+/// Read here rather than carried in the model because the machine owns no input device.
+/// `GetKeyState` reports the state as of the message currently being processed rather than the
+/// live hardware state, which is exactly what a pointer message wants: the answer belongs to the
+/// move that was posted, not to whatever the user has done since.
+pub(super) fn modifiers() -> Modifiers {
+    // SAFETY: Reads this thread's queued keyboard state for the message being dispatched. No
+    // pointer arguments, no retained state.
+    let control = unsafe { GetKeyState(i32::from(VK_CONTROL.0)) };
+    Modifiers {
+        // The high-order bit is "currently down"; the low-order toggle bit is for Caps Lock and
+        // friends and must not be mistaken for it.
+        ctrl: control < 0,
+    }
 }
 
 pub(super) fn screen_point(source: Rect, lparam: LPARAM) -> POINT {
