@@ -2,10 +2,11 @@
 
 Captastic is a fast, native screenshot tool for Windows, written in Rust. It runs as a resident
 daemon behind configurable global hotkeys, opens a live overlay for full-display, window, or
-resizable-region selection, and publishes the result to the Windows clipboard, to a PNG file, or to
-both. It keeps a bounded history of recent captures, targets the display the user means across
-multi-monitor and mixed-DPI layouts, and installs, upgrades, and uninstalls for the current user from
-a portable archive that needs no administrator privileges, or from a Chocolatey package.
+resizable-region selection, and publishes the result to the Windows clipboard, to a PNG, JPEG, or
+BMP file, or to both. It keeps a bounded history of recent captures, targets the display the user
+means across multi-monitor and mixed-DPI layouts, and installs, upgrades, and uninstalls for the
+current user from a portable archive that needs no administrator privileges, or from a Chocolatey
+package.
 Windows is the only supported platform: capture, overlay, hotkeys, and clipboard output are native
 Windows implementations rather than a portable abstraction, and other platforms are roadmap work
 rather than shipped code.
@@ -17,7 +18,23 @@ native frame, CPU readback, selection, clipboard, encoding, and file output — 
 rather than collapsed into one number, and every capture carries its own freshness and timing
 provenance.
 
-The DXGI backend supports two deliberately different modes. `latest` is the resident-daemon default: when a capture is triggered, it drains any immediately available desktop frame and otherwise reuses the last retained image, so the daemon performs no DXGI acquisition while idle. Only the first capture may wait briefly when no retained image exists yet. `fresh` waits for a desktop frame presented after the trigger and is intended for controlled latency experiments. Both modes report frame age/timing provenance, and BGRA8 CPU readback uses preallocated staging and CPU buffers. By default, the resident daemon opens a native live overlay before acquiring pixels. Its floating toolbar provides full-display, window, and resizable-region modes, an Options menu, and a Capture button. Region and full-display selection leave the desktop visible and changing until confirmation, then remove the overlay and request the output frame. Window mode uses DWM compositor relationships so animations and video keep updating in the chooser; clicking still performs a fresh isolated native window render. Results are published to the Windows clipboard as uncompressed DIBV5 images; straight-alpha window captures also include a registered PNG compatibility representation. Captures are marked so Windows keeps them out of the Win+V clipboard history and off the sync to the signed-in Microsoft account; `clipboard.allow_history` and `clipboard.allow_cloud_sync` opt back in.
+The DXGI backend supports two deliberately different modes. `latest` is the resident-daemon
+default: when a capture is triggered, it drains any immediately available desktop frame and
+otherwise reuses the last retained image, so the daemon performs no DXGI acquisition while idle.
+Only the first capture may wait briefly when no retained image exists yet. `fresh` waits for a
+desktop frame presented after the trigger and is intended for controlled latency experiments. Both
+modes report frame age/timing provenance, and BGRA8 CPU readback uses preallocated staging and CPU
+buffers. By default, the resident daemon captures the screen at the moment the hotkey is pressed
+and opens a native live overlay over those pixels. Its floating toolbar provides full-display,
+window, and resizable-region modes, an Options menu, and a Capture button. Region and full-display
+selection leave the desktop visible and changing until confirmation — or hold still on the frame
+from the press, when the view has been switched to it — then remove the overlay and publish
+whichever view was showing. Window mode uses DWM compositor relationships so animations and video
+keep updating in the chooser; clicking still performs a fresh isolated native window render.
+Results are published to the Windows clipboard as uncompressed DIBV5 images; straight-alpha window
+captures also include a registered PNG compatibility representation. Captures are marked so Windows
+keeps them out of the Win+V clipboard history and off the sync to the signed-in Microsoft account;
+`clipboard.allow_history` and `clipboard.allow_cloud_sync` opt back in.
 
 ## Build and verify
 
@@ -108,11 +125,11 @@ configuration. The explicit `daemon` form remains available for scripts, diagnos
 overrides. A named per-session control event prevents more than one daemon instance from running.
 While the daemon is active, Captastic places an icon in the Windows notification area. Double-click
 the icon to capture, or right-click it to capture, turn **Save Captures to Disk** on or off,
-open the most recent capture or show it in its folder (**Open Last Capture** and **Show in
-Folder**), pause/resume the global hotkey, open `captastic.toml`, open the persistent log, toggle
-**Start with Windows**, or exit cleanly. If Windows
-Explorer restarts, Captastic restores its notification icon automatically. Tray initialization
-failures are logged and do not disable the capture daemon.
+open the most recent capture, show it in its folder, or prune the capture history (**Open Last
+Capture**, **Show in Folder**, and **Prune Capture History**), pause/resume the global hotkey, open
+`captastic.toml`, open the persistent log, toggle **Start with Windows**, or exit cleanly. If
+Windows Explorer restarts, Captastic restores its notification icon automatically. Tray
+initialization failures are logged and do not disable the capture daemon.
 
 Release builds also contain `captastic-desktop.exe`, a console-free launcher intended for shortcuts
 and login startup. It starts the sibling `captastic.exe` daemon without creating a terminal window
@@ -176,12 +193,14 @@ preserves `~/.captastic` on upgrades and uninstall. See
 behavior, and the manual community publishing procedure.
 
 When `--config` is omitted, the daemon automatically loads
-`%USERPROFILE%\.captastic\captastic.toml` if it exists. The same file stores Captastic-managed UI
-state under `[ui.displays.<persistent-id>]`, including an independent toolbar position, last
-selected capture tool, and last adjusted region for every monitor. These preferences are retained
-after cancellation. Region coordinates are monitor-local, so negative origins do not leak into persisted state. Updates
-preserve the rest of the TOML document and its comments. Existing global `[ui]` values remain a
-backward-compatible fallback until that monitor records its own state.
+`%USERPROFILE%\.captastic\captastic.toml` if it exists. What Captastic remembers about how you last
+used it is not kept in that file: it lives beside it in `state.toml`, which Captastic owns and
+writes whole. That is an independent toolbar position, last selected capture tool, and last
+adjusted region for every monitor under `[displays.<persistent-id>]`, plus the global **Snap to
+Edges** and **Zoom** preferences. All of them are retained after cancellation. Region coordinates
+are monitor-local, so negative origins do not leak into persisted state. A `[ui]` section in
+`captastic.toml` predates the split: it is read once to carry those values across and ignored from
+then on, and Captastic says so at startup when it finds one that no longer does anything.
 
 The implicit default profile is startup-recoverable: syntactically damaged TOML or invalid UTF-8
 is renamed beside the original with a `.corrupt-*` suffix, Captastic starts from safe defaults,
@@ -192,12 +211,13 @@ Captastic retains the five newest corrupt backups and removes abandoned atomic-w
 siblings after seven days, preventing recovery artifacts from growing without bound.
 
 When the daemon is started with `--config <path>`, that path is also the sole destination for tray
-Open Config, the **Save Captures to Disk** setting, and managed UI-state updates; the default
-profile is not read or written. The daemon
-loads behavioral and remembered UI settings at startup, so hand edits take effect after a restart.
-Background UI saves re-read the current document and preserve unrelated edits and comments. The
-one-shot `captastic capture --selection true` command uses the default profile and flushes its UI
-updates before exiting.
+Open Config and the **Save Captures to Disk** setting, and the `state.toml` beside it holds that
+profile's remembered state; the default profile is not read or written. The daemon loads behavioral
+and remembered UI settings at startup, so hand edits take effect after a restart. Background saves
+rewrite `state.toml` alone, so they cannot disturb a configuration you are editing, and the one
+setting the notification area does write back — `output.enabled` — is edited in place, preserving
+every other value and comment. The one-shot `captastic capture --selection true` command uses the
+default profile unless `--config <path>` names another, and flushes its UI updates before exiting.
 
 ## Configurable hotkeys
 
@@ -297,8 +317,12 @@ rest of the document and its comments, so it survives a restart; the file is cre
 default profile has never been written. If that write fails the notification area says so and the
 setting still applies for this session. A start that fails — an output directory that cannot be
 created, say — leaves the item unchecked and reports why, because the checkmark states where the
-next capture will go. Everything else under `[output]` (format, directory, template) is read at
-startup as before, so changing those still means a restart.
+next capture will go, and so does a start refused because a previous file worker missed its stop
+deadline and may still be writing into that directory; it is allowed again as soon as that worker
+returns. Captures already queued when file output is switched off are not written — that is
+inherent to stopping a destination — but each one is named in the log with its capture id and
+counted as abandoned in the destination's summary. Everything else under `[output]` (format,
+directory, template) is read at startup as before, so changing those still means a restart.
 
 Captastic remembers recent captures under `[history]` (`max_items`, `max_age_days`,
 `max_total_bytes`; `max_items = 0` turns it off). The notification-area menu uses that history for
@@ -331,14 +355,16 @@ Windows terminal and strips all color escapes when stderr is redirected or color
 Persistent log files remain plain text. JSON logging is never colorized.
 
 Machine-readable command results continue to use stdout, so `--json` can be redirected or parsed
-without mixing in diagnostics. Captastic keeps its per-user configuration, UI state, and logs in
-`%USERPROFILE%\.captastic` on Windows (or `$HOME/.captastic` elsewhere). Configuration and UI state
-share `%USERPROFILE%\.captastic\captastic.toml`. The default log file is
-`%USERPROFILE%\.captastic\logs\captastic.log`; the resolved path is logged when the process starts and
-is included in daemon ready JSON. File writes run on a bounded background queue and never block the
-capture or overlay threads. Configure `logging.level` (`off`, `error`, `warn`, `info`, `debug`, or
-`trace`), `logging.format` (`compact` or `json`), and optional `logging.file` in TOML, or override
-them with the global `--log-level`, `--log-format`, and `--log-file` flags. The active log rotates
+without mixing in diagnostics. Captastic keeps its per-user configuration, remembered state, and
+logs in `%USERPROFILE%\.captastic` on Windows (or `$HOME/.captastic` elsewhere). The configuration
+is `captastic.toml`; Captastic's own memory is `state.toml` and the capture history is
+`history.toml`, both beside it and both written by Captastic rather than by hand. The default log
+file is `%USERPROFILE%\.captastic\logs\captastic.log`; the resolved path is logged when the process
+starts and is included in daemon ready JSON. File writes run on a bounded background queue and
+never block the capture or overlay threads. Configure `logging.level` (`off`, `error`, `warn`,
+`info`, `debug`, or `trace`), `logging.format` (`compact` or `json`), and optional `logging.file`
+in TOML, or override them with the global `--log-level`, `--log-format`, and `--log-file` flags.
+The active log rotates
 at `logging.max_file_bytes` (5 MiB by default), retaining `logging.retained_files` archives (three
 by default) as `captastic.log.1`, `captastic.log.2`, and `captastic.log.3`.
 
@@ -421,14 +447,21 @@ Ctrl+C or `captastic stop` requests an orderly shutdown, stops admitting capture
 - Tightly pitched DXGI staging textures use one contiguous CPU copy; padded textures retain the checked row-copy fallback.
 - Transparent-window PNG is streamed directly into its final byte vector with one 64 KiB scratch block. PNG and all clipboard allocations remain after CPU-frame readiness.
 - Selection JSON reports `overlay_preparation_ns`, `window_overview_ns`, retained preview count/bytes, and clipboard JSON reports `png_encode_ns`.
-- DXGI selection captures now retain an opt-in immutable GPU snapshot. Confirmed regions use
+- The CPU readback pool holds `capture.buffer_slots` plus `selection.queue_capacity` plus one
+  frames, because an open overlay pins the frame from its hotkey press for the whole interaction
+  rather than for the length of a capture. Slots are allocated on first use; at 4K each is
+  31.6 MiB, so the default ceiling is five slots and is reached only when that many frames really
+  are live. Exhausting it on a press or a confirmation raises a notification-area balloon.
+- DXGI selection captures retain an immutable GPU snapshot for the life of the overlay — every
+  overlay press but a direct full-display capture asks for one, because a tool switch inside the
+  overlay can still land on Region. Confirmed regions use
   `CopySubresourceRegion` and read back only the selected pixels; JSON identifies
   `dxgi_gpu_region` materialization and reports GPU copy submission, map wait, CPU copy, byte
   count, and total materialization time. A native error falls back to the checked CPU crop.
 
 For a smaller distributable binary without changing the profiled release build, use `cargo build --profile dist -p captastic-app`.
 
-See [ROADMAP.md](ROADMAP.md) for prioritized work after v0.1.0 — the remaining milestones, their
+See [ROADMAP.md](ROADMAP.md) for prioritized work after v0.2.0 — the remaining milestones, their
 status, and the release signing and distribution backlog — and
 [outputs/Captastic-Specification.md](outputs/Captastic-Specification.md) for the complete original
 implementation plan.
