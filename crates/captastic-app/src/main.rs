@@ -23,6 +23,7 @@ mod selection;
 #[cfg(windows)]
 mod worker_registry;
 
+use std::path::Path;
 use std::process;
 use std::time::Instant;
 
@@ -294,6 +295,7 @@ fn capture_with_preview_fallback(
     if args.selection && args.selection_preview != PreviewArg::Frozen {
         return capture_with_live_selection(args);
     }
+    let config = one_shot_config(args.config.as_deref())?;
     let display_policy = resolve_display_policy(&args.display)?;
     let mut backend = create_backend(&args.backend, &display_policy)?;
     let source = resolve_capture_source(&display_policy, backend.displays())?;
@@ -305,7 +307,7 @@ fn capture_with_preview_fallback(
         mode: capture_mode(args.mode),
         cpu_frame: args.cpu_frame,
         retain_native_frame: args.selection,
-        cursor: configured_cursor_mode(),
+        cursor: configured_cursor_mode(&config),
     };
     recorder.record(request.id, PerfEventKind::HotkeyReceived, 0);
     recorder.record(request.id, PerfEventKind::TriggerEnqueued, 0);
@@ -460,7 +462,7 @@ fn capture_with_preview_fallback(
             recorder.record(request.id, PerfEventKind::ClipboardStarted, 0);
             let payload = captastic_windows::ClipboardPayload::prepare(clipboard_frame)?;
             let mut publisher =
-                captastic_windows::ClipboardPublisher::new(one_shot_clipboard_retention())?;
+                captastic_windows::ClipboardPublisher::new(one_shot_clipboard_retention(&config))?;
             let report = publisher.publish(&payload).map_err(report_clipboard_loss)?;
             recorder.record(
                 request.id,
@@ -487,7 +489,8 @@ fn capture_with_preview_fallback(
         }
     }
     #[cfg(windows)]
-    let file_output_value = write_one_shot_file_output(frame.as_ref(), &mut recorder, request.id)?;
+    let file_output_value =
+        write_one_shot_file_output(&config, frame.as_ref(), &mut recorder, request.id)?;
     #[cfg(not(windows))]
     let file_output_value: Option<serde_json::Value> = None;
     recorder.record(request.id, PerfEventKind::AttemptFinished, 0);
@@ -516,21 +519,31 @@ fn capture_with_preview_fallback(
     Ok(())
 }
 
+/// The configuration a one-shot command runs under.
+///
+/// `--config` names a file the user is pointing at, so one that cannot be read or parsed is an
+/// error rather than a silent fall back to defaults: a run that quietly measures different
+/// settings than the ones under test is worse than a run that refuses. Without the flag this is
+/// the default file, and a configuration that fails to load falls back to `Default` — which is
+/// what every one-shot command did before the flag existed, and whose failure mode is the
+/// conservative one.
+fn one_shot_config(path: Option<&Path>) -> Result<AppConfig, AppError> {
+    match path {
+        Some(path) => Ok(AppConfig::load(path)?),
+        None => Ok(AppConfig::load_default().unwrap_or_default()),
+    }
+}
+
 /// What a one-shot capture lets Windows keep of the clipboard it publishes.
 ///
 /// Read from the same `[clipboard]` configuration the daemon uses, so `captastic capture
-/// --clipboard` cannot be a quieter way around a decision the user made once. Configuration that
-/// fails to load falls back to `Default`, which declines both retention paths — the failure mode
-/// of a missing config file should not be the permissive one.
+/// --clipboard` cannot be a quieter way around a decision the user made once.
 #[cfg(windows)]
-fn one_shot_clipboard_retention() -> captastic_windows::ClipboardRetention {
-    captastic_config::AppConfig::load_default().map_or_else(
-        |_| captastic_windows::ClipboardRetention::default(),
-        |config| captastic_windows::ClipboardRetention {
-            history: config.clipboard.allow_history,
-            cloud_sync: config.clipboard.allow_cloud_sync,
-        },
-    )
+fn one_shot_clipboard_retention(config: &AppConfig) -> captastic_windows::ClipboardRetention {
+    captastic_windows::ClipboardRetention {
+        history: config.clipboard.allow_history,
+        cloud_sync: config.clipboard.allow_cloud_sync,
+    }
 }
 
 /// Writes a one-shot capture to disk when `[output]` is enabled.
@@ -539,11 +552,11 @@ fn one_shot_clipboard_retention() -> captastic_windows::ClipboardRetention {
 /// output on gets it from `captastic capture` too rather than only from the background daemon.
 #[cfg(windows)]
 fn write_one_shot_file_output(
+    config: &AppConfig,
     frame: Option<&captastic_core::CpuFrame>,
     recorder: &mut captastic_core::EventRecorder,
     capture_id: captastic_core::CaptureId,
 ) -> Result<Option<serde_json::Value>, AppError> {
-    let config = captastic_config::AppConfig::load_default().unwrap_or_default();
     if !config.output.enabled {
         return Ok(None);
     }
@@ -625,6 +638,7 @@ fn report_clipboard_loss(failure: captastic_windows::ClipboardPublishError) -> A
 
 #[cfg(windows)]
 fn capture_with_live_selection(mut args: cli::CaptureArgs) -> Result<(), AppError> {
+    let config = one_shot_config(args.config.as_deref())?;
     let display_policy = resolve_display_policy(&args.display)?;
     let mut backend = create_backend(&args.backend, &display_policy)?;
     let source = resolve_capture_source(&display_policy, backend.displays())?;
@@ -797,7 +811,7 @@ fn capture_with_live_selection(mut args: cli::CaptureArgs) -> Result<(), AppErro
         recorder.record(capture_id, PerfEventKind::ClipboardStarted, 0);
         let payload = captastic_windows::ClipboardPayload::prepare(&selected_frame)?;
         let mut publisher =
-            captastic_windows::ClipboardPublisher::new(one_shot_clipboard_retention())?;
+            captastic_windows::ClipboardPublisher::new(one_shot_clipboard_retention(&config))?;
         let report = publisher.publish(&payload).map_err(report_clipboard_loss)?;
         recorder.record(
             capture_id,
@@ -1113,8 +1127,7 @@ fn config(command: ConfigCommand) -> Result<(), AppError> {
 ///
 /// One-shot captures have no `--cursor` flag: the policy is a standing preference rather than a
 /// per-capture choice, and duplicating it on the command line would let the two disagree.
-fn configured_cursor_mode() -> CursorMode {
-    let config = captastic_config::AppConfig::load_default().unwrap_or_default();
+fn configured_cursor_mode(config: &AppConfig) -> CursorMode {
     if config.capture.cursor == "include" {
         CursorMode::Include
     } else {
