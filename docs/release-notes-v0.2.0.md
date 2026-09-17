@@ -157,11 +157,14 @@ capture has landed on disk because of it, and neither of its rarer paths — a f
 its stop deadline, and captures abandoned because they were queued faster than they could be encoded
 — has been seen outside a test.
 
-**The three output formats were never opened in a viewer.** Files were written with the fake backend
-and identified by their magic bytes and by `file`; a picture that was upside down or channel-swapped
-would have passed. The bottom-up and channel-order tests are the defence, and they are unit tests.
-No straight-alpha frame reached an encoder outside them, so JPEG's white compositing and BMP's alpha
-header have not been exercised by a real window capture.
+**A window capture's alpha has not been through the two new encoders.** Both were checked once on a
+real capture: on 2026-09-17 a 3840 × 2160 full-display DXGI capture was written as JPEG at quality
+85 and as BMP. The JPEG was opened and viewed — right side up, with the page's purple and the
+browser chrome the colours they were on screen — and the BMP decoded through GDI+ as
+`3840x2160 Format24bppRgb`, with a sampled pixel at (1200, 400) white in both files, within JPEG's
+compression error. PNG output is unchanged from Milestone 4. What no run has produced is a
+straight-alpha window capture through either new encoder, so JPEG's compositing over opaque white
+and BMP's 32-bpp alpha header are exercised by unit tests alone.
 
 **The benchmark claim run has not been made.** No `--backend dxgi` benchmark was taken for this
 release, the absolute budget ceilings remain empty, and no baseline is committed. The fingerprint's
