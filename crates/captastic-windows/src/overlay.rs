@@ -2642,7 +2642,7 @@ fn ready_window_preview(
 }
 
 fn restore_highlight(state: &OverlayState, rect: Rect) {
-    let Some(visible) = intersect_rect(rect, state.model.source) else {
+    let Some(visible) = rect.intersection(state.model.source) else {
         return;
     };
     let x = visible.x - state.model.source.x;
@@ -3191,36 +3191,13 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
     );
 }
 
+/// The part of a native window rectangle that lies on the captured display.
+///
+/// A thin adapter over [`Rect::intersection`], which is the single implementation of half-open
+/// rectangle overlap in the workspace and is property-tested against `Rect::contains` there. The
+/// two hand-rolled copies that used to live here agreed with it by inspection only.
 fn intersect_with_source(native: RECT, source: Rect) -> Option<Rect> {
-    let source_right = i64::from(source.x) + i64::from(source.width);
-    let source_bottom = i64::from(source.y) + i64::from(source.height);
-    let left = i64::from(native.left).max(i64::from(source.x));
-    let top = i64::from(native.top).max(i64::from(source.y));
-    let right = i64::from(native.right).min(source_right);
-    let bottom = i64::from(native.bottom).min(source_bottom);
-    (right > left && bottom > top).then_some(Rect {
-        x: left as i32,
-        y: top as i32,
-        width: (right - left) as u32,
-        height: (bottom - top) as u32,
-    })
-}
-
-fn intersect_rect(rect: Rect, source: Rect) -> Option<Rect> {
-    let rect_right = i64::from(rect.x) + i64::from(rect.width);
-    let rect_bottom = i64::from(rect.y) + i64::from(rect.height);
-    let source_right = i64::from(source.x) + i64::from(source.width);
-    let source_bottom = i64::from(source.y) + i64::from(source.height);
-    let left = i64::from(rect.x).max(i64::from(source.x));
-    let top = i64::from(rect.y).max(i64::from(source.y));
-    let right = rect_right.min(source_right);
-    let bottom = rect_bottom.min(source_bottom);
-    (right > left && bottom > top).then_some(Rect {
-        x: left as i32,
-        y: top as i32,
-        width: (right - left) as u32,
-        height: (bottom - top) as u32,
-    })
+    window_enumeration::rect_from_native(native)?.intersection(source)
 }
 
 fn update_cursor(handle: Option<ResizeHandle>, region_cursor: &RegionCursor) {
@@ -3512,20 +3489,18 @@ mod tests {
     #[test]
     fn highlight_is_clipped_to_the_captured_display() {
         assert_eq!(
-            intersect_rect(
-                Rect {
-                    x: -20,
-                    y: 40,
-                    width: 80,
-                    height: 100,
-                },
-                Rect {
-                    x: 0,
-                    y: 0,
-                    width: 100,
-                    height: 100,
-                },
-            ),
+            Rect {
+                x: -20,
+                y: 40,
+                width: 80,
+                height: 100,
+            }
+            .intersection(Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            }),
             Some(Rect {
                 x: 0,
                 y: 40,

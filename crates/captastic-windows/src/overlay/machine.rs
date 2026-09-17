@@ -731,18 +731,7 @@ pub(super) fn default_region_for_source(source: Rect) -> Rect {
 }
 
 pub(super) fn fit_region_to_source(region: Rect, source: Rect) -> Rect {
-    let width = region.width.min(source.width);
-    let height = region.height.min(source.height);
-    let source_right = i64::from(source.x) + i64::from(source.width);
-    let source_bottom = i64::from(source.y) + i64::from(source.height);
-    let maximum_x = source_right - i64::from(width);
-    let maximum_y = source_bottom - i64::from(height);
-    Rect {
-        x: i64::from(region.x).clamp(i64::from(source.x), maximum_x) as i32,
-        y: i64::from(region.y).clamp(i64::from(source.y), maximum_y) as i32,
-        width,
-        height,
-    }
+    region.clamp_within(source)
 }
 
 pub(super) fn latest_interaction_region(
