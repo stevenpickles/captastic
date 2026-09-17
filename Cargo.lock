@@ -105,6 +105,7 @@ dependencies = [
 name = "captastic-config"
 version = "0.2.0"
 dependencies = [
+ "captastic-core",
  "log",
  "serde",
  "thiserror",

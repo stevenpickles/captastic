@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+# The image formats are named here and implemented there, and one enum is better than a mapping
+# table two crates have to keep in step. The dependency runs config -> core, never the reverse.
+captastic-core = { path = "../captastic-core" }
 log.workspace = true
 serde.workspace = true
 thiserror.workspace = true
