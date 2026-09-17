@@ -213,33 +213,67 @@ impl LatencySummary {
     }
 }
 
+/// What the validator remembers about one capture while walking its trace.
+#[derive(Clone, Copy, Debug, Default)]
+struct OrderProgress {
+    /// The rank of the furthest stage reached, in the table currently anchored.
+    rank: u8,
+    /// A CPU frame has been readied, so output events are legal.
+    cpu_frame_ready: bool,
+    /// Which table ranks this trace, once an event has established one.
+    order: Option<CaptureOrder>,
+    /// A selection has been confirmed. Only a confirmed selection can legitimately be followed
+    /// by a second capture request.
+    selection_confirmed: bool,
+}
+
 pub fn validate_event_order(events: &[PerfEvent]) -> Result<(), MetricsError> {
-    let mut state: HashMap<CaptureId, (u8, bool, Option<CaptureOrder>)> = HashMap::new();
+    let mut state: HashMap<CaptureId, OrderProgress> = HashMap::new();
     for event in events {
-        let entry = state.entry(event.capture_id).or_insert((0, false, None));
-        if event.kind.is_output() && !entry.1 {
+        let entry = state.entry(event.capture_id).or_default();
+        if event.kind.is_output() && !entry.cpu_frame_ready {
             return Err(MetricsError::OutputBeforeCpuFrame {
                 capture_id: event.capture_id.0,
                 current: event.kind.label(),
             });
         }
-        if entry.2.is_none() {
-            entry.2 = event.kind.establishes_order();
+        if entry.order.is_none() {
+            entry.order = event.kind.establishes_order();
+        }
+        // The third legal order: a snapshot taken at the trigger, selected from, and then a
+        // second capture taken at the moment the user confirmed. Its opening is
+        // indistinguishable from a plain frozen selection - trigger, capture, selection,
+        // confirmation - and only the capture request *after* the confirmation reveals which it
+        // was. That request re-anchors the trace to the selection-first table, rewinding to the
+        // confirmation's rank there: from the confirmation onwards the two orders describe the
+        // same thing, a capture anchored to the confirmation.
+        //
+        // Nothing else re-anchors, and a second confirmation after this point is still a
+        // regression - in the selection-first table it ranks behind the capture it would follow.
+        if event.kind == PerfEventKind::CaptureRequested
+            && entry.order == Some(CaptureOrder::CaptureFirst)
+            && entry.selection_confirmed
+        {
+            entry.order = Some(CaptureOrder::SelectionFirst);
+            entry.rank = PerfEventKind::SelectionConfirmed.rank(CaptureOrder::SelectionFirst);
         }
         let rank = event
             .kind
-            .rank(entry.2.unwrap_or(CaptureOrder::CaptureFirst));
-        if rank < entry.0 {
+            .rank(entry.order.unwrap_or(CaptureOrder::CaptureFirst));
+        if rank < entry.rank {
             return Err(MetricsError::EventOrderRegression {
                 capture_id: event.capture_id.0,
-                previous_rank: entry.0,
+                previous_rank: entry.rank,
                 current_rank: rank,
             });
         }
         if event.kind == PerfEventKind::CpuFrameReady {
-            entry.1 = true;
+            entry.cpu_frame_ready = true;
         }
-        entry.0 = rank;
+        if event.kind == PerfEventKind::SelectionConfirmed {
+            entry.selection_confirmed = true;
+        }
+        entry.rank = rank;
     }
     Ok(())
 }
@@ -309,6 +343,75 @@ mod tests {
         regressed.record(CaptureId(1), PerfEventKind::FileWriteStarted, 4);
         validate_event_order(regressed.events())
             .expect_err("a write that finishes before it starts is still a regression");
+    }
+
+    /// The full snapshot trace: capture at the hotkey, select from it, and - because the user
+    /// was looking at the live desktop rather than the snapshot when they confirmed - capture
+    /// again at the confirmation and materialize from that.
+    fn snapshot_trace() -> EventRecorder {
+        let mut recorder = EventRecorder::with_capacity(32);
+        recorder.record(CaptureId(1), PerfEventKind::HotkeyReceived, 0);
+        recorder.record(CaptureId(1), PerfEventKind::TriggerEnqueued, 1);
+        recorder.record(CaptureId(1), PerfEventKind::TriggerDequeued, 2);
+        recorder.record(CaptureId(1), PerfEventKind::CaptureRequested, 3);
+        recorder.record(CaptureId(1), PerfEventKind::NativeFrameReady, 4);
+        recorder.record(CaptureId(1), PerfEventKind::ReadbackStarted, 5);
+        recorder.record(CaptureId(1), PerfEventKind::CpuFrameReady, 6);
+        recorder.record(CaptureId(1), PerfEventKind::SelectionStarted, 7);
+        recorder.record(CaptureId(1), PerfEventKind::SelectionConfirmed, 8);
+        recorder.record(CaptureId(1), PerfEventKind::CaptureRequested, 9);
+        recorder.record(CaptureId(1), PerfEventKind::NativeFrameReady, 10);
+        recorder.record(CaptureId(1), PerfEventKind::ReadbackStarted, 11);
+        recorder.record(CaptureId(1), PerfEventKind::CpuFrameReady, 12);
+        recorder
+    }
+
+    #[test]
+    fn a_confirmation_capture_may_follow_a_trigger_snapshot() {
+        // Every overlay press now captures at the hotkey so the user can look at those pixels,
+        // and confirms against whichever view was showing. Confirming in the live view takes a
+        // second capture, which used to be an EventOrderRegression: the trace was anchored to
+        // the capture-first table by the snapshot and CaptureRequested ranks behind
+        // SelectionConfirmed there.
+        let mut recorder = snapshot_trace();
+        recorder.record(CaptureId(1), PerfEventKind::CropFinished, 13);
+        recorder.record(CaptureId(1), PerfEventKind::ClipboardStarted, 14);
+        recorder.record(CaptureId(1), PerfEventKind::ClipboardCommitted, 15);
+        recorder.record(CaptureId(1), PerfEventKind::AttemptFinished, 16);
+
+        validate_event_order(recorder.events())
+            .expect("a confirmation capture after a trigger snapshot is a legal order");
+    }
+
+    #[test]
+    fn a_second_confirmation_after_the_confirmation_capture_still_regresses() {
+        // Re-anchoring is not a licence to reopen the selection. Once the trace has moved to the
+        // selection-first table, a confirmation arriving after its capture is the same
+        // out-of-order event it always was, and the validator must still say so.
+        let mut recorder = snapshot_trace();
+        recorder.record(CaptureId(1), PerfEventKind::SelectionConfirmed, 13);
+
+        assert!(matches!(
+            validate_event_order(recorder.events()),
+            Err(MetricsError::EventOrderRegression { .. })
+        ));
+    }
+
+    #[test]
+    fn a_capture_request_without_a_confirmation_before_it_still_regresses() {
+        // The re-anchor is keyed on a confirmed selection, not merely on a second capture: two
+        // captures for one attempt with nothing confirmed in between is the engine misbehaving,
+        // and it must not be reclassified as a legal order.
+        let mut recorder = EventRecorder::with_capacity(8);
+        recorder.record(CaptureId(1), PerfEventKind::CaptureRequested, 1);
+        recorder.record(CaptureId(1), PerfEventKind::CpuFrameReady, 2);
+        recorder.record(CaptureId(1), PerfEventKind::CropFinished, 3);
+        recorder.record(CaptureId(1), PerfEventKind::CaptureRequested, 4);
+
+        assert!(matches!(
+            validate_event_order(recorder.events()),
+            Err(MetricsError::EventOrderRegression { .. })
+        ));
     }
 
     #[test]

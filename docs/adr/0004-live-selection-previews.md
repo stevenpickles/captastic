@@ -46,12 +46,20 @@ the request-time frame just as it does today.
 
 ## Metrics
 
-Both legal event orders are preserved and labelled:
+Every legal event order is preserved and labelled:
 
 ```text
-frozen: trigger -> capture -> selection -> confirmation -> materialization
-live:   trigger -> selection -> confirmation -> capture -> materialization
+frozen:   trigger -> capture -> selection -> confirmation -> materialization
+live:     trigger -> selection -> confirmation -> capture -> materialization
+snapshot: trigger -> capture -> selection -> confirmation -> capture -> materialization
 ```
+
+The third order is what a run takes when it captures at the hotkey so the user can look at those
+pixels, and the user confirms in the live view instead. Its opening is indistinguishable from
+`frozen`; the capture request arriving after the confirmation is what tells the two apart, and it
+re-anchors the trace to the `live` table from the confirmation onwards, where both orders describe
+the same confirmation-anchored capture. A confirmation arriving after that point is still an
+out-of-order event.
 
 Every result reports its effective preview mode, any fallback reason, and whether capture timing is
 anchored to the trigger or confirmation. Human interaction time is never reported as native capture
