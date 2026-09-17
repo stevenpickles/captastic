@@ -40,8 +40,15 @@ fake_frame_age_us = 1000
 [selection]
 enabled = true
 queue_capacity = 1
-# "auto" prefers a live compositor preview and falls back to the frozen capture path.
-# Use "live" to require confirmation-time capture or "frozen" for trigger-time pixels.
+# Every press of an overlay hotkey captures the screen at that moment, and the overlay can show
+# either those pixels or the live desktop. Press F (or use Options -> View) to switch; confirming
+# captures whichever view is showing. This setting chooses only which view the overlay *opens* in,
+# per run - the switch is never remembered.
+#   "auto"   (default) opens live, and if the layered presenter cannot be established it reopens
+#            the same run showing the captured frame instead, with the switch unavailable.
+#   "live"   opens live and fails rather than silently showing trigger-time pixels.
+#   "frozen" opens on the frame captured at the press.
+# The Window tool is unaffected either way: clicking a preview always renders that window fresh.
 preview = "auto"
 
 [clipboard]

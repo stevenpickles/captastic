@@ -763,6 +763,13 @@ fn toolbar_control_pressed(
                 mode: model.loupe.mode,
             });
         }
+        ToolbarControl::PreviewView => {
+            // Deliberately the same transition the `F` key takes, inertness included: a row that
+            // quietly did something different from the key it duplicates would be worse than
+            // either on its own. The menu stays open, so what the row did is visible in the row's
+            // own label without a second trip through Options.
+            effects.extend(toggle_view(model));
+        }
         ToolbarControl::ClipboardDestination => {}
         ToolbarControl::Cancel => return cancel(model),
     }
@@ -2654,6 +2661,56 @@ mod tests {
 
         assert_eq!(model.view, PreviewView::Frozen);
         assert!(view_toggle_enabled(&model));
+    }
+
+    #[test]
+    fn the_view_row_switches_the_view_and_keeps_the_menu_open() {
+        let mut model = region_model();
+        model.options_open = true;
+        let layout = layout_for(&model);
+
+        for expected in [PreviewView::Frozen, PreviewView::Live] {
+            let effects = transition(
+                &mut model,
+                OverlayInput::PointerDown {
+                    point: center(layout.preview_view),
+                    window_slot: None,
+                    time_ms: 0,
+                },
+            );
+            assert_eq!(model.view, expected);
+            assert!(model.options_open, "the menu stays open for another press");
+            assert_eq!(model.hovered_control, Some(ToolbarControl::PreviewView));
+            assert!(has_effect(&effects, |e| matches!(
+                e,
+                OverlayEffect::Invalidate
+            )));
+            assert!(close_outcome(&effects).is_none());
+        }
+    }
+
+    #[test]
+    fn the_view_row_is_inert_wherever_the_key_is() {
+        // The row and the key must agree exactly: a greyed row that quietly did something the
+        // key would not is worse than either on its own.
+        let mut model = region_model();
+        model.options_open = true;
+        model.view_toggle_available = false;
+        let layout = layout_for(&model);
+        let view = model.view;
+
+        transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point: center(layout.preview_view),
+                window_slot: None,
+                time_ms: 0,
+            },
+        );
+
+        assert_eq!(model.view, view);
+        assert!(model.options_open);
+        assert!(!view_toggle_enabled(&model));
     }
 
     #[test]

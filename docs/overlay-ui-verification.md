@@ -54,7 +54,7 @@ resize-handle geometry.
 | Tool control hit target | 44 x 44 |
 | Options control | 100 x 44 |
 | Capture control | 120 x 44 |
-| Options menu | 248 x 212 |
+| Options menu | 248 x 252 |
 | Menu row | 236 x 40 |
 | Toolbar/menu type | 16 |
 | Primary icon | 22 |
@@ -64,10 +64,10 @@ Expected physical sizes are:
 
 | Scaling | DPI | Toolbar (px) | Options menu (px) |
 | --- | ---: | ---: | ---: |
-| 100% | 96 | 418 x 56 | 248 x 212 |
-| 125% | 120 | 523 x 70 | 310 x 265 |
-| 150% | 144 | 627 x 84 | 372 x 318 |
-| 200% | 192 | 836 x 112 | 496 x 424 |
+| 100% | 96 | 418 x 56 | 248 x 252 |
+| 125% | 120 | 523 x 70 | 310 x 315 |
+| 150% | 144 | 627 x 84 | 372 x 378 |
+| 200% | 192 | 836 x 112 | 496 x 504 |
 
 The magnifier is a fixed 31 x 31 square of physical pixels, enlarged 6, 8, 9
 and 12 times at 100%, 125%, 150% and 200%. The sampled square is deliberately
@@ -169,6 +169,22 @@ For region precision, on every display configuration below:
 | Magnifier vs the badge | Move the pointer so the magnifier would land on the dimension badge | The badge moves; the magnifier does not |
 | Zoom modes | Options -> Zoom, pressing three times | Auto, Hold Z, Off, back to Auto; Hold Z ignores a slow drag, Off ignores the key; `state.toml` contains `region_zoom` and it survives a daemon restart |
 | Alt+Tab with Z held | Hold Z, Alt+Tab away, release Z, Alt+Tab back | The magnifier is gone rather than stuck on screen |
+
+For the frozen-view toggle, on every display configuration below:
+
+| Check | What to do | What must happen |
+| --- | --- | --- |
+| F freezes the view | With a video playing, press the hotkey, then press **F** | The video stops, and a **FROZEN · pixels from hotkey press** tag appears above the toolbar |
+| F returns to live | Press **F** again | The tag disappears and the video resumes from where it is now, not where it was |
+| The frozen view captures the press | Freeze with **F**, draw a region over the video, confirm | The clipboard holds the frame from the moment the hotkey was pressed; JSON reports `preview_mode: "frozen"`, `capture_anchor: "trigger"`, `view_switched: true` |
+| The live view captures the confirmation | Return to live, draw the same region, confirm | The clipboard holds the current frame; JSON reports `preview_mode: "live"`, `capture_anchor: "confirmation"` |
+| Full Display too | Repeat both in Full Display mode | The same, with `frozen_display` and `confirmation_display` |
+| The Window tool is unaffected | Switch to Window and press **F** | Nothing happens, no tag appears, and **Options -> View** is greyed |
+| The row and the key agree | Open Options and click the **View** row repeatedly | The label alternates "View: Live" and "View: Frozen", the menu stays open, and the tag follows |
+| Nothing is remembered | Confirm or cancel in the frozen view, then press the hotkey again | The overlay opens live again (or frozen under `selection.preview = "frozen"`); `state.toml` gains no new key |
+| The configured opening view | Set `selection.preview = "frozen"` and press the hotkey | The overlay opens frozen with the tag up; **F** still switches to live |
+| A greyed row means it | If the layered presenter ever fails (log: "layered selection presenter failed") | The overlay still opens frozen in an opaque window, the row is greyed, **F** does nothing, and JSON carries `preview_fallback_reason` |
+| The magnifier follows the view | Hold **Z** over moving content in each view | Live: the sample updates with the desktop. Frozen: the sample is still, and matches the frozen picture underneath |
 
 | Display configuration | Scaling | Required checks |
 | --- | --- | --- |

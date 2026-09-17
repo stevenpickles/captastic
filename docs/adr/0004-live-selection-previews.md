@@ -76,3 +76,62 @@ Explicit `live` mode fails when its required behavior cannot be established. `au
 selection with the frozen presenter after a bounded fallback capture. Protected, cloaked, closed,
 or otherwise unavailable window sources may use static previews or be omitted, but Captastic never
 substitutes an occluded desktop crop for native window capture.
+
+## Amendment (v0.2.0): the view is the user's, taken at the hotkey
+
+### Context
+
+The decision above settled which pixels a selection would publish before the overlay appeared.
+`frozen` captured at the trigger and cropped that frame; `live` captured nothing until the user
+confirmed. Both are defensible and each is wrong for a different task: choosing a region over a
+playing video needs the picture to stop, and choosing one over a menu that closes when the overlay
+takes focus needs it to keep going. The user could not ask for either, because by the time they
+were looking at anything the choice had already been made for them — once, in a configuration file.
+
+Two facts made the split unnecessary. The overlay's live presenter already runs the whole compose →
+`UpdateLayeredWindow` cycle, takes pointer capture, and registers DWM thumbnails against a layered
+window; nothing in the frozen branch depended on non-layered semantics. And the trigger-time
+capture the frozen path always took costs, in `latest` mode, one `CopyResource` plus readback and a
+memcpy into the DIB — about a millisecond at 4K, already measured and reported as
+`overlay_preparation_ns` and `cpu_ready_offset_ns`.
+
+### Decision
+
+Every overlay trigger captures at the press. One layered window serves both views. The overlay
+opens in the view `selection.preview` names and the user switches with `F` or **Options → View**;
+confirmation materializes from whichever view was on screen — the frozen view from the trigger
+snapshot, the live view from a capture taken at the confirmation.
+
+`selection.preview` therefore chooses only the opening view. `auto` and `live` open live and differ
+only in whether an unavailable layered presenter is a fallback or an error.
+
+The switch is per run. It is not persisted, and there is **no new configuration knob** for it:
+which view suits a capture is a property of that capture, not of the machine, and a remembered
+answer would be wrong about half the time while adding a setting whose effect the `F` key already
+has. If a measurement ever shows the trigger capture is too expensive to take on every press — on a
+much larger desktop, or a machine where `CopyResource` is not close to free — the escape hatch is a
+`selection.snapshot = false` that suppresses it, leaving `live` exactly as it behaves today with
+the toggle unavailable. It is not added now because nothing has measured a reason for it.
+
+The Window tool is unaffected. Clicking a preview has always requested a fresh full-resolution
+native render of that window, so the view behind the chooser changes nothing the user would get;
+`F` is inert there and the Options row is greyed.
+
+`CaptureCommand::FrozenSelectionFallback` is removed. A live presenter that will not establish
+itself no longer costs a cross-thread round trip and a second full capture to reopen frozen: the
+overlay already holds the trigger snapshot, so it destroys its window, drains the latched quit, and
+re-creates opaque around the pixels it has, with the view locked and the toggle retracted. The
+`fallback` capture anchor goes with the capture it named.
+
+Memory is what the frozen path has always used: one CPU frame and, for a region selection, one
+retained GPU texture, for the life of the overlay. A live-view confirmation releases both before
+the job returns to the capture thread, so the snapshot and the confirmation capture are never
+resident at once.
+
+### JSON
+
+`preview_mode` is now the view that was showing at the confirmation (`live` or `frozen`) rather
+than a restatement of the anchor. `capture_anchor` is `trigger` or `confirmation`; `fallback` is
+gone. `view_switched` is appended, because a run that ends in the view it opened in cannot
+otherwise be told from one that was switched and switched back. `requested_preview_mode` and field
+order are unchanged.

@@ -148,10 +148,24 @@ pub enum PreviewView {
 }
 
 impl PreviewView {
+    /// The name this view goes by in logs and JSON.
     pub const fn label(self) -> &'static str {
         match self {
             Self::Live => "live",
             Self::Frozen => "frozen",
+        }
+    }
+
+    /// The Options row's label, which states the view that is showing rather than the action.
+    ///
+    /// "View: Frozen at hotkey" would say *when* the picture stopped, which is the part that
+    /// matters, but it measures 220 px against the 192 px a menu row has for text at 96 DPI - and
+    /// widening the whole menu for one row is the same trade the snap row already declined. The
+    /// tag on screen carries the full sentence; this row only has to name the state.
+    pub(crate) const fn menu_label(self) -> &'static str {
+        match self {
+            Self::Live => "View: Live",
+            Self::Frozen => "View: Frozen",
         }
     }
 }
@@ -4049,6 +4063,7 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
         (ToolbarControl::DimBackground, layout.dim_background),
         (ToolbarControl::SnapToWindows, layout.snap_to_windows),
         (ToolbarControl::RegionZoom, layout.region_zoom),
+        (ToolbarControl::PreviewView, layout.preview_view),
         (
             ToolbarControl::ClipboardDestination,
             layout.clipboard_destination,
@@ -4122,6 +4137,27 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
         },
         state.model.loupe.mode.label(),
         rgb(245, 245, 247),
+        TextAlignment::Left,
+        tokens.font_height,
+    );
+    // No checkmark here either: two views cycle rather than one setting being on or off, and the
+    // label states which one is showing. Greyed - the same grey the clipboard row uses for a
+    // destination the user cannot turn off - when the run has nothing to switch to, or under the
+    // Window tool, where a click renders its window fresh whichever view is behind it.
+    draw_text(
+        device,
+        UiRect {
+            left: layout.preview_view.left + tokens.menu_text_offset,
+            top: layout.preview_view.top,
+            right: layout.preview_view.right - tokens.text_padding,
+            bottom: layout.preview_view.bottom,
+        },
+        state.model.view.menu_label(),
+        if machine::view_toggle_enabled(&state.model) {
+            rgb(245, 245, 247)
+        } else {
+            rgb(130, 130, 136)
+        },
         TextAlignment::Left,
         tokens.font_height,
     );
@@ -5577,6 +5613,16 @@ mod tests {
                     machine::LoupeMode::Off.label(),
                     layout.region_zoom.width() - tokens.menu_text_offset - tokens.text_padding,
                     layout.region_zoom.height(),
+                ),
+                (
+                    PreviewView::Live.menu_label(),
+                    layout.preview_view.width() - tokens.menu_text_offset - tokens.text_padding,
+                    layout.preview_view.height(),
+                ),
+                (
+                    PreviewView::Frozen.menu_label(),
+                    layout.preview_view.width() - tokens.menu_text_offset - tokens.text_padding,
+                    layout.preview_view.height(),
                 ),
                 (
                     "Copy to Clipboard",

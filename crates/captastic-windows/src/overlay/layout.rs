@@ -4,7 +4,7 @@ const TOOLBAR_WIDTH: i32 = 418;
 const TOOLBAR_HEIGHT: i32 = 56;
 const TOOLBAR_BOTTOM_MARGIN: i32 = 24;
 const MENU_WIDTH: i32 = 248;
-const MENU_HEIGHT: i32 = 212;
+const MENU_HEIGHT: i32 = 252;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ToolbarControl {
@@ -17,6 +17,7 @@ pub(super) enum ToolbarControl {
     DimBackground,
     SnapToWindows,
     RegionZoom,
+    PreviewView,
     ClipboardDestination,
     Cancel,
 }
@@ -460,6 +461,7 @@ pub(super) struct ToolbarLayout {
     pub(super) dim_background: UiRect,
     pub(super) snap_to_windows: UiRect,
     pub(super) region_zoom: UiRect,
+    pub(super) preview_view: UiRect,
     pub(super) clipboard_destination: UiRect,
     pub(super) cancel: UiRect,
 }
@@ -604,17 +606,23 @@ impl ToolbarLayout {
                 right: row_right,
                 bottom: menu.top + metrics.px(126),
             },
-            clipboard_destination: UiRect {
+            preview_view: UiRect {
                 left: row_left,
                 top: menu.top + metrics.px(126),
                 right: row_right,
                 bottom: menu.top + metrics.px(166),
             },
-            cancel: UiRect {
+            clipboard_destination: UiRect {
                 left: row_left,
                 top: menu.top + metrics.px(166),
                 right: row_right,
                 bottom: menu.top + metrics.px(206),
+            },
+            cancel: UiRect {
+                left: row_left,
+                top: menu.top + metrics.px(206),
+                right: row_right,
+                bottom: menu.top + metrics.px(246),
             },
             menu,
         }
@@ -630,6 +638,9 @@ impl ToolbarLayout {
             }
             if self.region_zoom.contains(point) {
                 return Some(ToolbarControl::RegionZoom);
+            }
+            if self.preview_view.contains(point) {
+                return Some(ToolbarControl::PreviewView);
             }
             if self.clipboard_destination.contains(point) {
                 return Some(ToolbarControl::ClipboardDestination);
@@ -1030,10 +1041,10 @@ mod tests {
     #[test]
     fn compact_toolbar_scales_at_supported_dpi_levels() {
         for (dpi, expected_width, expected_height, expected_menu) in [
-            (96, 418, 56, (248, 212)),
-            (120, 523, 70, (310, 265)),
-            (144, 627, 84, (372, 318)),
-            (192, 836, 112, (496, 424)),
+            (96, 418, 56, (248, 252)),
+            (120, 523, 70, (310, 315)),
+            (144, 627, 84, (372, 378)),
+            (192, 836, 112, (496, 504)),
         ] {
             let environment = DisplayEnvironment {
                 work_area: UiRect {
@@ -1060,6 +1071,7 @@ mod tests {
                 layout.dim_background,
                 layout.snap_to_windows,
                 layout.region_zoom,
+                layout.preview_view,
                 layout.clipboard_destination,
                 layout.cancel,
             ];
