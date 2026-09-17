@@ -1868,8 +1868,10 @@ fn toggle_file_output_from_tray(
 ) {
     let enabled = if workers.file_output().is_some() {
         destinations.remove(crate::file_output::DESTINATION_NAME);
+        let mut abandoned = 0_u64;
         if let Some(worker) = workers.take_file_output() {
             let teardown = worker.stop_before(Instant::now() + FILE_OUTPUT_TOGGLE_STOP_TIMEOUT);
+            abandoned = teardown.abandoned;
             for failure in teardown.failures {
                 crate::logging::warn(format_args!(
                     "file output was switched off holding a failure for capture {}: {}",
@@ -1886,7 +1888,15 @@ fn toggle_file_output_from_tray(
                 }
             }
         }
-        log::info!("captures are no longer saved to disk (notification area)");
+        // The count is stated here as well as in the summary: a user who has just switched
+        // file output off is the one person who needs to know a capture was still in the queue.
+        if abandoned > 0 {
+            log::warn!(
+                "captures are no longer saved to disk (notification area); {abandoned} capture(s) were still queued and were not written"
+            );
+        } else {
+            log::info!("captures are no longer saved to disk (notification area)");
+        }
         false
     } else if workers.is_shutting_down() {
         // A click that arrived while the daemon is winding down. Starting a worker now would

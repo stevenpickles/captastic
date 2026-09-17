@@ -20,6 +20,9 @@ pub struct OutputMetrics {
     destination: &'static str,
     written: u64,
     failed: u64,
+    /// Captures that were still queued when the destination stopped. Counted apart from failures:
+    /// nothing was attempted and nothing went wrong with them, they simply never got their turn.
+    abandoned: u64,
     /// Names that were already taken, summed. A steady rise means captures are arriving faster
     /// than the name template can distinguish them.
     collisions: u64,
@@ -34,6 +37,7 @@ impl OutputMetrics {
             destination,
             written: 0,
             failed: 0,
+            abandoned: 0,
             collisions: 0,
             bytes: 0,
             encode_ns: Vec::new(),
@@ -53,9 +57,21 @@ impl OutputMetrics {
         self.failed = self.failed.saturating_add(1);
     }
 
+    /// Records a capture the destination never got to, because it was stopped first.
+    pub fn record_abandoned(&mut self) {
+        self.abandoned = self.abandoned.saturating_add(1);
+    }
+
+    pub fn abandoned(&self) -> u64 {
+        self.abandoned
+    }
+
     /// True when this destination did anything at all, so an unused one stays silent.
+    ///
+    /// Abandoning a capture counts as something having happened: a run that wrote nothing and
+    /// dropped three queued captures on the way out has something to answer for.
     pub fn is_empty(&self) -> bool {
-        self.written == 0 && self.failed == 0
+        self.written == 0 && self.failed == 0 && self.abandoned == 0
     }
 
     pub fn summary(&self) -> OutputSummary {
@@ -63,6 +79,7 @@ impl OutputMetrics {
             destination: self.destination,
             written: self.written,
             failed: self.failed,
+            abandoned: self.abandoned,
             collisions: self.collisions,
             bytes: self.bytes,
             encode: LatencySummary::from_samples(&self.encode_ns),
@@ -87,6 +104,8 @@ pub struct OutputSummary {
     pub destination: &'static str,
     pub written: u64,
     pub failed: u64,
+    /// Captures still queued when the destination stopped, which never reached it.
+    pub abandoned: u64,
     pub collisions: u64,
     pub bytes: u64,
     pub encode: LatencySummary,
@@ -101,6 +120,7 @@ impl OutputSummary {
             "destination": self.destination,
             "written": self.written,
             "failed": self.failed,
+            "abandoned": self.abandoned,
             "collisions": self.collisions,
             "bytes": self.bytes,
             "encode_ns": summary_json(&self.encode),
@@ -111,11 +131,12 @@ impl OutputSummary {
     /// A one-line human form, deliberately not shaped like the capture-latency lines beside it.
     pub fn to_line(&self) -> String {
         format!(
-            "{} output: {} written ({:.1} MiB), {} failed, {} name collision(s); encode p50 {:.1} ms p99 {:.1} ms, write p50 {:.1} ms p99 {:.1} ms",
+            "{} output: {} written ({:.1} MiB), {} failed, {} abandoned, {} name collision(s); encode p50 {:.1} ms p99 {:.1} ms, write p50 {:.1} ms p99 {:.1} ms",
             self.destination,
             self.written,
             self.bytes as f64 / (1024.0 * 1024.0),
             self.failed,
+            self.abandoned,
             self.collisions,
             ns_to_ms(self.encode.p50_ns),
             ns_to_ms(self.encode.p99_ns),

@@ -87,6 +87,9 @@ pub struct FileOutputWorker {
 pub struct FileOutputTeardown {
     pub failures: Vec<FileOutputFailure>,
     pub summary: Option<crate::output_metrics::OutputSummary>,
+    /// Captures that were still queued when the stop arrived and never reached disk. Zero when
+    /// the worker was detached rather than stopped, because nothing finished counting them.
+    pub abandoned: u64,
 }
 
 /// A capture that did not reach disk.
@@ -199,6 +202,26 @@ impl FileOutputWorker {
                     }
                     finish_attempt(&mut job);
                 }
+                // Whatever was still queued when the stop arrived. The receive loop above
+                // abandons it either way — this is the difference between abandoning it silently
+                // and saying which captures were lost. `try_iter` yields the buffered jobs after
+                // a disconnect too, so it covers both ways out of the loop.
+                for mut job in receiver.try_iter() {
+                    metrics.record_abandoned();
+                    crate::logging::warn(format_args!(
+                        "capture {} was still queued when file output stopped; it was not written",
+                        job.capture_id.0
+                    ));
+                    // The attempt still owes its ending: a capture that vanished without one
+                    // leaves a trace that validates as an unfinished capture forever.
+                    finish_attempt(&mut job);
+                }
+                if metrics.abandoned() > 0 {
+                    crate::logging::warn(format_args!(
+                        "file output stopped with {} capture(s) still queued; they were not written",
+                        metrics.abandoned()
+                    ));
+                }
                 // Reported once, on the way out: a per-capture line already says what each
                 // capture cost, and this is the shape of the whole run.
                 let _ = summary_sender.try_send(metrics);
@@ -252,16 +275,18 @@ impl FileOutputWorker {
     pub fn stop_before(mut self, deadline: Instant) -> FileOutputTeardown {
         self.request_stop();
         self.stop_inner(deadline);
+        // Absent when the worker was detached at its deadline rather than exiting, in which case
+        // there are no totals to report because nothing finished counting them.
+        let summary = self
+            .summary_receiver
+            .try_recv()
+            .ok()
+            .filter(|metrics| !metrics.is_empty())
+            .map(|metrics| metrics.summary());
         FileOutputTeardown {
             failures: self.failure_receiver.try_iter().collect(),
-            // Absent when the worker was detached at its deadline rather than exiting, in which
-            // case there are no totals to report because nothing finished counting them.
-            summary: self
-                .summary_receiver
-                .try_recv()
-                .ok()
-                .filter(|metrics| !metrics.is_empty())
-                .map(|metrics| metrics.summary()),
+            abandoned: summary.as_ref().map_or(0, |summary| summary.abandoned),
+            summary,
         }
     }
 
@@ -598,6 +623,8 @@ fn ns_to_ms(ns: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Submitting through the seam a producer uses, rather than through the channel behind it.
+    use crate::output::OutputSink as _;
 
     /// A recorder that remembers nothing, for tests about writing rather than remembering.
     fn no_history() -> HistoryRecorder {
@@ -894,6 +921,83 @@ mod tests {
         // Nothing new on disk, and no second worker to catch it later.
         thread::sleep(Duration::from_millis(50));
         assert_eq!(written_files(&directory), 1);
+        std::fs::remove_dir_all(directory).expect("clean up");
+    }
+
+    /// A job whose frame is big enough that encoding it takes long enough to queue another
+    /// behind it. Used only where the test needs the worker to be busy at a known moment.
+    fn slow_job(side: u32) -> OutputJob {
+        let stride = side * 4;
+        let mut job = window_job(Some("editor"), None);
+        let frame = captastic_core::CpuFrame::new(
+            std::sync::Arc::from(vec![0_u8; (stride * side) as usize]),
+            side,
+            side,
+            stride,
+            captastic_core::PixelFormat::Bgra8Unorm,
+            captastic_core::FrameOrigin::TopLeft,
+            captastic_core::ColorSpace::Srgb,
+            captastic_core::FrameMetadata {
+                source_rect: captastic_core::Rect {
+                    x: 0,
+                    y: 0,
+                    width: side,
+                    height: side,
+                },
+                ..job.frame.metadata.clone()
+            },
+        )
+        .expect("test frame");
+        job.frame = frame;
+        job
+    }
+
+    #[test]
+    fn a_capture_still_queued_when_the_destination_stops_is_named_and_counted() {
+        // Switching file output off drops whatever the worker had not reached yet. That is the
+        // same thing shutdown has always done, and it was silent: nothing logged the capture,
+        // nothing counted it, and the run's totals said only that fewer had been written than the
+        // user took. A capture the user asked for and did not get is exactly what a log is for.
+        let directory = test_directory("abandoned");
+        let worker = FileOutputWorker::start(
+            directory.clone(),
+            captastic_config::DEFAULT_FILENAME_TEMPLATE.to_owned(),
+            OutputFormat::Png,
+            EncodeOptions::default(),
+            no_history(),
+            false,
+            4,
+        )
+        .expect("start the file worker");
+        let sink = worker.sink();
+
+        // Three captures arrive together and the stop follows immediately. The worker checks the
+        // stop flag between jobs, so it finishes at most the one it had already taken and the
+        // rest are still in the queue when it breaks — which is the state the stop has to
+        // account for. No timing assumption beyond "encoding a megapixel takes longer than
+        // queueing three messages".
+        for _ in 0..3 {
+            sink.submit(slow_job(512)).expect("the queue accepts");
+        }
+        drop(sink);
+
+        let teardown = worker.stop_before(Instant::now() + Duration::from_secs(10));
+        let summary = teardown.summary.expect("the worker reported its totals");
+        assert!(
+            teardown.abandoned >= 1,
+            "a queued capture is reported as abandoned, not merely missing"
+        );
+        assert_eq!(summary.abandoned, teardown.abandoned);
+        assert_eq!(
+            summary.written + summary.abandoned,
+            3,
+            "every capture is either written or accounted for as abandoned"
+        );
+        assert_eq!(summary.failed, 0, "an abandoned capture is not a failure");
+        assert!(summary
+            .to_line()
+            .contains(&format!("{} abandoned", summary.abandoned)));
+        assert_eq!(summary.to_json()["abandoned"], summary.abandoned);
         std::fs::remove_dir_all(directory).expect("clean up");
     }
 
