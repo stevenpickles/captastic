@@ -211,7 +211,9 @@ display the user intends without initializing a capture engine after the hotkey 
 - Same-adapter virtual-desktop composition preserves each output's physical pixels without scaling,
   normalizes rotated outputs before placement, fills topology gaps with opaque black, and resolves
   overlapping bounds by stable display ID so enumeration order cannot change the result. Composite
-  output uses three reusable CPU slots and rejects layouts larger than the 512 MiB frame limit.
+  output uses a bounded pool of reusable CPU slots — the same count as a single display's readback
+  pool, since an overlay pins a composed frame exactly as long as it pins any other — and rejects
+  layouts larger than the 512 MiB frame limit.
 - Multi-adapter topologies currently return a structured unsupported error. A later slice must define
   cross-adapter transfer/synchronization, mixed-refresh freshness semantics, and mixed color/HDR
   behavior without adding unbounded copies or capture-engine initialization to the hotkey path.
