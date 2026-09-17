@@ -153,10 +153,12 @@ captastic benchmark compare benchmarks\baselines\<host-slug>\v0.2.0\<cell>\repea
 Either side may be a single `run-N.json` or a whole `repeated.json`. The comparison refuses, with
 exit status 2, if the two did not measure the same thing — naming every differing field with both
 sides. Otherwise it prints a per-stage table: baseline and candidate p50 and p95, the deltas, both
-sets' own spreads, and a verdict of `within_noise`, `slower` or `faster`.
+sets' own spreads, and a verdict of `within_noise`, `slower`, `faster`, or `unmeasurable`.
 
 A stage is only `slower` or `faster` if it moved further than the widest of the two sets' own
-spreads and `--noise-percent` (default 7.0). A `slower` verdict is **not** a command failure: a
+spreads and `--noise-percent` (default 7.0). `unmeasurable` means one side's p50 was 0 ns, so there
+was nothing for a percentage to be of — the raw figures are still printed, and the stage needs more
+iterations before it can be compared at all. A `slower` verdict is **not** a command failure: a
 comparison is a measurement still being interpreted, and a command that exits non-zero on one is a
 command that gets run with `|| true` until the day it would have mattered.
 

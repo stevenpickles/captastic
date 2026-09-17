@@ -158,6 +158,14 @@ pub enum Verdict {
     WithinNoise,
     Slower,
     Faster,
+    /// One side has no figure to be a percentage of, so nothing can be said about the change.
+    ///
+    /// A stage whose baseline p50 is 0 ns has no denominator: the delta was reported as 0.0 % and
+    /// every candidate, however slow, came back `within_noise`. A stage that reads "unchanged" on
+    /// arithmetic that could not run is worse than one that says it has no answer - the first is
+    /// quoted, the second is looked into. `trigger_to_dequeue` lands here routinely on a fast host
+    /// with few iterations, where the whole stage rounds to nothing.
+    Unmeasurable,
 }
 
 impl fmt::Display for Verdict {
@@ -166,6 +174,7 @@ impl fmt::Display for Verdict {
             Self::WithinNoise => "within_noise",
             Self::Slower => "slower",
             Self::Faster => "faster",
+            Self::Unmeasurable => "unmeasurable",
         })
     }
 }
@@ -224,7 +233,14 @@ pub fn compare(
             p95_delta_percent: delta_percent(baseline_p95, candidate_p95),
             baseline_spread_percent: baseline_spread,
             candidate_spread_percent: candidate_spread,
-            verdict: verdict(delta, baseline_spread, candidate_spread, noise_percent),
+            verdict: verdict(
+                baseline_p50,
+                candidate_p50,
+                delta,
+                baseline_spread,
+                candidate_spread,
+                noise_percent,
+            ),
         });
     }
 
@@ -285,12 +301,22 @@ fn delta_percent(baseline: u64, candidate: u64) -> f64 {
 }
 
 /// A move is only a change if it is bigger than what either side already disagreed with itself by.
+///
+/// The raw figures come in as well as the delta, because a delta of zero means two different
+/// things: "the same" and "there was nothing to divide by". Only the first is `within_noise`.
 fn verdict(
+    baseline_p50_ns: u64,
+    candidate_p50_ns: u64,
     delta_percent: f64,
     baseline_spread: f64,
     candidate_spread: f64,
     noise_percent: f64,
 ) -> Verdict {
+    if baseline_p50_ns == 0 || candidate_p50_ns == 0 {
+        // A zero baseline has no denominator; a candidate that fell to zero against a baseline
+        // that was not is a change no percentage can size. Both raw figures travel alongside.
+        return Verdict::Unmeasurable;
+    }
     let floor = baseline_spread.max(candidate_spread).max(noise_percent);
     if delta_percent.abs() <= floor {
         Verdict::WithinNoise
@@ -501,6 +527,70 @@ mod tests {
             .expect("the native stage is compared");
         assert!(native.baseline_spread_percent > 25.0, "{native:?}");
         assert_eq!(native.verdict, Verdict::WithinNoise);
+    }
+
+    #[test]
+    fn a_stage_with_nothing_to_divide_by_says_so_instead_of_reading_as_unchanged() {
+        // A zero baseline made `delta_percent` return 0.0, so every candidate - at any latency at
+        // all - came back `within_noise`. A stage reporting "unchanged" from arithmetic that never
+        // ran gets quoted; one reporting "no answer" gets looked into. `trigger_to_dequeue` hits
+        // this routinely on a fast host with few iterations.
+        let mut zero_baseline = pinned(1_000_000, 2_000_000);
+        zero_baseline.trigger_to_dequeue_latency.p50_ns = 0;
+        let baseline = RunSet {
+            label: "baseline".to_owned(),
+            runs: vec![zero_baseline],
+        };
+        let candidate = RunSet {
+            label: "candidate".to_owned(),
+            runs: vec![pinned(1_000_000, 2_000_000)],
+        };
+
+        let comparison = compare(&baseline, &candidate, 7.0).expect("the hosts match");
+        let stage = comparison
+            .stages
+            .iter()
+            .find(|stage| stage.stage == "trigger_to_dequeue")
+            .expect("the stage is still reported");
+        assert_eq!(stage.verdict, Verdict::Unmeasurable);
+        assert_eq!(stage.baseline_p50_ns, 0);
+        // The raw figures still travel, because they are what the reader has to go on.
+        assert!(stage.candidate_p50_ns > 0);
+        assert_eq!(
+            serde_json::to_value(stage.verdict).expect("the verdict serializes"),
+            serde_json::Value::String("unmeasurable".to_owned())
+        );
+
+        // The stages that did have a denominator are judged as usual.
+        let native = comparison
+            .stages
+            .iter()
+            .find(|stage| stage.stage == "native_frame")
+            .expect("the native stage is compared");
+        assert_eq!(native.verdict, Verdict::WithinNoise);
+
+        // And a candidate that fell to zero against a baseline that had not is a change no
+        // percentage can size, rather than a spectacular improvement.
+        let mut zero_candidate = pinned(1_000_000, 2_000_000);
+        zero_candidate.native_frame_latency.p50_ns = 0;
+        let comparison = compare(
+            &RunSet {
+                label: "baseline".to_owned(),
+                runs: vec![pinned(1_000_000, 2_000_000)],
+            },
+            &RunSet {
+                label: "candidate".to_owned(),
+                runs: vec![zero_candidate],
+            },
+            7.0,
+        )
+        .expect("the hosts match");
+        let native = comparison
+            .stages
+            .iter()
+            .find(|stage| stage.stage == "native_frame")
+            .expect("the native stage is compared");
+        assert_eq!(native.verdict, Verdict::Unmeasurable);
     }
 
     #[test]
