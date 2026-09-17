@@ -215,6 +215,68 @@ policy and `latest`/`fresh` mode. Daemon triggers, selection, clipboard, and log
 worker queues. UI-state changes update the controller-owned in-memory snapshot synchronously and
 use a dedicated unbounded disk channel; its traffic is limited to compact overlay session-end
 events, and the persistence worker coalesces equivalent updates before writing.
+
+## File output
+
+Captastic can write every capture to disk as well as, or instead of, the clipboard. It is off by
+default:
+
+```toml
+[output]
+enabled = true
+format = "png"
+jpeg_quality = 90
+# directory = 'C:\Users\you\Pictures\Captastic'
+filename_template = "{timestamp}-{application}-{title}"
+```
+
+`directory` must be absolute — a daemon's working directory is whatever launched it, so a relative
+path would put captures somewhere unpredictable — and defaults to `<home>\Pictures\Captastic`. It
+is created when the daemon starts rather than at the first capture, so a directory that cannot be
+created is a startup error instead of a surprise at the hotkey.
+
+`format` chooses the encoder:
+
+- **`png`** — lossless, compressed, and it keeps the straight alpha of a window capture. The
+  default, and the right answer for a screenshot of text or an interface.
+- **`jpeg`** — lossy and much smaller, written with a `.jpg` extension. `jpeg_quality` is 1–100 and
+  defaults to 90. **JPEG cannot carry an alpha channel**, so the transparent corners and shadow of
+  a window capture are composited over opaque white. That is inherent to the format rather than
+  something Captastic decides on your behalf, and the log says so at debug level each time it
+  happens; use `png` or `bmp` to keep them.
+- **`bmp`** — uncompressed and alpha-preserving: a `BITMAPV5HEADER` with an alpha mask when the
+  capture has alpha, a plain 24-bpp bitmap when it does not. A 4K capture is 33 MB and stays that
+  way.
+
+All three refuse a half-float or scRGB frame by name rather than narrowing it silently; see
+[ADR 0006](docs/adr/0006-hdr-source-handling.md).
+
+`filename_template` names each capture, without its extension. The tokens are `{timestamp}`,
+`{date}`, `{time}`, `{display}`, `{mode}`, `{width}`, `{height}`, `{application}`, and `{title}`;
+the two window tokens expand to nothing for a display or region capture, and the separators around
+them collapse rather than leaving gaps behind. Values that come from a window are sanitized —
+forbidden characters, control characters, parent hops, reserved device names, and length — and a
+name can never place a capture outside the output directory.
+`captastic config validate --path <file>` rejects an unknown token, a path separator, or a template
+with no token at all, which is the same check the daemon makes at startup. A window title is
+content; see [ADR 0008](docs/adr/0008-what-a-capture-reveals-by-default.md) for why the default
+names it anyway.
+
+A capture never overwrites a file it did not create: a name already taken is retried as `name-2`,
+`name-3`, and so on, and the write itself refuses rather than replaces. Each written capture is
+reported with its format, path, byte count, and encode/write timings — as a log line, or as a
+`file_output_written` JSON event under `--json`.
+
+Captastic remembers recent captures under `[history]` (`max_items`, `max_age_days`,
+`max_total_bytes`; `max_items = 0` turns it off). The notification-area menu uses that history for
+**Open Last Capture**, **Show in Folder**, and **Prune Capture History**, each greyed until there
+is something to open.
+
+One-shot captures write to disk from the same configuration: `captastic capture --backend dxgi`
+honours `[output]`, and `--config <file>` points it at a configuration other than the default.
+
+## Logging and diagnostics
+
 Daemon, capture, and benchmark commands write operational output through Rust's `log` facade to
 both stderr and a persistent file. Read-only utility commands use stderr only unless `--log-file`
 is supplied.

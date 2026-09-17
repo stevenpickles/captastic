@@ -71,3 +71,20 @@ markers reach the real clipboard as a zero `DWORD`, and two ignored tests do exa
 Neither Clipboard History nor Cloud Clipboard was enabled on the development host, so the
 end-to-end behaviour — a capture published and then absent from Win+V — has not been observed here.
 The formats themselves are demonstrably live: an ordinary Chromium copy on that host carries both.
+
+## Addendum (v0.2.0): JPEG flattens alpha, and says so
+
+`output.format` now offers `jpeg`, and JPEG has nowhere to put an alpha channel. A window capture
+arrives as straight alpha — rounded corners, a drop shadow — so choosing that format means those
+pixels are composited over opaque white on the way to disk. The alternative was to refuse the
+capture, which would lose every window capture at the moment it was taken from a user who had set
+one line of configuration.
+
+This is not the silent conversion this ADR exists to rule out, and the distinction is worth being
+precise about. A file written in a format that cannot hold alpha is the format doing what the
+format does; the user chose it, the choice is one line, and it changes only how transparency is
+rendered, never what the capture reveals about them. The three places that could tell them do: the
+`[output]` comment in `captastic.example.toml`, the README's file output section, and a debug log
+line each time it happens. `png` and `bmp` both keep the alpha.
+
+The same standard as the rest of this ADR: the user can see it happening, and can change it.

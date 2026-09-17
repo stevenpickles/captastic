@@ -1790,24 +1790,15 @@ mod tests {
             ("jpeg", OutputFormat::Jpeg),
             ("bmp", OutputFormat::Bmp),
         ] {
-            let source = format!(
-                "schema_version = 1
-[output]
-format = \"{value}\"
-"
-            );
+            let source = format!("schema_version = 1\n[output]\nformat = \"{value}\"\n");
             let config: AppConfig = toml::from_str(&source).expect("supported output format");
             assert_eq!(config.output.format, expected);
             config.validate().expect("a supported format is valid");
         }
 
-        let error = toml::from_str::<AppConfig>(
-            "schema_version = 1
-[output]
-format = \"webp\"
-",
-        )
-        .expect_err("unknown output formats must be rejected");
+        let error =
+            toml::from_str::<AppConfig>("schema_version = 1\n[output]\nformat = \"webp\"\n")
+                .expect_err("unknown output formats must be rejected");
         assert!(error.to_string().contains("webp"), "{error}");
     }
 

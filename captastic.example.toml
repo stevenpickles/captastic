@@ -56,8 +56,21 @@ allow_cloud_sync = false
 [output]
 # Write every capture to disk, alongside the clipboard or instead of it.
 enabled = false
-# "png" is the only supported format today.
+# "png", "jpeg", or "bmp".
+#   png  - lossless and compressed, and it keeps the transparent corners and shadow of a window
+#          capture. The default, and the right answer for a screenshot of text or an interface.
+#   jpeg - lossy and much smaller, written with a .jpg extension. Worth it for a photograph, a map,
+#          or a video frame; it rings along the hard edges that make up most of a screenshot.
+#   bmp  - uncompressed, keeps alpha, and large: a 4K capture is 33 MB and stays that way. Useful
+#          where a tool has to read the file without a decoder.
+# JPEG cannot carry an alpha channel at all, so the transparent pixels of a window capture are
+# composited over opaque white. That is inherent to the format rather than a choice Captastic
+# makes on your behalf, and the log says so at debug level each time it happens - but if you
+# capture windows and want their corners and shadows, use "png" or "bmp".
 format = "png"
+# How hard a JPEG is compressed, 1-100. Ignored by the other two formats. 90 keeps the text in a
+# screenshot legible; much below 70 the ringing around hard edges becomes easy to see.
+jpeg_quality = 90
 queue_capacity = 2
 # Absolute path. Omit to use <home>/Pictures/Captastic. A daemon's working directory is whatever
 # launched it, so a relative path would put captures somewhere you could not predict.
