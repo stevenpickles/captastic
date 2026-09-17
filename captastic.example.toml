@@ -55,6 +55,8 @@ allow_cloud_sync = false
 
 [output]
 # Write every capture to disk, alongside the clipboard or instead of it.
+# Also a notification-area command: "Save Captures to Disk" starts and stops writing without a
+# restart and writes your choice back here. The settings below it are read at startup only.
 enabled = false
 # "png", "jpeg", or "bmp".
 #   png  - lossless and compressed, and it keeps the transparent corners and shadow of a window

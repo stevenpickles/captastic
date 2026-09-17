@@ -36,6 +36,7 @@ const TASKBAR_CREATED_NAME: PCWSTR = w!("TaskbarCreated");
 const TRAY_CALLBACK: u32 = WM_APP + 1;
 const TRAY_SET_STARTUP: u32 = WM_APP + 2;
 const TRAY_SET_HAS_HISTORY: u32 = WM_APP + 5;
+const TRAY_SET_FILE_OUTPUT: u32 = WM_APP + 4;
 const TRAY_SHOW_ERROR: u32 = WM_APP + 3;
 const TRAY_ICON_ID: u32 = 1;
 const APPLICATION_ICON_RESOURCE_ID: usize = 1;
@@ -48,6 +49,7 @@ const COMMAND_OPEN_LAST: usize = 1_006;
 const COMMAND_SHOW_IN_FOLDER: usize = 1_007;
 const COMMAND_PRUNE_HISTORY: usize = 1_008;
 const COMMAND_EXIT: usize = 1_009;
+const COMMAND_FILE_OUTPUT: usize = 1_010;
 const SESSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(4);
 const TRAY_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const TRAY_STOP_POLL: Duration = Duration::from_millis(5);
@@ -68,6 +70,8 @@ pub enum TrayEvent {
     ShowInFolder,
     /// Apply retention now, rather than waiting for the next capture to do it.
     PruneHistory,
+    /// Start or stop writing captures to disk, and remember which the user chose.
+    ToggleFileOutput,
     ToggleStartup,
     Exit,
 }
@@ -83,7 +87,7 @@ pub struct TrayIcon {
 }
 
 impl TrayIcon {
-    pub fn start(startup_enabled: bool) -> Result<Self, CaptureError> {
+    pub fn start(startup_enabled: bool, file_output_enabled: bool) -> Result<Self, CaptureError> {
         let (event_sender, receiver) = mpsc::sync_channel(8);
         let (notification_sender, notification_receiver) = mpsc::sync_channel(8);
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
@@ -98,6 +102,7 @@ impl TrayIcon {
                     event_sender,
                     notification_receiver,
                     startup_enabled,
+                    file_output_enabled,
                     tray_shutdown_requested,
                     tray_drain_completed,
                     &ready_sender,
@@ -151,6 +156,25 @@ impl TrayIcon {
             )
         }
         .map_err(|error| native_error("update_startup_menu", error))
+    }
+
+    /// Tells the tray whether captures are currently being written to disk, which is what the
+    /// checkmark beside `Save Captures to Disk` reports.
+    ///
+    /// Posted by the daemon after it has actually started or stopped the file worker, never
+    /// speculatively from the click: a failed start must leave the item unchecked, because the
+    /// checkmark is a statement about where the next capture will go.
+    pub fn set_file_output_enabled(&self, enabled: bool) -> Result<(), CaptureError> {
+        // SAFETY: hwnd identifies the live hidden tray window owned by the tray thread.
+        unsafe {
+            PostMessageW(
+                HWND(self.hwnd),
+                TRAY_SET_FILE_OUTPUT,
+                WPARAM(usize::from(enabled)),
+                LPARAM(0),
+            )
+        }
+        .map_err(|error| native_error("update_file_output_menu", error))
     }
 
     /// Tells the tray whether there is a remembered capture, which decides whether the history
@@ -271,6 +295,7 @@ fn run_tray(
     event_sender: SyncSender<TrayEvent>,
     notification_receiver: Receiver<TrayNotification>,
     startup_enabled: bool,
+    file_output_enabled: bool,
     session_shutdown_requested: Arc<AtomicBool>,
     session_drain_completed: Arc<AtomicBool>,
     ready_sender: &SyncSender<Result<(u32, isize), CaptureError>>,
@@ -305,7 +330,7 @@ fn run_tray(
         taskbar_created,
         session_shutdown_requested,
         session_drain_completed,
-        model: machine::TrayModel::new(startup_enabled),
+        model: machine::TrayModel::new(startup_enabled, file_output_enabled),
     });
     let state_pointer = Box::into_raw(state);
     // SAFETY: The registered class is live and state_pointer remains allocated through the loop.
@@ -447,6 +472,10 @@ mod machine {
     pub(super) struct TrayModel {
         pub(super) paused: bool,
         pub(super) startup_enabled: bool,
+        /// Whether captures are currently being written to disk. Owned by the daemon, which is
+        /// the only thing that knows whether the file worker actually started, and reported here
+        /// through [`TrayInput::FileOutputChanged`].
+        pub(super) file_output_enabled: bool,
         pub(super) has_history: bool,
         pub(super) icon: IconState,
         pub(super) session: SessionPhase,
@@ -458,10 +487,11 @@ mod machine {
     }
 
     impl TrayModel {
-        pub(super) fn new(startup_enabled: bool) -> Self {
+        pub(super) fn new(startup_enabled: bool, file_output_enabled: bool) -> Self {
             Self {
                 paused: false,
                 startup_enabled,
+                file_output_enabled,
                 // Nothing is known about history until the daemon reports it.
                 has_history: false,
                 icon: IconState::Absent,
@@ -502,6 +532,7 @@ mod machine {
         IconContextMenu,
         Menu(TrayMenuCommand),
         StartupStateChanged(bool),
+        FileOutputChanged(bool),
         HistoryAvailabilityChanged(bool),
         NotificationsPosted,
         QueryEndSession,
@@ -525,6 +556,7 @@ mod machine {
         OpenLastCapture,
         ShowInFolder,
         PruneHistory,
+        ToggleFileOutput,
         ToggleStartup,
         Exit,
     }
@@ -546,6 +578,9 @@ mod machine {
         ShowMenu {
             paused: bool,
             startup_enabled: bool,
+            /// Whether captures are being written to disk, which decides whether
+            /// `Save Captures to Disk` is shown checked.
+            file_output_enabled: bool,
             /// Whether there is a remembered capture to open, which decides whether the history
             /// entries are usable or greyed.
             has_history: bool,
@@ -618,6 +653,7 @@ mod machine {
                 vec![TrayEffect::ShowMenu {
                     paused: model.paused,
                     startup_enabled: model.startup_enabled,
+                    file_output_enabled: model.file_output_enabled,
                     has_history: model.has_history,
                 }],
                 Handled,
@@ -657,6 +693,13 @@ mod machine {
                 vec![TrayEffect::SendEvent(TrayEvent::PruneHistory)],
                 Handled,
             ),
+            TrayInput::Menu(TrayMenuCommand::ToggleFileOutput) => (
+                // Reported, not applied: only the daemon can start the file worker, and only it
+                // knows whether the directory was writable. The model's flag waits for
+                // `FileOutputChanged` rather than assuming the click succeeded.
+                vec![TrayEffect::SendEvent(TrayEvent::ToggleFileOutput)],
+                Handled,
+            ),
             TrayInput::Menu(TrayMenuCommand::ToggleStartup) => (
                 vec![TrayEffect::SendEvent(TrayEvent::ToggleStartup)],
                 Handled,
@@ -667,6 +710,11 @@ mod machine {
             }
             TrayInput::StartupStateChanged(enabled) => {
                 model.startup_enabled = enabled;
+                (Vec::new(), Handled)
+            }
+            TrayInput::FileOutputChanged(enabled) => {
+                // Like the history flag: read when the menu is next opened, so nothing redraws.
+                model.file_output_enabled = enabled;
                 (Vec::new(), Handled)
             }
             TrayInput::HistoryAvailabilityChanged(has_history) => {
@@ -838,6 +886,9 @@ fn translate_tray_message(
             COMMAND_PRUNE_HISTORY => {
                 TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::PruneHistory))
             }
+            COMMAND_FILE_OUTPUT => {
+                TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::ToggleFileOutput))
+            }
             COMMAND_STARTUP => {
                 TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::ToggleStartup))
             }
@@ -845,6 +896,9 @@ fn translate_tray_message(
             _ => TranslatedMessage::Consumed,
         },
         TRAY_SET_STARTUP => TranslatedMessage::Input(TrayInput::StartupStateChanged(wparam.0 != 0)),
+        TRAY_SET_FILE_OUTPUT => {
+            TranslatedMessage::Input(TrayInput::FileOutputChanged(wparam.0 != 0))
+        }
         TRAY_SET_HAS_HISTORY => {
             TranslatedMessage::Input(TrayInput::HistoryAvailabilityChanged(wparam.0 != 0))
         }
@@ -914,9 +968,16 @@ fn apply_tray_effect(hwnd: HWND, state_pointer: *mut TrayState, effect: machine:
         TrayEffect::ShowMenu {
             paused,
             startup_enabled,
+            file_output_enabled,
             has_history,
         } => {
-            if let Err(error) = show_context_menu(hwnd, paused, startup_enabled, has_history) {
+            if let Err(error) = show_context_menu(
+                hwnd,
+                paused,
+                startup_enabled,
+                file_output_enabled,
+                has_history,
+            ) {
                 log::warn!("failed to show tray menu: {error}");
             }
         }
@@ -1140,6 +1201,7 @@ fn show_context_menu(
     hwnd: HWND,
     paused: bool,
     startup_enabled: bool,
+    file_output_enabled: bool,
     has_history: bool,
 ) -> Result<(), CaptureError> {
     // SAFETY: Creates an empty popup menu owned by this function.
@@ -1167,6 +1229,23 @@ fn show_context_menu(
         // SAFETY: menu and static labels are live for each call.
         unsafe { AppendMenuW(menu, MF_STRING, COMMAND_LOGS, w!("Open Logs")) }
             .map_err(|error| native_error("append_logs_menu", error))?;
+        let file_output_flags = if file_output_enabled {
+            MF_STRING | MF_CHECKED
+        } else {
+            MF_STRING
+        };
+        // Directly above the entries that read what it produces: checked, the three below it fill
+        // up; unchecked, they are the reason there is nothing to open.
+        // SAFETY: menu and static label are live for the call.
+        unsafe {
+            AppendMenuW(
+                menu,
+                file_output_flags,
+                COMMAND_FILE_OUTPUT,
+                w!("Save Captures to Disk"),
+            )
+        }
+        .map_err(|error| native_error("append_file_output_menu", error))?;
         // Greyed rather than hidden when there is nothing to open: a menu whose shape changes
         // under you is harder to use than one whose items are visibly unavailable.
         let history_flags = if has_history {
@@ -1570,6 +1649,12 @@ mod tests {
             ),
             (
                 WM_COMMAND,
+                COMMAND_FILE_OUTPUT,
+                0,
+                TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::ToggleFileOutput)),
+            ),
+            (
+                WM_COMMAND,
                 COMMAND_STARTUP,
                 0,
                 TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::ToggleStartup)),
@@ -1592,6 +1677,18 @@ mod tests {
                 0,
                 0,
                 TranslatedMessage::Input(TrayInput::StartupStateChanged(false)),
+            ),
+            (
+                TRAY_SET_FILE_OUTPUT,
+                1,
+                0,
+                TranslatedMessage::Input(TrayInput::FileOutputChanged(true)),
+            ),
+            (
+                TRAY_SET_FILE_OUTPUT,
+                0,
+                0,
+                TranslatedMessage::Input(TrayInput::FileOutputChanged(false)),
             ),
             (
                 TRAY_SHOW_ERROR,
@@ -1649,7 +1746,7 @@ mod tests {
             (TrayMenuCommand::Exit, TrayEvent::Exit),
         ];
         for (command, event) in cases {
-            let mut model = TrayModel::new(false);
+            let mut model = TrayModel::new(false, false);
             let (effects, disposition) = transition(&mut model, TrayInput::Menu(command));
             assert_eq!(effects, vec![TrayEffect::SendEvent(event)], "{command:?}");
             assert_eq!(disposition, MessageDisposition::Handled);
@@ -1662,7 +1759,7 @@ mod tests {
             TrayInput::IconDoubleClick,
             TrayInput::Menu(TrayMenuCommand::Capture),
         ] {
-            let mut model = TrayModel::new(false);
+            let mut model = TrayModel::new(false, false);
             let (effects, _) = transition(&mut model, input.clone());
             assert_eq!(effects, vec![TrayEffect::SendEvent(TrayEvent::Capture)]);
 
@@ -1674,7 +1771,7 @@ mod tests {
 
     #[test]
     fn pausing_updates_the_tooltip_before_the_daemon_hears_about_it() {
-        let mut model = TrayModel::new(false);
+        let mut model = TrayModel::new(false, false);
         model.icon = IconState::Present;
         let (effects, _) = transition(&mut model, TrayInput::Menu(TrayMenuCommand::Pause));
         assert!(model.paused);
@@ -1699,7 +1796,7 @@ mod tests {
 
     #[test]
     fn repeated_session_queries_create_one_block_reason() {
-        let mut model = TrayModel::new(false);
+        let mut model = TrayModel::new(false, false);
         let (effects, disposition) = transition(&mut model, TrayInput::QueryEndSession);
         assert_eq!(effects, vec![TrayEffect::CreateShutdownBlockReason]);
         assert_eq!(disposition, MessageDisposition::AllowSessionEnd);
@@ -1712,7 +1809,7 @@ mod tests {
 
     #[test]
     fn a_canceled_session_shutdown_releases_the_block_without_draining() {
-        let mut model = TrayModel::new(false);
+        let mut model = TrayModel::new(false, false);
         let _ = transition(&mut model, TrayInput::QueryEndSession);
         let (effects, _) = transition(&mut model, TrayInput::EndSession { committed: false });
         // No WaitForSessionDrain: the daemon never hears about a shutdown Windows abandoned.
@@ -1726,7 +1823,7 @@ mod tests {
 
     #[test]
     fn a_committed_session_shutdown_drains_before_releasing_the_block() {
-        let mut model = TrayModel::new(false);
+        let mut model = TrayModel::new(false, false);
         let _ = transition(&mut model, TrayInput::QueryEndSession);
         let (effects, _) = transition(&mut model, TrayInput::EndSession { committed: true });
         assert_eq!(
@@ -1741,7 +1838,7 @@ mod tests {
 
     #[test]
     fn session_end_without_a_query_still_drains_but_owes_no_block_reason() {
-        let mut model = TrayModel::new(false);
+        let mut model = TrayModel::new(false, false);
         let (effects, _) = transition(&mut model, TrayInput::EndSession { committed: true });
         assert_eq!(effects, vec![TrayEffect::WaitForSessionDrain]);
 
@@ -1751,7 +1848,7 @@ mod tests {
 
     #[test]
     fn history_commands_reach_the_daemon_as_events() {
-        let mut model = TrayModel::new(false);
+        let mut model = TrayModel::new(false, false);
         for (command, expected) in [
             (TrayMenuCommand::OpenLastCapture, TrayEvent::OpenLastCapture),
             (TrayMenuCommand::ShowInFolder, TrayEvent::ShowInFolder),
@@ -1767,13 +1864,14 @@ mod tests {
     fn the_menu_learns_whether_there_is_a_capture_to_open() {
         // The entries are greyed until the daemon says otherwise, so a fresh install does not
         // offer to open something that does not exist.
-        let mut model = TrayModel::new(false);
+        let mut model = TrayModel::new(false, false);
         let (effects, _) = transition(&mut model, TrayInput::IconContextMenu);
         assert_eq!(
             effects,
             vec![TrayEffect::ShowMenu {
                 paused: false,
                 startup_enabled: false,
+                file_output_enabled: false,
                 has_history: false,
             }]
         );
@@ -1790,6 +1888,7 @@ mod tests {
             vec![TrayEffect::ShowMenu {
                 paused: false,
                 startup_enabled: false,
+                file_output_enabled: false,
                 has_history: true,
             }]
         );
@@ -1797,13 +1896,14 @@ mod tests {
 
     #[test]
     fn menu_snapshots_track_state_mutated_while_the_menu_was_open() {
-        let mut model = TrayModel::new(true);
+        let mut model = TrayModel::new(true, false);
         let (effects, _) = transition(&mut model, TrayInput::IconContextMenu);
         assert_eq!(
             effects,
             vec![TrayEffect::ShowMenu {
                 paused: false,
                 startup_enabled: true,
+                file_output_enabled: false,
                 has_history: false,
             }]
         );
@@ -1820,6 +1920,7 @@ mod tests {
             vec![TrayEffect::ShowMenu {
                 paused: true,
                 startup_enabled: false,
+                file_output_enabled: false,
                 has_history: true,
             }]
         );
@@ -1834,7 +1935,7 @@ mod tests {
             (IconState::Degraded, false, IconState::Degraded),
         ];
         for (initial, restored, expected) in cases {
-            let mut model = TrayModel::new(false);
+            let mut model = TrayModel::new(false, false);
             model.icon = initial;
             model.paused = true;
             let (effects, _) = transition(&mut model, TrayInput::TaskbarCreated);
@@ -1853,7 +1954,7 @@ mod tests {
 
     #[test]
     fn close_requests_exit_without_destroying_the_window() {
-        let mut model = TrayModel::new(false);
+        let mut model = TrayModel::new(false, false);
         let (effects, disposition) = transition(&mut model, TrayInput::CloseRequested);
         assert_eq!(effects, vec![TrayEffect::SendEvent(TrayEvent::Exit)]);
         assert_eq!(disposition, MessageDisposition::Handled);
@@ -1867,7 +1968,7 @@ mod tests {
     #[test]
     fn nim_modify_effects_are_suppressed_while_the_icon_is_missing() {
         for icon in [IconState::Absent, IconState::Degraded] {
-            let mut model = TrayModel::new(false);
+            let mut model = TrayModel::new(false, false);
             model.icon = icon;
             // The pause decision still happens and the daemon still hears it; only the tooltip
             // write against the nonexistent icon is suppressed.
@@ -1885,7 +1986,7 @@ mod tests {
         }
 
         // With the icon present both effects flow unchanged.
-        let mut model = TrayModel::new(false);
+        let mut model = TrayModel::new(false, false);
         model.icon = IconState::Present;
         let (effects, _) = transition(&mut model, TrayInput::Menu(TrayMenuCommand::Pause));
         assert_eq!(
@@ -1901,7 +2002,7 @@ mod tests {
 
     #[test]
     fn a_restored_icon_flushes_notifications_queued_during_the_outage() {
-        let mut model = TrayModel::new(false);
+        let mut model = TrayModel::new(false, false);
         model.icon = IconState::Degraded;
         let (effects, _) = transition(&mut model, TrayInput::IconAddCompleted { restored: true });
         assert_eq!(effects, vec![TrayEffect::DrainNotifications]);
@@ -1919,7 +2020,7 @@ mod tests {
         // The tooltip is an input to NIM_ADD itself: AddIcon snapshots the live pause flag when
         // TaskbarCreated arrives, so the re-added icon is born with the right text and no
         // post-restore ModifyTooltip refresh is owed for the writes suppressed during the outage.
-        let mut model = TrayModel::new(false);
+        let mut model = TrayModel::new(false, false);
         model.icon = IconState::Degraded;
         let _ = transition(&mut model, TrayInput::Menu(TrayMenuCommand::Pause));
         let (effects, _) = transition(&mut model, TrayInput::TaskbarCreated);
@@ -1929,13 +2030,13 @@ mod tests {
     #[test]
     fn a_dying_window_settles_the_block_reason_it_still_owes() {
         // Destroyed outside the handshake owes nothing.
-        let mut model = TrayModel::new(false);
+        let mut model = TrayModel::new(false, false);
         let (effects, _) = transition(&mut model, TrayInput::Destroyed);
         assert_eq!(effects, vec![TrayEffect::PostQuit]);
 
         // Destroyed mid-handshake (daemon stop, menu Exit, panic recovery): the destroy that
         // WM_ENDSESSION never got to perform runs before the quit, while the handle is valid.
-        let mut model = TrayModel::new(false);
+        let mut model = TrayModel::new(false, false);
         let _ = transition(&mut model, TrayInput::QueryEndSession);
         let (effects, _) = transition(&mut model, TrayInput::Destroyed);
         assert_eq!(
@@ -1948,7 +2049,7 @@ mod tests {
     #[test]
     fn a_settled_session_handshake_is_not_double_destroyed_at_teardown() {
         for committed in [false, true] {
-            let mut model = TrayModel::new(false);
+            let mut model = TrayModel::new(false, false);
             let _ = transition(&mut model, TrayInput::QueryEndSession);
             let _ = transition(&mut model, TrayInput::EndSession { committed });
             let (effects, _) = transition(&mut model, TrayInput::Destroyed);
@@ -1957,8 +2058,90 @@ mod tests {
     }
 
     #[test]
+    fn saving_to_disk_is_reported_to_the_daemon_and_checked_only_once_it_agrees() {
+        // The click is a request, not a decision: the daemon owns the file worker, and only it
+        // knows whether the output directory could be created.
+        let mut model = TrayModel::new(false, false);
+        let (effects, handled) = transition(
+            &mut model,
+            TrayInput::Menu(TrayMenuCommand::ToggleFileOutput),
+        );
+        assert_eq!(handled, MessageDisposition::Handled);
+        assert_eq!(
+            effects,
+            vec![TrayEffect::SendEvent(TrayEvent::ToggleFileOutput)]
+        );
+        assert!(
+            !model.file_output_enabled,
+            "the click alone must not check the item"
+        );
+
+        // A start that failed sends nothing back, so the next menu still shows it unchecked and
+        // the user is not told captures are being saved when they are not.
+        let (effects, _) = transition(&mut model, TrayInput::IconContextMenu);
+        assert_eq!(
+            effects,
+            vec![TrayEffect::ShowMenu {
+                paused: false,
+                startup_enabled: false,
+                file_output_enabled: false,
+                has_history: false,
+            }]
+        );
+
+        // Once the worker is running the daemon says so, and like the history flag it redraws
+        // nothing: the menu reads it when it next opens.
+        let (effects, handled) = transition(&mut model, TrayInput::FileOutputChanged(true));
+        assert_eq!(handled, MessageDisposition::Handled);
+        assert!(effects.is_empty());
+        let (effects, _) = transition(&mut model, TrayInput::IconContextMenu);
+        assert_eq!(
+            effects,
+            vec![TrayEffect::ShowMenu {
+                paused: false,
+                startup_enabled: false,
+                file_output_enabled: true,
+                has_history: false,
+            }]
+        );
+
+        // Turning it off is the same shape in reverse; nothing in the model toggles itself.
+        let (effects, _) = transition(
+            &mut model,
+            TrayInput::Menu(TrayMenuCommand::ToggleFileOutput),
+        );
+        assert_eq!(
+            effects,
+            vec![TrayEffect::SendEvent(TrayEvent::ToggleFileOutput)]
+        );
+        assert!(
+            model.file_output_enabled,
+            "still on until the daemon stops it"
+        );
+        let _ = transition(&mut model, TrayInput::FileOutputChanged(false));
+        assert!(!model.file_output_enabled);
+    }
+
+    #[test]
+    fn a_daemon_that_starts_with_file_output_on_opens_the_menu_checked() {
+        // `output.enabled = true` in the configuration: the first menu the user opens has to
+        // agree with where their captures have been going since startup.
+        let mut model = TrayModel::new(false, true);
+        let (effects, _) = transition(&mut model, TrayInput::IconContextMenu);
+        assert_eq!(
+            effects,
+            vec![TrayEffect::ShowMenu {
+                paused: false,
+                startup_enabled: false,
+                file_output_enabled: true,
+                has_history: false,
+            }]
+        );
+    }
+
+    #[test]
     fn display_reconfiguration_messages_invalidate_the_capture_topology() {
-        let mut model = TrayModel::new(false);
+        let mut model = TrayModel::new(false, false);
         let (effects, _) = transition(&mut model, TrayInput::DisplayChanged);
         assert_eq!(
             effects,
