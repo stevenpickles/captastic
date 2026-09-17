@@ -935,6 +935,7 @@ fn load_optional_one_shot_ui_state(
 }
 
 fn benchmark(args: BenchmarkArgs) -> Result<(), AppError> {
+    args.validate()?;
     let display_policy = resolve_display_policy(&args.display)?;
     let mut native_backend = if args.backend == "fake" {
         None
@@ -997,7 +998,7 @@ fn benchmark(args: BenchmarkArgs) -> Result<(), AppError> {
         drop(native_backend.take());
         let backend_name = args.backend.clone();
         let display_policy = display_policy.clone();
-        let repeated = benchmark::run_repeated(&options, args.repeat, move || {
+        let runs = benchmark::run_repeated(&options, args.repeat, move || {
             create_backend(&backend_name, &display_policy)
         })?;
         // Budgets apply to a repeat set too, and per run rather than to their average: a mean
@@ -1007,20 +1008,34 @@ fn benchmark(args: BenchmarkArgs) -> Result<(), AppError> {
         let budget_outcomes = args
             .budgets
             .as_deref()
-            .map(|path| budget::load(path).map(|file| budget::evaluate_each(&file, &repeated.runs)))
+            .map(|path| {
+                budget::load(path).map(|file| budget::evaluate_each(&file, &runs.repeated.runs))
+            })
             .transpose()?;
-        let combined = serde_json::json!({
-            "repeated": &repeated,
-            "budgets": &budget_outcomes,
-        });
+        // One typed envelope, printed and written. The hand-built JSON object this replaced meant
+        // the file an operator commits and the JSON the command prints were assembled separately,
+        // so nothing stopped them drifting - and nothing could read either of them back.
+        let combined = benchmark::RepeatedBenchmarkFile {
+            schema_version: benchmark::REPEATED_FILE_SCHEMA_VERSION,
+            repeated: runs.repeated,
+            budgets: budget_outcomes,
+        };
         if let Some(path) = args.output_results.as_deref() {
             benchmark::write_json(path, &combined)?;
+        }
+        if let Some(directory) = args.output_dir.as_deref() {
+            benchmark::write_repeat_artifacts(
+                directory,
+                &combined,
+                &runs.events,
+                args.raw_events.is_some(),
+            )?;
         }
         if args.json {
             println!("{}", serde_json::to_string_pretty(&combined)?);
         } else {
-            report_repeated(&repeated);
-            if let Some(outcomes) = budget_outcomes.as_deref() {
+            report_repeated(&combined.repeated);
+            if let Some(outcomes) = combined.budgets.as_deref() {
                 for (index, outcome) in outcomes.iter().enumerate() {
                     let heading = format!("run {}", index + 1);
                     if outcome.applied() {
@@ -1031,12 +1046,16 @@ fn benchmark(args: BenchmarkArgs) -> Result<(), AppError> {
                 }
             }
         }
-        if !repeated.incompatibilities.is_empty() {
+        if !combined.repeated.incompatibilities.is_empty() {
             return Err(AppError::InvalidArgument(
                 "repeat runs are not comparable; see the reported differences".to_owned(),
             ));
         }
-        if budget_outcomes.as_deref().is_some_and(budget::any_breached) {
+        if combined
+            .budgets
+            .as_deref()
+            .is_some_and(budget::any_breached)
+        {
             return Err(AppError::InvalidArgument(
                 "a repeat run breached a performance budget that applies to this host".to_owned(),
             ));
@@ -1413,6 +1432,19 @@ fn report_repeated(repeated: &benchmark::RepeatedBenchmark) {
             "  CPU frame p50 spread {:.1}% across {:?} ns",
             agreement.cpu_p50_spread_percent,
             agreement.cpu_p50_ns
+        );
+    }
+    // Every stage, at every percentile a claim gets quoted at. The acceptance rule the claim
+    // procedure states is "every stage agreed", and a reader who is shown only the two stages
+    // above cannot apply it - a set whose medians agree and whose tails do not looks identical.
+    for stage in &agreement.stages {
+        log::info!(
+            "  {} spread: p50 {:.1}%, p95 {:.1}%, p99 {:.1}% (p50 {:?} ns)",
+            stage.stage,
+            stage.p50_spread_percent,
+            stage.p95_spread_percent,
+            stage.p99_spread_percent,
+            stage.p50_ns
         );
     }
 }

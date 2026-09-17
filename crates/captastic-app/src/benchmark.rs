@@ -273,10 +273,87 @@ pub struct RepeatAgreement {
     pub cpu_p50_spread_percent: f64,
     pub total_successes: usize,
     pub total_failures: usize,
+    /// Every stage the pipeline reports, each with its own spread.
+    ///
+    /// The two fields above cover the two stages a claim has historically quoted, and they stay
+    /// because tooling and the human summary read them by name. They are not enough to accept a
+    /// run set: the acceptance rule is "every stage agreed", and a native frame that repeated to
+    /// within 2 % beside a trigger-to-dequeue that swung by 60 % is a set whose quiet stage was
+    /// the only one anybody looked at.
+    pub stages: Vec<StageAgreement>,
+}
+
+/// One pipeline stage across the repeats, at each percentile a claim is quoted at.
+///
+/// p95 and p99 are here because the spread of the tail is not the spread of the median. A capture
+/// tool's felt regression is an occasional stutter, so a set whose medians agree and whose tails do
+/// not is exactly the set that must not be accepted on the strength of its medians.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct StageAgreement {
+    /// `trigger_to_dequeue`, `native_frame`, `cpu_frame`, `readback`, or `frame_age`.
+    pub stage: String,
+    pub p50_ns: Vec<u64>,
+    pub p50_spread_percent: f64,
+    pub p95_ns: Vec<u64>,
+    pub p95_spread_percent: f64,
+    pub p99_ns: Vec<u64>,
+    pub p99_spread_percent: f64,
+}
+
+/// The five latency stages a report carries, in pipeline order, named once.
+///
+/// One list rather than five hand-written field accesses per consumer: a stage added to the report
+/// and forgotten in the agreement summary is a stage nobody checks the spread of, and `compare`
+/// would silently stop comparing it too.
+pub(crate) fn stage_summaries(
+    report: &BenchmarkReport,
+) -> [(&'static str, Option<&LatencySummary>); 5] {
+    [
+        (
+            "trigger_to_dequeue",
+            Some(&report.trigger_to_dequeue_latency),
+        ),
+        ("native_frame", Some(&report.native_frame_latency)),
+        ("cpu_frame", report.cpu_frame_latency.as_ref()),
+        ("readback", report.readback_latency.as_ref()),
+        ("frame_age", Some(&report.frame_age)),
+    ]
+}
+
+/// The per-stage agreement of a set of runs, skipping stages no run measured.
+fn stage_agreements(runs: &[BenchmarkReport]) -> Vec<StageAgreement> {
+    let Some(first) = runs.first() else {
+        return Vec::new();
+    };
+    let mut agreements = Vec::new();
+    for (index, (stage, _)) in stage_summaries(first).into_iter().enumerate() {
+        let summaries: Vec<&LatencySummary> = runs
+            .iter()
+            .filter_map(|run| stage_summaries(run)[index].1)
+            .collect();
+        if summaries.is_empty() {
+            // `--cpu-frame false` leaves two of the five unmeasured. Reporting them as a spread of
+            // zero would read as perfect agreement about nothing.
+            continue;
+        }
+        let p50: Vec<u64> = summaries.iter().map(|summary| summary.p50_ns).collect();
+        let p95: Vec<u64> = summaries.iter().map(|summary| summary.p95_ns).collect();
+        let p99: Vec<u64> = summaries.iter().map(|summary| summary.p99_ns).collect();
+        agreements.push(StageAgreement {
+            stage: stage.to_owned(),
+            p50_spread_percent: spread_percent(&p50),
+            p50_ns: p50,
+            p95_spread_percent: spread_percent(&p95),
+            p95_ns: p95,
+            p99_spread_percent: spread_percent(&p99),
+            p99_ns: p99,
+        });
+    }
+    agreements
 }
 
 /// Spread as a percentage of the smallest sample, or zero when there is nothing to compare.
-fn spread_percent(samples: &[u64]) -> f64 {
+pub(crate) fn spread_percent(samples: &[u64]) -> f64 {
     let Some(smallest) = samples.iter().copied().min() else {
         return 0.0;
     };
@@ -289,24 +366,56 @@ fn spread_percent(samples: &[u64]) -> f64 {
     ((largest - smallest) as f64 / smallest as f64) * 100.0
 }
 
+/// A repeat set and the raw events each of its runs produced.
+///
+/// The events travel beside the reports rather than inside them because a report is a file on
+/// disk with a fixed shape, and an event stream is hundreds of thousands of lines. `events[i]`
+/// belongs to `repeated.runs[i]`.
+pub struct RepeatedBenchmarkRuns {
+    pub repeated: RepeatedBenchmark,
+    pub events: Vec<Vec<PerfEvent>>,
+}
+
+/// A repeat set as it is written to `repeated.json` and read back by `benchmark compare`.
+///
+/// A typed envelope rather than the hand-built JSON object this used to print: the file an
+/// operator commits as a baseline and the JSON the command prints are now the same struct, so
+/// they cannot drift apart, and the file has a schema version like everything else that is kept.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct RepeatedBenchmarkFile {
+    pub schema_version: u32,
+    pub repeated: RepeatedBenchmark,
+    /// The budget verdict per run, when `--budgets` was given. `null` when it was not.
+    pub budgets: Option<Vec<crate::budget::BudgetOutcome>>,
+}
+
+/// The schema version of `repeated.json` and of the `--repeat` stdout envelope.
+pub const REPEATED_FILE_SCHEMA_VERSION: u32 = 1;
+
 /// Runs the benchmark `repeat` times and reports whether the results may be compared at all.
 pub fn run_repeated(
     options: &BenchmarkOptions,
     repeat: usize,
     mut make_backend: impl FnMut() -> Result<Box<dyn CaptureBackend>, AppError>,
-) -> Result<RepeatedBenchmark, AppError> {
+) -> Result<RepeatedBenchmarkRuns, AppError> {
     if repeat == 0 {
         return Err(AppError::InvalidArgument(
             "repeat must be greater than zero".to_owned(),
         ));
     }
     let mut runs = Vec::with_capacity(repeat);
+    let mut events = Vec::with_capacity(repeat);
     for _ in 0..repeat {
         // A fresh backend per run, because a warm one is a different measurement: the first
         // capture allocates a staging texture and a CPU slot, and reusing one across repeats
         // would hide that cost in every run but the first.
         let mut backend = make_backend()?;
-        runs.push(run_with_backend(backend.as_mut(), options)?.report);
+        // The events are kept, not dropped. Discarding them here is what made `--raw-events`
+        // silently do nothing under `--repeat`, which is the combination an operator collecting
+        // evidence actually runs: the flag was accepted, no file appeared, and nothing said why.
+        let run = run_with_backend(backend.as_mut(), options)?;
+        runs.push(run.report);
+        events.push(run.events);
     }
 
     let compatibility = RunCompatibility::of(&runs[0]);
@@ -334,16 +443,51 @@ pub fn run_repeated(
             cpu_p50_ns: cpu,
             total_successes: runs.iter().map(|run| run.successes).sum(),
             total_failures: runs.iter().map(|run| run.failures).sum(),
+            stages: stage_agreements(&runs),
         }
     });
 
-    Ok(RepeatedBenchmark {
-        schema_version: 1,
-        runs,
-        compatibility,
-        incompatibilities,
-        agreement,
+    Ok(RepeatedBenchmarkRuns {
+        repeated: RepeatedBenchmark {
+            schema_version: 1,
+            runs,
+            compatibility,
+            incompatibilities,
+            agreement,
+        },
+        events,
     })
+}
+
+/// Writes every repeat's raw artifacts into one directory, plus the typed set file.
+///
+/// One directory per set rather than one file per flag: the evidence for a published figure is the
+/// runs *and* their event streams *and* the budget verdict, and a baseline committed to the
+/// repository as three unrelated paths is one somebody reassembles by hand a year later.
+///
+/// `run-N.json` is a whole `BenchmarkReport`, so any one run can be compared on its own.
+pub fn write_repeat_artifacts(
+    directory: &Path,
+    file: &RepeatedBenchmarkFile,
+    events: &[Vec<PerfEvent>],
+    write_events: bool,
+) -> Result<(), AppError> {
+    fs::create_dir_all(directory).map_err(|source| AppError::Write {
+        path: directory.display().to_string(),
+        source,
+    })?;
+    for (index, report) in file.repeated.runs.iter().enumerate() {
+        write_json(&directory.join(format!("run-{}.json", index + 1)), report)?;
+        if write_events {
+            if let Some(events) = events.get(index) {
+                write_json_lines(
+                    &directory.join(format!("run-{}.events.jsonl", index + 1)),
+                    events,
+                )?;
+            }
+        }
+    }
+    write_json(&directory.join("repeated.json"), file)
 }
 
 pub fn run(options: &BenchmarkOptions) -> Result<BenchmarkRun, AppError> {
@@ -617,10 +761,11 @@ mod tests {
         // Three runs of the same question. The spread is what a performance claim rests on: a
         // mean alone would look identical whether the runs agreed or disagreed wildly.
         let options = instant_options(CursorMode::Exclude);
-        let repeated = run_repeated(&options, 3, || {
+        let runs = run_repeated(&options, 3, || {
             Ok(Box::new(FakeBackend::new(options.fake.clone())) as Box<dyn CaptureBackend>)
         })
         .expect("three runs");
+        let repeated = runs.repeated;
 
         assert_eq!(repeated.runs.len(), 3);
         assert!(repeated.incompatibilities.is_empty());
@@ -629,6 +774,123 @@ mod tests {
         assert_eq!(agreement.native_p50_ns.len(), 3);
         assert_eq!(agreement.total_successes, 9);
         assert_eq!(agreement.total_failures, 0);
+
+        // Every stage the run measured has its own spread, at every percentile. The two fields
+        // above cover two of the five, and a set is accepted on all of them.
+        let stages: Vec<&str> = agreement
+            .stages
+            .iter()
+            .map(|stage| stage.stage.as_str())
+            .collect();
+        assert_eq!(
+            stages,
+            [
+                "trigger_to_dequeue",
+                "native_frame",
+                "cpu_frame",
+                "readback",
+                "frame_age"
+            ]
+        );
+        for stage in &agreement.stages {
+            assert_eq!(stage.p50_ns.len(), 3, "{}", stage.stage);
+            assert_eq!(stage.p95_ns.len(), 3, "{}", stage.stage);
+            assert_eq!(stage.p99_ns.len(), 3, "{}", stage.stage);
+        }
+        let native = agreement
+            .stages
+            .iter()
+            .find(|stage| stage.stage == "native_frame")
+            .expect("the native stage is summarised");
+        assert_eq!(native.p50_ns, agreement.native_p50_ns);
+        assert_eq!(
+            native.p50_spread_percent,
+            agreement.native_p50_spread_percent
+        );
+    }
+
+    #[test]
+    fn a_run_without_a_cpu_frame_reports_no_spread_for_the_stages_it_never_measured() {
+        // Zero would read as perfect agreement about a stage nothing timed.
+        let options = BenchmarkOptions {
+            cpu_frame: false,
+            ..instant_options(CursorMode::Exclude)
+        };
+        let runs = run_repeated(&options, 2, || {
+            Ok(Box::new(FakeBackend::new(options.fake.clone())) as Box<dyn CaptureBackend>)
+        })
+        .expect("two runs");
+        let agreement = runs
+            .repeated
+            .agreement
+            .expect("compatible runs are summarised");
+        let stages: Vec<&str> = agreement
+            .stages
+            .iter()
+            .map(|stage| stage.stage.as_str())
+            .collect();
+        assert_eq!(stages, ["trigger_to_dequeue", "native_frame", "frame_age"]);
+    }
+
+    #[test]
+    fn every_repeat_leaves_its_own_artifacts_behind() {
+        // `--raw-events` under `--repeat` wrote nothing at all: the events were dropped inside
+        // `run_repeated` before anything could ask for them. An operator collecting the evidence
+        // for a published figure got a silent no-op in the one combination they actually run.
+        let directory = std::env::temp_dir().join(format!(
+            "captastic-benchmark-artifacts-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.subsec_nanos())
+                .unwrap_or_default()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+
+        let options = instant_options(CursorMode::Exclude);
+        let runs = run_repeated(&options, 3, || {
+            Ok(Box::new(FakeBackend::new(options.fake.clone())) as Box<dyn CaptureBackend>)
+        })
+        .expect("three runs");
+        assert_eq!(runs.events.len(), 3);
+        assert!(runs.events.iter().all(|events| !events.is_empty()));
+
+        let file = RepeatedBenchmarkFile {
+            schema_version: REPEATED_FILE_SCHEMA_VERSION,
+            repeated: runs.repeated,
+            budgets: None,
+        };
+        write_repeat_artifacts(&directory, &file, &runs.events, true).expect("artifacts written");
+
+        for index in 1..=3 {
+            // Each run file is a whole report, so any single repeat can be compared on its own.
+            let report = fs::read_to_string(directory.join(format!("run-{index}.json")))
+                .expect("a run file per repeat");
+            let report: BenchmarkReport =
+                serde_json::from_str(&report).expect("the run file is a report");
+            assert_eq!(report.schema_version, 3);
+            assert_eq!(report.timed_iterations, options.iterations);
+
+            let events = fs::read_to_string(directory.join(format!("run-{index}.events.jsonl")))
+                .expect("an event stream per repeat");
+            assert!(events.lines().count() > 0);
+            for line in events.lines() {
+                serde_json::from_str::<PerfEvent>(line).expect("every line is one event");
+            }
+        }
+
+        let set = fs::read_to_string(directory.join("repeated.json")).expect("the set file");
+        let parsed: RepeatedBenchmarkFile =
+            serde_json::from_str(&set).expect("the set file reads back");
+        assert_eq!(parsed.schema_version, REPEATED_FILE_SCHEMA_VERSION);
+        assert_eq!(parsed.repeated.runs.len(), 3);
+        assert!(parsed.budgets.is_none());
+        assert_eq!(
+            serde_json::to_string(&parsed).expect("the round trip re-serializes"),
+            serde_json::to_string(&file).expect("the set serializes")
+        );
+
+        fs::remove_dir_all(&directory).expect("remove the artifact directory");
     }
 
     #[test]
@@ -805,7 +1067,8 @@ mod tests {
         let repeated = run_repeated(&options, 2, || {
             Ok(Box::new(FakeBackend::new(options.fake.clone())) as Box<dyn CaptureBackend>)
         })
-        .expect("two runs");
+        .expect("two runs")
+        .repeated;
         let json = serde_json::to_string(&repeated).expect("the repeat set serializes");
         let parsed: RepeatedBenchmark =
             serde_json::from_str(&json).expect("the repeat set reads back");

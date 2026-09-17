@@ -113,7 +113,7 @@ pub struct RelativeBudgets {
 }
 
 /// One budget that was checked, and what it found.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BudgetCheck {
     pub name: String,
     pub limit: String,
@@ -122,7 +122,11 @@ pub struct BudgetCheck {
 }
 
 /// The outcome of applying a budget file to a run.
-#[derive(Debug, Serialize)]
+///
+/// Deserializable because it is written into `repeated.json` beside the runs it judged, and a
+/// baseline whose budget verdict cannot be read back is a baseline that has to be re-judged from
+/// scratch to be understood.
+#[derive(Debug, Deserialize, Serialize)]
 pub struct BudgetOutcome {
     pub host: String,
     /// Empty when the budget applied. Populated when it did not, saying why.

@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::build_info;
+use crate::error::AppError;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -187,8 +188,36 @@ pub struct BenchmarkArgs {
     pub output_results: Option<PathBuf>,
     #[arg(long)]
     pub raw_events: Option<PathBuf>,
+    /// Write every repeat's raw artifacts into this directory: `run-N.json` per run,
+    /// `run-N.events.jsonl` when `--raw-events` is given, and a `repeated.json` set file.
+    ///
+    /// The directory is what a baseline is: `benchmark compare` reads it back, and a published
+    /// figure whose supporting runs went to a console and were lost cannot be checked again.
+    #[arg(long)]
+    pub output_dir: Option<PathBuf>,
     #[arg(long)]
     pub json: bool,
+}
+
+impl BenchmarkArgs {
+    /// Rejects the flag combinations clap cannot express, before any capture is taken.
+    ///
+    /// Checked up front rather than at the point of use, so a run that would produce no artifacts
+    /// fails in the first millisecond rather than after two hundred timed captures.
+    pub fn validate(&self) -> Result<(), AppError> {
+        if self.repeat > 1 && self.raw_events.is_some() && self.output_dir.is_none() {
+            // A repeat set has one event stream per run, and they cannot all be written to the
+            // single path `--raw-events` names. Before this the flag was accepted and quietly
+            // ignored, which is the failure worth being loud about: the operator believed the
+            // evidence had been collected.
+            return Err(AppError::InvalidArgument(
+                "--raw-events with --repeat greater than 1 needs --output-dir: each run has its \
+                 own event stream, and they are written there as run-N.events.jsonl"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -297,6 +326,57 @@ mod tests {
             panic!("capture command should be selected");
         };
         assert_eq!(args.selection_preview, PreviewArg::Frozen);
+    }
+
+    #[test]
+    fn raw_events_under_repeat_says_which_flag_is_missing() {
+        // `--raw-events --repeat 3` used to be accepted and do nothing at all: `run_repeated`
+        // dropped the events, so no file was written and no message said so. The operator's whole
+        // reason for passing the flag was to keep that evidence.
+        let cli = Cli::try_parse_from([
+            "captastic",
+            "benchmark",
+            "--repeat",
+            "3",
+            "--raw-events",
+            "events.jsonl",
+        ])
+        .expect("the combination parses; it is refused by validation, not by clap");
+        let Some(Command::Benchmark(args)) = cli.command else {
+            panic!("expected a benchmark command");
+        };
+        let error = args.validate().expect_err("the combination is refused");
+        assert!(
+            error.to_string().contains("--output-dir"),
+            "the refusal names the flag that would fix it: {error}"
+        );
+
+        // With a directory to write them into, the same combination is exactly what the claim
+        // procedure asks an operator to run.
+        let cli = Cli::try_parse_from([
+            "captastic",
+            "benchmark",
+            "--repeat",
+            "3",
+            "--raw-events",
+            "events.jsonl",
+            "--output-dir",
+            "C:/tmp/run",
+        ])
+        .expect("benchmark with an output directory");
+        let Some(Command::Benchmark(args)) = cli.command else {
+            panic!("expected a benchmark command");
+        };
+        assert_eq!(args.output_dir.as_deref(), Some(Path::new("C:/tmp/run")));
+        args.validate().expect("the combination is accepted");
+
+        // A single run still writes its one event stream to the one path it was given.
+        let cli = Cli::try_parse_from(["captastic", "benchmark", "--raw-events", "events.jsonl"])
+            .expect("single-run raw events");
+        let Some(Command::Benchmark(args)) = cli.command else {
+            panic!("expected a benchmark command");
+        };
+        args.validate().expect("a single run needs no directory");
     }
 
     #[test]
