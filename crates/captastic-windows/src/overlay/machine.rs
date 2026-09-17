@@ -49,6 +49,16 @@ const _: () = assert!(LOUPE_SLOW_DIP_PER_SECOND < LOUPE_FAST_DIP_PER_SECOND);
 /// rest is noticed with time to spare.
 pub(super) const LOUPE_TICK_MS: u32 = 50;
 const _: () = assert!(LOUPE_TICK_MS < LOUPE_SLOW_SUSTAIN_MS);
+/// The shortest interval a speed is worth computing over.
+///
+/// `GetMessageTime` has millisecond resolution, so an interval of one or two milliseconds turns a
+/// single-pixel move into hundreds of pixels per second — enough to cross the fast threshold and
+/// hide the magnifier for the whole sustain period, from a movement the user would call holding
+/// still. Eight milliseconds is about half a frame at 60 Hz: short enough that a real flick is
+/// still caught within one sample, long enough that mouse-report granularity cannot masquerade as
+/// speed.
+pub(super) const LOUPE_MIN_SAMPLE_MS: u32 = 8;
+const _: () = assert!(LOUPE_MIN_SAMPLE_MS < LOUPE_TICK_MS);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CaptureTool {
@@ -976,9 +986,16 @@ fn observe_pointer_motion(model: &mut OverlayModel, point: POINT, time_ms: u32) 
     // over about every 49 days. A subtraction that saturated would report one enormous interval,
     // and therefore a speed of zero, at the moment of the rollover.
     let elapsed = time_ms.wrapping_sub(previous_time);
-    if elapsed == 0 {
-        // Several messages can carry the same millisecond. Keeping the earlier sample lets the
-        // distance accumulate into the next one instead of dividing by zero here.
+    if elapsed < LOUPE_MIN_SAMPLE_MS {
+        // Too short an interval to be a speed. Several messages can carry the same millisecond,
+        // and even a couple of milliseconds turns one pixel of movement into a figure past the
+        // fast threshold. Keeping the earlier sample lets the distance accumulate into the next
+        // interval that is long enough to mean something, instead of dividing by nearly nothing.
+        //
+        // This matters most just after a rest tick. A tick advances the sample's timestamp
+        // without moving it, so the very next mouse message is measured from a moment that may be
+        // a millisecond ago - and a single-pixel twitch would then have hidden the magnifier that
+        // the tick had only just brought up.
         return;
     }
     let distance = i64::from(point.x.saturating_sub(previous_point.x).abs())
@@ -3644,6 +3661,62 @@ mod tests {
         );
         // Further ticks change nothing and must not repaint.
         assert!(transition(&mut model, OverlayInput::Tick { time_ms: 1_500 }).is_empty());
+    }
+
+    #[test]
+    fn a_twitch_a_millisecond_after_a_rest_tick_does_not_hide_the_magnifier() {
+        // The case that made this routine rather than rare: a tick advances the sample's
+        // timestamp without moving it, so the very next mouse message is measured from a moment
+        // that may be one millisecond ago. One pixel in one millisecond reads as 1000 px/s -
+        // past the 600 px/s fast threshold - so the magnifier the tick had just brought up
+        // vanished again, for a movement the user would call holding still.
+        let start = POINT { x: 800, y: 500 };
+        let mut model = dragging_model(start, 1_000);
+        glide(&mut model, start, 2, 50, 1_000);
+        for step in 1..=3 {
+            transition(
+                &mut model,
+                OverlayInput::Tick {
+                    time_ms: 1_050 + step * LOUPE_TICK_MS,
+                },
+            );
+        }
+        assert!(loupe_visible(&model), "the rest tick brought it up");
+
+        let settled = 1_050 + 3 * LOUPE_TICK_MS;
+        for offset in 1..LOUPE_MIN_SAMPLE_MS {
+            transition(
+                &mut model,
+                OverlayInput::PointerMoved {
+                    point: POINT {
+                        x: start.x + i32::try_from(offset).expect("a small offset"),
+                        y: start.y,
+                    },
+                    window_hover: None,
+                    modifiers: Modifiers::default(),
+                    time_ms: settled + offset,
+                },
+            );
+            assert!(
+                loupe_visible(&model),
+                "one pixel {offset} ms after the tick is not a flick"
+            );
+        }
+
+        // A real flick over an interval long enough to mean something still hides it at once.
+        transition(
+            &mut model,
+            OverlayInput::PointerMoved {
+                point: POINT {
+                    x: start.x + 400,
+                    y: start.y,
+                },
+                window_hover: None,
+                modifiers: Modifiers::default(),
+                time_ms: settled + 50,
+            },
+        );
+        assert!(!loupe_visible(&model), "800 px/s is still a flick");
     }
 
     #[test]
