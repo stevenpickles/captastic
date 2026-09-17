@@ -118,6 +118,14 @@ fn parse<T: serde::de::DeserializeOwned>(
 /// What the candidate did relative to the baseline, stage by stage.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Comparison {
+    /// The version of this comparison's shape, like every other artifact the tool emits.
+    ///
+    /// A comparison is pasted into a release note or a regression ticket and read months later,
+    /// which makes it an artifact whether or not anything writes it to disk; a version is what
+    /// lets the reader then know whether a missing field was absent or never existed. Bump
+    /// `COMPARISON_SCHEMA_VERSION` when the stage list, the verdicts, or the envelope change
+    /// meaning. Independent of the report and repeat-set versions.
+    pub schema_version: u32,
     /// The question both sides were asking. Present because a comparison quoted without it is a
     /// percentage with no host attached, which is the thing this module exists to prevent.
     pub compatibility: RunCompatibility,
@@ -178,6 +186,9 @@ impl fmt::Display for Verdict {
         })
     }
 }
+
+/// The schema version of a `benchmark compare` result.
+pub const COMPARISON_SCHEMA_VERSION: u32 = 1;
 
 /// Compares two sets, or refuses and says exactly which host facts differ.
 pub fn compare(
@@ -245,6 +256,7 @@ pub fn compare(
     }
 
     Ok(Comparison {
+        schema_version: COMPARISON_SCHEMA_VERSION,
         compatibility: baseline_compatibility,
         stages,
         cursor_outcomes: CursorOutcomeComparison {

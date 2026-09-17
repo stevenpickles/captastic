@@ -251,6 +251,12 @@ fn build_identity(build: &crate::fingerprint::BuildIdentity) -> String {
 /// Several timed runs of the same question, and what they agree on.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct RepeatedBenchmark {
+    /// The version of the *set*: its compatibility, its incompatibilities, its agreement.
+    ///
+    /// Bump this one when any of those change shape or meaning - a new field on `RepeatAgreement`
+    /// that a reader must understand, say. Not the same number as the enclosing
+    /// `RepeatedBenchmarkFile::schema_version`, which versions the envelope around this, nor
+    /// `BenchmarkReport::schema_version`, which versions one run.
     pub schema_version: u32,
     pub runs: Vec<BenchmarkReport>,
     pub compatibility: RunCompatibility,
@@ -373,6 +379,14 @@ pub(crate) fn spread_percent(samples: &[u64]) -> f64 {
 /// they cannot drift apart, and the file has a schema version like everything else that is kept.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct RepeatedBenchmarkFile {
+    /// The version of *this envelope*: `schema_version`, `repeated`, `budgets`.
+    ///
+    /// Bump this one - `REPEATED_FILE_SCHEMA_VERSION` - when a field is added to, removed from, or
+    /// given a new meaning in the envelope itself, such as the budget verdict changing shape. A
+    /// change inside the repeat set bumps `RepeatedBenchmark::schema_version` instead, and a change
+    /// to a single run bumps `BenchmarkReport::schema_version`. The three are independent on
+    /// purpose: a reader that only wants the runs should not be turned away by an envelope that
+    /// grew a field.
     pub schema_version: u32,
     pub repeated: RepeatedBenchmark,
     /// The budget verdict per run, when `--budgets` was given. `null` when it was not.
@@ -1301,6 +1315,76 @@ mod tests {
         assert!(!directory.join("repeated.json").exists());
 
         fs::remove_dir_all(&directory).expect("remove the artifact directory");
+    }
+
+    #[test]
+    fn a_set_file_carrying_a_budget_verdict_reads_back_as_the_verdict_it_was() {
+        // `budgets` is the half of `repeated.json` nothing had exercised: every round-trip test
+        // wrote `null` there, so `BudgetOutcome`'s and `BudgetCheck`'s `Deserialize` impls were
+        // derived and never run. A baseline is committed *with* its verdict, and one that reads
+        // back as an empty check list is a baseline that has to be re-judged to be understood.
+        let options = instant_options(CursorMode::Exclude);
+        let repeated = run_repeated(
+            &options,
+            2,
+            || Ok(Box::new(FakeBackend::new(options.fake.clone())) as Box<dyn CaptureBackend>),
+            |_, _| Ok(()),
+        )
+        .expect("two runs");
+
+        // A budget that applies, so the outcome carries real checks rather than an empty list...
+        let applies = crate::budget::BudgetFile {
+            host: crate::budget::HostMatch {
+                description: "the synthetic host".to_owned(),
+                backend: Some("fake".to_owned()),
+                ..Default::default()
+            },
+            absolute: Default::default(),
+            relative: crate::budget::RelativeBudgets {
+                failure_percent: Some(0.0),
+                native_p99_over_p50: Some(6.0),
+                ..Default::default()
+            },
+        };
+        // ...and one that does not, so the skip reasons are exercised too.
+        let skips = crate::budget::BudgetFile {
+            host: crate::budget::HostMatch {
+                backend: Some("dxgi".to_owned()),
+                ..Default::default()
+            },
+            ..applies.clone()
+        };
+        let mut outcomes = crate::budget::evaluate_each(&applies, &repeated.runs);
+        outcomes.extend(crate::budget::evaluate_each(&skips, &repeated.runs));
+        assert!(outcomes[0].applied(), "the first budget describes this run");
+        assert!(!outcomes[0].checks.is_empty());
+        assert!(
+            !outcomes[2].skipped_because.is_empty(),
+            "the second does not"
+        );
+
+        let file = RepeatedBenchmarkFile {
+            schema_version: REPEATED_FILE_SCHEMA_VERSION,
+            repeated,
+            budgets: Some(outcomes),
+        };
+        let json = serde_json::to_string(&file).expect("the set file serializes");
+        let parsed: RepeatedBenchmarkFile =
+            serde_json::from_str(&json).expect("the set file reads back");
+
+        let budgets = parsed.budgets.as_ref().expect("the verdict survives");
+        assert_eq!(budgets.len(), 4);
+        assert_eq!(budgets[0].host, "the synthetic host");
+        assert!(budgets[0].applied());
+        assert!(!budgets[0].checks.is_empty());
+        assert!(budgets[0].checks.iter().all(|check| !check.name.is_empty()));
+        assert!(!budgets[2].skipped_because.is_empty());
+        // Equality of the re-serialized form rather than "it parsed": a field silently dropped by
+        // a serde attribute parses perfectly and loses the evidence.
+        assert_eq!(
+            serde_json::to_string(&parsed).expect("the round trip re-serializes"),
+            json
+        );
     }
 
     #[test]
