@@ -2,14 +2,13 @@
 
 > **This file is a draft of the release body for the `v0.2.0` GitHub release.** It is not the
 > release itself. Paste the content below the horizontal rule into the release description when the
-> tag is published, confirming that the attached artifact names match and resolving the performance
-> placeholder below. This file lives in the repository so the wording can be reviewed before it is
-> published.
+> tag is published, confirming that the attached artifact names match. This file lives in the
+> repository so the wording can be reviewed before it is published.
 
 ---
 
 Captastic v0.2.0 is about placing a region on the pixel you mean, and about giving captures a real
-home on disk. It carries PRs #87 through #92 on top of v0.1.1: region edges that snap to the windows
+home on disk. It carries PRs #87 through #95 on top of v0.1.1: region edges that snap to the windows
 under them, arrow keys that move an edge a pixel at a time, a magnifier that shows the pixel the
 pointer is covering, a view you can freeze and unfreeze with one key, file output in PNG, JPEG, or
 BMP that the notification area can switch on without a restart, and the benchmark tooling a future
@@ -18,15 +17,11 @@ still holds; see the
 [v0.1.0 release](https://github.com/stevenpickles/captastic/releases/tag/v0.1.0) for the full
 description and its known limitations.
 
-<!-- OPERATOR: run the procedure in benchmarks/README.md and replace the paragraph below with the
-     measured figures and the fingerprint they came with, or delete the paragraph. Do not quote a
-     millisecond without committed artifacts behind it. -->
-
 **Performance:** this release publishes no absolute performance numbers. The tooling that would
 support one — a host fingerprint in every report, comparability keyed on it, raw artifacts per
 repeat run, and a comparison that refuses two runs that did not measure the same thing — ships here,
-but the runs it exists to produce are an operator step that has not been taken. A figure would need
-three compatible repeat sets measured from a console session on the documented host, per
+but the runs it exists to produce were not made for this release. A figure needs three compatible
+repeat sets measured from a console session on the documented host, per
 [benchmarks/README.md](https://github.com/stevenpickles/captastic/blob/v0.2.0/benchmarks/README.md),
 quoted with the fingerprint and the spread that came with them.
 
@@ -130,41 +125,37 @@ quoted with the fingerprint and the spread that came with them.
 
 ## What was not observed
 
-The overlay work in this release is the part a person sees, and none of it has been watched working.
-No pointer was driven and no screen was read while it was built, and a second daemon cannot start
-while the daily one holds the session control event. The following are covered by unit and property
-tests on their pure seams, and by overlays that were opened, presented, and closed by an external
-close request — and by nothing else:
+The overlay work in this release was built without anyone driving a pointer or reading the screen,
+and was then walked through by hand on 2026-09-17 on one 3840 × 2160 display at 150 % scaling,
+against builds `0.2.0-dev.478` and `0.2.0-dev.479`. Everything on the region-precision and
+frozen-view checklists in [docs/overlay-ui-verification.md](https://github.com/stevenpickles/captastic/blob/v0.2.0/docs/overlay-ui-verification.md)
+was watched working: snapping and its guide at that one scaling, **Ctrl** releasing it, the arrow
+keys, the magnifier on **Z** and by itself on a slow drag, its placement at the display edges, the
+live-view sample coming back free of the overlay, the two new Options rows and the **View** row,
+**F** in both directions with its tag, confirmations in both views with their JSON, both preferences
+surviving a daemon restart, and the **Save Captures to Disk** item writing a capture to disk and
+back into `captastic.toml`.
 
-- snapping to a real window's edge at any scaling, the accent guide appearing along it, and **Ctrl**
-  releasing it mid-drag;
-- the arrow keys moving or resizing a region;
-- the magnifier appearing on **Z** or by itself on a slow drag, its placement near a display edge,
-  and its sample in the frozen view;
-- **the live-view magnifier sample coming back free of the overlay.** The sample is a plain desktop
-  blit and the overlay is marked `WDA_EXCLUDEFROMCAPTURE`, so in principle it is bare desktop; the
-  selection's edges are drawn synthetically, so correctness does not depend on that holding, but the
-  appearance does;
-- the two new Options rows and the **View** row rendering, greyed or otherwise, and the menu's new
-  height on screen;
-- a video stopping and resuming across the **F** toggle. Pressing **F** itself was watched on
-  2026-09-17 against build `0.2.0-dev.479`, and it is what found the one defect this release's
-  overlay work has had on a screen: the frozen view came up with see-through chrome and skewed
-  colours, because the compositor did not treat the layered window as opaque; the frozen view now
-  forces every pixel opaque before it is presented, and after that change the frozen view, its dim,
-  outline, handles, badge, toolbar, and the **FROZEN · pixels from hotkey press** tag all rendered
-  as intended;
-- a confirmation of any kind through a running daemon, and therefore the new `preview_mode`,
-  `capture_anchor`, and `view_switched` JSON from a real capture;
-- either new preference surviving a daemon restart end to end;
+That walk-through found two defects, both fixed before the tag:
+
+- **The frozen view came up unreadable** — see-through chrome and skewed colours — because the
+  compositor did not treat the layered window as opaque when asked to. The frozen view now forces
+  every pixel opaque before it is presented (PR #94).
+- **The default output directory was the wrong Pictures folder.** OneDrive's Known Folder Move had
+  moved the user's Pictures to `OneDrive\Pictures`, and Captastic, building its default from
+  `%USERPROFILE%`, wrote into the empty `Pictures` left behind — every test passing, the file
+  written exactly as asked, somewhere Explorer no longer calls Pictures. Captastic now asks the
+  shell for the Pictures folder and logs the directory it settled on when saving starts (PR #95).
+
+What has still not been watched:
+
+- a video stopping and resuming across the **F** toggle (the toggle was watched on a static
+  desktop);
+- snapping and the magnifier at any scaling other than 150 %, and on more than one display;
 - the presenter fallback firing, and therefore the opaque fallback window; and the
-  `BufferExhausted` balloon, which the pool change is meant to make unnecessary.
-
-**Nobody has clicked Save Captures to Disk.** The toggle, its persistence, and its failure paths are
-proved by tests against the same code paths, but the menu item has not been used on a live tray, no
-capture has landed on disk because of it, and neither of its rarer paths — a file worker held past
-its stop deadline, and captures abandoned because they were queued faster than they could be encoded
-— has been seen outside a test.
+  `BufferExhausted` balloon, which the pool change is meant to make unnecessary;
+- the file destination's rarer paths: a worker held past its stop deadline, and captures abandoned
+  because they were queued faster than they could be encoded. Both are unit-tested.
 
 **The default output directory was wrong, and only running it found that.** On 2026-09-17 Steven
 turned file output on and went looking for the captures. There was no `Pictures\Captastic` folder —

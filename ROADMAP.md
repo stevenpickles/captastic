@@ -137,25 +137,24 @@ that they are unverified.
 
 ## Release readiness — v0.2.0
 
-**Status:** every v0.2.0 slice is merged to `dev` as of 2026-09-17 — PRs #87 and #91 (benchmark
-evidence), #88 (output formats), #89 (region precision), #90 (the notification-area file-output
-toggle), and #92 (the frozen-view toggle). The release branch has not been cut, and the notes are
-a draft: [docs/release-notes-v0.2.0.md](docs/release-notes-v0.2.0.md). What remains needs a human
-at the machine, which is why none of it was done by the work that merged.
+**Status:** `release/v0.2.0` was cut from `dev` on 2026-09-17 after every slice merged — PRs #87
+and #91 (benchmark evidence), #88 (output formats), #89 (region precision), #90 (the
+notification-area file-output toggle), #92 (the frozen-view toggle), #93 (this section and the
+notes), and the two fixes the manual checklists found, #94 (the frozen view presented opaque) and
+#95 (the default output directory follows the shell's Pictures folder). The notes are
+[docs/release-notes-v0.2.0.md](docs/release-notes-v0.2.0.md).
 
 ### Gates — before the tag
 
-- **The manual checklists in PRs #89, #90 and #92.** None of the overlay behaviour this release is
-  about has been watched working: no agent drove a pointer or read the screen, and no second daemon
-  could take the session control event from the running one. The region-precision and frozen-view
-  matrices are in [docs/overlay-ui-verification.md](docs/overlay-ui-verification.md); the
-  file-output toggle's steps are in PR #90. The one check nothing else can substitute for is the
-  live-view magnifier sample coming back free of the overlay, which rests on
-  `WDA_EXCLUDEFROMCAPTURE` rather than on a test.
-- **The benchmark claim run is optional and gates only a number.** Running
-  [benchmarks/README.md](benchmarks/README.md) produces the accepted sets a published figure has to
-  rest on; skipping it is fine, and then the notes quote no figure. It is not a release blocker
-  either way.
+- **The manual checklists in PRs #89, #90 and #92: run.** On 2026-09-17, on one 3840 × 2160
+  display at 150 % scaling, every region-precision and frozen-view step in
+  [docs/overlay-ui-verification.md](docs/overlay-ui-verification.md) and the file-output toggle's
+  steps were watched working, including the live-view magnifier sample coming back free of the
+  overlay. The two defects they found are fixed above. Not watched: video stopping and resuming
+  across the `F` toggle, other scalings and a second display, the presenter fallback, the
+  `BufferExhausted` balloon, and the file destination's detach and abandoned-capture paths.
+- **The benchmark claim run: not made, by choice.** The notes quote no figure. Running
+  [benchmarks/README.md](benchmarks/README.md) remains the way to earn one for a later release.
 
 ### Then the release itself
 
@@ -778,22 +777,18 @@ not reproduced on demand, is in
 
 ## Recommended next branch
 
-`release/v0.2.0`, cut from `dev` once the manual checklists have been run. Everything v0.2.0
-contains is merged; the branch exists only to carry the release through `main`, the tag, and the
-merge back to `dev` as described under
+`release/v0.2.0`, cut from `dev` on 2026-09-17 after the manual checklists were run and the two
+defects they found were merged. Everything v0.2.0 contains is merged; the branch exists only to
+carry the release through `main`, the tag, and the merge back to `dev` as described under
 [Release readiness — v0.2.0](#release-readiness--v020), after which the workspace version moves to
 the 0.3.0 line.
 
-Before cutting it, the checklists are the work most likely to find something, because this is a
-release about overlay behaviour and none of that behaviour has been watched working: snapping and
-its guide, the arrow keys, the magnifier — the live-view sample above all — the two new Options
-rows, the `F` toggle and its tag, and the notification-area file-output toggle with a capture
-landing on disk after it. Each is a table in
-[docs/overlay-ui-verification.md](docs/overlay-ui-verification.md) or a numbered list in its pull
-request. The operator-run live verifications from v0.1.0 — sleep/wake, Remote Desktop, and the
-`DEVICE_REMOVED`/`DEVICE_RESET` limb of GPU-reset recovery through the elevated adapter cycle — are
-still outstanding and still deferrable, and the benchmark claim run is optional and gates only
-whether the notes may quote a number.
+The checklists did find something — twice — which is the argument for running them before every
+release about overlay behaviour: a presenter flag the compositor did not honour, and a default
+directory that was right for the profile and wrong for the user. The operator-run live
+verifications from v0.1.0 — sleep/wake, Remote Desktop, and the `DEVICE_REMOVED`/`DEVICE_RESET`
+limb of GPU-reset recovery through the elevated adapter cycle — are still outstanding and still
+deferrable, and the benchmark claim run was not made for v0.2.0, so its notes quote no number.
 
 Then the release itself: the release branch to `main` by pull request, the tag on `main`, the
 disposable-VM checklist, the manual `choco push` once the release URLs and hashes verify, the
