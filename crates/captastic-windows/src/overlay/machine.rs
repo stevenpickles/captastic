@@ -16,7 +16,7 @@ use super::snap::{
     guides_for, snap_coordinate, snap_point, snap_translation, ActiveSnaps, EdgeMask, RectEdges,
     SnapAxis, SnapHit, SnapTargets, NO_SNAPS, SNAP_THRESHOLD_DIP,
 };
-use super::{NativeWindowHandle, SelectionKind, WindowCandidate};
+use super::{NativeWindowHandle, PreviewView, SelectionKind, WindowCandidate};
 
 pub(super) const DRAG_THRESHOLD: i32 = 4;
 pub(super) const MIN_REGION_SIZE: i64 = 8;
@@ -218,6 +218,16 @@ pub(super) struct ToolbarDrag {
 pub(super) struct OverlayModel {
     pub(super) source: Rect,
     pub(super) display_environment: DisplayEnvironment,
+    /// Which pixels are on screen right now: the live desktop, or the snapshot taken at the
+    /// hotkey press. This is what the confirmation materializes from.
+    pub(super) view: PreviewView,
+    /// The view the run opened in, so switching twice returns the user to where they started
+    /// rather than to a hard-coded default.
+    pub(super) initial_view: PreviewView,
+    /// Whether the view can be switched at all. False when there is no snapshot to switch to,
+    /// and false when the layered presenter had to be abandoned and only the snapshot can be
+    /// shown. A run with it false ignores every request to switch rather than pretending.
+    pub(super) view_toggle_available: bool,
     pub(super) tool: CaptureTool,
     pub(super) selection: Option<Rect>,
     pub(super) selection_kind: Option<SelectionKind>,
@@ -1550,6 +1560,11 @@ mod tests {
         OverlayModel {
             source: SOURCE,
             display_environment: environment(),
+            // The default shape of a v0.2.0 run: a snapshot was taken at the press, the overlay
+            // opened live on top of it, and the user can switch.
+            view: PreviewView::Live,
+            initial_view: PreviewView::Live,
+            view_toggle_available: true,
             tool: CaptureTool::Region,
             selection: None,
             selection_kind: None,
