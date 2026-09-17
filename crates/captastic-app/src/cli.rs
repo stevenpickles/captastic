@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::build_info;
+use crate::error::AppError;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -145,8 +146,44 @@ pub struct CaptureArgs {
     pub json: bool,
 }
 
+/// `benchmark`, which is either a run or one of the commands that works on runs already recorded.
+///
+/// `args_conflicts_with_subcommands` keeps every existing invocation parsing exactly as it did:
+/// the run flags are still `benchmark`'s own, not a `benchmark run` subcommand's, so no script,
+/// no README line and no operator's muscle memory had to change to make room for `compare`.
 #[derive(Debug, Args)]
+#[command(args_conflicts_with_subcommands = true)]
 pub struct BenchmarkArgs {
+    #[command(subcommand)]
+    pub command: Option<BenchmarkCommand>,
+    #[command(flatten)]
+    pub run: BenchmarkRunArgs,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BenchmarkCommand {
+    /// Compare a candidate run against a baseline measured on the same host.
+    ///
+    /// Either side may be a single `run-N.json` report or a whole `repeated.json` set.
+    Compare {
+        /// The accepted baseline: a `run-N.json` report or a `repeated.json` set.
+        baseline: PathBuf,
+        /// The run being judged, in the same two shapes.
+        candidate: PathBuf,
+        #[arg(long)]
+        json: bool,
+        /// How far a stage may move before it is called a change rather than noise.
+        ///
+        /// The default is just above the 1.7-6.6 % run-to-run spread this host has measured. The
+        /// larger of the two sets' own measured spreads wins when it is wider than this, because a
+        /// set that disagreed with itself by 12 % cannot detect an 8 % regression.
+        #[arg(long, default_value_t = 7.0)]
+        noise_percent: f64,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct BenchmarkRunArgs {
     #[arg(long, default_value = "fake")]
     pub backend: String,
     /// Display policy: pointer, primary, virtual_desktop, or display:<persistent-id>.
@@ -185,10 +222,51 @@ pub struct BenchmarkArgs {
     pub budgets: Option<PathBuf>,
     #[arg(long)]
     pub output_results: Option<PathBuf>,
+    /// Write the per-capture event stream to this path.
+    ///
+    /// Under `--repeat` with `--output-dir` the streams go to `run-N.events.jsonl` in that
+    /// directory instead, one per run, and this path is not used - a repeat set has one stream per
+    /// run and they cannot share a file. The run says so rather than leaving the path unwritten.
     #[arg(long)]
     pub raw_events: Option<PathBuf>,
+    /// Replace the artifacts already in `--output-dir` rather than refusing.
+    ///
+    /// Only the files a set owns are removed - `run-*.json`, `run-*.events.jsonl`, `repeated.json`
+    /// - so anything else in the directory survives.
+    #[arg(long, requires = "output_dir")]
+    pub overwrite: bool,
+    /// Write every repeat's raw artifacts into this directory: `run-N.json` per run,
+    /// `run-N.events.jsonl` when `--raw-events` is given, and a `repeated.json` set file.
+    ///
+    /// The directory is what a baseline is: `benchmark compare` reads it back, and a published
+    /// figure whose supporting runs went to a console and were lost cannot be checked again. A
+    /// directory that already holds a set is refused unless `--overwrite` is given, because two
+    /// sets mixed in one directory read as one set that never ran.
+    #[arg(long)]
+    pub output_dir: Option<PathBuf>,
     #[arg(long)]
     pub json: bool,
+}
+
+impl BenchmarkRunArgs {
+    /// Rejects the flag combinations clap cannot express, before any capture is taken.
+    ///
+    /// Checked up front rather than at the point of use, so a run that would produce no artifacts
+    /// fails in the first millisecond rather than after two hundred timed captures.
+    pub fn validate(&self) -> Result<(), AppError> {
+        if self.repeat > 1 && self.raw_events.is_some() && self.output_dir.is_none() {
+            // A repeat set has one event stream per run, and they cannot all be written to the
+            // single path `--raw-events` names. Before this the flag was accepted and quietly
+            // ignored, which is the failure worth being loud about: the operator believed the
+            // evidence had been collected.
+            return Err(AppError::InvalidArgument(
+                "--raw-events with --repeat greater than 1 needs --output-dir: each run has its \
+                 own event stream, and they are written there as run-N.events.jsonl"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -297,6 +375,130 @@ mod tests {
             panic!("capture command should be selected");
         };
         assert_eq!(args.selection_preview, PreviewArg::Frozen);
+    }
+
+    #[test]
+    fn raw_events_under_repeat_says_which_flag_is_missing() {
+        // `--raw-events --repeat 3` used to be accepted and do nothing at all: `run_repeated`
+        // dropped the events, so no file was written and no message said so. The operator's whole
+        // reason for passing the flag was to keep that evidence.
+        let cli = Cli::try_parse_from([
+            "captastic",
+            "benchmark",
+            "--repeat",
+            "3",
+            "--raw-events",
+            "events.jsonl",
+        ])
+        .expect("the combination parses; it is refused by validation, not by clap");
+        let Some(Command::Benchmark(args)) = cli.command else {
+            panic!("expected a benchmark command");
+        };
+        let args = args.run;
+        let error = args.validate().expect_err("the combination is refused");
+        assert!(
+            error.to_string().contains("--output-dir"),
+            "the refusal names the flag that would fix it: {error}"
+        );
+
+        // With a directory to write them into, the same combination is exactly what the claim
+        // procedure asks an operator to run.
+        let cli = Cli::try_parse_from([
+            "captastic",
+            "benchmark",
+            "--repeat",
+            "3",
+            "--raw-events",
+            "events.jsonl",
+            "--output-dir",
+            "C:/tmp/run",
+        ])
+        .expect("benchmark with an output directory");
+        let Some(Command::Benchmark(args)) = cli.command else {
+            panic!("expected a benchmark command");
+        };
+        assert_eq!(
+            args.run.output_dir.as_deref(),
+            Some(Path::new("C:/tmp/run"))
+        );
+        args.run.validate().expect("the combination is accepted");
+
+        // A single run still writes its one event stream to the one path it was given.
+        let cli = Cli::try_parse_from(["captastic", "benchmark", "--raw-events", "events.jsonl"])
+            .expect("single-run raw events");
+        let Some(Command::Benchmark(args)) = cli.command else {
+            panic!("expected a benchmark command");
+        };
+        args.run
+            .validate()
+            .expect("a single run needs no directory");
+    }
+
+    #[test]
+    fn benchmark_gained_a_subcommand_without_moving_its_own_flags() {
+        // `args_conflicts_with_subcommands` is what makes this safe: the run flags stayed on
+        // `benchmark` itself rather than moving to a `benchmark run` subcommand, so every script,
+        // README line and budget-file comment that predates `compare` still parses.
+        let cli = Cli::try_parse_from(["captastic", "benchmark", "--iterations", "5"])
+            .expect("the pre-existing form still parses");
+        let Some(Command::Benchmark(args)) = cli.command else {
+            panic!("expected a benchmark command");
+        };
+        assert!(args.command.is_none(), "no subcommand was asked for");
+        assert_eq!(args.run.iterations, 5);
+
+        let cli = Cli::try_parse_from([
+            "captastic",
+            "benchmark",
+            "compare",
+            "a.json",
+            "b.json",
+            "--noise-percent",
+            "3",
+        ])
+        .expect("the compare form parses");
+        let Some(Command::Benchmark(args)) = cli.command else {
+            panic!("expected a benchmark command");
+        };
+        let Some(BenchmarkCommand::Compare {
+            baseline,
+            candidate,
+            json,
+            noise_percent,
+        }) = args.command
+        else {
+            panic!("expected a compare subcommand");
+        };
+        assert_eq!(baseline, Path::new("a.json"));
+        assert_eq!(candidate, Path::new("b.json"));
+        assert!(!json);
+        assert!((noise_percent - 3.0).abs() < f64::EPSILON);
+
+        // The default noise floor sits just above the run-to-run spread this host has measured.
+        let cli = Cli::try_parse_from(["captastic", "benchmark", "compare", "a.json", "b.json"])
+            .expect("compare without a noise floor");
+        let Some(Command::Benchmark(args)) = cli.command else {
+            panic!("expected a benchmark command");
+        };
+        let Some(BenchmarkCommand::Compare { noise_percent, .. }) = args.command else {
+            panic!("expected a compare subcommand");
+        };
+        assert!((noise_percent - 7.0).abs() < f64::EPSILON);
+
+        // Run flags and the subcommand are mutually exclusive rather than silently ignored.
+        assert!(
+            Cli::try_parse_from([
+                "captastic",
+                "benchmark",
+                "--iterations",
+                "5",
+                "compare",
+                "a.json",
+                "b.json",
+            ])
+            .is_err(),
+            "a run flag beside `compare` would do nothing and must not be accepted"
+        );
     }
 
     #[test]
