@@ -84,8 +84,12 @@ format = "png"
 # screenshot legible; much below 70 the ringing around hard edges becomes easy to see.
 jpeg_quality = 90
 queue_capacity = 2
-# Absolute path. Omit to use <home>/Pictures/Captastic. A daemon's working directory is whatever
-# launched it, so a relative path would put captures somewhere you could not predict.
+# Absolute path. A daemon's working directory is whatever launched it, so a relative path would put
+# captures somewhere you could not predict.
+# Omit this to use "Captastic" inside the Pictures folder Windows shows you - which is where
+# OneDrive, a roaming profile, or a policy has put it if one of those has moved it, not necessarily
+# <home>\Pictures. Captastic asks the shell rather than assuming, and logs the directory it settled
+# on when it starts saving captures, so you can always see where they are going.
 # directory = 'C:\Users\you\Pictures\Captastic'
 # Names each capture, without the extension. Tokens: {timestamp} {date} {time} {display} {mode}
 # {width} {height} {application} {title}. Values coming from a window are sanitized, and a name can
