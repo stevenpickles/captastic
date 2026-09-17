@@ -30,8 +30,9 @@ The placement algorithm:
    beyond the label, padding, and resize-handle clearance.
 3. Otherwise evaluates top, bottom, right, and left candidates.
 4. Rejects candidates that cannot fit within the active monitor inset, then
-   scores overlap with the toolbar, open Options menu, pointer/crosshair, and
-   resize-handle clearance.
+   scores overlap with the toolbar, open Options menu, magnifier, pointer/
+   crosshair, and resize-handle clearance. The magnifier does not move for the
+   badge: it is anchored to the pointer and the badge is not.
 5. Clamps the winning badge to the active monitor.
 6. Retains the current side while it remains valid and uses an 8-DIP
    inside/outside hysteresis band, preventing one-pixel placement jumps.
@@ -53,7 +54,7 @@ resize-handle geometry.
 | Tool control hit target | 44 x 44 |
 | Options control | 100 x 44 |
 | Capture control | 120 x 44 |
-| Options menu | 248 x 172 |
+| Options menu | 248 x 212 |
 | Menu row | 236 x 40 |
 | Toolbar/menu type | 16 |
 | Primary icon | 22 |
@@ -63,10 +64,15 @@ Expected physical sizes are:
 
 | Scaling | DPI | Toolbar (px) | Options menu (px) |
 | --- | ---: | ---: | ---: |
-| 100% | 96 | 418 x 56 | 248 x 172 |
-| 125% | 120 | 523 x 70 | 310 x 215 |
-| 150% | 144 | 627 x 84 | 372 x 258 |
-| 200% | 192 | 836 x 112 | 496 x 344 |
+| 100% | 96 | 418 x 56 | 248 x 212 |
+| 125% | 120 | 523 x 70 | 310 x 265 |
+| 150% | 144 | 627 x 84 | 372 x 318 |
+| 200% | 192 | 836 x 112 | 496 x 424 |
+
+The magnifier is a fixed 31 x 31 square of physical pixels, enlarged 6, 8, 9
+and 12 times at 100%, 125%, 150% and 200%. The sampled square is deliberately
+not DPI-scaled: there are no more real pixels around the pointer at 200%, and
+the point of the magnifier is to show the pixels the capture will contain.
 
 This is not a uniform shrink. Tool buttons retain 44-DIP pointer targets, while
 the grip, separators, icons, corners, padding, and gaps use purpose-specific
@@ -109,7 +115,23 @@ The test suite proves that:
 - Ctrl and the disabled option both produce the unsnapped rectangle and no
   guides;
 - arrow nudges stay inside the display and above the minimum size for any run
-  of presses, never snap, and stop emitting repaints at a display edge.
+  of presses, never snap, and stop emitting repaints at a display edge;
+- the magnifier appears only after the pointer has been slow for the sustain
+  period, hides at once above the fast threshold, and holds its state inside
+  the band between the two, in both directions;
+- Auto requires an adjustment in flight, the key does not, and Off answers no
+  to both;
+- a rest tick shows it for a pointer that has stopped, and a tick that changes
+  nothing emits no repaint;
+- the message clock wrapping does not make a fast pointer look stationary, and
+  several messages sharing one millisecond accumulate instead of dividing by
+  zero;
+- the magnifier stays inside the monitor and never overlaps its own source
+  square, for any pointer position on any monitor at all four scalings;
+- enlargement is exact nearest-neighbour: a magnified pixel is a solid block of
+  its source colour and no colour appears that was not in the source;
+- a selection edge maps to the pixel boundary it occupies, and only edges
+  inside the sampled square are drawn.
 
 Changes to these invariants belong in the pure layout helpers or their tests
 before Win32 painting changes.
@@ -137,6 +159,16 @@ For region precision, on every display configuration below:
 | Turn it off | Options -> Snap to Edges, then repeat | No snapping and no guides; reopen the overlay and the row is still unchecked; `state.toml` contains `snap_to_windows = false` |
 | Nudge | With a region selected, press the arrow keys, then with Shift, then with Ctrl | One pixel, ten pixels, and a resize of the right/bottom edges; the badge tracks each press; holding a key repeats; a key held at the display edge changes nothing |
 | Nudge does not snap | Nudge an edge to one pixel off a window border | It stays exactly where it was put |
+| Magnifier on the key | Hold Z in Region mode, with and without a drag in flight | It appears beside the pointer, never over it, and disappears on release |
+| Magnifier on a slow drag | Drag an edge and slow to a deliberate pace | It appears by itself after about a tenth of a second and stays while the pointer is slow |
+| Magnifier on a flick | Flick the pointer across the screen mid-drag | It disappears at once and does not flicker back on the way down |
+| Magnifier at rest | Stop the pointer dead mid-drag without releasing | It appears; the mouse has stopped sending messages, so this is the rest timer doing its job |
+| Magnifier and a snapped edge | Snap the region's right edge to a window's right border, then hold Z | The accent guide and the selection edge in the magnifier fall on the same pixel boundary, and the last pixel inside the selection is the window's last pixel |
+| Magnifier placement | Take the pointer into each corner of the display while holding Z | It flips side and stays on screen; it never covers the square of pixels it is magnifying |
+| Magnifier in the live view | With `selection.preview = "live"`, hold Z over moving content | The sample is undimmed desktop that updates, with **no trace of the overlay's own dimming, outline, toolbar or magnifier** in it |
+| Magnifier vs the badge | Move the pointer so the magnifier would land on the dimension badge | The badge moves; the magnifier does not |
+| Zoom modes | Options -> Zoom, pressing three times | Auto, Hold Z, Off, back to Auto; Hold Z ignores a slow drag, Off ignores the key; `state.toml` contains `region_zoom` and it survives a daemon restart |
+| Alt+Tab with Z held | Hold Z, Alt+Tab away, release Z, Alt+Tab back | The magnifier is gone rather than stuck on screen |
 
 | Display configuration | Scaling | Required checks |
 | --- | --- | --- |
