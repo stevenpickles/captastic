@@ -277,34 +277,27 @@ fn stop() -> Result<(), AppError> {
     ))
 }
 
+/// The one-shot capture, with an optional selection over it.
+///
+/// One path for every preview mode. A selection always captures first - the overlay needs those
+/// pixels to be able to show the frozen view at all - and then materializes from whichever view
+/// the user was looking at when they confirmed, taking a second capture only when that view was
+/// the live desktop.
 fn capture(args: cli::CaptureArgs) -> Result<(), AppError> {
-    capture_with_preview_fallback(args, None)
-}
-
-fn capture_with_preview_fallback(
-    args: cli::CaptureArgs,
-    preview_fallback_reason: Option<String>,
-) -> Result<(), AppError> {
-    #[cfg(not(windows))]
-    let _ = preview_fallback_reason;
     if (args.selection || args.clipboard) && !args.cpu_frame {
         return Err(AppError::InvalidArgument(
             "selection and clipboard output require --cpu-frame true".to_owned(),
         ));
     }
-    #[cfg(windows)]
-    if args.selection && args.selection_preview != PreviewArg::Frozen {
-        return capture_with_live_selection(args);
-    }
     let config = one_shot_config(args.config.as_deref())?;
     let display_policy = resolve_display_policy(&args.display)?;
     let mut backend = create_backend(&args.backend, &display_policy)?;
     let source = resolve_capture_source(&display_policy, backend.displays())?;
-    let mut recorder = EventRecorder::with_capacity(16);
+    let mut recorder = EventRecorder::with_capacity(24);
     let request = CaptureRequest {
         id: CaptureId(1),
         triggered_at: Instant::now(),
-        source,
+        source: source.clone(),
         mode: capture_mode(args.mode),
         cpu_frame: args.cpu_frame,
         retain_native_frame: args.selection,
@@ -318,6 +311,13 @@ fn capture_with_preview_fallback(
     #[cfg(windows)]
     let mut frame = frame;
     let native_frame = outcome.native_frame;
+    // Reported from the frame that was actually materialized from: a live-view confirmation
+    // replaces the trigger capture's texture with its own, and a window render has none.
+    let native_frame_retained = native_frame.is_some();
+    #[cfg(windows)]
+    let mut native_frame_retained = native_frame_retained;
+    #[cfg(windows)]
+    let mut native_frame = native_frame;
     #[cfg(windows)]
     let mut selection_value = None;
     #[cfg(not(windows))]
@@ -341,8 +341,15 @@ fn capture_with_preview_fallback(
             let worker = selection::OneShotUiStateWorker::start(ui_store)?;
             // One-shot: the resources live for this single run and drop with it.
             let mut overlay_resources = captastic_windows::OverlayResources::new();
-            let selection = captastic_windows::select_from_frozen_frame_with_initial_tool_and_ui(
-                &full_frame,
+            let selection = captastic_windows::select_from_preview_source_with_initial_tool_and_ui(
+                captastic_windows::SelectionPreviewSource::snapshot(
+                    &full_frame,
+                    match args.selection_preview {
+                        PreviewArg::Frozen => captastic_windows::PreviewView::Frozen,
+                        PreviewArg::Auto | PreviewArg::Live => captastic_windows::PreviewView::Live,
+                    },
+                    args.selection_preview == PreviewArg::Live,
+                ),
                 worker.controller(),
                 captastic_windows::InitialSelectionTool::Remembered,
                 Some(remembered_ui),
@@ -364,16 +371,64 @@ fn capture_with_preview_fallback(
                 PerfEventKind::SelectionConfirmed,
                 selection.selection_ns,
             );
+            // The view that was showing at the button press decides which pixels are published.
+            // A window click is its own answer whichever view was up: it renders that window
+            // fresh, so it is confirmation-anchored either way.
+            let confirmation_anchored = selection.kind == captastic_windows::SelectionKind::Window
+                || selection.view == captastic_windows::PreviewView::Live;
+            let (source_frame, source_native_frame) = if selection.kind
+                == captastic_windows::SelectionKind::Window
+            {
+                let ready_offset_ns = duration_ns(request.triggered_at.elapsed());
+                recorder.record(request.id, PerfEventKind::CaptureRequested, ready_offset_ns);
+                recorder.record(request.id, PerfEventKind::NativeFrameReady, ready_offset_ns);
+                recorder.record(request.id, PerfEventKind::CpuFrameReady, ready_offset_ns);
+                (full_frame, None)
+            } else if selection.view == captastic_windows::PreviewView::Live {
+                // The user was looking at the desktop itself, so the pixels they chose are the
+                // current ones. The snapshot is dropped before the second capture rather than
+                // after it, so two full-display frames are never resident at once.
+                drop(full_frame);
+                drop(native_frame.take());
+                if let Err(error) = captastic_windows::flush_desktop_composition() {
+                    log::warn!(
+                        "one-shot selection could not synchronize overlay removal before capture: {error}"
+                    );
+                }
+                let confirmation = CaptureRequest {
+                    id: request.id,
+                    triggered_at: Instant::now(),
+                    source: source.clone(),
+                    mode: capture_mode(args.mode),
+                    cpu_frame: true,
+                    retain_native_frame: selection.kind == captastic_windows::SelectionKind::Region,
+                    // Suppressed for the same reason as the daemon's confirmation capture: this
+                    // frame is taken the instant the user confirms, with the pointer on
+                    // Captastic's own overlay.
+                    cursor: CursorMode::Exclude,
+                };
+                let outcome = backend.capture(&confirmation, &mut recorder)?;
+                let confirmed = outcome.frame.ok_or_else(|| {
+                    AppError::BackendUnavailable(
+                        "confirmation capture returned no CPU frame".to_owned(),
+                    )
+                })?;
+                (confirmed, outcome.native_frame)
+            } else {
+                (full_frame, native_frame.take())
+            };
             let materialize_started = Instant::now();
-            let mut materialization = match selection.kind {
-                captastic_windows::SelectionKind::Display => "frozen_display",
-                captastic_windows::SelectionKind::Region => "frozen_desktop_crop",
-                captastic_windows::SelectionKind::Window => "native_window_render",
+            let mut materialization = match (selection.kind, confirmation_anchored) {
+                (captastic_windows::SelectionKind::Display, false) => "frozen_display",
+                (captastic_windows::SelectionKind::Display, true) => "confirmation_display",
+                (captastic_windows::SelectionKind::Region, false) => "frozen_desktop_crop",
+                (captastic_windows::SelectionKind::Region, true) => "confirmation_desktop_crop",
+                (captastic_windows::SelectionKind::Window, _) => "native_window_render",
             };
             let mut gpu_materialization = None;
             let mut gpu_fallback_error = None;
             let gpu_result = if selection.kind == captastic_windows::SelectionKind::Region {
-                native_frame.as_deref().map(|native_frame| {
+                source_native_frame.as_deref().map(|native_frame| {
                     captastic_windows::materialize_native_region(native_frame, selection.rect)
                 })
             } else {
@@ -395,7 +450,7 @@ fn capture_with_preview_fallback(
                     result.frame
                 }
                 Ok(Some(None)) | Ok(None) => {
-                    captastic_windows::materialize_selection(&full_frame, &selection)?
+                    captastic_windows::materialize_selection(&source_frame, &selection)?
                 }
                 Err(error) => {
                     crate::logging::warn(format_args!(
@@ -403,11 +458,12 @@ fn capture_with_preview_fallback(
                         request.id.0
                     ));
                     gpu_fallback_error = Some(error.to_string());
-                    captastic_windows::materialize_selection(&full_frame, &selection)?
+                    captastic_windows::materialize_selection(&source_frame, &selection)?
                 }
             };
             let materialization_ns = duration_ns(materialize_started.elapsed());
             recorder.record(request.id, PerfEventKind::CropFinished, materialization_ns);
+            native_frame_retained = source_native_frame.is_some();
             selection_value = Some(json!({
                 "kind": match selection.kind {
                     captastic_windows::SelectionKind::Display => "display",
@@ -416,18 +472,14 @@ fn capture_with_preview_fallback(
                 },
                 "rect": selection.rect,
                 "selection_ns": selection.selection_ns,
-                "requested_preview_mode": if preview_fallback_reason.is_some() {
-                    "auto"
-                } else {
-                    match args.selection_preview {
-                        PreviewArg::Auto => "auto",
-                        PreviewArg::Live => "live",
-                        PreviewArg::Frozen => "frozen",
-                    }
+                "requested_preview_mode": match args.selection_preview {
+                    PreviewArg::Auto => "auto",
+                    PreviewArg::Live => "live",
+                    PreviewArg::Frozen => "frozen",
                 },
-                "preview_mode": "frozen",
-                "preview_fallback_reason": preview_fallback_reason.as_deref(),
-                "capture_anchor": if preview_fallback_reason.is_some() { "fallback" } else { "trigger" },
+                "preview_mode": selection.view.label(),
+                "preview_fallback_reason": selection.presenter_fallback_reason.as_deref(),
+                "capture_anchor": if confirmation_anchored { "confirmation" } else { "trigger" },
                 "overlay_preparation_ns": selection.preparation_ns,
                 "window_overview_ns": selection.window_overview_ns,
                 "window_preview_count": selection.window_preview_count,
@@ -438,6 +490,7 @@ fn capture_with_preview_fallback(
                 "materialization_ns": materialization_ns,
                 "gpu_materialization": gpu_materialization,
                 "gpu_fallback_error": gpu_fallback_error,
+                "view_switched": selection.view_switched,
             }));
             frame = Some(selected_frame);
         }
@@ -505,7 +558,7 @@ fn capture_with_preview_fallback(
         "synthetic": backend.name() == "fake",
         "metadata": metadata,
         "cpu_frame_bytes": frame.as_ref().map(|frame| frame.required_bytes()),
-        "native_frame_retained": native_frame.is_some(),
+        "native_frame_retained": native_frame_retained,
         "selection": selection_value,
         "clipboard": clipboard_value,
         "file_output": file_output_value,
@@ -643,220 +696,6 @@ fn report_clipboard_loss(failure: captastic_windows::ClipboardPublishError) -> A
         ));
     }
     AppError::from(failure.error)
-}
-
-#[cfg(windows)]
-fn capture_with_live_selection(mut args: cli::CaptureArgs) -> Result<(), AppError> {
-    let config = one_shot_config(args.config.as_deref())?;
-    let display_policy = resolve_display_policy(&args.display)?;
-    let mut backend = create_backend(&args.backend, &display_policy)?;
-    let source = resolve_capture_source(&display_policy, backend.displays())?;
-    let capture_id = CaptureId(1);
-    let triggered_at = Instant::now();
-    let mode = capture_mode(args.mode);
-    let metadata = daemon::preview_metadata(capture_id, &source, backend.displays(), mode.clone())?;
-    let mut recorder = EventRecorder::with_capacity(16);
-    recorder.record(capture_id, PerfEventKind::HotkeyReceived, 0);
-    recorder.record(capture_id, PerfEventKind::TriggerEnqueued, 0);
-    recorder.record(capture_id, PerfEventKind::TriggerDequeued, 0);
-
-    let ui_store = captastic_config::UiStateStore::for_default_storage();
-    let remembered_ui = load_optional_one_shot_ui_state(&ui_store, &metadata.display_id.0);
-    let ui_worker = selection::OneShotUiStateWorker::start(ui_store)?;
-    // One-shot: fresh resources per attempt. A live-presenter failure falls back into
-    // capture_with_preview_fallback, whose frozen attempt allocates its own set - the old
-    // thread_local handed the failed attempt's surfaces across that boundary, an optimization
-    // this ownership model deliberately gives up on the rare error path.
-    let mut overlay_resources = captastic_windows::OverlayResources::new();
-    let selection_result = captastic_windows::select_from_preview_source_with_initial_tool_and_ui(
-        captastic_windows::SelectionPreviewSource::live(&metadata),
-        ui_worker.controller(),
-        captastic_windows::InitialSelectionTool::Remembered,
-        Some(remembered_ui),
-        &mut overlay_resources,
-    );
-    let selection = match selection_result {
-        Ok(selection) => selection,
-        Err(error) if args.selection_preview == PreviewArg::Auto => {
-            // The fallback capture starts its own worker, so this one must be retired first.
-            finish_one_shot_ui_state(Some(ui_worker));
-            crate::logging::warn(format_args!(
-                "one-shot live presenter failed; retrying with a frozen preview: {error}"
-            ));
-            let reason = error.to_string();
-            args.selection_preview = PreviewArg::Frozen;
-            return capture_with_preview_fallback(args, Some(reason));
-        }
-        Err(error) => {
-            finish_one_shot_ui_state(Some(ui_worker));
-            return Err(error.into());
-        }
-    };
-    recorder.record(capture_id, PerfEventKind::SelectionStarted, 0);
-    let selection = match selection {
-        captastic_windows::SelectionOutcome::Selected(selection) => *selection,
-        outcome => {
-            finish_one_shot_ui_state(Some(ui_worker));
-            recorder.record(capture_id, PerfEventKind::AttemptFinished, 0);
-            captastic_core::validate_event_order(recorder.events())?;
-            report_selection_without_capture(capture_id, &outcome, args.json)?;
-            return Ok(());
-        }
-    };
-    recorder.record(
-        capture_id,
-        PerfEventKind::SelectionConfirmed,
-        selection.selection_ns,
-    );
-
-    let (full_frame, native_frame) = if selection.kind == captastic_windows::SelectionKind::Window {
-        let frame = captastic_windows::captured_window_frame(&selection).ok_or_else(|| {
-            AppError::BackendUnavailable(
-                "confirmed window selection did not retain its native frame".to_owned(),
-            )
-        })?;
-        let ready_offset_ns = duration_ns(triggered_at.elapsed());
-        recorder.record(capture_id, PerfEventKind::CaptureRequested, ready_offset_ns);
-        recorder.record(capture_id, PerfEventKind::NativeFrameReady, ready_offset_ns);
-        recorder.record(capture_id, PerfEventKind::CpuFrameReady, ready_offset_ns);
-        (frame, None)
-    } else {
-        if let Err(error) = captastic_windows::flush_desktop_composition() {
-            log::warn!(
-                "one-shot selection could not synchronize overlay removal before capture: {error}"
-            );
-        }
-        let request = CaptureRequest {
-            id: capture_id,
-            triggered_at: Instant::now(),
-            source,
-            mode,
-            cpu_frame: true,
-            retain_native_frame: selection.kind == captastic_windows::SelectionKind::Region,
-            // Suppressed for the same reason as the daemon's confirmation capture: this frame is
-            // taken the instant the user confirms, with the pointer on Captastic's own overlay.
-            cursor: CursorMode::Exclude,
-        };
-        let outcome = backend.capture(&request, &mut recorder)?;
-        let frame = outcome.frame.ok_or_else(|| {
-            AppError::BackendUnavailable("confirmation capture returned no CPU frame".to_owned())
-        })?;
-        (frame, outcome.native_frame)
-    };
-
-    let materialize_started = Instant::now();
-    let mut materialization = match selection.kind {
-        captastic_windows::SelectionKind::Display => "confirmation_display",
-        captastic_windows::SelectionKind::Region => "confirmation_desktop_crop",
-        captastic_windows::SelectionKind::Window => "native_window_render",
-    };
-    let mut gpu_materialization = None;
-    let mut gpu_fallback_error = None;
-    let gpu_result = if selection.kind == captastic_windows::SelectionKind::Region {
-        native_frame.as_deref().map(|native_frame| {
-            captastic_windows::materialize_native_region(native_frame, selection.rect)
-        })
-    } else {
-        None
-    };
-    let selected_frame = match gpu_result.transpose() {
-        Ok(Some(Some(result))) => {
-            materialization = "dxgi_gpu_region";
-            gpu_materialization = Some(json!({
-                "gpu_copy_submit_ns": result.gpu_copy_submit_ns,
-                "map_wait_ns": result.map_wait_ns,
-                "cpu_copy_ns": result.cpu_copy_ns,
-                "total_ns": result.total_ns,
-                "bytes_read": result.bytes_read,
-                "full_frame_bytes": result.full_frame_bytes,
-                "bytes_avoided": result.bytes_avoided,
-                "contiguous_rows": result.contiguous_rows,
-            }));
-            result.frame
-        }
-        Ok(Some(None)) | Ok(None) => {
-            captastic_windows::materialize_selection(&full_frame, &selection)?
-        }
-        Err(error) => {
-            crate::logging::warn(format_args!(
-                "capture {} GPU region materialization failed; using CPU crop: {error}",
-                capture_id.0
-            ));
-            gpu_fallback_error = Some(error.to_string());
-            captastic_windows::materialize_selection(&full_frame, &selection)?
-        }
-    };
-    let materialization_ns = duration_ns(materialize_started.elapsed());
-    recorder.record(capture_id, PerfEventKind::CropFinished, materialization_ns);
-    let selection_value = json!({
-        "kind": match selection.kind {
-            captastic_windows::SelectionKind::Display => "display",
-            captastic_windows::SelectionKind::Region => "region",
-            captastic_windows::SelectionKind::Window => "window",
-        },
-        "rect": selection.rect,
-        "selection_ns": selection.selection_ns,
-        "requested_preview_mode": match args.selection_preview {
-            PreviewArg::Auto => "auto",
-            PreviewArg::Live => "live",
-            PreviewArg::Frozen => "frozen",
-        },
-        "preview_mode": "live",
-        "capture_anchor": "confirmation",
-        "overlay_preparation_ns": selection.preparation_ns,
-        "window_overview_ns": selection.window_overview_ns,
-        "window_preview_count": selection.window_preview_count,
-        "window_live_preview_count": selection.window_live_preview_count,
-        "window_frozen_preview_count": selection.window_frozen_preview_count,
-        "window_preview_bytes": selection.window_preview_bytes,
-        "materialization": materialization,
-        "materialization_ns": materialization_ns,
-        "gpu_materialization": gpu_materialization,
-        "gpu_fallback_error": gpu_fallback_error,
-    });
-
-    let mut clipboard_value = None;
-    if args.clipboard {
-        recorder.record(capture_id, PerfEventKind::ClipboardStarted, 0);
-        let payload = captastic_windows::ClipboardPayload::prepare(&selected_frame)?;
-        let mut publisher =
-            captastic_windows::ClipboardPublisher::new(one_shot_clipboard_retention(&config))?;
-        let report = publisher.publish(&payload).map_err(report_clipboard_loss)?;
-        recorder.record(
-            capture_id,
-            PerfEventKind::ClipboardCommitted,
-            report.publish_ns,
-        );
-        clipboard_value = Some(json!({
-            "payload_bytes": report.payload_bytes,
-            "png_payload_bytes": report.png_payload_bytes,
-            "png_encode_ns": report.png_encode_ns,
-            "allocation_copy_ns": report.allocation_copy_ns,
-            "open_wait_ns": report.open_wait_ns,
-            "open_retries": report.open_retries,
-            "publish_ns": report.publish_ns,
-            "history_excluded": report.history_excluded,
-            "cloud_sync_excluded": report.cloud_sync_excluded,
-        }));
-    }
-    recorder.record(capture_id, PerfEventKind::AttemptFinished, 0);
-    captastic_core::validate_event_order(recorder.events())?;
-    let value = json!({
-        "schema_version": 1,
-        "synthetic": backend.name() == "fake",
-        "metadata": selected_frame.metadata,
-        "cpu_frame_bytes": selected_frame.required_bytes(),
-        "native_frame_retained": native_frame.is_some(),
-        "selection": selection_value,
-        "clipboard": clipboard_value,
-    });
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&value)?);
-    } else {
-        log::info!("capture {} complete: {}", capture_id.0, value);
-    }
-    finish_one_shot_ui_state(Some(ui_worker));
-    Ok(())
 }
 
 /// Reports a one-shot selection that produced no capture, naming a display change as one.

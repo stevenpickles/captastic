@@ -212,6 +212,37 @@ pub struct OverlaySelection {
     pub(crate) window_frame: Option<CpuFrame>,
 }
 
+impl OverlaySelection {
+    /// A selection shaped exactly as an overlay run reports one, for tests in dependent crates
+    /// that have to exercise materialization without a desktop to draw on.
+    ///
+    /// Not part of the product surface - nothing in Captastic builds one of these outside
+    /// `build_overlay_selection` - but the alternative was making the captured window frame
+    /// public, and a crate that cannot construct the value it is handed cannot test what it does
+    /// with it.
+    #[doc(hidden)]
+    pub fn for_test(kind: SelectionKind, rect: Rect, view: PreviewView) -> Self {
+        Self {
+            rect,
+            kind,
+            window: None,
+            window_title: None,
+            window_application: None,
+            selection_ns: 0,
+            preparation_ns: 0,
+            window_overview_ns: None,
+            window_preview_count: 0,
+            window_live_preview_count: 0,
+            window_frozen_preview_count: 0,
+            window_preview_bytes: 0,
+            view,
+            view_switched: false,
+            presenter_fallback_reason: None,
+            window_frame: None,
+        }
+    }
+}
+
 /// The close reason an overlay reports for `WM_DISPLAYCHANGE`: the monitors themselves changed —
 /// one arrived, one left, or the arrangement moved.
 ///

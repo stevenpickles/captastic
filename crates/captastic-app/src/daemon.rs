@@ -38,8 +38,7 @@ use captastic_config::{
 use captastic_core::{
     validate_event_order, CaptureBackend, CaptureError, CaptureErrorKind, CaptureId, CaptureMode,
     CaptureRequest, CaptureSource, CpuFrame, CursorAbsence, CursorCapture, CursorMode, DisplayId,
-    DisplayInfo, EncodeOptions, EventRecorder, FrameMetadata, NativeFrame, OutputFormat,
-    PerfEventKind, Rect, TimingProvenance,
+    EncodeOptions, EventRecorder, FrameMetadata, NativeFrame, OutputFormat, PerfEventKind, Rect,
 };
 #[cfg(windows)]
 use serde_json::json;
@@ -480,13 +479,15 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                     continue;
                 }
                 if selection_enabled
-                    && selection_preview != PreviewMode::Frozen
                     && matches!(action_route(trigger.action), ActionRoute::Overlay(_))
                 {
-                    // The overlay is placed from the engine's display list and nothing captures
-                    // until the user confirms, so this is the only chance to notice that a
-                    // monitor change has left the list stale. Rebuild first; the frozen path gets
-                    // the same protection from its immediate capture.
+                    // Runs for *every* overlay trigger now, not only the ones that would capture
+                    // after confirmation. The overlay is placed from the engine's display list,
+                    // and the confirmation capture a live-view confirm takes is asked for against
+                    // whatever list the engine holds by then; a monitor change between two presses
+                    // used to open the overlay on the previous arrangement and produce a capture
+                    // describing bounds the drawn region no longer fit inside. Since any press can
+                    // now end in a confirmation capture, any press needs this check.
                     let (validation, recovery_attempts, reinitialize_error) =
                         ensure_current_display_configuration(
                             &mut backend,
@@ -494,7 +495,7 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                             |delay| wait_for_backoff(delay, &worker_stop_requested),
                             |attempt, delay, error| {
                                 crate::logging::warn(format_args!(
-                                    "live selection {} found the capture engine's display list stale; rebuilding it {}/{} in {:.0} ms: {error}",
+                                    "selection {} found the capture engine's display list stale; rebuilding it {}/{} in {:.0} ms: {error}",
                                     capture_id.0,
                                     attempt,
                                     CAPTURE_RECOVERY_RETRIES,
@@ -504,7 +505,7 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                         );
                     if let Some(reinitialize_error) = reinitialize_error {
                         crate::logging::warn(format_args!(
-                            "capture engine reinitialization failed before live selection {}: {reinitialize_error}",
+                            "capture engine reinitialization failed before selection {}: {reinitialize_error}",
                             capture_id.0
                         ));
                         recovery = Some(BackendRecovery::after_failure(
@@ -518,7 +519,7 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                             recovery = Some(BackendRecovery::immediate());
                         }
                         crate::logging::error(format_args!(
-                            "live selection {} could not verify the display configuration: {error}",
+                            "selection {} could not verify the display configuration: {error}",
                             capture_id.0
                         ));
                         // The hotkey was pressed and no overlay will appear. A dock event is a
@@ -533,77 +534,11 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                     }
                     if recovery_attempts > 0 {
                         log::info!(
-                            "capture engine rebuilt for live selection {} after {} attempt(s)",
+                            "capture engine rebuilt for selection {} after {} attempt(s)",
                             capture_id.0,
                             recovery_attempts
                         );
                     }
-                    let active_backend = backend.as_ref().expect("a validated backend is present");
-                    let source = match super::resolve_capture_source(
-                        &display_policy,
-                        active_backend.displays(),
-                    ) {
-                        Ok(source) => source,
-                        Err(error) => {
-                            crate::logging::error(format_args!(
-                                "live selection {} could not resolve its display: {error}",
-                                capture_id.0
-                            ));
-                            continue;
-                        }
-                    };
-                    let metadata = match preview_metadata(
-                        capture_id,
-                        &source,
-                        active_backend.displays(),
-                        mode.clone(),
-                    ) {
-                        Ok(metadata) => metadata,
-                        Err(error) => {
-                            crate::logging::error(format_args!(
-                                "live selection {} could not describe its display: {error}",
-                                capture_id.0
-                            ));
-                            continue;
-                        }
-                    };
-                    let Some(sender) = selection_sender.as_ref() else {
-                        crate::logging::error(format_args!(
-                            "live selection {} has no selection worker",
-                            capture_id.0
-                        ));
-                        continue;
-                    };
-                    let recorder = trigger_recorder(capture_id, &trigger);
-                    let output_status = match output_status_or_fatal(
-                        capture_id,
-                        dispatch_live_selection(
-                            sender,
-                            capture_id,
-                            &trigger,
-                            action_route(trigger.action),
-                            metadata,
-                            &cached_ui,
-                            selection_preview,
-                            recorder,
-                        ),
-                    ) {
-                        Ok(status) => status,
-                        Err(error) => {
-                            let _ = done_sender.send(Err(error));
-                            break;
-                        }
-                    };
-                    if queued_to_selection_worker(output_status) {
-                        selections_in_flight = selections_in_flight.saturating_add(1);
-                    }
-                    log::info!(
-                        "capture {} action={} output={}",
-                        capture_id.0,
-                        trigger.action,
-                        output_status
-                    );
-                    continue;
                 }
                 let (capture_result, mut recorder, recovery_attempts, reinitialize_error) =
                     capture_with_backend_recovery(
@@ -883,112 +818,6 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                             &capture_notices,
                             job,
                             "it could not resume after its confirmation capture",
-                        );
-                    }
-                }
-            }
-            CaptureCommand::FrozenSelectionFallback(mut request) => {
-                let capture_id = request.job.capture_id;
-                let capture_source =
-                    if request.job.metadata.display_id == DisplayId::virtual_desktop() {
-                        CaptureSource::VirtualDesktop
-                    } else {
-                        CaptureSource::Display(request.job.metadata.display_id.clone())
-                    };
-                if backend.is_none() {
-                    request.job.terminal_error = Some(
-                        "capture engine is recovering during automatic preview fallback".to_owned(),
-                    );
-                    match crate::selection::try_submit(
-                        selection_sender
-                            .as_ref()
-                            .expect("preview fallback requires its selection worker"),
-                        request.job,
-                    ) {
-                        Ok(()) => {}
-                        Err(crate::selection::SubmitError::Full(job))
-                        | Err(crate::selection::SubmitError::Disconnected(job)) => {
-                            // The attempt ends here, so it can no longer report completion.
-                            selections_in_flight = selections_in_flight.saturating_sub(1);
-                            report_dropped_selection(
-                                    &capture_notices,
-                                    job,
-                                    "its preview fallback could not be queued while the capture engine was recovering",
-                                );
-                        }
-                    }
-                    continue;
-                }
-                let capture_request = CaptureRequest {
-                    id: capture_id,
-                    triggered_at: request.requested_at,
-                    source: capture_source,
-                    mode: mode.clone(),
-                    cpu_frame: true,
-                    retain_native_frame: true,
-                    // A frozen preview is captured before the overlay exists, so its pointer is
-                    // the user's own and the configured policy applies unchanged.
-                    cursor,
-                };
-                let (capture_result, (), recovery_attempts, reinitialize_error) =
-                    capture_with_backend_recovery(
-                        &mut backend,
-                        |active_backend| {
-                            let result =
-                                active_backend.capture(&capture_request, &mut request.job.recorder);
-                            (result, ())
-                        },
-                        || super::create_backend(&backend_name, &display_policy),
-                        |delay| wait_for_backoff(delay, &worker_stop_requested),
-                        |attempt, delay, error| {
-                            crate::logging::warn(format_args!(
-                                    "preview fallback capture {} lost the engine; retrying {}/{} in {:.0} ms: {error}",
-                                    capture_id.0,
-                                    attempt,
-                                    CAPTURE_RECOVERY_RETRIES,
-                                    delay.as_secs_f64() * 1_000.0
-                                ));
-                        },
-                    );
-                if let Some(reinitialize_error) = reinitialize_error {
-                    recovery = Some(BackendRecovery::after_failure(
-                        recovery_attempts,
-                        waiting_for_desktop(&reinitialize_error),
-                    ));
-                    crate::logging::warn(format_args!(
-                            "capture engine reinitialization failed during preview fallback {}: {reinitialize_error}",
-                            capture_id.0
-                        ));
-                }
-                match capture_result {
-                    Ok(outcome) => {
-                        request.job.cpu_ready_offset_ns =
-                            Some(duration_ns(request.job.triggered_at, Instant::now()));
-                        request.job.metadata = outcome.metadata;
-                        request.job.frame = outcome.frame;
-                        request.job.native_frame = outcome.native_frame;
-                        request.job.confirmation_anchored = false;
-                    }
-                    Err(error) => {
-                        if requires_backend_recovery(&error) && recovery.is_none() {
-                            backend.take();
-                            recovery = Some(BackendRecovery::immediate());
-                        }
-                        request.job.terminal_error = Some(error.to_string());
-                    }
-                }
-                let sender = selection_sender
-                    .as_ref()
-                    .expect("preview fallback requires its selection worker");
-                match crate::selection::try_submit(sender, request.job) {
-                    Ok(()) => {}
-                    Err(crate::selection::SubmitError::Full(job))
-                    | Err(crate::selection::SubmitError::Disconnected(job)) => {
-                        selections_in_flight = selections_in_flight.saturating_sub(1);
-                        report_dropped_selection(
-                            &capture_notices,
-                            job,
-                            "it could not resume with its frozen preview fallback",
                         );
                     }
                 }
@@ -2359,147 +2188,6 @@ fn output_status_or_fatal(
 }
 
 #[cfg(windows)]
-pub(crate) fn preview_metadata(
-    capture_id: CaptureId,
-    source: &CaptureSource,
-    displays: &[DisplayInfo],
-    mode: CaptureMode,
-) -> Result<FrameMetadata, AppError> {
-    let (display_id, source_rect, rotation_degrees) = match source {
-        CaptureSource::Display(requested) => {
-            let display = if requested.is_primary_alias() {
-                displays
-                    .iter()
-                    .find(|display| display.is_primary)
-                    .or_else(|| displays.first())
-            } else {
-                displays.iter().find(|display| display.id == *requested)
-            }
-            .ok_or_else(|| {
-                AppError::BackendUnavailable(format!(
-                    "display {} disappeared before live selection",
-                    requested.0
-                ))
-            })?;
-            (display.id.clone(), display.bounds, display.rotation_degrees)
-        }
-        CaptureSource::VirtualDesktop => {
-            let first = displays.first().ok_or_else(|| {
-                AppError::BackendUnavailable(
-                    "no attached displays are available for live selection".to_owned(),
-                )
-            })?;
-            let mut left = i64::from(first.bounds.x);
-            let mut top = i64::from(first.bounds.y);
-            let mut right = first.bounds.right();
-            let mut bottom = first.bounds.bottom();
-            for display in &displays[1..] {
-                left = left.min(i64::from(display.bounds.x));
-                top = top.min(i64::from(display.bounds.y));
-                right = right.max(display.bounds.right());
-                bottom = bottom.max(display.bounds.bottom());
-            }
-            let source_rect = Rect {
-                x: i32::try_from(left).map_err(|_| {
-                    AppError::BackendUnavailable("virtual desktop x origin overflowed".to_owned())
-                })?,
-                y: i32::try_from(top).map_err(|_| {
-                    AppError::BackendUnavailable("virtual desktop y origin overflowed".to_owned())
-                })?,
-                width: u32::try_from(right.saturating_sub(left)).map_err(|_| {
-                    AppError::BackendUnavailable("virtual desktop width overflowed".to_owned())
-                })?,
-                height: u32::try_from(bottom.saturating_sub(top)).map_err(|_| {
-                    AppError::BackendUnavailable("virtual desktop height overflowed".to_owned())
-                })?,
-            };
-            (DisplayId::virtual_desktop(), source_rect, 0)
-        }
-    };
-
-    Ok(FrameMetadata {
-        capture_id,
-        backend: "selection-preview".to_owned(),
-        display_id,
-        source_rect,
-        rotation_degrees,
-        capture_mode: mode,
-        presentation_offset_ns: None,
-        timing_provenance: TimingProvenance::Unavailable,
-        native_ready_offset_ns: 0,
-        cpu_ready_offset_ns: None,
-        frame_age_ns: None,
-        verified_current_offset_ns: None,
-        frame_generation: None,
-        copy_count: 0,
-        pool_slot: None,
-        cursor: None,
-    })
-}
-
-#[cfg(windows)]
-#[allow(clippy::too_many_arguments)]
-fn dispatch_live_selection(
-    sender: &mpsc::SyncSender<crate::selection::SelectionJob>,
-    capture_id: CaptureId,
-    trigger: &TriggerEvent,
-    route: ActionRoute,
-    metadata: FrameMetadata,
-    cached_ui: &UiState,
-    preview_mode: PreviewMode,
-    recorder: EventRecorder,
-) -> Result<&'static str, AppError> {
-    let ActionRoute::Overlay(initial_tool) = route else {
-        return Err(AppError::InvalidArgument(
-            "live selection requires an overlay action".to_owned(),
-        ));
-    };
-    let remembered_ui = Some(captastic_config::resolve_display_ui_state(
-        cached_ui,
-        &metadata.display_id.0,
-    ));
-    let job = crate::selection::SelectionJob {
-        capture_id,
-        triggered_at: trigger.received_at,
-        action: trigger.action,
-        chord: trigger.chord,
-        initial_tool,
-        cpu_ready_offset_ns: None,
-        remembered_ui,
-        source: trigger.source,
-        metadata,
-        frame: None,
-        native_frame: None,
-        recorder,
-        confirmed_selection: None,
-        terminal_error: None,
-        selection_offset_ns: None,
-        confirmation_anchored: true,
-        preview_mode,
-        preview_fallback_reason: None,
-    };
-    match crate::selection::try_submit(sender, job) {
-        Ok(()) => Ok("live_selection_queued"),
-        Err(crate::selection::SubmitError::Full(job)) => {
-            let capture_id = crate::selection::finish_rejected(*job)?;
-            crate::logging::warn(format_args!(
-                "live selection {} skipped because the selection queue is full",
-                capture_id.0
-            ));
-            Ok("selection_queue_full")
-        }
-        Err(crate::selection::SubmitError::Disconnected(job)) => {
-            let capture_id = crate::selection::finish_rejected(*job)?;
-            crate::logging::warn(format_args!(
-                "live selection {} skipped because the selection worker stopped",
-                capture_id.0
-            ));
-            Ok("selection_worker_disconnected")
-        }
-    }
-}
-
-#[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 fn dispatch_output(
     selection_sender: Option<&mpsc::SyncSender<crate::selection::SelectionJob>>,
@@ -2678,7 +2366,6 @@ fn dispatch_selection(
         selection_offset_ns: None,
         confirmation_anchored: false,
         preview_mode,
-        preview_fallback_reason: None,
     };
     match crate::selection::try_submit(sender, job) {
         Ok(()) => Ok("selection_queued"),
@@ -2927,7 +2614,6 @@ pub fn run(_args: DaemonArgs) -> Result<(), AppError> {
 pub(crate) enum CaptureCommand {
     Trigger(TriggerEvent),
     LiveSelection(Box<crate::selection::LiveSelectionRequest>),
-    FrozenSelectionFallback(Box<crate::selection::FrozenSelectionFallbackRequest>),
     /// Reports that an attempt handed to the selection worker reached a terminal state, including
     /// cancellation, which produces no other command. Without it the capture worker could never
     /// observe that a `--max-captures` attempt had finished.
@@ -3054,6 +2740,8 @@ mod tests {
         FrameMetadata, FrameOrigin, PixelFormat, Rect, TimingProvenance,
     };
 
+    use captastic_core::DisplayInfo;
+
     use super::*;
 
     struct TempConfig {
@@ -3062,72 +2750,6 @@ mod tests {
     }
 
     static NEXT_TEMP_CONFIG: AtomicU64 = AtomicU64::new(0);
-
-    fn preview_display(id: &str, bounds: Rect, primary: bool) -> DisplayInfo {
-        DisplayInfo {
-            id: DisplayId(id.to_owned()),
-            name: id.to_owned(),
-            bounds,
-            scale_factor: 1.0,
-            rotation_degrees: 0,
-            is_primary: primary,
-        }
-    }
-
-    #[test]
-    fn live_preview_metadata_preserves_display_identity_and_virtual_bounds() {
-        let displays = [
-            preview_display(
-                "left",
-                Rect {
-                    x: -1280,
-                    y: 0,
-                    width: 1280,
-                    height: 1024,
-                },
-                false,
-            ),
-            preview_display(
-                "primary-id",
-                Rect {
-                    x: 0,
-                    y: -200,
-                    width: 1920,
-                    height: 1080,
-                },
-                true,
-            ),
-        ];
-        let mode = CaptureMode::Latest { max_age_ms: None };
-
-        let primary = preview_metadata(
-            CaptureId(1),
-            &CaptureSource::Display(DisplayId::primary()),
-            &displays,
-            mode.clone(),
-        )
-        .expect("primary preview metadata");
-        assert_eq!(primary.display_id.0, "primary-id");
-        assert_eq!(primary.source_rect, displays[1].bounds);
-
-        let desktop = preview_metadata(
-            CaptureId(2),
-            &CaptureSource::VirtualDesktop,
-            &displays,
-            mode,
-        )
-        .expect("virtual preview metadata");
-        assert_eq!(desktop.display_id, DisplayId::virtual_desktop());
-        assert_eq!(
-            desktop.source_rect,
-            Rect {
-                x: -1280,
-                y: -200,
-                width: 3200,
-                height: 1224,
-            }
-        );
-    }
 
     impl TempConfig {
         fn with_contents(contents: &str) -> Self {
@@ -3299,7 +2921,6 @@ mod tests {
             selection_offset_ns: None,
             confirmation_anchored: true,
             preview_mode: PreviewMode::Live,
-            preview_fallback_reason: None,
         })
     }
 
