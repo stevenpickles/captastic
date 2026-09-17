@@ -275,6 +275,10 @@ is something to open.
 One-shot captures write to disk from the same configuration: `captastic capture --backend dxgi`
 honours `[output]`, and `--config <file>` points it at a configuration other than the default.
 
+JPEG encoding uses the [`jpeg-encoder`](https://crates.io/crates/jpeg-encoder) crate, which is
+MIT or Apache-2.0 licensed with IJG-licensed portions: this software is based in part on the work
+of the Independent JPEG Group.
+
 ## Logging and diagnostics
 
 Daemon, capture, and benchmark commands write operational output through Rust's `log` facade to

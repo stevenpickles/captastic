@@ -13,3 +13,8 @@ https://github.com/stevenpickles/captastic
 Captastic is developed by the Captastic contributors. These licenses grant the
 right to redistribute the binaries embedded in this package subject to their
 respective terms.
+
+Captastic's JPEG file output uses the jpeg-encoder crate, licensed MIT or
+Apache-2.0 with portions under the IJG license. As that license asks of
+distributed executables: this software is based in part on the work of the
+Independent JPEG Group.
