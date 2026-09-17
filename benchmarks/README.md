@@ -2,7 +2,8 @@
 
 Captastic publishes no performance number that is not backed by artifacts committed here. This file
 is the procedure for producing them, and the reasoning behind each step that would otherwise look
-like ceremony.
+like ceremony. The tooling it relies on landed in PRs #87 (the host fingerprint and compatibility)
+and #91 (the raw artifacts, `benchmark compare`, and this procedure).
 
 The failure this guards against is not a wrong number. It is a *plausible* one. Two cursor-on runs
 on this project were once reported at +171 and −157 microseconds before per-capture outcome counting

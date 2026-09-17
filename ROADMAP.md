@@ -316,8 +316,9 @@ tone mapping should do. `FakeBackend` honours the freshness contract the recover
 The soak criteria are met on both backends, and the detach ledger is what made their results
 readable. What is left to plan around is evidence rather than resilience: the sequence-marker
 workload, deferred past v0.2.0, and the operator runs that the deferred published-claim criterion
-now waits on — the fingerprint and repeat-artifact automation behind it shipped in v0.2.0. The live lifecycle verifications that remain — sleep/wake,
-Remote Desktop, and the `DEVICE_REMOVED`/`DEVICE_RESET` limb of GPU reset — are listed under
+now waits on — the fingerprint and repeat-artifact automation behind it shipped in v0.2.0. The live
+lifecycle verifications that remain — sleep/wake, Remote Desktop, and the
+`DEVICE_REMOVED`/`DEVICE_RESET` limb of GPU reset — are listed under
 [Release readiness](#release-readiness--v010) because they are recommended before the tag.
 
 **Outcome:** Captastic handles the remaining pixel formats and Windows lifecycle transitions with
@@ -381,24 +382,24 @@ explicit, tested behavior.
   exists, since `FakeBackend` stamps `request.id & 0xff` into every pixel it produces
   (`crates/captastic-core/src/fake.rs`), which is what makes "which frame was materialized"
   provable at all today.
-- ~~Collect environment fingerprints and automate warm-up, raw artifacts, repeat runs, and compatible
-  baseline comparison.~~ **Done**, across the fingerprint PR (#87) and the raw-artifact and
-  comparison PR that followed it. Warm-up discard and `--repeat N` against a
-  fresh backend per run were already there. Every report now carries an `EnvironmentFingerprint`
-  identifying the host it describes — OS build, CPU, adapters with driver versions, displays with
-  scale and refresh, session, power source, power plan, and the whole build including its dirty
-  flag — and is deserializable, so a report can be a baseline rather than only a printout.
-  `RunCompatibility` keys on that fingerprint, so two development builds a hundred commits apart no
-  longer compare as the same software, and `HostMatch` lets a budget name the same facts.
+- ~~Collect environment fingerprints and automate warm-up, raw artifacts, repeat runs, and
+  compatible baseline comparison.~~ **Done** (PRs #87 and #91). Warm-up discard and `--repeat N`
+  against a fresh backend per run were already there. Every report now carries an
+  `EnvironmentFingerprint` identifying the host it describes — OS build, CPU, adapters with driver
+  versions, displays with scale and refresh, session, power source, power plan, and the whole build
+  including its dirty flag — and is deserializable, so a report can be a baseline rather than only
+  a printout. `RunCompatibility` keys on that fingerprint, so two development builds a hundred
+  commits apart no longer compare as the same software, and `HostMatch` lets a budget name the same
+  facts.
 
   `--output-dir` writes the raw artifacts of a whole repeat set: `run-N.json` per run,
   `run-N.events.jsonl` when `--raw-events` is given (which under `--repeat` used to be accepted and
   silently do nothing), and a typed `repeated.json` carrying the set, its compatibility, its
   per-stage agreement at p50/p95/p99 for all five latency stages, and the budget verdict.
   `captastic benchmark compare <baseline> <candidate>` reads either shape back and reports the
-  per-stage deltas with a `within_noise`/`slower`/`faster` verdict, or refuses with exit status 2
-  naming every host fact that differs. The operator procedure that turns this into a publishable
-  claim is [benchmarks/README.md](benchmarks/README.md).
+  per-stage deltas with a `within_noise`/`slower`/`faster`/`unmeasurable` verdict, or refuses with
+  exit status 2 naming every host fact that differs. The operator procedure that turns this into a
+  publishable claim is [benchmarks/README.md](benchmarks/README.md).
 - ~~Enforce relative and absolute performance budgets only on a documented physical benchmark host;
   hosted CI should continue enforcing correctness rather than GPU timing.~~ **Mechanism done.**
   `captastic benchmark --budgets benchmarks/budgets.toml` judges a run, and a budget names the host
