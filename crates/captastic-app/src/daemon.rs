@@ -38,7 +38,8 @@ use captastic_config::{
 use captastic_core::{
     validate_event_order, CaptureBackend, CaptureError, CaptureErrorKind, CaptureId, CaptureMode,
     CaptureRequest, CaptureSource, CpuFrame, CursorAbsence, CursorCapture, CursorMode, DisplayId,
-    DisplayInfo, EventRecorder, FrameMetadata, NativeFrame, PerfEventKind, Rect, TimingProvenance,
+    DisplayInfo, EncodeOptions, EventRecorder, FrameMetadata, NativeFrame, OutputFormat,
+    PerfEventKind, Rect, TimingProvenance,
 };
 #[cfg(windows)]
 use serde_json::json;
@@ -78,6 +79,8 @@ struct ResolvedDaemonArgs {
     output_directory: std::path::PathBuf,
     output_queue_capacity: usize,
     output_filename_template: String,
+    output_format: OutputFormat,
+    output_encode_options: EncodeOptions,
     history_store: captastic_config::HistoryStore,
     history_retention: captastic_config::RetentionPolicy,
     selection: bool,
@@ -198,6 +201,13 @@ fn resolve_daemon_args_with_default(
             ))?,
         output_queue_capacity: config.output.queue_capacity,
         output_filename_template: config.output.filename_template.clone(),
+        output_format: config.output.format,
+        // PNG effort stays at the default `Compact`: a file write happens on a worker thread where
+        // bytes on disk matter more than microseconds, and that is not a user's decision to make.
+        output_encode_options: EncodeOptions {
+            jpeg_quality: config.output.jpeg_quality,
+            ..EncodeOptions::default()
+        },
         history_store: args.config.as_ref().map_or_else(
             captastic_config::HistoryStore::for_default_storage,
             captastic_config::HistoryStore::for_config,
@@ -1069,6 +1079,8 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             crate::file_output::FileOutputWorker::start(
                 args.output_directory.clone(),
                 args.output_filename_template.clone(),
+                args.output_format,
+                args.output_encode_options,
                 crate::file_output::HistoryRecorder::new(
                     args.history_store.clone(),
                     args.history_retention,
@@ -1281,6 +1293,9 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         "output_directory": workers
             .file_output()
             .map(|worker| worker.directory().display().to_string()),
+        // Stated at startup rather than only per capture, so a user reading the ready line can see
+        // what the next hotkey press will leave on disk.
+        "output_format": args.file_output.then(|| args.output_format.as_str()),
         "output_queue_capacity": args.file_output.then_some(args.output_queue_capacity),
         "tray": tray.is_some(),
         "log_file": crate::logging::path().map(|path| path.display().to_string()),

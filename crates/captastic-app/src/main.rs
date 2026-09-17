@@ -582,6 +582,13 @@ fn write_one_shot_file_output(
         &config.output.filename_template,
         captastic_config::HotkeyAction::FullDisplay,
         frame,
+        config.output.format,
+        // The same `Compact` PNG effort the daemon's worker uses; only the JPEG quality is the
+        // user's to set.
+        &captastic_core::EncodeOptions {
+            jpeg_quality: config.output.jpeg_quality,
+            ..captastic_core::EncodeOptions::default()
+        },
     )?;
     recorder.record(capture_id, PerfEventKind::EncodeFinished, encode_ns);
     recorder.record(capture_id, PerfEventKind::FileWriteStarted, 0);
@@ -613,6 +620,7 @@ fn write_one_shot_file_output(
         }
     }
     Ok(Some(json!({
+        "format": config.output.format.as_str(),
         "path": path.display().to_string(),
         "bytes": bytes,
         "encode_ns": encode_ns,

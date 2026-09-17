@@ -10,7 +10,9 @@ use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use captastic_core::{validate_event_order, CaptureId, PerfEventKind, PngEffort};
+use captastic_core::{
+    encode_capture, validate_event_order, CaptureId, EncodeOptions, OutputFormat, PerfEventKind,
+};
 use serde_json::json;
 
 use crate::error::AppError;
@@ -62,6 +64,8 @@ impl FileOutputWorker {
     pub fn start(
         directory: PathBuf,
         filename_template: String,
+        format: OutputFormat,
+        encode_options: EncodeOptions,
         history: HistoryRecorder,
         json_output: bool,
         queue_capacity: usize,
@@ -101,7 +105,13 @@ impl FileOutputWorker {
                         Err(mpsc::RecvTimeoutError::Timeout) => continue,
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     };
-                    match write_capture(&worker_directory, &worker_template, &mut job) {
+                    match write_capture(
+                        &worker_directory,
+                        &worker_template,
+                        format,
+                        &encode_options,
+                        &mut job,
+                    ) {
                         Ok(report) => {
                             metrics.record_write(
                                 report.bytes,
@@ -109,7 +119,7 @@ impl FileOutputWorker {
                                 report.write_ns,
                                 report.collisions,
                             );
-                            report_written(&job, &report, json_output);
+                            report_written(&job, &report, format, json_output);
                             worker_history.record(&job, &report);
                             // A full channel means the daemon has not drained the previous signal
                             // yet, which already says what this one would.
@@ -288,6 +298,8 @@ pub fn write_capture_now(
     template: &str,
     action: captastic_config::HotkeyAction,
     frame: &captastic_core::CpuFrame,
+    format: OutputFormat,
+    encode_options: &EncodeOptions,
 ) -> Result<(PathBuf, usize, u64, u64), AppError> {
     crate::filename_template::validate_template(template).map_err(AppError::InvalidArgument)?;
     std::fs::create_dir_all(directory).map_err(|error| {
@@ -297,10 +309,11 @@ pub fn write_capture_now(
         ))
     })?;
     let encode_started = Instant::now();
-    let encoded = captastic_core::encode_frame(frame, PngEffort::Compact).map_err(|error| {
+    let encoded = encode_capture(frame, format, encode_options).map_err(|error| {
         AppError::BackendUnavailable(format!("failed to encode capture: {error}"))
     })?;
     let encode_ns = duration_ns(encode_started.elapsed());
+    report_alpha_flattening(&encoded, format);
     let write_started = Instant::now();
     let stem = crate::filename_template::expand(
         template,
@@ -316,11 +329,11 @@ pub fn write_capture_now(
             title: None,
         },
     );
-    let (path, _) = write_without_clobbering(directory, &stem, &encoded)
+    let (path, _) = write_without_clobbering(directory, &stem, encoded.extension, &encoded.bytes)
         .map_err(AppError::BackendUnavailable)?;
     Ok((
         path,
-        encoded.len(),
+        encoded.bytes.len(),
         encode_ns,
         duration_ns(write_started.elapsed()),
     ))
@@ -330,16 +343,20 @@ pub fn write_capture_now(
 fn write_capture(
     directory: &Path,
     template: &str,
+    format: OutputFormat,
+    encode_options: &EncodeOptions,
     job: &mut OutputJob,
 ) -> Result<WriteReport, String> {
     job.recorder
         .record(job.capture_id, PerfEventKind::EncodeStarted, elapsed(job));
     let encode_started = Instant::now();
-    // `Compact` rather than the clipboard's `Fast`: this runs on a worker thread where bytes on
-    // disk outlive the milliseconds spent producing them.
-    let encoded = captastic_core::encode_frame(&job.frame, PngEffort::Compact)
+    // PNG's `Compact` rather than the clipboard's `Fast`: this runs on a worker thread where bytes
+    // on disk outlive the milliseconds spent producing them. The caller sets that, the format, and
+    // the JPEG quality from `[output]`.
+    let encoded = encode_capture(&job.frame, format, encode_options)
         .map_err(|error| format!("failed to encode capture: {error}"))?;
     let encode_ns = duration_ns(encode_started.elapsed());
+    report_alpha_flattening(&encoded, format);
     job.recorder
         .record(job.capture_id, PerfEventKind::EncodeFinished, encode_ns);
 
@@ -349,15 +366,19 @@ fn write_capture(
         elapsed(job),
     );
     let write_started = Instant::now();
-    let (path, collisions) =
-        write_without_clobbering(directory, &capture_stem(template, job), &encoded)?;
+    let (path, collisions) = write_without_clobbering(
+        directory,
+        &capture_stem(template, job),
+        encoded.extension,
+        &encoded.bytes,
+    )?;
     let write_ns = duration_ns(write_started.elapsed());
     job.recorder
         .record(job.capture_id, PerfEventKind::FileWriteFinished, write_ns);
 
     Ok(WriteReport {
         path,
-        bytes: encoded.len(),
+        bytes: encoded.bytes.len(),
         encode_ns,
         write_ns,
         collisions,
@@ -373,6 +394,7 @@ fn write_capture(
 fn write_without_clobbering(
     directory: &Path,
     stem: &str,
+    extension: &str,
     contents: &[u8],
 ) -> Result<(PathBuf, u32), String> {
     for attempt in 0..MAX_COLLISION_ATTEMPTS {
@@ -383,9 +405,9 @@ fn write_without_clobbering(
         };
         // The containment check runs on every write, not only in the sanitizer's tests. It should
         // be impossible for a sanitized stem to fail it; that is exactly why it is cheap to keep.
-        let Some(path) = crate::filename_template::resolve(directory, &candidate, "png") else {
+        let Some(path) = crate::filename_template::resolve(directory, &candidate, extension) else {
             return Err(format!(
-                "refusing to write {candidate}.png: it would land outside {}",
+                "refusing to write {candidate}.{extension}: it would land outside {}",
                 directory.display()
             ));
         };
@@ -421,7 +443,23 @@ fn capture_stem(template: &str, job: &OutputJob) -> String {
     )
 }
 
-fn report_written(job: &OutputJob, report: &WriteReport, json_output: bool) {
+/// Says when a capture's alpha channel was composited away to fit the chosen format.
+///
+/// JPEG cannot carry alpha, so a window capture written as one loses its rounded corners to opaque
+/// white. That is inherent to the format the user chose rather than something Captastic decided,
+/// but it is still a difference between what was on screen and what is on disk, and ADR 0008's
+/// standard is that the user can find out. Debug rather than info: once the format is set this is
+/// true of every window capture, and at info level it would crowd out the lines that vary.
+fn report_alpha_flattening(encoded: &captastic_core::EncodedCapture, format: OutputFormat) {
+    if encoded.alpha_flattened {
+        log::debug!(
+            "{} cannot carry alpha: this capture's transparent pixels were composited over opaque white",
+            format.label()
+        );
+    }
+}
+
+fn report_written(job: &OutputJob, report: &WriteReport, format: OutputFormat, json_output: bool) {
     if json_output {
         println!(
             "{}",
@@ -431,6 +469,7 @@ fn report_written(job: &OutputJob, report: &WriteReport, json_output: bool) {
                 "capture_id": job.capture_id,
                 "source": job.source,
                 "action": job.action,
+                "format": format.as_str(),
                 "path": report.path.display().to_string(),
                 "bytes": report.bytes,
                 "encode_ns": report.encode_ns,
@@ -440,9 +479,10 @@ fn report_written(job: &OutputJob, report: &WriteReport, json_output: bool) {
         );
     } else {
         log::info!(
-            "file output {}: wrote {} ({} bytes, encode {:.3} ms, write {:.3} ms{})",
+            "file output {}: wrote {} as {} ({} bytes, encode {:.3} ms, write {:.3} ms{})",
             job.capture_id.0,
             report.path.display(),
+            format,
             report.bytes,
             ns_to_ms(report.encode_ns),
             ns_to_ms(report.write_ns),
@@ -594,6 +634,8 @@ mod tests {
         let Err(error) = FileOutputWorker::start(
             directory.clone(),
             "captastic-{tilte}".to_owned(),
+            OutputFormat::Png,
+            EncodeOptions::default(),
             no_history(),
             false,
             1,
@@ -611,7 +653,7 @@ mod tests {
         // tests: a caller that reached here with an unsanitized stem must still be stopped.
         let directory = test_directory("escape");
 
-        let error = write_without_clobbering(&directory, "../escape", b"capture")
+        let error = write_without_clobbering(&directory, "../escape", "png", b"capture")
             .expect_err("a traversing stem must be refused");
         assert!(error.contains("outside"), "{error}");
         assert!(
@@ -627,6 +669,38 @@ mod tests {
     }
 
     #[test]
+    fn a_capture_is_named_for_the_format_it_was_encoded_in() {
+        // The extension comes from the encoder rather than from a constant at the write site,
+        // which is what stops a JPEG from landing as `.png` and opening as a broken image.
+        let directory = test_directory("extensions");
+        let frame = window_job(None, None).frame;
+        for (format, expected) in [
+            (OutputFormat::Png, "png"),
+            (OutputFormat::Jpeg, "jpg"),
+            (OutputFormat::Bmp, "bmp"),
+        ] {
+            let (path, ..) = write_capture_now(
+                &directory,
+                captastic_config::DEFAULT_FILENAME_TEMPLATE,
+                captastic_config::HotkeyAction::FullDisplay,
+                &frame,
+                format,
+                &EncodeOptions::default(),
+            )
+            .unwrap_or_else(|error| panic!("{format}: {error}"));
+            assert_eq!(
+                path.extension().and_then(|extension| extension.to_str()),
+                Some(expected),
+                "{format} landed at {}",
+                path.display()
+            );
+            let written = std::fs::read(&path).expect("capture written");
+            assert!(!written.is_empty(), "{format} wrote an empty file");
+        }
+        std::fs::remove_dir_all(directory).expect("clean up");
+    }
+
+    #[test]
     fn a_capture_never_overwrites_a_file_it_did_not_create() {
         // The output directory is somewhere the user also keeps things. A screenshot silently
         // replacing one of them is worse than a screenshot that fails to save.
@@ -636,7 +710,7 @@ mod tests {
         std::fs::write(&occupied, b"something the user already had").expect("seed a file");
 
         let (path, collisions) =
-            write_without_clobbering(&directory, stem, b"capture").expect("write");
+            write_without_clobbering(&directory, stem, "png", b"capture").expect("write");
 
         assert_ne!(path, occupied);
         assert_eq!(collisions, 1);
@@ -654,9 +728,13 @@ mod tests {
         let mut written = Vec::new();
         for expected_collisions in 0..3_u32 {
             // One fixed stem, so every write after the first must find its own name.
-            let (path, collisions) =
-                write_without_clobbering(&directory, "captastic-20260815-221030-123", b"capture")
-                    .expect("write");
+            let (path, collisions) = write_without_clobbering(
+                &directory,
+                "captastic-20260815-221030-123",
+                "png",
+                b"capture",
+            )
+            .expect("write");
             assert_eq!(collisions, expected_collisions);
             assert!(!written.contains(&path), "reused {}", path.display());
             written.push(path);
@@ -669,8 +747,9 @@ mod tests {
         let directory = test_directory("missing");
         let missing = directory.join("not-created");
 
-        let error = write_without_clobbering(&missing, "captastic-20260815-221030-123", b"capture")
-            .expect_err("a missing directory cannot be written to");
+        let error =
+            write_without_clobbering(&missing, "captastic-20260815-221030-123", "png", b"capture")
+                .expect_err("a missing directory cannot be written to");
         assert!(error.contains("failed to write"), "{error}");
 
         std::fs::remove_dir_all(directory).expect("clean up");
@@ -685,6 +764,8 @@ mod tests {
         let worker = FileOutputWorker::start(
             nested.clone(),
             captastic_config::DEFAULT_FILENAME_TEMPLATE.to_owned(),
+            OutputFormat::Png,
+            EncodeOptions::default(),
             no_history(),
             false,
             1,
@@ -707,6 +788,8 @@ mod tests {
         let Err(error) = FileOutputWorker::start(
             blocked.join("captures"),
             captastic_config::DEFAULT_FILENAME_TEMPLATE.to_owned(),
+            OutputFormat::Png,
+            EncodeOptions::default(),
             no_history(),
             false,
             1,
