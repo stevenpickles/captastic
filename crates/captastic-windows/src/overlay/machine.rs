@@ -16,7 +16,7 @@ use super::snap::{
     guides_for, snap_coordinate, snap_point, snap_translation, ActiveSnaps, EdgeMask, RectEdges,
     SnapAxis, SnapHit, SnapTargets, NO_SNAPS, SNAP_THRESHOLD_DIP,
 };
-use super::{NativeWindowHandle, SelectionKind, WindowCandidate};
+use super::{NativeWindowHandle, PreviewView, SelectionKind, WindowCandidate};
 
 pub(super) const DRAG_THRESHOLD: i32 = 4;
 pub(super) const MIN_REGION_SIZE: i64 = 8;
@@ -218,6 +218,16 @@ pub(super) struct ToolbarDrag {
 pub(super) struct OverlayModel {
     pub(super) source: Rect,
     pub(super) display_environment: DisplayEnvironment,
+    /// Which pixels are on screen right now: the live desktop, or the snapshot taken at the
+    /// hotkey press. This is what the confirmation materializes from.
+    pub(super) view: PreviewView,
+    /// The view the run opened in, so switching twice returns the user to where they started
+    /// rather than to a hard-coded default.
+    pub(super) initial_view: PreviewView,
+    /// Whether the view can be switched at all. False when there is no snapshot to switch to,
+    /// and false when the layered presenter had to be abandoned and only the snapshot can be
+    /// shown. A run with it false ignores every request to switch rather than pretending.
+    pub(super) view_toggle_available: bool,
     pub(super) tool: CaptureTool,
     pub(super) selection: Option<Rect>,
     pub(super) selection_kind: Option<SelectionKind>,
@@ -304,6 +314,10 @@ pub(super) enum OverlayInput {
     LoupeKeyChanged { held: bool },
     /// The shell's rest timer fired: no pointer message has arrived, so the pointer is stationary.
     Tick { time_ms: u32 },
+    /// The user asked to switch between the live desktop and the snapshot taken at the hotkey
+    /// press. Inert when this run has nothing to switch to, and under the Window tool, whose
+    /// click renders its window fresh either way.
+    ToggleView,
     /// An arrow key adjusted the region by `(dx, dy)` physical pixels. `resize` moves the right
     /// and bottom edges instead of the whole rectangle.
     ///
@@ -452,6 +466,7 @@ pub(super) fn transition(model: &mut OverlayModel, input: OverlayInput) -> Vec<O
         OverlayInput::PointerCaptureLost => pointer_capture_lost(model),
         OverlayInput::LoupeKeyChanged { held } => loupe_key_changed(model, held),
         OverlayInput::Tick { time_ms } => loupe_tick(model, time_ms),
+        OverlayInput::ToggleView => toggle_view(model),
         OverlayInput::Nudge { dx, dy, resize } => nudge(model, dx, dy, resize),
         OverlayInput::ConfirmRequested => confirm(model),
         OverlayInput::CancelRequested => cancel(model),
@@ -748,6 +763,13 @@ fn toolbar_control_pressed(
                 mode: model.loupe.mode,
             });
         }
+        ToolbarControl::PreviewView => {
+            // Deliberately the same transition the `F` key takes, inertness included: a row that
+            // quietly did something different from the key it duplicates would be worse than
+            // either on its own. The menu stays open, so what the row did is visible in the row's
+            // own label without a second trip through Options.
+            effects.extend(toggle_view(model));
+        }
         ToolbarControl::ClipboardDestination => {}
         ToolbarControl::Cancel => return cancel(model),
     }
@@ -894,6 +916,48 @@ fn pointer_up(model: &mut OverlayModel, point: POINT, modifiers: Modifiers) -> V
     }
     effects.push(OverlayEffect::Invalidate);
     effects
+}
+
+/// Whether the frozen-view tag should be on screen.
+///
+/// Three conditions, and the third is not obvious. The tag says the picture has stopped, so it is
+/// only interesting in the frozen view, and it means nothing under the Window tool where a click
+/// renders its window fresh either way. And it sits in the band above the toolbar - which is
+/// exactly where the toolbar's own hover tooltips go. Painting both put the tooltip on top of the
+/// tag, so the toolbar owns that band whenever the pointer is on it: hovering any control hides
+/// the tag until the pointer leaves, rather than covering it with something else.
+pub(super) fn view_tag_visible(model: &OverlayModel) -> bool {
+    model.view == PreviewView::Frozen
+        && model.tool != CaptureTool::Window
+        && model.hovered_control.is_none()
+}
+
+/// Whether this run can switch views at all right now.
+///
+/// Two reasons it cannot. A run with no snapshot has nothing to switch to, and a run whose
+/// layered presenter had to be abandoned can only show the snapshot; both clear
+/// `view_toggle_available`. And under the Window tool the question does not arise: clicking a
+/// tile renders that window fresh whichever view is behind it, so switching would change nothing
+/// the user would get while implying that it had.
+pub(super) fn view_toggle_enabled(model: &OverlayModel) -> bool {
+    model.view_toggle_available && model.tool != CaptureTool::Window
+}
+
+/// Switches between the live desktop and the snapshot taken at the hotkey press.
+///
+/// Inert rather than refused when switching is unavailable: the key and the menu row are both
+/// always live, and a request that cannot be honoured changes nothing and repaints nothing.
+fn toggle_view(model: &mut OverlayModel) -> Vec<OverlayEffect> {
+    if !view_toggle_enabled(model) {
+        return Vec::new();
+    }
+    model.view = match model.view {
+        PreviewView::Live => PreviewView::Frozen,
+        PreviewView::Frozen => PreviewView::Live,
+    };
+    // Every pixel on screen is about to mean something else, including the magnifier's, so the
+    // whole overlay is repainted rather than any part of it patched.
+    vec![OverlayEffect::Invalidate]
 }
 
 /// Whether an adjustment of the region is in flight: a rubber band, a move, or a resize.
@@ -1550,6 +1614,11 @@ mod tests {
         OverlayModel {
             source: SOURCE,
             display_environment: environment(),
+            // The default shape of a v0.2.0 run: a snapshot was taken at the press, the overlay
+            // opened live on top of it, and the user can switch.
+            view: PreviewView::Live,
+            initial_view: PreviewView::Live,
+            view_toggle_available: true,
             tool: CaptureTool::Region,
             selection: None,
             selection_kind: None,
@@ -2518,6 +2587,221 @@ mod tests {
             e,
             OverlayEffect::BuildSnapTargets
         )));
+    }
+
+    #[test]
+    fn f_switches_the_view_and_switching_twice_returns_to_where_the_run_opened() {
+        let mut model = region_model();
+        assert_eq!(model.view, PreviewView::Live);
+
+        let effects = transition(&mut model, OverlayInput::ToggleView);
+        assert_eq!(model.view, PreviewView::Frozen);
+        assert!(has_effect(&effects, |e| matches!(
+            e,
+            OverlayEffect::Invalidate
+        )));
+
+        let effects = transition(&mut model, OverlayInput::ToggleView);
+        assert_eq!(
+            model.view, model.initial_view,
+            "switching twice returns to the view the run opened in, not to a default"
+        );
+        assert!(has_effect(&effects, |e| matches!(
+            e,
+            OverlayEffect::Invalidate
+        )));
+    }
+
+    #[test]
+    fn a_run_that_opened_frozen_switches_back_to_frozen() {
+        // The configuration chooses the opening view, and `initial_view` is what "back" means.
+        let mut model = region_model();
+        model.view = PreviewView::Frozen;
+        model.initial_view = PreviewView::Frozen;
+
+        transition(&mut model, OverlayInput::ToggleView);
+        assert_eq!(model.view, PreviewView::Live);
+        transition(&mut model, OverlayInput::ToggleView);
+        assert_eq!(model.view, PreviewView::Frozen);
+    }
+
+    #[test]
+    fn switching_the_view_is_inert_under_the_window_tool() {
+        // A window click renders that window fresh whichever view is behind it, so switching
+        // would change nothing the user gets while implying that it had.
+        let mut model = region_model();
+        let effects = activate_tool(&mut model, CaptureTool::Window);
+        assert!(!effects.is_empty());
+        let view = model.view;
+
+        let effects = transition(&mut model, OverlayInput::ToggleView);
+
+        assert_eq!(model.view, view);
+        assert!(
+            effects.is_empty(),
+            "an inert toggle must not even repaint the overlay"
+        );
+    }
+
+    #[test]
+    fn switching_the_view_is_inert_when_this_run_has_nothing_to_switch_to() {
+        // Either there was no snapshot, or the layered presenter had to be abandoned and only
+        // the snapshot can be shown. Both leave one view possible, and the request is dropped
+        // rather than refused: the key is always live and there is nothing to report.
+        let mut model = region_model();
+        model.view_toggle_available = false;
+        model.view = PreviewView::Frozen;
+
+        let effects = transition(&mut model, OverlayInput::ToggleView);
+
+        assert_eq!(model.view, PreviewView::Frozen);
+        assert!(effects.is_empty());
+        assert!(!view_toggle_enabled(&model));
+    }
+
+    #[test]
+    fn a_tool_round_trip_keeps_the_view_the_user_chose() {
+        // The view is a property of the run, not of the tool. Going out to the Window chooser
+        // and back must not quietly put the user back on the live desktop.
+        let mut model = region_model();
+        transition(&mut model, OverlayInput::ToggleView);
+        assert_eq!(model.view, PreviewView::Frozen);
+
+        activate_tool(&mut model, CaptureTool::Window);
+        assert_eq!(model.view, PreviewView::Frozen);
+        activate_tool(&mut model, CaptureTool::FullDisplay);
+        assert_eq!(model.view, PreviewView::Frozen);
+        activate_tool(&mut model, CaptureTool::Region);
+
+        assert_eq!(model.view, PreviewView::Frozen);
+        assert!(view_toggle_enabled(&model));
+    }
+
+    #[test]
+    fn the_view_can_be_switched_mid_drag_and_with_modifiers_held() {
+        // Deliberately not guarded. A user half-way through drawing a region over a video is
+        // exactly the person who wants to stop it moving, and making them let go first would
+        // lose the rectangle they had. Switching changes which pixels are behind the selection,
+        // not the selection: the drag survives it, and the release commits the same geometry.
+        let mut model = region_model();
+        transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point: point(100, 100),
+                window_slot: None,
+                time_ms: 0,
+            },
+        );
+        transition(
+            &mut model,
+            OverlayInput::PointerMoved {
+                point: point(300, 250),
+                window_hover: None,
+                modifiers: Modifiers {
+                    ctrl: true,
+                    shift: true,
+                },
+                time_ms: 10,
+            },
+        );
+        assert!(region_drag_active(&model));
+        let in_flight = model.selection;
+
+        let effects = transition(&mut model, OverlayInput::ToggleView);
+
+        assert_eq!(model.view, PreviewView::Frozen);
+        assert!(has_effect(&effects, |e| matches!(
+            e,
+            OverlayEffect::Invalidate
+        )));
+        assert!(
+            region_drag_active(&model),
+            "switching the view must not drop the drag in flight"
+        );
+        assert_eq!(model.selection, in_flight, "nor move what has been drawn");
+
+        // And the release still commits, in the view the user switched to.
+        transition(
+            &mut model,
+            OverlayInput::PointerUp {
+                point: point(300, 250),
+                modifiers: Modifiers::default(),
+            },
+        );
+        assert!(!region_drag_active(&model));
+        assert_eq!(model.selection_kind, Some(SelectionKind::Region));
+        assert_eq!(model.view, PreviewView::Frozen);
+    }
+
+    #[test]
+    fn the_frozen_tag_yields_the_band_above_the_toolbar_to_the_tooltips() {
+        let mut model = region_model();
+        assert!(!view_tag_visible(&model), "the live view carries no tag");
+
+        transition(&mut model, OverlayInput::ToggleView);
+        assert!(view_tag_visible(&model));
+
+        // Tooltips are laid out in the same band and painted later, so they would sit on top of
+        // the tag. The toolbar owns that band while the pointer is on it.
+        model.hovered_control = Some(ToolbarControl::Capture);
+        assert!(!view_tag_visible(&model));
+        model.hovered_control = None;
+        assert!(view_tag_visible(&model), "the tag returns with the pointer");
+
+        // Under the Window tool the view means nothing, so neither does a tag about it.
+        activate_tool(&mut model, CaptureTool::Window);
+        assert_eq!(model.view, PreviewView::Frozen);
+        assert!(!view_tag_visible(&model));
+    }
+
+    #[test]
+    fn the_view_row_switches_the_view_and_keeps_the_menu_open() {
+        let mut model = region_model();
+        model.options_open = true;
+        let layout = layout_for(&model);
+
+        for expected in [PreviewView::Frozen, PreviewView::Live] {
+            let effects = transition(
+                &mut model,
+                OverlayInput::PointerDown {
+                    point: center(layout.preview_view),
+                    window_slot: None,
+                    time_ms: 0,
+                },
+            );
+            assert_eq!(model.view, expected);
+            assert!(model.options_open, "the menu stays open for another press");
+            assert_eq!(model.hovered_control, Some(ToolbarControl::PreviewView));
+            assert!(has_effect(&effects, |e| matches!(
+                e,
+                OverlayEffect::Invalidate
+            )));
+            assert!(close_outcome(&effects).is_none());
+        }
+    }
+
+    #[test]
+    fn the_view_row_is_inert_wherever_the_key_is() {
+        // The row and the key must agree exactly: a greyed row that quietly did something the
+        // key would not is worse than either on its own.
+        let mut model = region_model();
+        model.options_open = true;
+        model.view_toggle_available = false;
+        let layout = layout_for(&model);
+        let view = model.view;
+
+        transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point: center(layout.preview_view),
+                window_slot: None,
+                time_ms: 0,
+            },
+        );
+
+        assert_eq!(model.view, view);
+        assert!(model.options_open);
+        assert!(!view_toggle_enabled(&model));
     }
 
     #[test]

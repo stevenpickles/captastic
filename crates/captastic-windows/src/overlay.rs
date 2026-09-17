@@ -68,7 +68,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SetFocus, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP, VK_Z,
+    SetFocus, VK_DOWN, VK_ESCAPE, VK_F, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP, VK_Z,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClassNameW,
@@ -77,11 +77,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, SetWindowDisplayAffinity, SetWindowLongPtrW, ShowWindow, TranslateMessage,
     UpdateLayeredWindow, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
     IDC_CROSS, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, MSG, SPI_SETLOGICALDPIOVERRIDE,
-    SPI_SETWORKAREA, SW_SHOW, ULW_ALPHA, WDA_EXCLUDEFROMCAPTURE, WM_APP, WM_CAPTURECHANGED,
-    WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP,
-    WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
-    WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WM_SETFOCUS, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW,
-    WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    SPI_SETWORKAREA, SW_SHOW, ULW_ALPHA, ULW_OPAQUE, WDA_EXCLUDEFROMCAPTURE, WM_APP,
+    WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND,
+    WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WM_SETFOCUS,
+    WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP,
 };
 #[cfg(test)]
 use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, PM_NOREMOVE, WM_QUIT};
@@ -131,6 +132,56 @@ pub enum InitialSelectionTool {
     Window,
 }
 
+/// Which pixels the overlay is showing the user *right now*.
+///
+/// Not the same question as which presenter is on screen. One layered window serves both views:
+/// [`PreviewView::Live`] lets the real desktop through and keeps changing, [`PreviewView::Frozen`]
+/// paints the snapshot taken at the hotkey press. The view is what the user sees, and therefore
+/// what the confirmation must materialize from; the presenter is only how the window gets there.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PreviewView {
+    /// The desktop as it is, seen through the overlay. Confirmation captures fresh pixels.
+    #[default]
+    Live,
+    /// The frame captured at the hotkey press. Confirmation crops that frame.
+    Frozen,
+}
+
+impl PreviewView {
+    /// The name this view goes by in logs and JSON.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Frozen => "frozen",
+        }
+    }
+
+    /// The Options row's label, which states the view that is showing rather than the action.
+    ///
+    /// "View: Frozen at hotkey" would say *when* the picture stopped, which is the part that
+    /// matters, but it measures 220 px against the 192 px a menu row has for text at 96 DPI - and
+    /// widening the whole menu for one row is the same trade the snap row already declined. The
+    /// tag on screen carries the full sentence; this row only has to name the state.
+    pub(crate) const fn menu_label(self) -> &'static str {
+        match self {
+            Self::Live => "View: Live",
+            Self::Frozen => "View: Frozen",
+        }
+    }
+}
+
+/// How the overlay window gets its pixels onto the screen.
+///
+/// `Layered` is the only presenter that can show the live desktop, and it shows the frozen
+/// snapshot just as well (with `ULW_OPAQUE` and no alpha pass). `Opaque` is the in-process
+/// fallback for a machine where establishing the layered presenter fails: it can only ever show
+/// the frozen view, which is why falling back also locks the view and hides the toggle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Presenter {
+    Layered,
+    Opaque,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NativeWindowHandle(isize);
 
@@ -162,7 +213,48 @@ pub struct OverlaySelection {
     pub window_live_preview_count: usize,
     pub window_frozen_preview_count: usize,
     pub window_preview_bytes: usize,
+    /// The view that was on screen when the user confirmed. The caller materializes from this and
+    /// nothing else: it is the only record of which pixels the user was actually looking at.
+    pub view: PreviewView,
+    /// Whether the user changed the view at least once during the run. Reported rather than
+    /// inferred, because a run that ends in the view it opened in is indistinguishable from one
+    /// that was switched and switched back.
+    pub view_switched: bool,
+    /// Why the layered presenter could not be established, when it could not. `None` on every
+    /// machine where it worked, which is expected to be all of them.
+    pub presenter_fallback_reason: Option<String>,
     pub(crate) window_frame: Option<CpuFrame>,
+}
+
+impl OverlaySelection {
+    /// A selection shaped exactly as an overlay run reports one, for tests in dependent crates
+    /// that have to exercise materialization without a desktop to draw on.
+    ///
+    /// Not part of the product surface - nothing in Captastic builds one of these outside
+    /// `build_overlay_selection` - but the alternative was making the captured window frame
+    /// public, and a crate that cannot construct the value it is handed cannot test what it does
+    /// with it.
+    #[doc(hidden)]
+    pub fn for_test(kind: SelectionKind, rect: Rect, view: PreviewView) -> Self {
+        Self {
+            rect,
+            kind,
+            window: None,
+            window_title: None,
+            window_application: None,
+            selection_ns: 0,
+            preparation_ns: 0,
+            window_overview_ns: None,
+            window_preview_count: 0,
+            window_live_preview_count: 0,
+            window_frozen_preview_count: 0,
+            window_preview_bytes: 0,
+            view,
+            view_switched: false,
+            presenter_fallback_reason: None,
+            window_frame: None,
+        }
+    }
 }
 
 /// The close reason an overlay reports for `WM_DISPLAYCHANGE`: the monitors themselves changed —
@@ -420,24 +512,48 @@ pub fn select_from_frozen_frame_with_initial_tool_and_ui(
     )
 }
 
+/// What an overlay run has to present from, and which view it opens in.
+///
+/// A run with a `snapshot` can show either view and lets the user switch between them; a run
+/// without one can only ever show the live desktop.
 #[derive(Clone, Copy, Debug)]
 pub struct SelectionPreviewSource<'a> {
     metadata: &'a FrameMetadata,
-    frozen_frame: Option<&'a CpuFrame>,
+    /// The frame captured at the hotkey press, when there is one.
+    snapshot: Option<&'a CpuFrame>,
+    /// The view the overlay opens in. Only honoured when a snapshot backs it: without one,
+    /// `Frozen` has nothing to paint.
+    initial_view: PreviewView,
+    /// Whether the layered presenter is a requirement rather than a preference. Set when the
+    /// caller asked for the live view explicitly, where an opaque window showing trigger-time
+    /// pixels would be the wrong answer rather than a degraded one.
+    require_layered: bool,
 }
 
 impl<'a> SelectionPreviewSource<'a> {
-    pub fn frozen(frame: &'a CpuFrame) -> Self {
+    /// A run backed by the trigger-time snapshot, opening in `initial_view`.
+    pub fn snapshot(frame: &'a CpuFrame, initial_view: PreviewView, require_layered: bool) -> Self {
         Self {
             metadata: &frame.metadata,
-            frozen_frame: Some(frame),
+            snapshot: Some(frame),
+            initial_view,
+            require_layered,
         }
     }
 
+    /// A run backed by a snapshot and opening on it. The layered presenter is preferred but not
+    /// required: an opaque window shows exactly these pixels.
+    pub fn frozen(frame: &'a CpuFrame) -> Self {
+        Self::snapshot(frame, PreviewView::Frozen, false)
+    }
+
+    /// A run with no pixels of its own, which can only present the live desktop.
     pub fn live(metadata: &'a FrameMetadata) -> Self {
         Self {
             metadata,
-            frozen_frame: None,
+            snapshot: None,
+            initial_view: PreviewView::Live,
+            require_layered: true,
         }
     }
 
@@ -445,8 +561,13 @@ impl<'a> SelectionPreviewSource<'a> {
         self.metadata
     }
 
-    pub fn is_live(self) -> bool {
-        self.frozen_frame.is_none()
+    /// The view this run will actually open in: `Frozen` needs a snapshot to paint.
+    fn resolved_initial_view(self) -> PreviewView {
+        if self.snapshot.is_some() {
+            self.initial_view
+        } else {
+            PreviewView::Live
+        }
     }
 }
 
@@ -462,7 +583,7 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
         return Ok(SelectionOutcome::Cancelled);
     }
     let _dpi_context = ThreadDpiContext::enter_per_monitor_v2()?;
-    if let Some(frame) = preview_source.frozen_frame {
+    if let Some(frame) = preview_source.snapshot {
         validate_frame(frame)?;
     }
     let metadata = preview_source.metadata;
@@ -474,7 +595,7 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
     }
     // SAFETY: Reads the current foreground window without retaining or mutating it.
     let previous_foreground = unsafe { GetForegroundWindow() };
-    let pixels = preview_source.frozen_frame.map(tight_pixels).transpose()?;
+    let pixels = preview_source.snapshot.map(tight_pixels).transpose()?;
     let cached = resources.take_matching(source.width, source.height);
     let (
         surface,
@@ -515,10 +636,13 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
             PrivateFontResource::register()?,
         )
     };
-    if preview_source.is_live() {
-        // Live region selection exposes the desktop through the layered window and does not use
-        // this surface. Retain one pre-overlay desktop image, though, so switching to the opaque
-        // window chooser has real pixels from which to build its blurred backdrop.
+    if preview_source.snapshot.is_none() {
+        // No snapshot was written into `surface`, so it holds nothing at all. Retain one
+        // pre-overlay desktop image so switching to the window chooser has real pixels from
+        // which to build its blurred backdrop. A run that *does* have a snapshot already has
+        // better pixels there — taken at the press, by the capture engine — and re-reading the
+        // desktop over them would both cost a full-screen BitBlt and overwrite the one image
+        // the frozen view exists to show.
         if let Err(error) = capture_live_window_backdrop(&surface, source) {
             log::warn!("live window backdrop capture failed: {error}; using a neutral background");
             fill_device_rect(
@@ -561,9 +685,16 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
         InitialSelectionTool::Window => CaptureTool::Window,
     };
     let (selection, selection_kind) = initial_selection(tool, last_region, source);
+    let initial_view = preview_source.resolved_initial_view();
     let state = Box::new(OverlayState {
         model: OverlayModel {
             source,
+            view: initial_view,
+            initial_view,
+            // Both views need pixels to switch between: the snapshot for the frozen one and a
+            // layered window for the live one. A run with a snapshot has the first; the second
+            // is retracted below if the layered presenter has to be abandoned.
+            view_toggle_available: preview_source.snapshot.is_some(),
             display_environment,
             tool,
             selection,
@@ -592,7 +723,11 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
             active_snaps: NO_SNAPS,
         },
         overlay_hwnd: HWND(0),
-        live_preview: preview_source.is_live(),
+        presenter: Presenter::Layered,
+        presenter_fallback_reason: None,
+        require_layered: preview_source.require_layered,
+        snapshot_present: preview_source.snapshot.is_some(),
+        view_switched: false,
         surface,
         back_buffer,
         dimmer,
@@ -637,7 +772,20 @@ struct OverlayState {
     /// The pure product-state machine; every transition-owned field lives here.
     model: OverlayModel,
     overlay_hwnd: HWND,
-    live_preview: bool,
+    /// How this run is getting its pixels onto the screen. Always starts `Layered`; only the
+    /// first-present fallback in [`run_overlay`] ever changes it.
+    presenter: Presenter,
+    /// Why the layered presenter was abandoned, when it was.
+    presenter_fallback_reason: Option<String>,
+    /// Whether the caller demanded the layered presenter. `true` makes a first-present failure
+    /// an error rather than a fallback.
+    require_layered: bool,
+    /// Whether `surface` holds the trigger-time snapshot. An opaque window has nothing else to
+    /// show, so this is half of what makes the presenter fallback possible at all.
+    snapshot_present: bool,
+    /// Whether the user switched the view during this run. Shell-side because it is telemetry
+    /// about the run, not a product decision the machine makes anything of.
+    view_switched: bool,
     surface: FrozenSurface,
     back_buffer: FrozenSurface,
     dimmer: FrozenSurface,
@@ -734,13 +882,17 @@ impl OverlayResources {
 impl OverlayState {
     /// Whether the pixels in `surface` are what the user is looking at.
     ///
-    /// The one place the magnifier's sampling decision is made. In the frozen presenter the
-    /// overlay is painting a still image and that image is authoritative; in the live presenter
-    /// the layered window is showing the real desktop through itself and `surface` holds nothing
-    /// but a pre-overlay backdrop captured for the window chooser, which is stale the moment
-    /// anything on screen moves. Magnifying that would show the user pixels that are not there.
+    /// The one place the magnifier's sampling decision is made. In the frozen view the overlay is
+    /// painting a still image and that image is authoritative; in the live view the layered
+    /// window is showing the real desktop through itself and `surface` holds trigger-time pixels
+    /// that are *not* what will be captured — stale the moment anything on screen moves.
+    /// Magnifying those would show the user pixels that are not there.
+    ///
+    /// Keyed on the view rather than the presenter for exactly that reason: a run that has a
+    /// snapshot in `surface` and is showing the live desktop over it must still sample the
+    /// desktop.
     fn showing_frozen_pixels(&self) -> bool {
-        !self.live_preview
+        self.model.view == PreviewView::Frozen
     }
 }
 
@@ -1076,72 +1228,26 @@ fn run_overlay(
         instance,
     };
     let source = state.model.source;
-    let live_preview = state.live_preview;
     let width = i32::try_from(source.width)
         .map_err(|_| invalid_frame("overlay width exceeds Win32 limits"))?;
     let height = i32::try_from(source.height)
         .map_err(|_| invalid_frame("overlay height exceeds Win32 limits"))?;
     let state_pointer = Box::into_raw(state);
-    // SAFETY: The registered class and callback are valid. state_pointer remains allocated until
-    // the message loop exits; WM_NCCREATE stores it as window user data.
-    let hwnd = unsafe {
-        CreateWindowExW(
-            WS_EX_TOPMOST
-                | WS_EX_TOOLWINDOW
-                | if live_preview {
-                    WS_EX_LAYERED
-                } else {
-                    Default::default()
-                },
-            CLASS_NAME,
-            w!("Captastic Selection"),
-            WS_POPUP,
-            source.x,
-            source.y,
-            width,
-            height,
-            None,
-            None,
-            instance,
-            Some(state_pointer.cast()),
-        )
-    };
-    if hwnd.0 == 0 {
-        // SAFETY: Window creation failed, so Win32 did not retain the state allocation.
-        let state = unsafe { Box::from_raw(state_pointer) };
-        let _ = cache_overlay_state(state, resources);
-        return Err(last_error("create_overlay_window"));
-    }
-    // SAFETY: state_pointer remains exclusively owned by this overlay thread. Recording the HWND
-    // lets tool transitions register compositor previews against this top-level destination.
-    unsafe {
-        (*state_pointer).overlay_hwnd = hwnd;
-        if (*state_pointer).model.tool == CaptureTool::Window {
-            start_window_overview_build(hwnd, &mut *state_pointer);
-        }
-    }
-    if live_preview {
-        // Build the first per-pixel layer before showing the window. This both establishes the
-        // layered presenter and validates it early enough for automatic frozen-mode fallback.
-        // SAFETY: state_pointer remains exclusively owned by this overlay thread.
-        let state = unsafe { &mut *state_pointer };
-        compose_overlay_state(state);
-        if let Err(error) = present_live_layer(hwnd, state) {
-            // SAFETY: hwnd and state_pointer were created on this thread and are not published.
-            let _ = unsafe { DestroyWindow(hwnd) };
-            // The synchronous WM_DESTROY posted a quit that no message loop will consume. Leaving
-            // it queued would immediately end the frozen-mode fallback run on this same thread.
-            drain_pending_quit();
-            // SAFETY: no callback can access the state after DestroyWindow returns.
+    let hwnd = match establish_presenter(state_pointer, instance, source, width, height) {
+        Ok(hwnd) => hwnd,
+        Err(error) => {
+            // SAFETY: Presenter setup left no live window holding the state allocation.
             let state = unsafe { Box::from_raw(state_pointer) };
             let _ = cache_overlay_state(state, resources);
             return Err(error);
         }
-        // Capture exclusion is defense in depth. Confirmation still destroys this window before
-        // asking the capture owner for pixels.
-        // SAFETY: hwnd is a live top-level window owned by this process.
-        if let Err(error) = unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) } {
-            log::warn!("live selection overlay could not be excluded from capture: {error}");
+    };
+    // SAFETY: state_pointer remains exclusively owned by this overlay thread. The chooser build
+    // starts only once the presenter has settled, so a fallback re-creation cannot strand a
+    // build posting messages at a window that no longer exists.
+    unsafe {
+        if (*state_pointer).model.tool == CaptureTool::Window {
+            start_window_overview_build(hwnd, &mut *state_pointer);
         }
     }
     controller.inner.hwnd.store(hwnd.0, Ordering::SeqCst);
@@ -1195,6 +1301,116 @@ fn run_overlay(
     restore_input_context(previous_foreground);
     drop(class_guard);
     Ok(outcome)
+}
+
+/// Creates the overlay window and gets its first frame onto the layer, falling back to an opaque
+/// window when the layered presenter cannot be established and the run can live without it.
+///
+/// One layered window serves both views, so this runs for every run rather than only live ones:
+/// the first `UpdateLayeredWindow` is what proves the presenter works, and doing it before the
+/// window is shown is what makes a fallback invisible rather than a flash of a broken overlay.
+///
+/// The fallback is only available to a run that has a snapshot to paint and did not demand the
+/// layered presenter. It destroys the window, drains the quit that `WM_DESTROY` latched — leaving
+/// it queued would end the replacement run's message loop immediately — locks the view to
+/// `Frozen`, and re-creates without `WS_EX_LAYERED`. An explicit `live` request fails hard
+/// instead: an opaque window showing trigger-time pixels is the wrong answer to it, not a
+/// degraded one.
+///
+/// # Safety-relevant ownership
+///
+/// `state_pointer` is owned by the caller for the whole call: on the error return no window holds
+/// it, and on success exactly one live window does.
+fn establish_presenter(
+    state_pointer: *mut OverlayState,
+    instance: HINSTANCE,
+    source: Rect,
+    width: i32,
+    height: i32,
+) -> Result<HWND, CaptureError> {
+    loop {
+        // SAFETY: state_pointer is exclusively owned by this overlay thread; no window is live
+        // at this point in the loop, so no callback can be reading it.
+        let layered = unsafe { (*state_pointer).presenter } == Presenter::Layered;
+        // SAFETY: The registered class and callback are valid. state_pointer remains allocated
+        // until the message loop exits; WM_NCCREATE stores it as window user data.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_TOPMOST
+                    | WS_EX_TOOLWINDOW
+                    | if layered {
+                        WS_EX_LAYERED
+                    } else {
+                        Default::default()
+                    },
+                CLASS_NAME,
+                w!("Captastic Selection"),
+                WS_POPUP,
+                source.x,
+                source.y,
+                width,
+                height,
+                None,
+                None,
+                instance,
+                Some(state_pointer.cast()),
+            )
+        };
+        if hwnd.0 == 0 {
+            return Err(last_error("create_overlay_window"));
+        }
+        // SAFETY: state_pointer remains exclusively owned by this overlay thread. Recording the
+        // HWND lets tool transitions register compositor previews against this destination.
+        unsafe { (*state_pointer).overlay_hwnd = hwnd };
+        // Every overlay, including the opaque fallback. Capture exclusion is defence in depth -
+        // confirmation still destroys this window before asking the capture owner for pixels -
+        // but a window that can be showing the live desktop one keystroke from now has no
+        // business appearing in somebody else's screen recording, and the fallback window is
+        // only locked to the frozen view by a decision this code made, not by anything Windows
+        // knows.
+        // SAFETY: hwnd is a live top-level window owned by this process.
+        let excluded = unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) };
+        if let Err(error) = excluded {
+            log::warn!("selection overlay could not be excluded from capture: {error}");
+        }
+        if !layered {
+            return Ok(hwnd);
+        }
+        // Build the first layer before showing the window: this both establishes the layered
+        // presenter and validates it early enough to fall back invisibly.
+        // SAFETY: state_pointer remains exclusively owned by this overlay thread.
+        let state = unsafe { &mut *state_pointer };
+        compose_overlay_state(state);
+        let present = present_layer(hwnd, state);
+        let fallback_allowed = !state.require_layered && state.snapshot_present;
+        match present {
+            Ok(()) => return Ok(hwnd),
+            Err(error) => {
+                // SAFETY: hwnd and state_pointer were created on this thread and are not
+                // published to any other.
+                let _ = unsafe { DestroyWindow(hwnd) };
+                // The synchronous WM_DESTROY posted a quit that no message loop will consume.
+                drain_pending_quit();
+                // SAFETY: no callback can access the state after DestroyWindow returns.
+                let state = unsafe { &mut *state_pointer };
+                state.overlay_hwnd = HWND(0);
+                if !fallback_allowed {
+                    return Err(error);
+                }
+                log::warn!(
+                    "layered selection presenter failed; showing the frozen view in an opaque window: {error}"
+                );
+                state.presenter = Presenter::Opaque;
+                state.presenter_fallback_reason = Some(error.to_string());
+                // An opaque window can only ever show the snapshot, so the view is not a choice
+                // any more and offering to switch it would be offering something that cannot
+                // happen.
+                state.model.view = PreviewView::Frozen;
+                state.model.initial_view = PreviewView::Frozen;
+                state.model.view_toggle_available = false;
+            }
+        }
+    }
 }
 
 unsafe extern "system" fn overlay_window_proc(
@@ -1405,6 +1621,14 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                 OverlayInput::LoupeKeyChanged { held: true },
             )
         }
+        WM_KEYDOWN if wparam.0 == usize::from(VK_F.0) => {
+            if key_is_autorepeat(lparam) {
+                // Holding F is not a request to flicker between the two views thirty times a
+                // second. Only the transition from up to down means anything here.
+                return LRESULT(0);
+            }
+            run_machine(hwnd, state_pointer, OverlayInput::ToggleView)
+        }
         WM_KEYUP if wparam.0 == usize::from(VK_Z.0) => run_machine(
             hwnd,
             state_pointer,
@@ -1551,6 +1775,11 @@ fn build_overlay_selection(
             .filter_map(|thumbnail| thumbnail.surface.as_ref())
             .map(|surface| surface.byte_length)
             .sum(),
+        // The view that is on screen at this instant, not the one the run opened in: the whole
+        // point of the toggle is that the user confirms what they are looking at.
+        view: state.model.view,
+        view_switched: state.view_switched,
+        presenter_fallback_reason: state.presenter_fallback_reason.clone(),
         window_frame,
     }
 }
@@ -1571,10 +1800,40 @@ const fn confirm_preview_split(kind: SelectionKind, live: usize, total: usize) -
 /// transition ends before any effect executes, so effects that reenter this window procedure
 /// (`ReleaseCapture`, `DestroyWindow`) can never observe a live `&mut` of the state.
 fn run_machine(hwnd: HWND, state_pointer: *mut OverlayState, input: OverlayInput) -> LRESULT {
+    // SAFETY: Single-field read; the borrow ends on this line.
+    let view_before = unsafe { (*state_pointer).model.view };
     // SAFETY: The Box remains alive for the message loop; this borrow ends at the semicolon.
     let effects = transition(unsafe { &mut (*state_pointer).model }, input);
+    // Observed here rather than announced by an effect, and latched rather than compared at the
+    // end: whether the *user* changed the view is telemetry about the run, not a decision the
+    // machine makes anything of, and a run switched twice ends where it started while still
+    // having been switched. One place covers both the `F` key and the Options row.
+    // SAFETY: This takes a whole-struct `&mut` to read `model.view` and write `view_switched`.
+    // The Box remains alive for the message loop, `transition` has already returned so no other
+    // borrow of the state is live, and nothing inside this block can reenter the window
+    // procedure: it is two field accesses and no call. The borrow ends at the closing brace,
+    // before `apply_overlay_effects` derives its own.
+    unsafe {
+        let state = &mut *state_pointer;
+        state.view_switched = latch_view_switch(state.view_switched, view_before, state.model.view);
+    }
     apply_overlay_effects(hwnd, state_pointer, effects);
     LRESULT(0)
+}
+
+/// Whether the user has changed the view at any point in this run, given what it was before an
+/// input and what it is after.
+///
+/// Latched, never recomputed: a run switched to the frozen view and back ends in the view it
+/// opened in, and comparing the two at the end would report it as never switched - which is
+/// exactly the case the flag exists to tell apart.
+const fn latch_view_switch(switched: bool, before: PreviewView, after: PreviewView) -> bool {
+    // `PreviewView` is not `const`-comparable through `PartialEq`, so the match spells it out.
+    switched
+        || !matches!(
+            (before, after),
+            (PreviewView::Live, PreviewView::Live) | (PreviewView::Frozen, PreviewView::Frozen)
+        )
 }
 
 fn apply_overlay_effects(
@@ -1793,12 +2052,13 @@ fn paint(hwnd: HWND, state_pointer: *mut OverlayState) {
         // borrow is created, and the borrow ends before EndPaint can synchronously send messages.
         let state = unsafe { &mut *state_pointer };
         compose_overlay_state(state);
-        if state.live_preview {
-            if let Err(error) = present_live_layer(hwnd, state) {
-                log::error!("live overlay presentation failed: {error}");
+        match state.presenter {
+            Presenter::Layered => {
+                if let Err(error) = present_layer(hwnd, state) {
+                    log::error!("overlay presentation failed: {error}");
+                }
             }
-        } else {
-            copy_overlay_to_paint_device(device, state);
+            Presenter::Opaque => copy_overlay_to_paint_device(device, state),
         }
     }
     // SAFETY: Balances BeginPaint for this exact hwnd/paint structure after releasing state.
@@ -1890,7 +2150,7 @@ fn compose_overlay_state(state: &mut OverlayState) {
             draw_window_overview_static(&state.back_buffer, state);
         }
         draw_window_overview_interactive(state);
-    } else if state.live_preview {
+    } else if state.model.view == PreviewView::Live {
         paint_live_selection_background(state);
     } else {
         // SAFETY: Both memory contexts are live, compatible GDI DCs with selected DIBs. Compose
@@ -1911,7 +2171,9 @@ fn compose_overlay_state(state: &mut OverlayState) {
     }
     // Window mode's dim wash is already part of its static overview cache. Other tools compose it
     // here so the selected region can subsequently restore its original frozen pixels.
-    if state.model.tool != CaptureTool::Window && state.model.dim_background && !state.live_preview
+    if state.model.tool != CaptureTool::Window
+        && state.model.dim_background
+        && state.model.view == PreviewView::Frozen
     {
         let _ = apply_dim_wash(
             state.back_buffer.device,
@@ -1929,7 +2191,7 @@ fn compose_overlay_state(state: &mut OverlayState) {
     prepare_loupe(state);
     if state.model.tool != CaptureTool::Window {
         if let Some(rect) = state.model.selection {
-            if !state.live_preview {
+            if state.model.view == PreviewView::Frozen {
                 restore_highlight(state, rect);
             }
             draw_outline(state.back_buffer.device, state.model.source, rect);
@@ -2039,8 +2301,26 @@ fn paint_live_selection_background(state: &OverlayState) {
     fill_live_background(&state.back_buffer);
 }
 
-fn present_live_layer(hwnd: HWND, state: &OverlayState) -> Result<(), CaptureError> {
-    prepare_live_layer_pixels(state);
+/// Puts the composed back buffer on the screen through the layered window.
+///
+/// Both views present through this one path. The live view needs per-pixel alpha, so it runs the
+/// alpha pass and asks for `ULW_ALPHA`. The frozen view is a still image with nothing behind it
+/// worth seeing: it asks for `ULW_OPAQUE` and skips the alpha pass entirely, which is both
+/// correct — every pixel of a frozen overlay is Captastic's — and a full-screen per-pixel loop
+/// saved on every paint.
+fn present_layer(hwnd: HWND, state: &OverlayState) -> Result<(), CaptureError> {
+    let live = state.model.view == PreviewView::Live;
+    if live {
+        prepare_live_layer_pixels(state);
+    } else {
+        // The frozen view skips the alpha pass, and with it the `GdiFlush` that pass performs
+        // before touching the DIB bytes. The flush is still required: `UpdateLayeredWindow` reads
+        // the back buffer's bits directly, and GDI drawing this thread has queued but not yet
+        // executed would otherwise land after the compositor had taken its copy.
+        // SAFETY: Flushes the calling thread's own GDI batch. It takes no arguments, touches no
+        // handle this function owns, and cannot fail in a way that matters here.
+        let _ = unsafe { GdiFlush() };
+    }
     let destination = POINT {
         x: state.model.source.x,
         y: state.model.source.y,
@@ -2050,11 +2330,13 @@ fn present_live_layer(hwnd: HWND, state: &OverlayState) -> Result<(), CaptureErr
         cx: state.back_buffer.width,
         cy: state.back_buffer.height,
     };
+    // The opaque blend is stated rather than left to `ULW_OPAQUE` ignoring it: were the flag ever
+    // honoured together with a blend, this one still composes the layer exactly as drawn.
     let blend = BLENDFUNCTION {
         BlendOp: 0,
         BlendFlags: 0,
         SourceConstantAlpha: u8::MAX,
-        AlphaFormat: AC_SRC_ALPHA as u8,
+        AlphaFormat: if live { AC_SRC_ALPHA as u8 } else { 0 },
     };
     // SAFETY: A null HWND obtains the desktop DC used only for palette matching during this call.
     let screen = unsafe { GetDC(None) };
@@ -2073,12 +2355,12 @@ fn present_live_layer(hwnd: HWND, state: &OverlayState) -> Result<(), CaptureErr
             Some(&source),
             COLORREF(0),
             Some(&blend),
-            ULW_ALPHA,
+            if live { ULW_ALPHA } else { ULW_OPAQUE },
         )
     };
     // SAFETY: Balances the successful GetDC(None) above on this thread.
     unsafe { ReleaseDC(None, screen) };
-    result.map_err(|error| overlay_error("present_live_overlay", error))
+    result.map_err(|error| overlay_error("present_overlay_layer", error))
 }
 
 fn prepare_live_layer_pixels(state: &OverlayState) {
@@ -2594,17 +2876,21 @@ fn render_overview_batch(hwnd: HWND, state: &mut OverlayState, generation: usize
 
 /// Builds a tile for each window, and reports which of them still need pixels.
 ///
-/// In live mode a tile needs only the shape of its window, which `DwmQueryThumbnailSourceSize`
-/// answers in about a millisecond without capturing anything. In frozen mode there is no
-/// compositor drawing tiles for us, so every window needs a render.
+/// Under the layered presenter a tile needs only the shape of its window, which
+/// `DwmQueryThumbnailSourceSize` answers in about a millisecond without capturing anything.
+/// Without it there is no compositor drawing tiles for us, so every window needs a render.
+///
+/// Keyed on the presenter, not the view: DWM composes its thumbnails against the destination
+/// window regardless of which pixels Captastic is painting underneath, and the Window tool is
+/// unaffected by the view in any case — clicking a tile always renders the window fresh.
 fn seed_window_tiles(
     state: &mut OverlayState,
     handles: &[NativeWindowHandle],
 ) -> Vec<NativeWindowHandle> {
     let mut needs_render = Vec::new();
+    let layered = state.presenter == Presenter::Layered;
     for handle in handles {
-        let source = state
-            .live_preview
+        let source = layered
             .then(|| dwm_source_size(state.overlay_hwnd, *handle))
             .flatten()
             .or_else(|| native_window_size(*handle));
@@ -2616,8 +2902,8 @@ fn seed_window_tiles(
             );
             continue;
         };
-        // Frozen mode draws every tile itself, so every tile needs pixels.
-        if !state.live_preview {
+        // Without DWM every tile is drawn here, so every tile needs pixels.
+        if !layered {
             needs_render.push(*handle);
         }
         state.window_thumbnails.push(WindowThumbnail {
@@ -2668,7 +2954,10 @@ fn ensure_overview_batch_posted(hwnd: HWND, state: &OverlayState) {
 
 fn refresh_live_window_thumbnails(state: &mut OverlayState) {
     state.live_window_thumbnails.clear();
-    if !state.live_preview || state.model.tool != CaptureTool::Window || state.overlay_hwnd.0 == 0 {
+    if state.presenter != Presenter::Layered
+        || state.model.tool != CaptureTool::Window
+        || state.overlay_hwnd.0 == 0
+    {
         return;
     }
 
@@ -3465,6 +3754,10 @@ fn draw_toolbar(state: &OverlayState) {
         state.model.display_environment,
         state.model.toolbar_position,
     );
+    // First, so the Options menu paints over it when both want the space above the toolbar: an
+    // open menu is what the user is looking at, and the tag is still readable the moment it
+    // closes.
+    draw_view_tag(state, layout);
     if state.model.options_open {
         draw_options_menu(device, state, layout);
     }
@@ -3708,6 +4001,81 @@ fn draw_hover_tooltip(device: HDC, state: &OverlayState, layout: ToolbarLayout) 
     );
 }
 
+/// The label on the tag that shows while the frozen view is on screen.
+///
+/// Named once so the glyph-fit test measures the string the overlay paints, and worded to answer
+/// the question the user will actually be asking - not "which mode is this" but "why has the
+/// video stopped".
+const FROZEN_VIEW_TAG: &str = "FROZEN · pixels from hotkey press";
+
+/// Draws the tag that says the overlay is showing the snapshot rather than the desktop.
+///
+/// Only while the frozen view is up, only outside the Window tool where the view means nothing,
+/// and only while the pointer is off the toolbar - the tooltips claim the same band and, being
+/// painted later, would sit on top of this. The live view carries no tag at all: an overlay
+/// showing what is really there is the unremarkable case, and labelling it would put a permanent
+/// pill on every capture.
+fn draw_view_tag(state: &OverlayState, layout: ToolbarLayout) {
+    if !machine::view_tag_visible(&state.model) {
+        return;
+    }
+    let device = state.back_buffer.device;
+    let metrics = state.model.display_environment.metrics;
+    let work_area = state.model.display_environment.work_area;
+    let tokens = metrics.toolbar_tokens();
+    let font_height = tokens.font_height;
+    let measured = measure_ui_text(device, FROZEN_VIEW_TAG, font_height);
+    let width = measured
+        .cx
+        .saturating_add(tokens.tooltip_padding_x.saturating_mul(2))
+        .min((work_area.width() - metrics.px(16)).max(1));
+    let height = (measured.cy + tokens.tooltip_padding_y * 2).max(metrics.px(32));
+    let left = ((layout.bounds.left + layout.bounds.right - width) / 2).clamp(
+        work_area.left + metrics.px(8),
+        (work_area.right - width - metrics.px(8)).max(work_area.left + metrics.px(8)),
+    );
+    // Above the toolbar, which is where the eye already is, and below it only when there is no
+    // room above - the same rule the tooltips follow, so the two never argue about which side of
+    // the toolbar its chrome belongs on.
+    let preferred_top = if layout.bounds.top >= work_area.top + height + metrics.px(16) {
+        layout.bounds.top - height - metrics.px(8)
+    } else {
+        layout.bounds.bottom + metrics.px(8)
+    };
+    let top = preferred_top.clamp(
+        work_area.top + metrics.px(8),
+        (work_area.bottom - height - metrics.px(8)).max(work_area.top + metrics.px(8)),
+    );
+    let bounds = UiRect {
+        left,
+        top,
+        right: left + width,
+        bottom: top + height,
+    };
+    // The accent border rather than the toolbar's grey: this is a statement about the pixels, not
+    // another control, and it has to be noticed without being alarming.
+    draw_round_box(
+        device,
+        bounds,
+        rgb(28, 42, 66),
+        rgb(86, 156, 255),
+        tokens.tooltip_corner_radius,
+    );
+    draw_text(
+        device,
+        UiRect {
+            left: bounds.left + tokens.tooltip_padding_x,
+            top: bounds.top,
+            right: bounds.right - tokens.tooltip_padding_x,
+            bottom: bounds.bottom,
+        },
+        FROZEN_VIEW_TAG,
+        rgb(198, 220, 255),
+        TextAlignment::Center,
+        font_height,
+    );
+}
+
 fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
     let metrics = state.model.display_environment.metrics;
     let tokens = metrics.toolbar_tokens();
@@ -3722,6 +4090,7 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
         (ToolbarControl::DimBackground, layout.dim_background),
         (ToolbarControl::SnapToWindows, layout.snap_to_windows),
         (ToolbarControl::RegionZoom, layout.region_zoom),
+        (ToolbarControl::PreviewView, layout.preview_view),
         (
             ToolbarControl::ClipboardDestination,
             layout.clipboard_destination,
@@ -3795,6 +4164,27 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
         },
         state.model.loupe.mode.label(),
         rgb(245, 245, 247),
+        TextAlignment::Left,
+        tokens.font_height,
+    );
+    // No checkmark here either: two views cycle rather than one setting being on or off, and the
+    // label states which one is showing. Greyed - the same grey the clipboard row uses for a
+    // destination the user cannot turn off - when the run has nothing to switch to, or under the
+    // Window tool, where a click renders its window fresh whichever view is behind it.
+    draw_text(
+        device,
+        UiRect {
+            left: layout.preview_view.left + tokens.menu_text_offset,
+            top: layout.preview_view.top,
+            right: layout.preview_view.right - tokens.text_padding,
+            bottom: layout.preview_view.bottom,
+        },
+        state.model.view.menu_label(),
+        if machine::view_toggle_enabled(&state.model) {
+            rgb(245, 245, 247)
+        } else {
+            rgb(130, 130, 136)
+        },
         TextAlignment::Left,
         tokens.font_height,
     );
@@ -3942,8 +4332,81 @@ mod tests {
             window_live_preview_count: 0,
             window_frozen_preview_count: 0,
             window_preview_bytes: 0,
+            view: PreviewView::Frozen,
+            view_switched: false,
+            presenter_fallback_reason: None,
             window_frame: None,
         }
+    }
+
+    #[test]
+    fn switching_the_view_and_switching_back_still_counts_as_switched() {
+        // The whole reason this is latched in the shell rather than compared at the end. A run
+        // that ends in the view it opened in is otherwise indistinguishable from one the user
+        // never touched, and `view_switched` exists precisely to tell those two apart.
+        let mut switched = false;
+        switched = latch_view_switch(switched, PreviewView::Live, PreviewView::Live);
+        assert!(
+            !switched,
+            "an input that leaves the view alone changes nothing"
+        );
+
+        switched = latch_view_switch(switched, PreviewView::Live, PreviewView::Frozen);
+        assert!(switched);
+
+        switched = latch_view_switch(switched, PreviewView::Frozen, PreviewView::Live);
+        assert!(
+            switched,
+            "switching back does not unsay that it was switched"
+        );
+
+        // And every later input keeps it set, whatever it does.
+        for (before, after) in [
+            (PreviewView::Live, PreviewView::Live),
+            (PreviewView::Frozen, PreviewView::Frozen),
+        ] {
+            assert!(latch_view_switch(switched, before, after));
+        }
+    }
+
+    #[test]
+    fn a_preview_source_without_a_snapshot_can_only_open_live() {
+        let mut metadata = frame_metadata_for_tests();
+        metadata.source_rect = Rect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        };
+        let frame = CpuFrame::new(
+            Arc::from(vec![0_u8; 4]),
+            1,
+            1,
+            4,
+            PixelFormat::Bgra8Unorm,
+            FrameOrigin::TopLeft,
+            ColorSpace::Srgb,
+            metadata,
+        )
+        .expect("a valid one-pixel frame");
+
+        // A snapshot opens in whichever view it was asked for, and does not insist on the
+        // layered presenter: an opaque window shows exactly those pixels.
+        assert_eq!(
+            SelectionPreviewSource::snapshot(&frame, PreviewView::Live, false)
+                .resolved_initial_view(),
+            PreviewView::Live
+        );
+        assert_eq!(
+            SelectionPreviewSource::frozen(&frame).resolved_initial_view(),
+            PreviewView::Frozen
+        );
+        assert!(!SelectionPreviewSource::frozen(&frame).require_layered);
+        // Without a snapshot there is nothing to paint a frozen view from, and the layered
+        // presenter is the only way to show anything at all.
+        let live = SelectionPreviewSource::live(&frame.metadata);
+        assert_eq!(live.resolved_initial_view(), PreviewView::Live);
+        assert!(live.require_layered);
     }
 
     #[test]
@@ -5209,6 +5672,16 @@ mod tests {
                     layout.region_zoom.height(),
                 ),
                 (
+                    PreviewView::Live.menu_label(),
+                    layout.preview_view.width() - tokens.menu_text_offset - tokens.text_padding,
+                    layout.preview_view.height(),
+                ),
+                (
+                    PreviewView::Frozen.menu_label(),
+                    layout.preview_view.width() - tokens.menu_text_offset - tokens.text_padding,
+                    layout.preview_view.height(),
+                ),
+                (
                     "Copy to Clipboard",
                     layout.clipboard_destination.width()
                         - tokens.menu_text_offset
@@ -5232,6 +5705,16 @@ mod tests {
                     "{label} is {measured:?} at {dpi} DPI but only {available_height} px are available"
                 );
             }
+            // The view tag sizes its pill around the measurement rather than fitting inside a
+            // fixed row, so the constraint is the display: a tag wider than the work area is
+            // clipped, and a clipped explanation of why the desktop has stopped moving is worse
+            // than none. 1280 DIPs is the narrowest configuration the verification doc covers.
+            let tag = measure_ui_text(surface.device, FROZEN_VIEW_TAG, tokens.font_height);
+            let narrowest = metrics.px(1280) - metrics.px(16);
+            assert!(
+                tag.cx + tokens.tooltip_padding_x * 2 <= narrowest,
+                "the frozen view tag is {tag:?} at {dpi} DPI but only {narrowest} px are available"
+            );
         }
     }
 

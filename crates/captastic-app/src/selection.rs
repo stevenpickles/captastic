@@ -251,15 +251,30 @@ impl SelectionWorker {
                     &job.metadata.display_id.0,
                     job.remembered_ui.unwrap_or_default(),
                 );
-                let mut selection_was_confirmed = job.confirmed_selection.is_some();
+                let selection_was_confirmed = job.confirmed_selection.is_some();
                 let selection = if let Some(selection) = job.confirmed_selection.take() {
                     Ok(captastic_windows::SelectionOutcome::Selected(Box::new(
                         selection,
                     )))
                 } else {
-                    let preview_source = job.frame.as_ref().map_or_else(
-                        || captastic_windows::SelectionPreviewSource::live(&job.metadata),
-                        captastic_windows::SelectionPreviewSource::frozen,
+                    // Every overlay press arrives with the pixels from that press, so the overlay
+                    // can show either view and the user can move between them. The configuration
+                    // chooses the one it opens on; `live` additionally makes the layered
+                    // presenter a requirement rather than a preference, because an opaque window
+                    // showing trigger-time pixels is the wrong answer to it.
+                    let Some(frame) = job.frame.as_ref() else {
+                        finish_without_clipboard(
+                            &mut job,
+                            json_output,
+                            "selection_failed",
+                            "the overlay was opened without the pixels captured at its trigger",
+                        );
+                        continue;
+                    };
+                    let preview_source = captastic_windows::SelectionPreviewSource::snapshot(
+                        frame,
+                        initial_view(job.preview_mode),
+                        job.preview_mode == PreviewMode::Live,
                     );
                     captastic_windows::select_from_preview_source_with_initial_tool_and_ui(
                         preview_source,
@@ -269,6 +284,7 @@ impl SelectionWorker {
                         &mut overlay_resources,
                     )
                 };
+
                 match selection {
                     Ok(captastic_windows::SelectionOutcome::Selected(selection)) => {
                         let selection = *selection;
@@ -292,105 +308,139 @@ impl SelectionWorker {
                         let selection_offset_ns = job
                             .selection_offset_ns
                             .unwrap_or_else(|| duration_ns(job.triggered_at.elapsed()));
-                        if job.frame.is_none()
-                            && selection.kind == captastic_windows::SelectionKind::Window
-                        {
-                            let Some(frame) = captastic_windows::captured_window_frame(&selection)
-                            else {
-                                finish_without_clipboard(
-                                    &mut job,
-                                    json_output,
-                                    "selection_failed",
-                                    "confirmed window selection did not retain its native frame",
-                                );
-                                continue;
-                            };
-                            job.recorder.record(
-                                job.capture_id,
-                                PerfEventKind::SelectionConfirmed,
-                                selection.selection_ns,
-                            );
-                            let ready_offset_ns = duration_ns(job.triggered_at.elapsed());
-                            job.recorder.record(
-                                job.capture_id,
-                                PerfEventKind::CaptureRequested,
-                                ready_offset_ns,
-                            );
-                            job.recorder.record(
-                                job.capture_id,
-                                PerfEventKind::NativeFrameReady,
-                                ready_offset_ns,
-                            );
-                            job.recorder.record(
-                                job.capture_id,
-                                PerfEventKind::CpuFrameReady,
-                                ready_offset_ns,
-                            );
-                            job.cpu_ready_offset_ns = Some(ready_offset_ns);
-                            job.metadata = frame.metadata.clone();
-                            job.frame = Some(frame);
-                            job.confirmation_anchored = true;
-                            selection_was_confirmed = true;
-                        }
-                        if job.frame.is_none() {
-                            job.recorder.record(
-                                job.capture_id,
-                                PerfEventKind::SelectionConfirmed,
-                                selection.selection_ns,
-                            );
-                            job.selection_offset_ns = Some(selection_offset_ns);
-                            if let Err(error) = captastic_windows::flush_desktop_composition() {
-                                log::warn!(
-                                    "selection {} could not synchronize overlay removal before capture: {error}",
-                                    job.capture_id.0
-                                );
-                            }
-                            let request = LiveSelectionRequest {
-                                job,
-                                selection,
-                                confirmed_at: Instant::now(),
-                            };
-                            match capture_sender.try_send(
-                                crate::daemon::CaptureCommand::LiveSelection(Box::new(request)),
-                            ) {
-                                Ok(()) => attempt.handed_back(),
-                                Err(error) => {
-                                    let command = match error {
-                                        mpsc::TrySendError::Full(command)
-                                        | mpsc::TrySendError::Disconnected(command) => command,
-                                    };
-                                    let crate::daemon::CaptureCommand::LiveSelection(request) =
-                                        command
-                                    else {
-                                        unreachable!("selection worker sends only live selections")
-                                    };
-                                    let mut job = request.job;
+                        // Which pixels this confirmation is made of, decided once and in one
+                        // place: whether the job has already been round-tripped through its
+                        // confirmation capture, whether a window was clicked, and - for
+                        // everything else - which view the user was actually looking at.
+                        let route = ConfirmationRoute::of(
+                            selection_was_confirmed,
+                            selection.kind,
+                            selection.view,
+                        );
+                        match route {
+                            ConfirmationRoute::Resumed => {}
+                            ConfirmationRoute::WindowFrame => {
+                                let Some(frame) =
+                                    captastic_windows::captured_window_frame(&selection)
+                                else {
                                     finish_without_clipboard(
                                         &mut job,
                                         json_output,
                                         "selection_failed",
-                                        "capture command queue was unavailable after confirmation",
+                                        "confirmed window selection did not retain its native frame",
                                     );
-                                    notify_dropped_selection(
-                                        &notices,
-                                        job.capture_id,
-                                        "the capture command queue was unavailable after its selection was confirmed",
+                                    continue;
+                                };
+                                job.recorder.record(
+                                    job.capture_id,
+                                    PerfEventKind::SelectionConfirmed,
+                                    selection.selection_ns,
+                                );
+                                let ready_offset_ns = duration_ns(job.triggered_at.elapsed());
+                                job.recorder.record(
+                                    job.capture_id,
+                                    PerfEventKind::CaptureRequested,
+                                    ready_offset_ns,
+                                );
+                                job.recorder.record(
+                                    job.capture_id,
+                                    PerfEventKind::NativeFrameReady,
+                                    ready_offset_ns,
+                                );
+                                job.recorder.record(
+                                    job.capture_id,
+                                    PerfEventKind::CpuFrameReady,
+                                    ready_offset_ns,
+                                );
+                                job.cpu_ready_offset_ns = Some(ready_offset_ns);
+                                job.metadata = frame.metadata.clone();
+                                job.frame = Some(frame);
+                                // The desktop texture belonged to the trigger snapshot and has
+                                // nothing to do with a freshly rendered window.
+                                job.native_frame = None;
+                            }
+                            ConfirmationRoute::TriggerSnapshot => {
+                                job.recorder.record(
+                                    job.capture_id,
+                                    PerfEventKind::SelectionConfirmed,
+                                    selection.selection_ns,
+                                );
+                            }
+                            ConfirmationRoute::ConfirmationCapture => {
+                                job.recorder.record(
+                                    job.capture_id,
+                                    PerfEventKind::SelectionConfirmed,
+                                    selection.selection_ns,
+                                );
+                                job.selection_offset_ns = Some(selection_offset_ns);
+                                // The snapshot goes before the job does. The user was looking at
+                                // the live desktop, so those pixels can no longer be published,
+                                // and carrying a full-display CPU frame and a GPU texture across
+                                // to the capture thread would hold both for the length of a
+                                // capture that is about to replace them.
+                                release_snapshot(&mut job);
+                                if let Err(error) = captastic_windows::flush_desktop_composition() {
+                                    log::warn!(
+                                        "selection {} could not synchronize overlay removal before capture: {error}",
+                                        job.capture_id.0
                                     );
                                 }
+                                let request = LiveSelectionRequest {
+                                    job,
+                                    selection,
+                                    confirmed_at: Instant::now(),
+                                };
+                                match capture_sender.try_send(
+                                    crate::daemon::CaptureCommand::LiveSelection(Box::new(request)),
+                                ) {
+                                    Ok(()) => attempt.handed_back(),
+                                    Err(error) => {
+                                        let command = match error {
+                                            mpsc::TrySendError::Full(command)
+                                            | mpsc::TrySendError::Disconnected(command) => command,
+                                        };
+                                        let crate::daemon::CaptureCommand::LiveSelection(request) =
+                                            command
+                                        else {
+                                            unreachable!(
+                                                "selection worker sends only live selections"
+                                            )
+                                        };
+                                        let mut job = request.job;
+                                        finish_without_clipboard(
+                                            &mut job,
+                                            json_output,
+                                            "selection_failed",
+                                            "capture command queue was unavailable after confirmation",
+                                        );
+                                        notify_dropped_selection(
+                                            &notices,
+                                            job.capture_id,
+                                            "the capture command queue was unavailable after its selection was confirmed",
+                                        );
+                                    }
+                                }
+                                continue;
                             }
-                            continue;
                         }
-                        if !selection_was_confirmed {
-                            job.recorder.record(
-                                job.capture_id,
-                                PerfEventKind::SelectionConfirmed,
-                                selection.selection_ns,
+                        // One assignment, from the route, so the reported anchor and the
+                        // materialization label can never describe different frames.
+                        job.confirmation_anchored = route.confirmation_anchored();
+                        // Every route that reaches here is supposed to carry its pixels, and a
+                        // `.expect` would have been true of all four. But this runs on the
+                        // long-lived selection thread: if a resumed job ever came back without a
+                        // frame, panicking would take every future hotkey press with it. A
+                        // selection that cannot be materialized is a selection that failed, and
+                        // there is already a way to say so.
+                        let Some(frame) = job.frame.take() else {
+                            finish_without_clipboard(
+                                &mut job,
+                                json_output,
+                                "selection_failed",
+                                "the confirmed selection arrived without the pixels to crop",
                             );
-                        }
-                        let frame = job
-                            .frame
-                            .as_ref()
-                            .expect("captured pixels exist after live selection resumes");
+                            continue;
+                        };
                         let materialize_started = Instant::now();
                         let mut materialization = selection_materialization(
                             selection.kind,
@@ -424,7 +474,7 @@ impl SelectionWorker {
                                 result.frame
                             }
                             Ok(Some(None)) | Ok(None) => {
-                                match captastic_windows::materialize_selection(frame, &selection) {
+                                match captastic_windows::materialize_selection(&frame, &selection) {
                                     Ok(frame) => frame,
                                     Err(error) => {
                                         finish_without_clipboard(
@@ -443,7 +493,7 @@ impl SelectionWorker {
                                     "selection {} GPU materialization failed; using CPU crop: {error}",
                                     job.capture_id.0
                                 ));
-                                match captastic_windows::materialize_selection(frame, &selection) {
+                                match captastic_windows::materialize_selection(&frame, &selection) {
                                     Ok(frame) => frame,
                                     Err(error) => {
                                         finish_without_clipboard(
@@ -489,12 +539,16 @@ impl SelectionWorker {
                                     "chord": job.chord.map(|chord| chord.to_string()),
                                     "selection_interaction_ns": selection.selection_ns,
                                     "requested_preview_mode": preview_mode(job.preview_mode),
-                                    "preview_mode": if job.confirmation_anchored { "live" } else { "frozen" },
-                                    "preview_fallback_reason": job.preview_fallback_reason.as_deref(),
+                                    // The view that was on screen when the user confirmed, which
+                                    // is no longer decided by the configuration alone.
+                                    "preview_mode": selection.view.label(),
+                                    "preview_fallback_reason": selection.presenter_fallback_reason.as_deref(),
+                                    // Only two anchors remain. "fallback" described a second
+                                    // trigger-time capture taken to reopen the overlay frozen,
+                                    // and there is no such capture any more: the snapshot the
+                                    // overlay opened with is the one that gets published.
                                     "capture_anchor": if job.confirmation_anchored {
                                         "confirmation"
-                                    } else if job.preview_fallback_reason.is_some() {
-                                        "fallback"
                                     } else {
                                         "trigger"
                                     },
@@ -509,6 +563,10 @@ impl SelectionWorker {
                                     "gpu_materialization": gpu_materialization,
                                     "gpu_fallback_error": gpu_fallback_error,
                                     "selected_frame_bytes": selected_frame.required_bytes(),
+                                    // Appended, not inserted: a run that ends in the view it
+                                    // opened in is otherwise indistinguishable from one that was
+                                    // switched and switched back.
+                                    "view_switched": selection.view_switched,
                                 })
                             );
                         }
@@ -611,52 +669,10 @@ impl SelectionWorker {
                         notify_dropped_selection(&notices, job.capture_id, clause);
                     }
                     Err(error) => {
-                        if job.frame.is_none()
-                            && job.preview_mode == PreviewMode::Auto
-                            && job.preview_fallback_reason.is_none()
-                        {
-                            crate::logging::warn(format_args!(
-                                "selection {} live presenter failed; reopening with a frozen preview: {error}",
-                                job.capture_id.0
-                            ));
-                            job.preview_fallback_reason = Some(error.to_string());
-                            let request = FrozenSelectionFallbackRequest {
-                                job,
-                                requested_at: Instant::now(),
-                            };
-                            match capture_sender.try_send(
-                                crate::daemon::CaptureCommand::FrozenSelectionFallback(Box::new(
-                                    request,
-                                )),
-                            ) {
-                                Ok(()) => attempt.handed_back(),
-                                Err(error) => {
-                                    let command = match error {
-                                        mpsc::TrySendError::Full(command)
-                                        | mpsc::TrySendError::Disconnected(command) => command,
-                                    };
-                                    let crate::daemon::CaptureCommand::FrozenSelectionFallback(
-                                        request,
-                                    ) = command
-                                    else {
-                                        unreachable!("selection worker sends only fallback captures")
-                                    };
-                                    let mut job = request.job;
-                                    finish_without_clipboard(
-                                        &mut job,
-                                        json_output,
-                                        "selection_failed",
-                                        "capture command queue was unavailable for automatic preview fallback",
-                                    );
-                                    notify_dropped_selection(
-                                        &notices,
-                                        job.capture_id,
-                                        "the capture command queue was unavailable for its automatic preview fallback",
-                                    );
-                                }
-                            }
-                            continue;
-                        }
+                        // No cross-thread preview fallback any more. The overlay already holds
+                        // the trigger snapshot, so a layered presenter that will not establish
+                        // itself is recovered from in place, inside the same run, by re-creating
+                        // the window opaque around the pixels it already has.
                         if !selection_was_confirmed {
                             job.recorder.record(
                                 job.capture_id,
@@ -795,7 +811,6 @@ pub struct SelectionJob {
     pub selection_offset_ns: Option<u64>,
     pub confirmation_anchored: bool,
     pub preview_mode: PreviewMode,
-    pub preview_fallback_reason: Option<String>,
 }
 
 pub struct LiveSelectionRequest {
@@ -804,9 +819,76 @@ pub struct LiveSelectionRequest {
     pub confirmed_at: Instant,
 }
 
-pub struct FrozenSelectionFallbackRequest {
-    pub job: SelectionJob,
-    pub requested_at: Instant,
+/// Which pixels a confirmed selection is made of.
+///
+/// One decision, taken once, from three facts: whether this job has already been round-tripped
+/// through its confirmation capture, whether a window was clicked, and - for everything else -
+/// which view the user was looking at when they pressed the button.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfirmationRoute {
+    /// The job has come back from the capture thread and already carries the confirmed pixels.
+    Resumed,
+    /// A window was clicked. Its click always renders that window fresh, whichever view was
+    /// showing, so the Window tool is unaffected by the view entirely.
+    WindowFrame,
+    /// The frozen view was on screen: crop the snapshot taken at the hotkey press.
+    TriggerSnapshot,
+    /// The live view was on screen: the desktop the user was looking at is the current one, so
+    /// capture it now and crop that.
+    ConfirmationCapture,
+}
+
+impl ConfirmationRoute {
+    fn of(
+        resumed: bool,
+        kind: captastic_windows::SelectionKind,
+        view: captastic_windows::PreviewView,
+    ) -> Self {
+        if resumed {
+            Self::Resumed
+        } else if kind == captastic_windows::SelectionKind::Window {
+            Self::WindowFrame
+        } else if view == captastic_windows::PreviewView::Frozen {
+            Self::TriggerSnapshot
+        } else {
+            Self::ConfirmationCapture
+        }
+    }
+
+    /// Whether the pixels this route publishes were captured at the confirmation rather than at
+    /// the hotkey press. Drives both the reported `capture_anchor` and the materialization label,
+    /// so the two can never disagree about which frame the user got.
+    const fn confirmation_anchored(self) -> bool {
+        match self {
+            // A resumed job is only ever back here because its live-view confirmation asked the
+            // capture thread for a frame and got one; a window click rendered its window fresh.
+            Self::Resumed | Self::WindowFrame | Self::ConfirmationCapture => true,
+            Self::TriggerSnapshot => false,
+        }
+    }
+}
+
+/// The view an overlay run opens in for a configured preview mode.
+///
+/// `auto` and `live` both open live, and differ only in whether a layered presenter that will not
+/// establish itself is an error or a fallback. `frozen` opens on the snapshot. None of the three
+/// decides what the user is looking at by the time they confirm, which is the point.
+const fn initial_view(mode: PreviewMode) -> captastic_windows::PreviewView {
+    match mode {
+        PreviewMode::Frozen => captastic_windows::PreviewView::Frozen,
+        PreviewMode::Auto | PreviewMode::Live => captastic_windows::PreviewView::Live,
+    }
+}
+
+/// Drops the trigger snapshot before the job travels back to the capture thread.
+///
+/// The user confirmed against the live desktop, so those pixels can never be published now, and
+/// carrying a full-display CPU frame plus a retained GPU texture across a channel to wait out a
+/// capture that is about to replace both is a lot of memory held for nothing. The anchor is left
+/// alone: it is set from the route, in one place, so it can never disagree with the label.
+fn release_snapshot(job: &mut SelectionJob) {
+    job.frame = None;
+    job.native_frame = None;
 }
 
 pub enum SubmitError {
@@ -1077,7 +1159,192 @@ fn coalesce_ui_update(
 mod tests {
     use std::fs;
 
+    use captastic_core::{
+        CaptureBackend, CaptureMode, CaptureRequest, CaptureSource, CursorMode, FakeBackend,
+        FakeBackendConfig, Rect,
+    };
+    use captastic_windows::{PreviewView, SelectionKind};
+
     use super::*;
+
+    /// A desktop frame from the fake backend, whose every pixel is `request.id & 0xff`. Two
+    /// captures with different ids therefore produce two frames that can be told apart pixel by
+    /// pixel, which is the whole point: "which frame was published" stops being a matter of
+    /// reading the code.
+    fn stamped_frame(id: u8) -> CpuFrame {
+        let mut backend = FakeBackend::new(FakeBackendConfig {
+            width: 8,
+            height: 8,
+            ..FakeBackendConfig::default()
+        });
+        let mut recorder = EventRecorder::with_capacity(8);
+        backend
+            .capture(
+                &CaptureRequest {
+                    id: CaptureId(u64::from(id)),
+                    triggered_at: Instant::now(),
+                    source: CaptureSource::Display(captastic_core::DisplayId::primary()),
+                    mode: CaptureMode::Latest { max_age_ms: None },
+                    cpu_frame: true,
+                    retain_native_frame: false,
+                    cursor: CursorMode::Exclude,
+                },
+                &mut recorder,
+            )
+            .expect("the fake backend captures")
+            .frame
+            .expect("the fake backend returns a CPU frame")
+    }
+
+    fn confirmed_selection(
+        kind: SelectionKind,
+        view: PreviewView,
+        rect: Rect,
+    ) -> captastic_windows::OverlaySelection {
+        captastic_windows::OverlaySelection::for_test(kind, rect, view)
+    }
+
+    #[test]
+    fn the_route_table_names_one_source_of_pixels_for_every_confirmation() {
+        use ConfirmationRoute as Route;
+
+        // A job that has been round-tripped through its confirmation capture already carries the
+        // pixels, whatever view or tool produced it.
+        for kind in [
+            SelectionKind::Display,
+            SelectionKind::Region,
+            SelectionKind::Window,
+        ] {
+            for view in [PreviewView::Live, PreviewView::Frozen] {
+                assert_eq!(Route::of(true, kind, view), Route::Resumed);
+            }
+        }
+        // The Window tool is unaffected by the view: its click renders that window fresh either
+        // way, which is what makes greying the Options row under it honest.
+        for view in [PreviewView::Live, PreviewView::Frozen] {
+            assert_eq!(
+                Route::of(false, SelectionKind::Window, view),
+                Route::WindowFrame
+            );
+        }
+        // Everything else follows the view that was on screen.
+        for kind in [SelectionKind::Display, SelectionKind::Region] {
+            assert_eq!(
+                Route::of(false, kind, PreviewView::Frozen),
+                Route::TriggerSnapshot
+            );
+            assert_eq!(
+                Route::of(false, kind, PreviewView::Live),
+                Route::ConfirmationCapture
+            );
+        }
+        // Only the snapshot route publishes pixels from the trigger.
+        assert!(!Route::TriggerSnapshot.confirmation_anchored());
+        for route in [
+            Route::Resumed,
+            Route::WindowFrame,
+            Route::ConfirmationCapture,
+        ] {
+            assert!(route.confirmation_anchored());
+        }
+    }
+
+    #[test]
+    fn the_view_that_was_showing_decides_which_pixels_are_published() {
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        };
+        // The capture taken at the hotkey press, and the one a live-view confirmation would ask
+        // for afterwards. Different ids so their pixels are distinguishable.
+        let trigger = stamped_frame(1);
+        let confirmation = stamped_frame(2);
+
+        // Frozen view: the route keeps the job's own frame, so the crop is made of the pixels
+        // from the press.
+        let frozen = confirmed_selection(SelectionKind::Region, PreviewView::Frozen, rect);
+        let route = ConfirmationRoute::of(false, frozen.kind, frozen.view);
+        assert_eq!(route, ConfirmationRoute::TriggerSnapshot);
+        assert_eq!(
+            selection_materialization(frozen.kind, route.confirmation_anchored()),
+            "frozen_desktop_crop"
+        );
+        let cropped = captastic_windows::materialize_selection(&trigger, &frozen)
+            .expect("the trigger snapshot crops");
+        assert!(
+            cropped.pixels().iter().all(|byte| *byte == 1),
+            "a frozen-view confirmation must publish the trigger capture's pixels"
+        );
+
+        // Live view: the job releases its snapshot and comes back with the confirmation capture.
+        let live = confirmed_selection(SelectionKind::Region, PreviewView::Live, rect);
+        let route = ConfirmationRoute::of(false, live.kind, live.view);
+        assert_eq!(route, ConfirmationRoute::ConfirmationCapture);
+        // The job that returns from the capture thread is a resumed one, and both routes agree
+        // that its pixels are confirmation-anchored.
+        assert_eq!(
+            selection_materialization(
+                live.kind,
+                ConfirmationRoute::of(true, live.kind, live.view).confirmation_anchored()
+            ),
+            "confirmation_desktop_crop"
+        );
+        let cropped = captastic_windows::materialize_selection(&confirmation, &live)
+            .expect("the confirmation capture crops");
+        assert!(
+            cropped.pixels().iter().all(|byte| *byte == 2),
+            "a live-view confirmation must publish the confirmation capture's pixels"
+        );
+    }
+
+    #[test]
+    fn releasing_the_snapshot_leaves_no_pixels_to_travel_with_the_job() {
+        // The job is about to cross a channel and wait out a capture that replaces both of
+        // these. Carrying a full-display CPU frame and a retained GPU texture along for the ride
+        // is memory held for pixels that can no longer be published.
+        let mut job = job_for_tests();
+        job.frame = Some(stamped_frame(1));
+        job.native_frame = None;
+
+        release_snapshot(&mut job);
+
+        assert!(job.frame.is_none());
+        assert!(job.native_frame.is_none());
+    }
+
+    fn job_for_tests() -> SelectionJob {
+        let frame = stamped_frame(1);
+        SelectionJob {
+            capture_id: CaptureId(1),
+            triggered_at: Instant::now(),
+            action: HotkeyAction::Region,
+            chord: None,
+            initial_tool: captastic_windows::InitialSelectionTool::Region,
+            cpu_ready_offset_ns: Some(0),
+            remembered_ui: None,
+            source: "test",
+            metadata: frame.metadata.clone(),
+            frame: Some(frame),
+            native_frame: None,
+            recorder: EventRecorder::with_capacity(8),
+            confirmed_selection: None,
+            terminal_error: None,
+            selection_offset_ns: None,
+            confirmation_anchored: false,
+            preview_mode: PreviewMode::Auto,
+        }
+    }
+
+    #[test]
+    fn the_configured_preview_mode_only_chooses_the_view_the_overlay_opens_in() {
+        assert_eq!(initial_view(PreviewMode::Frozen), PreviewView::Frozen);
+        // `auto` and `live` differ in whether a layered presenter that will not establish itself
+        // is a fallback or an error, not in what the user first sees.
+        assert_eq!(initial_view(PreviewMode::Auto), PreviewView::Live);
+        assert_eq!(initial_view(PreviewMode::Live), PreviewView::Live);
+    }
 
     #[test]
     fn worker_join_timeout_does_not_wait_for_a_stuck_thread() {

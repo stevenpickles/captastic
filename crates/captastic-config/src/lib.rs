@@ -600,7 +600,7 @@ impl AppConfig {
         }
         if self.capture.buffer_slots != 3 {
             return Err(ConfigError::InvalidValue(
-                "capture.buffer_slots: the CPU readback pool is currently fixed at three slots; remove the override".to_owned(),
+                "capture.buffer_slots: the CPU readback pool's base is currently fixed at three slots; remove the override. Selection adds to this base automatically - it does not need configuring".to_owned(),
             ));
         }
         if !matches!(self.capture.mode.as_str(), "fresh" | "latest") {

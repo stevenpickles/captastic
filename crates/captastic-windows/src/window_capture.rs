@@ -1729,6 +1729,7 @@ mod tests {
 
     use super::*;
     use crate::session::{DesktopState, HRESULT_ACCESS_DENIED};
+    use crate::PreviewView;
     use captastic_core::{
         CaptureId, CaptureMode, ColorSpace, DisplayId, FrameOrigin, PixelFormat, TimingProvenance,
     };
@@ -2738,6 +2739,9 @@ mod tests {
                 window_live_preview_count: 0,
                 window_frozen_preview_count: 0,
                 window_preview_bytes: 0,
+                view: PreviewView::Frozen,
+                view_switched: false,
+                presenter_fallback_reason: None,
                 window_frame: None,
             },
         )
@@ -2767,6 +2771,9 @@ mod tests {
                 window_live_preview_count: 0,
                 window_frozen_preview_count: 0,
                 window_preview_bytes: 0,
+                view: PreviewView::Frozen,
+                view_switched: false,
+                presenter_fallback_reason: None,
                 window_frame: None,
             },
         )
@@ -2794,6 +2801,9 @@ mod tests {
                 window_live_preview_count: 0,
                 window_frozen_preview_count: 0,
                 window_preview_bytes: 0,
+                view: PreviewView::Frozen,
+                view_switched: false,
+                presenter_fallback_reason: None,
                 window_frame: Some(preview.clone()),
             },
         )
@@ -2817,6 +2827,9 @@ mod tests {
                 window_live_preview_count: 0,
                 window_frozen_preview_count: 0,
                 window_preview_bytes: 0,
+                view: PreviewView::Frozen,
+                view_switched: false,
+                presenter_fallback_reason: None,
                 window_frame: Some(preview.clone()),
             })
             .expect("window confirmation should expose its native frame")

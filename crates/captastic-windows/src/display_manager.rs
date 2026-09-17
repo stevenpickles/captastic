@@ -47,6 +47,14 @@ pub struct DxgiDisplayManager {
 
 impl DxgiDisplayManager {
     pub fn new() -> Result<Self, CaptureError> {
+        Self::with_cpu_slots(crate::dxgi::DEFAULT_CPU_BUFFER_SLOTS)
+    }
+
+    /// Builds a manager whose per-display readback pools and virtual-desktop composite pool each
+    /// hold `cpu_slots` frames. See [`crate::dxgi::DxgiBackend::with_cpu_slots`]: a selection
+    /// overlay pins a frame for the length of a human interaction, and the composed
+    /// virtual-desktop frame an overlay is drawn over is pinned exactly as long.
+    pub fn with_cpu_slots(cpu_slots: usize) -> Result<Self, CaptureError> {
         // Sampled before enumerating so a change that lands mid-build surfaces as TopologyChanged
         // rather than being trusted. The window is wider than `DxgiBackend::new`'s: it spans the
         // enumeration *and* one session build per display below, each of which samples the
@@ -88,7 +96,7 @@ impl DxgiDisplayManager {
         let mut sessions = Vec::with_capacity(displays.len());
         let mut unavailable = Vec::new();
         for display in &displays {
-            match DxgiBackend::new(&display.id) {
+            match DxgiBackend::with_cpu_slots(&display.id, cpu_slots) {
                 Ok(backend) => {
                     log::info!(
                         "retained DXGI session initialized display={} name={:?} bounds={}x{}{:+}{:+}",
@@ -158,7 +166,7 @@ impl DxgiDisplayManager {
             capabilities,
             virtual_bounds,
             virtual_topology_error,
-            composite_pool: CompositeBufferPool::new(COMPOSITE_BUFFER_SLOTS),
+            composite_pool: CompositeBufferPool::new(cpu_slots.max(COMPOSITE_BUFFER_SLOTS)),
             display_configuration_generation: generation_before_enumeration,
             display_arrangement: arrangement_before_enumeration,
         })
