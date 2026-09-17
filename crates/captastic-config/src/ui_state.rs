@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::fsio::{atomic_write, replace_file};
 use crate::{
     default_config_path, storage_directory, CaptureRegion, CaptureRegionSource, CaptureTool,
-    ConfigError, ConfirmedRegion, DisplayUiConfig, DisplayUiState, UiConfig,
+    ConfigError, ConfirmedRegion, DisplayUiConfig, DisplayUiState, RegionZoom, UiConfig,
 };
 
 pub const STATE_FILE_NAME: &str = "state.toml";
@@ -44,6 +44,21 @@ pub struct UiState {
     pub last_capture_tool: Option<CaptureTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_region: Option<CaptureRegion>,
+    /// Whether the region tool snaps to window edges. A global preference, not a per-display one.
+    ///
+    /// `Option` with `skip_serializing_if`, and `STATE_SCHEMA_VERSION` deliberately unchanged: a
+    /// state file written before this existed still loads, and one written after it still loads
+    /// into a build that predates it only in the sense that `deny_unknown_fields` rejects the
+    /// whole file. That rejection is a logged fallback to defaults on every read path, not a
+    /// crash, so an older binary run against a newer file loses remembered layout for that run
+    /// and nothing else. Bumping the schema would turn the same situation into a hard
+    /// `UnsupportedSchema` error, which is strictly worse for a preference this small.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snap_to_windows: Option<bool>,
+    /// When the region tool's magnifier appears. Global, `Option`, and no schema bump, for the
+    /// same reasons as `snap_to_windows` above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region_zoom: Option<RegionZoom>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub displays: BTreeMap<String, DisplayUiConfig>,
 }
@@ -56,6 +71,8 @@ impl Default for UiState {
             overlay_y: None,
             last_capture_tool: None,
             last_region: None,
+            snap_to_windows: None,
+            region_zoom: None,
             displays: BTreeMap::new(),
         }
     }
@@ -70,6 +87,9 @@ impl UiState {
             overlay_y: ui.overlay_y,
             last_capture_tool: ui.last_capture_tool,
             last_region: ui.last_region,
+            // Never lived in the configuration's [ui] section, so a migration carries nothing.
+            snap_to_windows: None,
+            region_zoom: None,
             displays: ui.displays.clone(),
         }
     }
@@ -79,6 +99,8 @@ impl UiState {
             && self.overlay_y.is_none()
             && self.last_capture_tool.is_none()
             && self.last_region.is_none()
+            && self.snap_to_windows.is_none()
+            && self.region_zoom.is_none()
             && self.displays.is_empty()
     }
 
@@ -124,6 +146,9 @@ pub fn resolve_display_ui_state(state: &UiState, display_id: &str) -> DisplayUiS
                     .zip(entry.last_confirmed_region_source)
             })
             .map(|(region, source)| ConfirmedRegion { region, source }),
+        // Global: every display resolves the same answer, including one with no entry at all.
+        snap_to_windows: state.snap_to_windows,
+        region_zoom: state.region_zoom,
     }
 }
 
@@ -290,6 +315,16 @@ impl UiStateStore {
                 display.last_region_source = region_source;
             }
         })
+    }
+
+    /// Records whether the region tool snaps to window edges, for every display.
+    pub fn save_snap_to_windows(&self, enabled: bool) -> Result<(), ConfigError> {
+        self.update(|state| state.snap_to_windows = Some(enabled))
+    }
+
+    /// Records when the region tool's magnifier appears, for every display.
+    pub fn save_region_zoom(&self, mode: RegionZoom) -> Result<(), ConfigError> {
+        self.update(|state| state.region_zoom = Some(mode))
     }
 
     pub fn save_display_confirmed_region(
@@ -756,6 +791,76 @@ last_capture_tool = \"window\"
             UiStateStore::at(&state_path).load(),
             Err(ConfigError::UnsupportedSchema(version)) if version == STATE_SCHEMA_VERSION + 1
         ));
+    }
+
+    #[test]
+    fn the_snap_preference_is_global_and_reaches_a_display_with_no_entry() {
+        let directory = TestDirectory::new("snap-global");
+        let state_path = directory.join(STATE_FILE_NAME);
+        let store = UiStateStore::at(&state_path);
+
+        // Unset until the user says otherwise, so the overlay's own default stands.
+        assert_eq!(
+            store
+                .load_display_ui_state("display-1")
+                .expect("load")
+                .snap_to_windows,
+            None
+        );
+
+        store.save_snap_to_windows(false).expect("save the toggle");
+        store
+            .save_region_zoom(RegionZoom::Off)
+            .expect("save the zoom mode");
+        for display in ["display-1", "a display this machine has never drawn on"] {
+            let resolved = store.load_display_ui_state(display).expect("load");
+            assert_eq!(resolved.snap_to_windows, Some(false), "{display}");
+            assert_eq!(resolved.region_zoom, Some(RegionZoom::Off), "{display}");
+        }
+        // It survives beside per-display state rather than replacing it.
+        store
+            .save_display_overlay_center("display-1", 0.25, 0.75)
+            .expect("save a per-display value");
+        let state = store.load().expect("load");
+        assert_eq!(state.snap_to_windows, Some(false));
+        assert_eq!(
+            resolve_display_ui_state(&state, "display-1").overlay_center,
+            Some((0.25, 0.75))
+        );
+
+        // Written as a plain global key, with the schema version untouched.
+        let text = fs::read_to_string(&state_path).expect("read state");
+        assert!(text.contains("snap_to_windows = false"), "{text}");
+        assert!(text.contains("region_zoom = \"off\""), "{text}");
+        assert!(
+            text.contains(&format!("schema_version = {STATE_SCHEMA_VERSION}")),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_older_binary_falls_back_to_defaults_rather_than_failing_on_a_newer_key() {
+        // What an installation that downgrades actually experiences. `deny_unknown_fields` makes
+        // the whole file unreadable to a build that predates the key; every caller treats that as
+        // a warning and continues with defaults, which is why the schema version is not bumped.
+        let directory = TestDirectory::new("unknown-key");
+        let state_path = directory.join(STATE_FILE_NAME);
+        fs::write(
+            &state_path,
+            format!(
+                "schema_version = {STATE_SCHEMA_VERSION}
+a_key_from_the_future = true
+"
+            ),
+        )
+        .expect("write state");
+        let error = UiStateStore::at(&state_path)
+            .load()
+            .expect_err("an unknown key is refused");
+        assert!(
+            !matches!(error, ConfigError::UnsupportedSchema(_)),
+            "a parse refusal, not a schema refusal: {error}"
+        );
     }
 
     #[test]

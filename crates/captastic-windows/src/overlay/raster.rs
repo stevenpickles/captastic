@@ -9,9 +9,9 @@ use windows::Win32::Graphics::Gdi::{
     AlphaBlend, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, Ellipse,
     FillRect, GdiFlush, GetStockObject, GetTextExtentPoint32W, LineTo, MoveToEx, Rectangle,
     RoundRect, SelectObject, SetBkMode, SetStretchBltMode, SetTextColor, StretchBlt, AC_SRC_ALPHA,
-    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, CLEARTYPE_QUALITY, DEFAULT_CHARSET,
-    DEFAULT_PITCH, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_MEDIUM, HALFTONE,
-    HDC, HFONT, NULL_BRUSH, PS_SOLID, RGBQUAD, SRCCOPY, TRANSPARENT,
+    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, CLEARTYPE_QUALITY, COLORONCOLOR,
+    DEFAULT_CHARSET, DEFAULT_PITCH, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+    FW_MEDIUM, HALFTONE, HDC, HFONT, NULL_BRUSH, PS_SOLID, RGBQUAD, SRCCOPY, TRANSPARENT,
 };
 
 use captastic_core::{CaptureError, Rect};
@@ -449,6 +449,34 @@ pub(super) fn draw_surface_to_rect(device: HDC, surface: &FrozenSurface, destina
     // SAFETY: Both DCs own live DIBs. Destination bounds are positive and GDI performs scaling.
     unsafe {
         SetStretchBltMode(device, HALFTONE);
+        StretchBlt(
+            device,
+            destination.left,
+            destination.top,
+            width,
+            height,
+            surface.device,
+            0,
+            0,
+            surface.width,
+            surface.height,
+            SRCCOPY,
+        );
+    }
+}
+
+/// Enlarges a surface with no interpolation at all: every source pixel becomes a solid block.
+///
+/// `HALFTONE`, which every other scaling path here uses, averages neighbours — exactly the wrong
+/// answer for a magnifier, whose entire purpose is to show which pixel is which. `COLORONCOLOR`
+/// drops and duplicates rows and columns instead, so an enlargement by an integer factor is an
+/// exact nearest-neighbour blow-up and no colour appears that was not in the source.
+pub(super) fn draw_surface_nearest(device: HDC, surface: &FrozenSurface, destination: UiRect) {
+    let width = (destination.right - destination.left).max(1);
+    let height = (destination.bottom - destination.top).max(1);
+    // SAFETY: Both DCs own live DIBs. Destination bounds are positive and GDI performs scaling.
+    unsafe {
+        SetStretchBltMode(device, COLORONCOLOR);
         StretchBlt(
             device,
             destination.left,
@@ -1077,6 +1105,59 @@ mod tests {
             mask[center_mask] & (0x80 >> (REGION_CURSOR_CENTER as usize % 8)),
             0
         );
+    }
+
+    #[test]
+    fn the_magnifier_blow_up_invents_no_colours() {
+        // Four distinct pixels enlarged six times. Nearest-neighbour means every one of the 36
+        // destination pixels in a block is exactly its source pixel; an averaging filter would
+        // put blended colours along the seams, which is precisely what makes a magnifier lie
+        // about which pixel is which.
+        let source = FrozenSurface::new(
+            2,
+            2,
+            &[
+                10, 20, 30, 255, // BGRA
+                40, 50, 60, 255, //
+                70, 80, 90, 255, //
+                100, 110, 120, 255,
+            ],
+        )
+        .expect("source surface");
+        let destination = FrozenSurface::empty(12, 12).expect("destination surface");
+        draw_surface_nearest(
+            destination.device,
+            &source,
+            UiRect {
+                left: 0,
+                top: 0,
+                right: 12,
+                bottom: 12,
+            },
+        );
+        // SAFETY: Flushes the queued StretchBlt before the CPU reads the destination DIB.
+        unsafe { GdiFlush() };
+        let pixels = destination.pixel_bytes();
+        let at = |x: usize, y: usize| {
+            let offset = (y * 12 + x) * 4;
+            [pixels[offset], pixels[offset + 1], pixels[offset + 2]]
+        };
+        for (block_x, block_y, expected) in [
+            (0, 0, [10, 20, 30]),
+            (1, 0, [40, 50, 60]),
+            (0, 1, [70, 80, 90]),
+            (1, 1, [100, 110, 120]),
+        ] {
+            for x in 0..6 {
+                for y in 0..6 {
+                    assert_eq!(
+                        at(block_x * 6 + x, block_y * 6 + y),
+                        expected,
+                        "block ({block_x},{block_y}) pixel ({x},{y})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -25,9 +25,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::{intersect_with_source, overlay_error, NativeWindowHandle};
 
+/// One window the chooser may offer, and the rectangle the user sees it occupying.
+///
+/// `frame` is the DWM extended frame bounds clipped to the window rect — the window without the
+/// invisible resize border around it, which is the edge a region should snap to. It is in desktop
+/// coordinates and is *not* clipped to the captured display; the snap inventory does that, and
+/// the chooser does not need it clipped at all.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct WindowCandidate {
     pub(super) handle: NativeWindowHandle,
+    pub(super) frame: Rect,
 }
 
 pub(super) fn enumerate_visible_windows(
@@ -160,8 +167,12 @@ fn collect_window(hwnd: HWND, collector: &mut WindowCollector) {
                 extended_style,
                 display_affinity,
             );
+            // The extended-frame query is a DWM attribute read against a foreign window: it reads
+            // compositor state and sends no message, so it cannot wait on that window's thread and
+            // cannot re-enter the overlay's window procedure the way a title query would (H3).
             collector.windows.push(WindowCandidate {
                 handle: NativeWindowHandle(hwnd.0),
+                frame: crate::window_capture::window_geometry(hwnd, window_bounds).frame,
             });
         }
     }
