@@ -599,9 +599,7 @@ fn pointer_down(
         CaptureTool::FullDisplay => return vec![OverlayEffect::Invalidate],
         CaptureTool::Region => {}
     }
-    // The press that starts any region adjustment is the last moment the inventory can be built
-    // without the user waiting on it mid-drag, and the first moment it is certainly wanted.
-    let mut effects: Vec<OverlayEffect> = request_snap_targets(model).into_iter().collect();
+    let mut effects: Vec<OverlayEffect> = Vec::new();
     let existing_region = (model.selection_kind == Some(SelectionKind::Region))
         .then_some(model.selection)
         .flatten();
@@ -649,6 +647,15 @@ fn pointer_down(
             OverlayEffect::Invalidate,
         ]);
     }
+    // Last, and emphatically after CapturePointer. This effect runs the whole window enumeration
+    // - a DXGI factory, EnumWindows, a DWM query per candidate - inside the effect loop, and the
+    // shell has not taken the mouse until CapturePointer executes. Emitting it first meant that
+    // on a press-and-sweep the pointer could leave the overlay during the enumeration, and the
+    // button-up would then be delivered to whatever window it had crossed onto: the drag would
+    // never end, `anchor` would stay set, and the next click would extend a band the user thought
+    // they had finished. Nothing in the press needs the inventory anyway - the anchor is snapped
+    // at the drag latch, which is a later message.
+    effects.extend(request_snap_targets(model));
     effects
 }
 
@@ -3866,6 +3873,22 @@ mod tests {
             e,
             OverlayEffect::BuildSnapTargets
         )));
+
+        // And it is the *last* effect, after the capture. The enumeration runs inside the effect
+        // loop; until CapturePointer has executed the shell does not own the mouse, so a press
+        // and sweep during that window would deliver the button-up to another window and leave
+        // this drag running forever.
+        let order: Vec<&str> = effects
+            .iter()
+            .map(|effect| match effect {
+                OverlayEffect::CapturePointer => "capture",
+                OverlayEffect::BuildSnapTargets => "enumerate",
+                _ => "other",
+            })
+            .collect();
+        let capture = order.iter().position(|kind| *kind == "capture");
+        let enumerate = order.iter().position(|kind| *kind == "enumerate");
+        assert!(capture < enumerate, "{order:?}");
 
         // The shell answers, and no later press asks again: enumeration is the expensive part of
         // opening the chooser and a drag must not repeat it.
