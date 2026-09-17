@@ -10,7 +10,7 @@ display = "pointer"
 trigger_queue_capacity = 4
 
 [hotkey]
-# "coalesce" is not implemented yet (roadmap milestone 4); repeat must remain "ignore".
+# "coalesce" is not implemented yet; repeat must remain "ignore".
 repeat = "ignore"
 
 # Omit an action to leave it disabled. The default registers only last_workflow.
