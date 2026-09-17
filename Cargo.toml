@@ -17,6 +17,13 @@ authors = ["Captastic contributors"]
 [workspace.dependencies]
 anstream = "=0.6.5"
 clap = { version = "=4.4.14", features = ["derive"] }
+# The one thing Captastic cannot write by hand: a JPEG needs a DCT, quantization tables, and a
+# Huffman coder, and hand-rolling those is how a screenshot tool grows a codec bug. Pure Rust with
+# no C toolchain, like png, and exact-pinnable the same way. Default features off: the only one is
+# `std`, which adds `io::Write` support this crate does not need - it encodes into a `Vec` - while
+# `simd` (which `std` does not imply) is this crate's only source of `unsafe`, so declining both
+# leaves a dependency that compiles under its own `forbid(unsafe_code)`.
+jpeg-encoder = { version = "=0.7.1", default-features = false }
 log = { version = "=0.4.20", features = ["std"] }
 # Pulls flate2/miniz_oxide as its DEFLATE backend: pure Rust, no C toolchain, exact-pinnable
 # through the committed lockfile like every other dependency here.

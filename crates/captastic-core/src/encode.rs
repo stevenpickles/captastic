@@ -23,17 +23,21 @@ pub enum OutputFormat {
     /// Lossless, alpha-carrying, and the default: a screenshot is usually kept to be read.
     #[default]
     Png,
+    /// Lossy, and unable to carry alpha at all: see [`crate::jpeg`] for what that costs a window
+    /// capture and why it flattens rather than refuses.
+    Jpeg,
     /// Uncompressed, alpha-carrying, and universally readable by Windows tooling.
     Bmp,
 }
 
 impl OutputFormat {
-    pub const ALL: [Self; 2] = [Self::Png, Self::Bmp];
+    pub const ALL: [Self; 3] = [Self::Png, Self::Jpeg, Self::Bmp];
 
     /// The spelling used in configuration and in JSON output.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Png => "png",
+            Self::Jpeg => "jpeg",
             Self::Bmp => "bmp",
         }
     }
@@ -42,14 +46,19 @@ impl OutputFormat {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Png => "PNG",
+            Self::Jpeg => "JPEG",
             Self::Bmp => "BMP",
         }
     }
 
     /// The extension a capture in this format is written with.
+    ///
+    /// `jpeg` is written as `.jpg`: the configuration value names the format, and this names the
+    /// file, where the three-letter form is what Windows tools and file dialogs expect.
     pub const fn extension(self) -> &'static str {
         match self {
             Self::Png => "png",
+            Self::Jpeg => "jpg",
             Self::Bmp => "bmp",
         }
     }
@@ -61,13 +70,30 @@ impl fmt::Display for OutputFormat {
     }
 }
 
+/// The quality a JPEG is written at when nothing says otherwise.
+///
+/// High enough that text on a screenshot stays legible, low enough that choosing JPEG is worth
+/// doing at all.
+pub const DEFAULT_JPEG_QUALITY: u8 = 90;
+
 /// The knobs that only matter to some of the formats.
 ///
 /// Passed whole rather than per-format so a caller threads one value through and each encoder
 /// picks what applies to it.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EncodeOptions {
     pub png_effort: crate::png::PngEffort,
+    /// 1..=100; higher is larger and closer to the original.
+    pub jpeg_quality: u8,
+}
+
+impl Default for EncodeOptions {
+    fn default() -> Self {
+        Self {
+            png_effort: crate::png::PngEffort::default(),
+            jpeg_quality: DEFAULT_JPEG_QUALITY,
+        }
+    }
 }
 
 /// One encoded capture, and what it has to be called.
@@ -75,6 +101,11 @@ pub struct EncodedCapture {
     pub bytes: Vec<u8>,
     /// The extension the bytes must be written under, so callers never map format to suffix again.
     pub extension: &'static str,
+    /// Whether an alpha channel was composited away to produce these bytes.
+    ///
+    /// Carried rather than logged here: the encoder knows it happened, and the destination knows
+    /// where such a thing belongs. It is never silent, which is ADR 0008's standard.
+    pub alpha_flattened: bool,
 }
 
 /// Reports the size rather than the bytes: a debug line that prints a 33 MB image is not a debug
@@ -85,6 +116,7 @@ impl fmt::Debug for EncodedCapture {
             .debug_struct("EncodedCapture")
             .field("bytes", &self.bytes.len())
             .field("extension", &self.extension)
+            .field("alpha_flattened", &self.alpha_flattened)
             .finish()
     }
 }
@@ -154,11 +186,13 @@ pub fn encode_capture(
 ) -> Result<EncodedCapture, EncodeError> {
     let bytes = match format {
         OutputFormat::Png => crate::png::encode_frame(frame, options.png_effort)?,
+        OutputFormat::Jpeg => crate::jpeg::encode_frame(frame, options.jpeg_quality)?,
         OutputFormat::Bmp => crate::bmp::encode_frame(frame)?,
     };
     Ok(EncodedCapture {
         bytes,
         extension: format.extension(),
+        alpha_flattened: format == OutputFormat::Jpeg && frame.alpha() == FrameAlpha::Straight,
     })
 }
 
@@ -264,7 +298,17 @@ mod tests {
             assert_eq!(format.to_string(), format.as_str());
         }
         assert_eq!(OutputFormat::default(), OutputFormat::Png);
-        assert_eq!(OutputFormat::ALL.map(OutputFormat::as_str), ["png", "bmp"]);
+        assert_eq!(
+            OutputFormat::ALL.map(OutputFormat::as_str),
+            ["png", "jpeg", "bmp"]
+        );
+    }
+
+    #[test]
+    fn jpeg_is_written_under_the_extension_windows_expects() {
+        assert_eq!(OutputFormat::Jpeg.extension(), "jpg");
+        assert_eq!(OutputFormat::Png.extension(), "png");
+        assert_eq!(OutputFormat::Bmp.extension(), "bmp");
     }
 
     #[test]
@@ -298,6 +342,26 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{format} encode: {error}"));
             assert_eq!(encoded.extension, format.extension());
             assert!(!encoded.bytes.is_empty(), "{format} produced no bytes");
+            assert!(
+                !encoded.alpha_flattened,
+                "{format}: an opaque frame has no alpha to flatten"
+            );
+        }
+    }
+
+    #[test]
+    fn only_jpeg_reports_flattening_an_alpha_channel() {
+        // The fact a destination logs, so a user who chose JPEG and captured a window learns why
+        // its rounded corners came out white.
+        let translucent = frame(1, 1, 4, vec![10, 20, 30, 0]).with_alpha(FrameAlpha::Straight);
+        for format in OutputFormat::ALL {
+            let encoded = encode_capture(&translucent, format, &EncodeOptions::default())
+                .unwrap_or_else(|error| panic!("{format} encode: {error}"));
+            assert_eq!(
+                encoded.alpha_flattened,
+                format == OutputFormat::Jpeg,
+                "{format} reported the wrong alpha handling"
+            );
         }
     }
 }

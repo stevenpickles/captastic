@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+jpeg-encoder.workspace = true
 png.workspace = true
 serde.workspace = true
 thiserror.workspace = true
