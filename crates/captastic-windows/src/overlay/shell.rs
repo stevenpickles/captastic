@@ -17,7 +17,7 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, MDT_EFFECTIVE_DPI,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL,
+    GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateIconIndirect, DestroyCursor, IsWindow, LoadCursorW, PeekMessageW, SetCursor,
@@ -439,12 +439,20 @@ pub(super) fn consume_self_initiated_capture_change(releasing_pointer_capture: &
 pub(super) fn modifiers() -> Modifiers {
     // SAFETY: Reads this thread's queued keyboard state for the message being dispatched. No
     // pointer arguments, no retained state.
-    let control = unsafe { GetKeyState(i32::from(VK_CONTROL.0)) };
     Modifiers {
-        // The high-order bit is "currently down"; the low-order toggle bit is for Caps Lock and
-        // friends and must not be mistaken for it.
-        ctrl: control < 0,
+        ctrl: key_is_down(VK_CONTROL.0),
+        shift: key_is_down(VK_SHIFT.0),
     }
+}
+
+/// Whether a virtual key is held as of the message being dispatched.
+///
+/// `GetKeyState` returns the "currently down" answer in the high-order bit and a toggle state —
+/// Caps Lock and friends — in the low-order one. Testing the sign is the documented way to read
+/// the first without ever seeing the second.
+fn key_is_down(virtual_key: u16) -> bool {
+    // SAFETY: Reads this thread's queued keyboard state. No pointer arguments, nothing retained.
+    unsafe { GetKeyState(i32::from(virtual_key)) < 0 }
 }
 
 pub(super) fn screen_point(source: Rect, lparam: LPARAM) -> POINT {

@@ -65,7 +65,9 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentProcessId;
-use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE, VK_RETURN};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    SetFocus, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClassNameW,
     GetForegroundWindow, GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
@@ -1316,6 +1318,23 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
         WM_KEYDOWN if wparam.0 == usize::from(VK_ESCAPE.0) => {
             run_machine(hwnd, state_pointer, OverlayInput::CancelRequested)
         }
+        WM_KEYDOWN if arrow_direction(wparam).is_some() => {
+            let (x, y) = arrow_direction(wparam).unwrap_or((0, 0));
+            let modifiers = modifiers();
+            // Autorepeat is not filtered here: holding an arrow down is exactly how a user walks
+            // an edge across a few pixels, and Windows' own repeat rate is the right cadence for
+            // it. Ctrl turns the same keys into a resize of the right and bottom edges.
+            let step = modifiers.nudge_step();
+            run_machine(
+                hwnd,
+                state_pointer,
+                OverlayInput::Nudge {
+                    dx: x * step,
+                    dy: y * step,
+                    resize: modifiers.ctrl,
+                },
+            )
+        }
         WM_CAPTURECHANGED => {
             // A self-initiated ReleaseCapture round trip is protocol, not product state: consume
             // the shell's flag and never involve the machine.
@@ -1350,6 +1369,22 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             // SAFETY: Standard handling for messages Captastic does not consume.
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
+    }
+}
+
+/// The unit step an arrow key asks for, or `None` for any other key.
+const fn arrow_direction(wparam: WPARAM) -> Option<(i32, i32)> {
+    let key = wparam.0 as u16;
+    if key == VK_LEFT.0 {
+        Some((-1, 0))
+    } else if key == VK_RIGHT.0 {
+        Some((1, 0))
+    } else if key == VK_UP.0 {
+        Some((0, -1))
+    } else if key == VK_DOWN.0 {
+        Some((0, 1))
+    } else {
+        None
     }
 }
 

@@ -20,6 +20,12 @@ use super::{NativeWindowHandle, SelectionKind, WindowCandidate};
 
 pub(super) const DRAG_THRESHOLD: i32 = 4;
 pub(super) const MIN_REGION_SIZE: i64 = 8;
+/// One arrow press moves one physical pixel — the whole point of the key being there at all, and
+/// deliberately not DPI-scaled: the badge counts physical pixels and so must this.
+pub(super) const NUDGE_STEP: i32 = 1;
+/// With Shift held, ten. Enough to cross a window border in a couple of presses without losing
+/// the ability to land on an exact pixel by letting go of Shift.
+pub(super) const NUDGE_COARSE_STEP: i32 = 10;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CaptureTool {
@@ -166,6 +172,12 @@ pub(super) enum OverlayInput {
     WindowPreviewResolved { rect: Option<Rect> },
     /// The shell finished the enumeration requested by [`OverlayEffect::BuildSnapTargets`].
     SnapTargetsReady { targets: SnapTargets },
+    /// An arrow key adjusted the region by `(dx, dy)` physical pixels. `resize` moves the right
+    /// and bottom edges instead of the whole rectangle.
+    ///
+    /// The shell has already folded the modifier state into these numbers, so the machine never
+    /// has to know which key was pressed — only what the user asked the region to do.
+    Nudge { dx: i32, dy: i32, resize: bool },
     /// Enter pressed.
     ConfirmRequested,
     /// Escape, right-click, or an external close request.
@@ -181,8 +193,22 @@ pub(super) enum OverlayInput {
 /// the model, because the machine owns no clock and no input device.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct Modifiers {
-    /// Ctrl held: suppress snapping entirely for this message and clear any guide.
+    /// Ctrl held. On the pointer path: suppress snapping entirely for this message and clear any
+    /// guide. On the arrow keys: adjust the region's size rather than its position.
     pub(super) ctrl: bool,
+    /// Shift held: take the coarse nudge step instead of one pixel. Means nothing to the pointer.
+    pub(super) shift: bool,
+}
+
+impl Modifiers {
+    /// How far one arrow press moves the region.
+    pub(super) const fn nudge_step(self) -> i32 {
+        if self.shift {
+            NUDGE_COARSE_STEP
+        } else {
+            NUDGE_STEP
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -279,6 +305,7 @@ pub(super) fn transition(model: &mut OverlayModel, input: OverlayInput) -> Vec<O
         OverlayInput::PointerUp { point, modifiers } => pointer_up(model, point, modifiers),
         OverlayInput::DoubleClicked { point } => double_clicked(model, point),
         OverlayInput::PointerCaptureLost => pointer_capture_lost(model),
+        OverlayInput::Nudge { dx, dy, resize } => nudge(model, dx, dy, resize),
         OverlayInput::ConfirmRequested => confirm(model),
         OverlayInput::CancelRequested => cancel(model),
         OverlayInput::DisplayConfigurationInvalidated { reason } => {
@@ -685,6 +712,63 @@ fn pointer_up(model: &mut OverlayModel, point: POINT, modifiers: Modifiers) -> V
     }
     effects.push(OverlayEffect::Invalidate);
     effects
+}
+
+/// Adjusts the region by an exact number of physical pixels from the keyboard.
+///
+/// The only way to place an edge on a pixel the mouse cannot reach — a trackpad that skips, a
+/// high-DPI display where one mouse count is two pixels, or simply a hand that will not hold
+/// still. Deliberately never snaps: the user typing an exact number of pixels has already said
+/// where they want the edge, and a rule that pulled it somewhere else would make the keys useless
+/// for the one job they exist for. It clears any guide for the same reason.
+///
+/// Inert unless the region tool has a region and no drag is in flight. A drag owns the geometry
+/// while it runs, and a key arriving mid-drag would move a rectangle the next mouse message is
+/// about to recompute from its own anchor anyway.
+fn nudge(model: &mut OverlayModel, dx: i32, dy: i32, resize: bool) -> Vec<OverlayEffect> {
+    if model.tool != CaptureTool::Region
+        || model.selection_kind != Some(SelectionKind::Region)
+        || model.anchor.is_some()
+        || model.resizing.is_some()
+        || model.moving_region.is_some()
+    {
+        return Vec::new();
+    }
+    let Some(region) = model.selection else {
+        return Vec::new();
+    };
+    let adjusted = if resize {
+        resize_region_by(region, dx, dy, model.source)
+    } else {
+        region.translated(i64::from(dx), i64::from(dy))
+    }
+    .clamp_within(model.source);
+    let had_guides = model.active_snaps != NO_SNAPS;
+    model.active_snaps = NO_SNAPS;
+    if adjusted == region && !had_guides {
+        // Held against the edge of the display: autorepeat keeps delivering, and repainting an
+        // unchanged overlay sixty times a second for it would be pure waste.
+        return Vec::new();
+    }
+    model.selection = Some(adjusted);
+    // No persistence effect: confirming and cancelling both persist the latest region already,
+    // and those are the only two ways this overlay ends.
+    vec![OverlayEffect::Invalidate]
+}
+
+/// Moves the region's right and bottom edges by `(dx, dy)`, never below the minimum size and
+/// never past the display.
+fn resize_region_by(region: Rect, dx: i32, dy: i32, source: Rect) -> Rect {
+    let left = i64::from(region.x);
+    let top = i64::from(region.y);
+    // The floors are themselves capped at the display, exactly as `resize_region` does it: a
+    // region already pressed against the right edge has no room for the minimum and the clamp
+    // range would otherwise be inverted.
+    let minimum_right = (left + MIN_REGION_SIZE).min(source.right());
+    let minimum_bottom = (top + MIN_REGION_SIZE).min(source.bottom());
+    let right = (region.right() + i64::from(dx)).clamp(minimum_right, source.right());
+    let bottom = (region.bottom() + i64::from(dy)).clamp(minimum_bottom, source.bottom());
+    Rect::from_edges(left, top, right, bottom).unwrap_or(region)
 }
 
 fn window_preview_resolved(model: &mut OverlayModel, rect: Option<Rect>) -> Vec<OverlayEffect> {
@@ -2289,7 +2373,10 @@ mod tests {
         height: 200,
     };
 
-    const CTRL: Modifiers = Modifiers { ctrl: true };
+    const CTRL: Modifiers = Modifiers {
+        ctrl: true,
+        shift: false,
+    };
 
     fn snapping_model() -> OverlayModel {
         let mut model = region_model();
@@ -2585,6 +2672,197 @@ mod tests {
     }
 
     #[test]
+    fn arrows_move_the_region_by_exact_pixels_and_ctrl_resizes_it() {
+        let start = Rect {
+            x: 200,
+            y: 200,
+            width: 100,
+            height: 100,
+        };
+        let cases = [
+            // (dx, dy, resize, expected)
+            (
+                -1,
+                0,
+                false,
+                Rect {
+                    x: 199,
+                    y: 200,
+                    width: 100,
+                    height: 100,
+                },
+            ),
+            (
+                0,
+                10,
+                false,
+                Rect {
+                    x: 200,
+                    y: 210,
+                    width: 100,
+                    height: 100,
+                },
+            ),
+            (
+                1,
+                0,
+                true,
+                Rect {
+                    x: 200,
+                    y: 200,
+                    width: 101,
+                    height: 100,
+                },
+            ),
+            (
+                0,
+                -10,
+                true,
+                Rect {
+                    x: 200,
+                    y: 200,
+                    width: 100,
+                    height: 90,
+                },
+            ),
+        ];
+        for (dx, dy, resize, expected) in cases {
+            let mut model = snapping_model();
+            model.selection = Some(start);
+            model.selection_kind = Some(SelectionKind::Region);
+            let effects = transition(&mut model, OverlayInput::Nudge { dx, dy, resize });
+            assert_eq!(model.selection, Some(expected), "{dx},{dy} resize={resize}");
+            // A nudge only repaints. Confirming and cancelling are the only ways this overlay
+            // ends and both already persist the latest region.
+            assert_eq!(effects.len(), 1, "{dx},{dy} resize={resize}");
+            assert!(matches!(effects[0], OverlayEffect::Invalidate));
+        }
+    }
+
+    #[test]
+    fn a_nudge_never_snaps_and_clears_any_guide() {
+        // Parked exactly one pixel off a window edge — inside the snap radius — and then nudged
+        // away from it. The keys are the way to place a pixel the mouse cannot reach, so a rule
+        // that pulled the edge back onto the window would make them useless for their one job.
+        let mut model = snapping_model();
+        model.selection = Some(Rect {
+            x: 399,
+            y: 299,
+            width: 100,
+            height: 100,
+        });
+        model.selection_kind = Some(SelectionKind::Region);
+        model.active_snaps = [
+            Some(SnapGuide {
+                axis: SnapAxis::X,
+                position: 400,
+                span: (300, 500),
+                trailing: false,
+            }),
+            None,
+        ];
+        transition(
+            &mut model,
+            OverlayInput::Nudge {
+                dx: -1,
+                dy: 0,
+                resize: false,
+            },
+        );
+        assert_eq!(
+            model.selection.map(|region| region.x),
+            Some(398),
+            "the region went exactly where it was told"
+        );
+        assert_eq!(model.active_snaps, NO_SNAPS);
+    }
+
+    #[test]
+    fn a_nudge_is_inert_without_a_region_and_while_a_drag_owns_the_geometry() {
+        let region = Rect {
+            x: 200,
+            y: 200,
+            width: 100,
+            height: 100,
+        };
+        let nudge = OverlayInput::Nudge {
+            dx: 1,
+            dy: 0,
+            resize: false,
+        };
+
+        // No region selection: the full-display and window tools have nothing to nudge.
+        for tool in [CaptureTool::FullDisplay, CaptureTool::Window] {
+            let mut model = region_model();
+            model.tool = tool;
+            model.selection = Some(region);
+            model.selection_kind = Some(SelectionKind::Display);
+            assert!(transition(&mut model, nudge.clone()).is_empty(), "{tool:?}");
+            assert_eq!(model.selection, Some(region));
+        }
+
+        // Mid-drag: the next mouse message would recompute the rectangle from its own anchor
+        // anyway, so a key arriving now could only make the overlay flicker.
+        let mut model = region_model();
+        model.selection = Some(region);
+        model.selection_kind = Some(SelectionKind::Region);
+        transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point: point(250, 250),
+                window_slot: None,
+            },
+        );
+        assert!(model.moving_region.is_some());
+        assert!(transition(&mut model, nudge.clone()).is_empty());
+        assert_eq!(model.selection, Some(region));
+    }
+
+    #[test]
+    fn a_nudge_held_against_a_wall_stops_repainting() {
+        let mut model = region_model();
+        // Flush against the left edge of the display already.
+        model.selection = Some(Rect {
+            x: SOURCE.x,
+            y: 100,
+            width: 100,
+            height: 100,
+        });
+        model.selection_kind = Some(SelectionKind::Region);
+        let effects = transition(
+            &mut model,
+            OverlayInput::Nudge {
+                dx: -10,
+                dy: 0,
+                resize: false,
+            },
+        );
+        assert!(
+            effects.is_empty(),
+            "autorepeat against a wall must not repaint sixty times a second"
+        );
+        assert_eq!(model.selection.map(|region| region.x), Some(SOURCE.x));
+    }
+
+    #[test]
+    fn shift_takes_the_coarse_step() {
+        assert_eq!(Modifiers::default().nudge_step(), NUDGE_STEP);
+        assert_eq!(
+            Modifiers {
+                ctrl: false,
+                shift: true,
+            }
+            .nudge_step(),
+            NUDGE_COARSE_STEP
+        );
+        assert_eq!(
+            CTRL.nudge_step(),
+            NUDGE_STEP,
+            "Ctrl alone is still one pixel"
+        );
+    }
+
+    #[test]
     fn guides_do_not_survive_a_stolen_capture_or_a_tool_switch() {
         for steal in [true, false] {
             let mut model = snapping_model();
@@ -2622,7 +2900,7 @@ mod tests {
                 to in any_point(),
                 ctrl in proptest::bool::ANY,
             ) {
-                let modifiers = Modifiers { ctrl };
+                let modifiers = Modifiers { ctrl, shift: false };
                 let mut model = snapping_model();
                 drag(&mut model, from, to, modifiers);
                 let shown = model.selection;
@@ -2659,12 +2937,34 @@ mod tests {
                     OverlayInput::PointerMoved {
                         point: to,
                         window_hover: None,
-                        modifiers: Modifiers { ctrl },
+                        modifiers: Modifiers { ctrl, shift: false },
                     },
                 );
                 let moved = model.selection.expect("a moved region");
                 prop_assert_eq!((moved.width, moved.height), (original.width, original.height));
                 prop_assert_eq!(moved.intersection(SOURCE), Some(moved));
+            }
+
+            /// However many arrows are held down, and in whatever order, the region stays a legal
+            /// selection: inside the display and never under the floor. Autorepeat delivers these
+            /// by the dozen, so "eventually illegal" would be reached in about a second.
+            #[test]
+            fn any_run_of_nudges_leaves_a_legal_region(
+                steps in proptest::collection::vec(
+                    (-10i32..=10, -10i32..=10, proptest::bool::ANY),
+                    1..=24,
+                ),
+            ) {
+                let mut model = region_model();
+                model.selection = Some(Rect { x: 900, y: 500, width: 120, height: 90 });
+                model.selection_kind = Some(SelectionKind::Region);
+                for (dx, dy, resize) in steps {
+                    transition(&mut model, OverlayInput::Nudge { dx, dy, resize });
+                    let region = model.selection.expect("a nudge never drops the selection");
+                    prop_assert_eq!(region.intersection(SOURCE), Some(region));
+                    prop_assert!(i64::from(region.width) >= MIN_REGION_SIZE);
+                    prop_assert!(i64::from(region.height) >= MIN_REGION_SIZE);
+                }
             }
 
             /// Re-delivering the same pointer position is a no-op. Windows coalesces and repeats
