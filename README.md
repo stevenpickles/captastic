@@ -224,16 +224,17 @@ action bindings, and one chord assigned to multiple actions are errors. Existing
 both forms for that action is rejected as ambiguous.
 
 `last_workflow`, `region`, and `window` capture the screen and open the selection overlay over
-those pixels, with the remembered, Region, or Window tool respectively. `full_display` publishes the resolved display directly without
-constructing overlay resources. `repeat_last_region` uses only that display's last confirmed Region
-selection, validates its persistent display identity and source geometry, and uses GPU region
-materialization with checked CPU fallback. Missing, stale, or invalid confirmed state opens Region
-mode from daemon-cached restored/default UI state and logs a structured fallback reason; it never
-captures unrelated state or reads TOML after the trigger. All actions retain the configured display
-policy and `latest`/`fresh` mode. Daemon triggers, selection, clipboard, and logging use bounded
-worker queues. UI-state changes update the controller-owned in-memory snapshot synchronously and
-use a dedicated unbounded disk channel; its traffic is limited to compact overlay session-end
-events, and the persistence worker coalesces equivalent updates before writing.
+those pixels, with the remembered, Region, or Window tool respectively. `full_display` publishes
+the resolved display directly without constructing overlay resources. `repeat_last_region` uses
+only that display's last confirmed Region selection, validates its persistent display identity and
+source geometry, and uses GPU region materialization with checked CPU fallback. Missing, stale, or
+invalid confirmed state opens Region mode from daemon-cached restored/default UI state and logs a
+structured fallback reason; it never captures unrelated state or reads TOML after the trigger. All
+actions retain the configured display policy and `latest`/`fresh` mode. Daemon triggers, selection,
+clipboard, and logging use bounded worker queues. UI-state changes update the controller-owned
+in-memory snapshot synchronously and use a dedicated unbounded disk channel; its traffic is limited
+to compact overlay session-end events, and the persistence worker coalesces equivalent updates
+before writing.
 
 ## File output
 

@@ -117,6 +117,23 @@ The Window tool is unaffected. Clicking a preview has always requested a fresh f
 native render of that window, so the view behind the chooser changes nothing the user would get;
 `F` is inert there and the Options row is greyed.
 
+Two consequences of one layered window are worth stating outright, because both change behaviour
+for a `frozen`-configured overlay that this amendment otherwise leaves alone.
+
+`WDA_EXCLUDEFROMCAPTURE` now applies to every overlay. It was set only on the live presenter, so a
+frozen overlay was never excluded from Windows' capture APIs and could appear in another
+application's screen recording. That was defensible while the frozen overlay was an opaque window
+showing pixels that had already been captured; it is not defensible now that the same window can
+be showing the live desktop a keystroke later, and the exclusion is defence in depth in both
+views regardless.
+
+And a failed overlay is no longer reopened across threads. The old `auto` fallback re-captured and
+re-dispatched the whole selection, so any failure inside the overlay run - class registration, the
+module handle, the cursor - got a second attempt. Only a failed *first present* falls back now,
+and it falls back in place, inside the same run. The failures that were never about the presenter
+no longer get a retry they were only ever receiving by accident; they end the attempt and are
+reported, which is what they always should have done.
+
 `CaptureCommand::FrozenSelectionFallback` is removed. A live presenter that will not establish
 itself no longer costs a cross-thread round trip and a second full capture to reopen frozen: the
 overlay already holds the trigger snapshot, so it destroys its window, drains the latched quit, and

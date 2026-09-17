@@ -1362,6 +1362,17 @@ fn establish_presenter(
         // SAFETY: state_pointer remains exclusively owned by this overlay thread. Recording the
         // HWND lets tool transitions register compositor previews against this destination.
         unsafe { (*state_pointer).overlay_hwnd = hwnd };
+        // Every overlay, including the opaque fallback. Capture exclusion is defence in depth -
+        // confirmation still destroys this window before asking the capture owner for pixels -
+        // but a window that can be showing the live desktop one keystroke from now has no
+        // business appearing in somebody else's screen recording, and the fallback window is
+        // only locked to the frozen view by a decision this code made, not by anything Windows
+        // knows.
+        // SAFETY: hwnd is a live top-level window owned by this process.
+        let excluded = unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) };
+        if let Err(error) = excluded {
+            log::warn!("selection overlay could not be excluded from capture: {error}");
+        }
         if !layered {
             return Ok(hwnd);
         }
@@ -1373,16 +1384,7 @@ fn establish_presenter(
         let present = present_layer(hwnd, state);
         let fallback_allowed = !state.require_layered && state.snapshot_present;
         match present {
-            Ok(()) => {
-                // Capture exclusion is defense in depth. Confirmation still destroys this window
-                // before asking the capture owner for pixels.
-                // SAFETY: hwnd is a live top-level window owned by this process.
-                let excluded = unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) };
-                if let Err(error) = excluded {
-                    log::warn!("selection overlay could not be excluded from capture: {error}");
-                }
-                return Ok(hwnd);
-            }
+            Ok(()) => return Ok(hwnd),
             Err(error) => {
                 // SAFETY: hwnd and state_pointer were created on this thread and are not
                 // published to any other.
@@ -1806,7 +1808,11 @@ fn run_machine(hwnd: HWND, state_pointer: *mut OverlayState, input: OverlayInput
     // end: whether the *user* changed the view is telemetry about the run, not a decision the
     // machine makes anything of, and a run switched twice ends where it started while still
     // having been switched. One place covers both the `F` key and the Options row.
-    // SAFETY: Single-field borrow, released on this line.
+    // SAFETY: This takes a whole-struct `&mut` to read `model.view` and write `view_switched`.
+    // The Box remains alive for the message loop, `transition` has already returned so no other
+    // borrow of the state is live, and nothing inside this block can reenter the window
+    // procedure: it is two field accesses and no call. The borrow ends at the closing brace,
+    // before `apply_overlay_effects` derives its own.
     unsafe {
         let state = &mut *state_pointer;
         state.view_switched |= state.model.view != view_before;
@@ -2292,8 +2298,12 @@ fn present_layer(hwnd: HWND, state: &OverlayState) -> Result<(), CaptureError> {
     if live {
         prepare_live_layer_pixels(state);
     } else {
-        // SAFETY: Flushes this thread's queued GDI drawing so the composed image is complete
-        // before the compositor reads the DIB.
+        // The frozen view skips the alpha pass, and with it the `GdiFlush` that pass performs
+        // before touching the DIB bytes. The flush is still required: `UpdateLayeredWindow` reads
+        // the back buffer's bits directly, and GDI drawing this thread has queued but not yet
+        // executed would otherwise land after the compositor had taken its copy.
+        // SAFETY: Flushes the calling thread's own GDI batch. It takes no arguments, touches no
+        // handle this function owns, and cannot fail in a way that matters here.
         let _ = unsafe { GdiFlush() };
     }
     let destination = POINT {
