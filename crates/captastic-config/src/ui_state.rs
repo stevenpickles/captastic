@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::fsio::{atomic_write, replace_file};
 use crate::{
     default_config_path, storage_directory, CaptureRegion, CaptureRegionSource, CaptureTool,
-    ConfigError, ConfirmedRegion, DisplayUiConfig, DisplayUiState, UiConfig,
+    ConfigError, ConfirmedRegion, DisplayUiConfig, DisplayUiState, RegionZoom, UiConfig,
 };
 
 pub const STATE_FILE_NAME: &str = "state.toml";
@@ -55,6 +55,10 @@ pub struct UiState {
     /// `UnsupportedSchema` error, which is strictly worse for a preference this small.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snap_to_windows: Option<bool>,
+    /// When the region tool's magnifier appears. Global, `Option`, and no schema bump, for the
+    /// same reasons as `snap_to_windows` above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region_zoom: Option<RegionZoom>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub displays: BTreeMap<String, DisplayUiConfig>,
 }
@@ -68,6 +72,7 @@ impl Default for UiState {
             last_capture_tool: None,
             last_region: None,
             snap_to_windows: None,
+            region_zoom: None,
             displays: BTreeMap::new(),
         }
     }
@@ -84,6 +89,7 @@ impl UiState {
             last_region: ui.last_region,
             // Never lived in the configuration's [ui] section, so a migration carries nothing.
             snap_to_windows: None,
+            region_zoom: None,
             displays: ui.displays.clone(),
         }
     }
@@ -94,6 +100,7 @@ impl UiState {
             && self.last_capture_tool.is_none()
             && self.last_region.is_none()
             && self.snap_to_windows.is_none()
+            && self.region_zoom.is_none()
             && self.displays.is_empty()
     }
 
@@ -141,6 +148,7 @@ pub fn resolve_display_ui_state(state: &UiState, display_id: &str) -> DisplayUiS
             .map(|(region, source)| ConfirmedRegion { region, source }),
         // Global: every display resolves the same answer, including one with no entry at all.
         snap_to_windows: state.snap_to_windows,
+        region_zoom: state.region_zoom,
     }
 }
 

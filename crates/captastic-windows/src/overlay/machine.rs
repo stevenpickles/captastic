@@ -27,6 +27,29 @@ pub(super) const NUDGE_STEP: i32 = 1;
 /// the ability to land on an exact pixel by letting go of Shift.
 pub(super) const NUDGE_COARSE_STEP: i32 = 10;
 
+/// Below this pointer speed, in device-independent pixels per second, the pointer counts as slow
+/// enough that the user is placing an edge rather than travelling to one.
+///
+/// 150 DIP/s is about a finger's width every three seconds: unmistakably deliberate, and well
+/// under the speed of even a careful traverse across a window.
+pub(super) const LOUPE_SLOW_DIP_PER_SECOND: i64 = 150;
+/// Above this speed the pointer is travelling and the loupe gets out of the way. The gap between
+/// the two is a hysteresis band: inside it the loupe keeps whatever state it already had, so a
+/// hand hovering around the boundary does not make it blink.
+pub(super) const LOUPE_FAST_DIP_PER_SECOND: i64 = 600;
+/// How long the pointer has to stay slow before the loupe appears. Short enough to feel
+/// immediate, long enough that the deceleration at the end of a fast drag does not trigger it.
+pub(super) const LOUPE_SLOW_SUSTAIN_MS: u32 = 120;
+const _: () = assert!(LOUPE_SLOW_DIP_PER_SECOND < LOUPE_FAST_DIP_PER_SECOND);
+/// How often the shell asks the machine to reconsider while a region drag is in flight.
+///
+/// Mouse messages stop arriving the instant the pointer stops, and "stopped" is the strongest
+/// possible form of "slow". Without a tick the loupe would appear for every hesitation except the
+/// one that matters most. 50 ms is well inside the 120 ms sustain, so a pointer that comes to
+/// rest is noticed with time to spare.
+pub(super) const LOUPE_TICK_MS: u32 = 50;
+const _: () = assert!(LOUPE_TICK_MS < LOUPE_SLOW_SUSTAIN_MS);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CaptureTool {
     FullDisplay,
@@ -84,6 +107,67 @@ pub(super) struct MoveDrag {
     pub(super) pointer_origin: POINT,
 }
 
+/// When the magnifier shows.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum LoupeMode {
+    /// On the Z key, and by itself whenever the pointer slows during a region drag.
+    #[default]
+    Auto,
+    /// Only while Z is held.
+    Key,
+    /// Never.
+    Off,
+}
+
+impl LoupeMode {
+    pub(super) const fn from_config(mode: captastic_config::RegionZoom) -> Self {
+        match mode {
+            captastic_config::RegionZoom::Auto => Self::Auto,
+            captastic_config::RegionZoom::Key => Self::Key,
+            captastic_config::RegionZoom::Off => Self::Off,
+        }
+    }
+}
+
+/// Everything the machine knows about the magnifier.
+///
+/// The speed tracking lives here rather than in the shell because it is a product decision — how
+/// slow is slow, and for how long — and because it is the part worth testing. The shell only
+/// supplies the timestamps.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct LoupeState {
+    pub(super) mode: LoupeMode,
+    /// Z is held down.
+    pub(super) key_held: bool,
+    /// The pointer has been slow long enough for Auto mode to show the loupe by itself.
+    pub(super) auto_visible: bool,
+    /// The last pointer position and the message time it arrived with.
+    last_sample: Option<(POINT, u32)>,
+    /// When the pointer first became slow, while it still is.
+    slow_since: Option<u32>,
+}
+
+impl LoupeState {
+    /// The state a run starts in: the configured mode, no key held, nothing measured yet.
+    pub(super) fn new(mode: LoupeMode) -> Self {
+        Self {
+            mode,
+            ..Self::default()
+        }
+    }
+
+    /// Forgets everything about the pointer's motion, without touching the mode or the key.
+    ///
+    /// Run whenever an adjustment starts or ends. The speed either side of that boundary is not
+    /// one movement, and carrying a "slow since" across it would show the loupe for a press that
+    /// followed a pause, or keep it up after the drag it belonged to had finished.
+    fn forget_motion(&mut self) {
+        self.last_sample = None;
+        self.slow_since = None;
+        self.auto_visible = false;
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct ToolbarDrag {
     pub(super) pointer_offset: POINT,
@@ -125,6 +209,8 @@ pub(super) struct OverlayModel {
     /// window that moved while the overlay was up would cost far more than the staleness is worth.
     /// `None` means "not asked for yet", which is why it is not simply an empty inventory.
     pub(super) snap_targets: Option<SnapTargets>,
+    /// The magnifier's mode, key state, and pointer-speed tracking.
+    pub(super) loupe: LoupeState,
     /// The guide lines the current selection's snapped edges justify, at most one per axis.
     /// Purely a consequence of the last adjustment: cleared on release, on a stolen capture, and
     /// on any tool change, because a line the selection is no longer sitting on is a lie.
@@ -145,6 +231,9 @@ pub(super) enum OverlayInput {
         point: POINT,
         window_hover: Option<WindowCandidate>,
         modifiers: Modifiers,
+        /// The message's own timestamp, from `GetMessageTime`. Wraps roughly every 49 days, which
+        /// the speed arithmetic handles by subtracting with wraparound.
+        time_ms: u32,
     },
     /// Primary button pressed. Under the Window tool the shell resolves which thumbnail slot
     /// (if any) the press landed on.
@@ -155,6 +244,7 @@ pub(super) enum OverlayInput {
     PointerDown {
         point: POINT,
         window_slot: Option<NativeWindowHandle>,
+        time_ms: u32,
     },
     /// Primary button released. Fully modeled for every tool.
     ///
@@ -172,6 +262,11 @@ pub(super) enum OverlayInput {
     WindowPreviewResolved { rect: Option<Rect> },
     /// The shell finished the enumeration requested by [`OverlayEffect::BuildSnapTargets`].
     SnapTargetsReady { targets: SnapTargets },
+    /// The magnifier's hotkey went down or came up. Also delivered with `held: false` when the
+    /// overlay loses focus, because a key released over another window is never reported here.
+    LoupeKeyChanged { held: bool },
+    /// The shell's rest timer fired: no pointer message has arrived, so the pointer is stationary.
+    Tick { time_ms: u32 },
     /// An arrow key adjusted the region by `(dx, dy)` physical pixels. `resize` moves the right
     /// and bottom edges instead of the whole rectangle.
     ///
@@ -297,8 +392,13 @@ pub(super) fn transition(model: &mut OverlayModel, input: OverlayInput) -> Vec<O
             point,
             window_hover,
             modifiers,
-        } => pointer_moved(model, point, window_hover, modifiers),
-        OverlayInput::PointerDown { point, window_slot } => pointer_down(model, point, window_slot),
+            time_ms,
+        } => pointer_moved(model, point, window_hover, modifiers, time_ms),
+        OverlayInput::PointerDown {
+            point,
+            window_slot,
+            time_ms,
+        } => pointer_down(model, point, window_slot, time_ms),
         OverlayInput::WindowPreviewResolved { rect } => window_preview_resolved(model, rect),
         OverlayInput::SnapTargetsReady { targets } => {
             model.snap_targets = Some(targets);
@@ -309,6 +409,8 @@ pub(super) fn transition(model: &mut OverlayModel, input: OverlayInput) -> Vec<O
         OverlayInput::PointerUp { point, modifiers } => pointer_up(model, point, modifiers),
         OverlayInput::DoubleClicked { point } => double_clicked(model, point),
         OverlayInput::PointerCaptureLost => pointer_capture_lost(model),
+        OverlayInput::LoupeKeyChanged { held } => loupe_key_changed(model, held),
+        OverlayInput::Tick { time_ms } => loupe_tick(model, time_ms),
         OverlayInput::Nudge { dx, dy, resize } => nudge(model, dx, dy, resize),
         OverlayInput::ConfirmRequested => confirm(model),
         OverlayInput::CancelRequested => cancel(model),
@@ -325,9 +427,11 @@ fn pointer_moved(
     point: POINT,
     window_hover: Option<WindowCandidate>,
     modifiers: Modifiers,
+    time_ms: u32,
 ) -> Vec<OverlayEffect> {
     let local = local_point(model.source, point);
     model.pointer_local = Some(local);
+    observe_pointer_motion(model, point, time_ms);
     let mut effects = Vec::new();
     if let Some(drag) = model.toolbar_drag {
         model.toolbar_position = ToolbarLayout::clamp_origin(
@@ -433,12 +537,16 @@ fn pointer_down(
     model: &mut OverlayModel,
     point: POINT,
     window_slot: Option<NativeWindowHandle>,
+    time_ms: u32,
 ) -> Vec<OverlayEffect> {
     let local = local_point(model.source, point);
     let layout = ToolbarLayout::new(model.display_environment, model.toolbar_position);
     if let Some(control) = layout.hit_test(local, model.options_open) {
         return toolbar_control_pressed(model, control, layout.bounds.contains(local), local);
     }
+    // A press begins a new movement. The pointer's speed before it belonged to getting here.
+    model.loupe.forget_motion();
+    model.loupe.last_sample = Some((point, time_ms));
     // Any press outside the toolbar starts a new adjustment; whatever the last one was snapped to
     // is no longer being maintained.
     model.active_snaps = NO_SNAPS;
@@ -623,6 +731,7 @@ pub(super) fn activate_tool(model: &mut OverlayModel, tool: CaptureTool) -> Vec<
     model.resizing = None;
     model.moving_region = None;
     model.active_snaps = NO_SNAPS;
+    model.loupe.forget_motion();
     let tool_changed = model.tool != tool;
     let mut effects = Vec::new();
     if tool_changed {
@@ -705,6 +814,7 @@ fn pointer_up(model: &mut OverlayModel, point: POINT, modifiers: Modifiers) -> V
         }
     }
     model.active_snaps = NO_SNAPS;
+    model.loupe.forget_motion();
     model.dragging = false;
     model.hovered_handle = if model.selection_kind == Some(SelectionKind::Region) {
         model.selection.and_then(|selection| {
@@ -726,6 +836,122 @@ fn pointer_up(model: &mut OverlayModel, point: POINT, modifiers: Modifiers) -> V
     }
     effects.push(OverlayEffect::Invalidate);
     effects
+}
+
+/// Whether an adjustment of the region is in flight: a rubber band, a move, or a resize.
+pub(super) fn region_drag_active(model: &OverlayModel) -> bool {
+    model.resizing.is_some() || model.moving_region.is_some() || model.anchor.is_some()
+}
+
+/// Whether the magnifier should be on screen right now.
+///
+/// Held Z shows it whenever a region could be adjusted, drag or no drag. Auto only shows it
+/// during an adjustment: a loupe following an idle pointer around the desktop magnifies nothing
+/// the user is doing anything with.
+pub(super) fn loupe_visible(model: &OverlayModel) -> bool {
+    if model.tool != CaptureTool::Region
+        || model.loupe.mode == LoupeMode::Off
+        || model.pointer_local.is_none()
+        // Over the toolbar or its menu, where there is nothing to magnify and the loupe would
+        // cover the control being aimed at.
+        || model.hovered_control.is_some()
+    {
+        return false;
+    }
+    model.loupe.key_held
+        || (model.loupe.mode == LoupeMode::Auto
+            && model.loupe.auto_visible
+            && region_drag_active(model))
+}
+
+/// Whether the shell should be running its rest timer.
+///
+/// Only Auto needs it, and only during a drag: the timer exists to notice that the pointer has
+/// stopped, and a stopped pointer is only interesting while an edge is being placed.
+pub(super) fn loupe_timer_wanted(model: &OverlayModel) -> bool {
+    model.tool == CaptureTool::Region
+        && model.loupe.mode == LoupeMode::Auto
+        && region_drag_active(model)
+}
+
+fn loupe_key_changed(model: &mut OverlayModel, held: bool) -> Vec<OverlayEffect> {
+    if model.loupe.key_held == held {
+        return Vec::new();
+    }
+    let was_visible = loupe_visible(model);
+    model.loupe.key_held = held;
+    if loupe_visible(model) == was_visible {
+        return Vec::new();
+    }
+    vec![OverlayEffect::Invalidate]
+}
+
+/// The rest timer fired, meaning no pointer message arrived since the last one: the pointer is
+/// exactly where it was, which is the strongest possible form of slow.
+fn loupe_tick(model: &mut OverlayModel, time_ms: u32) -> Vec<OverlayEffect> {
+    let Some((point, _)) = model.loupe.last_sample else {
+        // Nothing to measure against yet. Start the clock from here.
+        model.loupe.last_sample = Some((
+            model
+                .pointer_local
+                .map_or(POINT { x: 0, y: 0 }, |local| POINT {
+                    x: local.x.saturating_add(model.source.x),
+                    y: local.y.saturating_add(model.source.y),
+                }),
+            time_ms,
+        ));
+        return Vec::new();
+    };
+    let was_visible = loupe_visible(model);
+    observe_pointer_motion(model, point, time_ms);
+    if loupe_visible(model) == was_visible {
+        return Vec::new();
+    }
+    vec![OverlayEffect::Invalidate]
+}
+
+/// Folds one pointer sample into the speed tracking that Auto mode decides on.
+///
+/// Speed is Chebyshev distance (the larger of the two axis deltas) over elapsed milliseconds, in
+/// physical pixels per second. Chebyshev rather than Euclidean because it needs no square root
+/// and, for this purpose, "how far did the pointer get" is the larger axis; the difference
+/// between the two never exceeds 41 % and the thresholds are far coarser than that.
+fn observe_pointer_motion(model: &mut OverlayModel, point: POINT, time_ms: u32) {
+    let metrics = model.display_environment.metrics;
+    let slow = i64::from(metrics.px(i32::try_from(LOUPE_SLOW_DIP_PER_SECOND).unwrap_or(i32::MAX)));
+    let fast = i64::from(metrics.px(i32::try_from(LOUPE_FAST_DIP_PER_SECOND).unwrap_or(i32::MAX)));
+    let Some((previous_point, previous_time)) = model.loupe.last_sample else {
+        model.loupe.last_sample = Some((point, time_ms));
+        return;
+    };
+    // Wrapping, because `GetMessageTime` is milliseconds since boot in a 32-bit counter and rolls
+    // over about every 49 days. A subtraction that saturated would report one enormous interval,
+    // and therefore a speed of zero, at the moment of the rollover.
+    let elapsed = time_ms.wrapping_sub(previous_time);
+    if elapsed == 0 {
+        // Several messages can carry the same millisecond. Keeping the earlier sample lets the
+        // distance accumulate into the next one instead of dividing by zero here.
+        return;
+    }
+    let distance = i64::from(point.x.saturating_sub(previous_point.x).abs())
+        .max(i64::from(point.y.saturating_sub(previous_point.y).abs()));
+    let speed = distance.saturating_mul(1_000) / i64::from(elapsed);
+    model.loupe.last_sample = Some((point, time_ms));
+    if speed > fast {
+        // Travelling. Get out of the way at once, and start the sustain clock over.
+        model.loupe.auto_visible = false;
+        model.loupe.slow_since = None;
+    } else if speed < slow {
+        match model.loupe.slow_since {
+            Some(since) if time_ms.wrapping_sub(since) >= LOUPE_SLOW_SUSTAIN_MS => {
+                model.loupe.auto_visible = true;
+            }
+            Some(_) => {}
+            None => model.loupe.slow_since = Some(time_ms),
+        }
+    }
+    // Between the two thresholds nothing changes. That band is the whole reason a hand wavering
+    // around the boundary does not make the loupe blink on and off.
 }
 
 /// Adjusts the region by an exact number of physical pixels from the keyboard.
@@ -818,6 +1044,7 @@ fn pointer_capture_lost(model: &mut OverlayModel) -> Vec<OverlayEffect> {
     model.dragging = false;
     model.hovered_handle = None;
     model.active_snaps = NO_SNAPS;
+    model.loupe.forget_motion();
     let mut effects = Vec::new();
     // An abandoned toolbar drag deliberately does not persist the position: the pointer never
     // came to rest, so the last committed position stays authoritative.
@@ -1238,6 +1465,7 @@ mod tests {
             hovered: None,
             snap_to_windows: true,
             snap_targets: Some(SnapTargets::default()),
+            loupe: LoupeState::default(),
             active_snaps: NO_SNAPS,
         }
     }
@@ -1272,6 +1500,7 @@ mod tests {
             OverlayInput::PointerDown {
                 point: point(100, 100),
                 window_slot: None,
+                time_ms: 0,
             },
         );
         assert!(model.anchor.is_some());
@@ -1292,6 +1521,7 @@ mod tests {
                 point: point(103, 100),
                 window_hover: None,
                 modifiers: Modifiers::default(),
+                time_ms: 0,
             },
         );
         assert!(!model.dragging);
@@ -1304,6 +1534,7 @@ mod tests {
                 point: point(104, 100),
                 window_hover: None,
                 modifiers: Modifiers::default(),
+                time_ms: 0,
             },
         );
         assert!(model.dragging);
@@ -1313,6 +1544,7 @@ mod tests {
                 point: point(300, 240),
                 window_hover: None,
                 modifiers: Modifiers::default(),
+                time_ms: 0,
             },
         );
         assert_eq!(model.selection_kind, Some(SelectionKind::Region));
@@ -1348,6 +1580,7 @@ mod tests {
             OverlayInput::PointerDown {
                 point: point(100, 100),
                 window_slot: None,
+                time_ms: 0,
             },
         );
         transition(
@@ -1356,6 +1589,7 @@ mod tests {
                 point: point(102, 101),
                 window_hover: None,
                 modifiers: Modifiers::default(),
+                time_ms: 0,
             },
         );
         let effects = transition(
@@ -1388,6 +1622,7 @@ mod tests {
             OverlayInput::PointerDown {
                 point: point(300, 300),
                 window_slot: None,
+                time_ms: 0,
             },
         );
         let resize = model
@@ -1409,6 +1644,7 @@ mod tests {
                 point: point(340, 360),
                 window_hover: None,
                 modifiers: Modifiers::default(),
+                time_ms: 0,
             },
         );
         assert_eq!(
@@ -1458,6 +1694,7 @@ mod tests {
             OverlayInput::PointerDown {
                 point: point(180, 160),
                 window_slot: None,
+                time_ms: 0,
             },
         );
         assert!(model.moving_region.is_some());
@@ -1468,6 +1705,7 @@ mod tests {
                 point: point(230, 200),
                 window_hover: None,
                 modifiers: Modifiers::default(),
+                time_ms: 0,
             },
         );
         transition(
@@ -1497,6 +1735,7 @@ mod tests {
             OverlayInput::PointerDown {
                 point: point(100, 100),
                 window_slot: None,
+                time_ms: 0,
             },
         );
         transition(
@@ -1505,6 +1744,7 @@ mod tests {
                 point: point(200, 200),
                 window_hover: None,
                 modifiers: Modifiers::default(),
+                time_ms: 0,
             },
         );
         assert!(model.dragging);
@@ -1535,6 +1775,7 @@ mod tests {
             OverlayInput::PointerDown {
                 point: point(10, 10),
                 window_slot: None,
+                time_ms: 0,
             },
         );
         transition(
@@ -1543,6 +1784,7 @@ mod tests {
                 point: point(90, 60),
                 window_hover: None,
                 modifiers: Modifiers::default(),
+                time_ms: 0,
             },
         );
         let effects = transition(
@@ -1695,6 +1937,7 @@ mod tests {
                 point: point(500, 400),
                 window_hover: None,
                 modifiers: Modifiers::default(),
+                time_ms: 0,
             },
         );
         assert_eq!(model.hovered_control, Some(ToolbarControl::Background));
@@ -1873,6 +2116,7 @@ mod tests {
                 OverlayInput::PointerDown {
                     point: screen,
                     window_slot: None,
+                    time_ms: 0,
                 },
             );
             assert_eq!(model.hovered_control, Some(expected));
@@ -1970,6 +2214,7 @@ mod tests {
                 OverlayInput::PointerDown {
                     point: local,
                     window_slot: None,
+                    time_ms: 0,
                 },
             );
             let drag = model.toolbar_drag.expect("drag-handle press starts a drag");
@@ -2007,6 +2252,7 @@ mod tests {
             OverlayInput::PointerDown {
                 point: center(layout.options),
                 window_slot: None,
+                time_ms: 0,
             },
         );
         assert!(model.options_open);
@@ -2021,6 +2267,7 @@ mod tests {
             OverlayInput::PointerDown {
                 point: menu_background,
                 window_slot: None,
+                time_ms: 0,
             },
         );
         assert!(model.options_open);
@@ -2033,6 +2280,7 @@ mod tests {
             OverlayInput::PointerDown {
                 point: center(layout.options),
                 window_slot: None,
+                time_ms: 0,
             },
         );
         assert!(!model.options_open);
@@ -2044,6 +2292,7 @@ mod tests {
             OverlayInput::PointerDown {
                 point: point(5, 5),
                 window_slot: None,
+                time_ms: 0,
             },
         );
         assert!(!model.options_open);
@@ -2061,6 +2310,7 @@ mod tests {
                 OverlayInput::PointerDown {
                     point: center(layout.options),
                     window_slot: None,
+                    time_ms: 0,
                 },
             );
             assert_eq!(model.options_open, expected_open);
@@ -2082,6 +2332,7 @@ mod tests {
             OverlayInput::PointerDown {
                 point: center(layout.dim_background),
                 window_slot: None,
+                time_ms: 0,
             },
         );
         assert_eq!(model.dim_background, !dimmed_before);
@@ -2115,6 +2366,7 @@ mod tests {
             OverlayInput::PointerDown {
                 point: center(layout.snap_to_windows),
                 window_slot: None,
+                time_ms: 0,
             },
         );
         assert!(!model.snap_to_windows);
@@ -2143,6 +2395,7 @@ mod tests {
             OverlayInput::PointerDown {
                 point: center(layout.snap_to_windows),
                 window_slot: None,
+                time_ms: 0,
             },
         );
         assert!(model.snap_to_windows);
@@ -2167,6 +2420,7 @@ mod tests {
             OverlayInput::PointerDown {
                 point: capture,
                 window_slot: None,
+                time_ms: 0,
             },
         );
         assert!(
@@ -2187,6 +2441,7 @@ mod tests {
             OverlayInput::PointerDown {
                 point: capture,
                 window_slot: None,
+                time_ms: 0,
             },
         );
         assert!(matches!(
@@ -2214,6 +2469,7 @@ mod tests {
             OverlayInput::PointerDown {
                 point: center(layout.cancel),
                 window_slot: None,
+                time_ms: 0,
             },
         );
         assert_eq!(persisted_region(&effects), Some(Some(region)));
@@ -2246,6 +2502,7 @@ mod tests {
             OverlayInput::PointerDown {
                 point: point(400, 300),
                 window_slot: Some(handle),
+                time_ms: 0,
             },
         );
         assert_eq!(model.selected_window, Some(handle));
@@ -2301,6 +2558,7 @@ mod tests {
                 OverlayInput::PointerDown {
                     point: point(400, 300),
                     window_slot: Some(handle),
+                    time_ms: 0,
                 },
             );
             // Every click re-requests the preview: the shell's cache is deliberately
@@ -2339,6 +2597,7 @@ mod tests {
             OverlayInput::PointerDown {
                 point: point(400, 300),
                 window_slot: None,
+                time_ms: 0,
             },
         );
         assert_eq!(model.selected_window, None);
@@ -2359,6 +2618,7 @@ mod tests {
                 point: point(400, 300),
                 window_hover: Some(candidate(0x77)),
                 modifiers: Modifiers::default(),
+                time_ms: 0,
             },
         );
         assert_eq!(
@@ -2384,6 +2644,7 @@ mod tests {
                 point: center(layout.capture),
                 window_hover: Some(candidate(0x77)),
                 modifiers: Modifiers::default(),
+                time_ms: 0,
             },
         );
         assert_eq!(model.hovered_control, Some(ToolbarControl::Capture));
@@ -2400,6 +2661,7 @@ mod tests {
                 point: point(10, 10),
                 window_hover: None,
                 modifiers: Modifiers::default(),
+                time_ms: 0,
             },
         );
         assert!(model.hovered.is_none());
@@ -2416,6 +2678,7 @@ mod tests {
             OverlayInput::PointerDown {
                 point: point(400, 300),
                 window_slot: None,
+                time_ms: 0,
             },
         );
         assert!(!model.options_open);
@@ -2497,6 +2760,7 @@ mod tests {
             OverlayInput::PointerDown {
                 point: from,
                 window_slot: None,
+                time_ms: 0,
             },
         );
         transition(
@@ -2505,6 +2769,7 @@ mod tests {
                 point: to,
                 window_hover: None,
                 modifiers,
+                time_ms: 0,
             },
         );
     }
@@ -2558,6 +2823,7 @@ mod tests {
             OverlayInput::PointerDown {
                 point: point(403, 303),
                 window_slot: None,
+                time_ms: 0,
             },
         );
         assert_eq!(model.anchor, Some(point(403, 303)));
@@ -2567,6 +2833,7 @@ mod tests {
                 point: point(405, 304),
                 window_hover: None,
                 modifiers: Modifiers::default(),
+                time_ms: 0,
             },
         );
         assert!(
@@ -2582,6 +2849,7 @@ mod tests {
                 point: point(450, 350),
                 window_hover: None,
                 modifiers: Modifiers::default(),
+                time_ms: 0,
             },
         );
         assert!(model.dragging);
@@ -2615,6 +2883,7 @@ mod tests {
                 point: point(596, 496),
                 window_hover: None,
                 modifiers: CTRL,
+                time_ms: 0,
             },
         );
         let region = model.selection.expect("a region");
@@ -2651,6 +2920,7 @@ mod tests {
             OverlayInput::PointerDown {
                 point: point(596, 400),
                 window_slot: None,
+                time_ms: 0,
             },
         );
         assert_eq!(
@@ -2663,6 +2933,7 @@ mod tests {
                 point: point(597, 400),
                 window_hover: None,
                 modifiers: Modifiers::default(),
+                time_ms: 0,
             },
         );
         let region = model.selection.expect("a region");
@@ -2694,6 +2965,7 @@ mod tests {
             OverlayInput::PointerDown {
                 point: point(150, 150),
                 window_slot: None,
+                time_ms: 0,
             },
         );
         assert!(model.moving_region.is_some());
@@ -2704,6 +2976,7 @@ mod tests {
                 point: point(453, 353),
                 window_hover: None,
                 modifiers: Modifiers::default(),
+                time_ms: 0,
             },
         );
         let region = model.selection.expect("a region");
@@ -2746,6 +3019,7 @@ mod tests {
             OverlayInput::PointerDown {
                 point: point(140, 120),
                 window_slot: None,
+                time_ms: 0,
             },
         );
         assert_eq!(
@@ -2758,6 +3032,7 @@ mod tests {
                 point: point(102, 120),
                 window_hover: None,
                 modifiers: Modifiers::default(),
+                time_ms: 0,
             },
         );
         let region = model.selection.expect("a region");
@@ -2909,6 +3184,7 @@ mod tests {
             OverlayInput::PointerDown {
                 point: point(250, 250),
                 window_slot: None,
+                time_ms: 0,
             },
         );
         assert!(model.moving_region.is_some());
@@ -2980,6 +3256,397 @@ mod tests {
         }
     }
 
+    /// A drag in flight, with the pointer parked at `point` as of `time_ms`.
+    fn dragging_model(point: POINT, time_ms: u32) -> OverlayModel {
+        let mut model = region_model();
+        model.selection = Some(Rect {
+            x: 100,
+            y: 100,
+            width: 400,
+            height: 400,
+        });
+        model.selection_kind = Some(SelectionKind::Region);
+        transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point,
+                window_slot: None,
+                time_ms,
+            },
+        );
+        assert!(
+            region_drag_active(&model),
+            "the press must start an adjustment"
+        );
+        model
+    }
+
+    /// Moves the pointer by `dx` physical pixels over `elapsed` milliseconds.
+    fn glide(model: &mut OverlayModel, from: POINT, dx: i32, elapsed: u32, at: u32) -> POINT {
+        let to = POINT {
+            x: from.x + dx,
+            y: from.y,
+        };
+        transition(
+            model,
+            OverlayInput::PointerMoved {
+                point: to,
+                window_hover: None,
+                modifiers: Modifiers::default(),
+                time_ms: at.wrapping_add(elapsed),
+            },
+        );
+        to
+    }
+
+    #[test]
+    fn a_slow_drag_shows_the_loupe_only_once_it_has_been_slow_long_enough() {
+        // At 96 DPI the thresholds are 150 and 600 physical px/s. Two pixels every 50 ms is
+        // 40 px/s: unmistakably slow.
+        let start = POINT { x: 800, y: 500 };
+        let mut model = dragging_model(start, 1_000);
+        let mut point = start;
+        let mut now = 1_000;
+
+        // The first slow sample starts the sustain clock; it is the ones after it that run it
+        // down, so the third move is still only 100 ms into a 120 ms wait.
+        for (step, expected) in [(1, false), (2, false), (3, false), (4, true)] {
+            point = glide(&mut model, point, 2, 50, now);
+            now += 50;
+            assert_eq!(
+                loupe_visible(&model),
+                expected,
+                "{} ms after the first slow sample",
+                (step - 1) * 50
+            );
+        }
+    }
+
+    #[test]
+    fn a_flick_hides_it_again_and_the_band_between_keeps_it_steady() {
+        let start = POINT { x: 800, y: 500 };
+        let mut model = dragging_model(start, 1_000);
+        let mut point = start;
+        let mut now = 1_000;
+        for _ in 0..4 {
+            point = glide(&mut model, point, 2, 50, now);
+            now += 50;
+        }
+        assert!(loupe_visible(&model));
+
+        // 40 px in 50 ms is 800 px/s: past the fast threshold, so it goes at once.
+        point = glide(&mut model, point, 40, 50, now);
+        now += 50;
+        assert!(!loupe_visible(&model));
+
+        // 20 px in 50 ms is 400 px/s: inside the band between 150 and 600, which changes nothing
+        // in either direction. This is what stops a wavering hand making it blink.
+        for _ in 0..4 {
+            point = glide(&mut model, point, 20, 50, now);
+            now += 50;
+            assert!(!loupe_visible(&model), "the band must not show it");
+        }
+
+        // Slowing down brings it back, after the sustain.
+        for _ in 0..4 {
+            point = glide(&mut model, point, 2, 50, now);
+            now += 50;
+        }
+        assert!(loupe_visible(&model));
+
+        // And from visible, the band must not hide it either.
+        glide(&mut model, point, 20, 50, now);
+        assert!(loupe_visible(&model), "the band must not hide it");
+    }
+
+    #[test]
+    fn auto_needs_an_adjustment_in_flight() {
+        // The same slow pointer with no drag: a loupe following an idle pointer around the
+        // desktop magnifies nothing the user is doing anything with.
+        let mut model = region_model();
+        model.selection = Some(Rect {
+            x: 100,
+            y: 100,
+            width: 400,
+            height: 400,
+        });
+        model.selection_kind = Some(SelectionKind::Region);
+        let mut point = POINT { x: 800, y: 900 };
+        let mut now = 1_000;
+        // One extra sample over the drag case: with no press to seed it, the first move is what
+        // establishes the sample the second is measured against.
+        for _ in 0..5 {
+            point = glide(&mut model, point, 2, 50, now);
+            now += 50;
+        }
+        assert!(model.loupe.auto_visible, "the pointer really is slow");
+        assert!(!loupe_visible(&model), "but nothing is being adjusted");
+        assert!(!loupe_timer_wanted(&model));
+    }
+
+    #[test]
+    fn a_stopped_pointer_is_noticed_by_the_tick_rather_than_by_a_message_that_never_comes() {
+        // Mouse messages stop the instant the pointer stops, so without the timer the one
+        // hesitation that matters most is the one the loupe would never see.
+        let start = POINT { x: 800, y: 500 };
+        let mut model = dragging_model(start, 1_000);
+        glide(&mut model, start, 2, 50, 1_000);
+        assert!(
+            loupe_timer_wanted(&model),
+            "a drag under Auto wants the timer"
+        );
+
+        for step in 1..=2 {
+            assert!(
+                transition(
+                    &mut model,
+                    OverlayInput::Tick {
+                        time_ms: 1_050 + step * LOUPE_TICK_MS,
+                    },
+                )
+                .is_empty(),
+                "still inside the sustain, so nothing to repaint"
+            );
+            assert!(!loupe_visible(&model));
+        }
+        let effects = transition(
+            &mut model,
+            OverlayInput::Tick {
+                time_ms: 1_050 + 3 * LOUPE_TICK_MS,
+            },
+        );
+        assert!(loupe_visible(&model));
+        assert!(
+            matches!(effects.as_slice(), [OverlayEffect::Invalidate]),
+            "the tick that changes visibility repaints, {effects:?}"
+        );
+        // Further ticks change nothing and must not repaint.
+        assert!(transition(&mut model, OverlayInput::Tick { time_ms: 1_500 }).is_empty());
+    }
+
+    #[test]
+    fn the_key_shows_it_with_or_without_a_drag_and_releasing_hides_it() {
+        let mut model = region_model();
+        model.pointer_local = Some(point(400, 400));
+        assert!(!loupe_visible(&model));
+
+        let effects = transition(&mut model, OverlayInput::LoupeKeyChanged { held: true });
+        assert!(loupe_visible(&model), "no drag required for the key");
+        assert!(matches!(effects.as_slice(), [OverlayEffect::Invalidate]));
+        // A repeat of the same state is inert, which is what lets the shell ignore autorepeat
+        // cheaply and what makes a duplicate key-up from losing focus harmless.
+        assert!(transition(&mut model, OverlayInput::LoupeKeyChanged { held: true }).is_empty());
+
+        let effects = transition(&mut model, OverlayInput::LoupeKeyChanged { held: false });
+        assert!(!loupe_visible(&model));
+        assert!(matches!(effects.as_slice(), [OverlayEffect::Invalidate]));
+        assert!(transition(&mut model, OverlayInput::LoupeKeyChanged { held: false }).is_empty());
+    }
+
+    #[test]
+    fn each_mode_answers_for_itself() {
+        for (mode, key, auto_after_slow_drag) in [
+            (LoupeMode::Auto, true, true),
+            (LoupeMode::Key, true, false),
+            (LoupeMode::Off, false, false),
+        ] {
+            // Held key.
+            let mut model = region_model();
+            model.loupe.mode = mode;
+            model.pointer_local = Some(point(400, 400));
+            transition(&mut model, OverlayInput::LoupeKeyChanged { held: true });
+            assert_eq!(loupe_visible(&model), key, "{mode:?} with the key held");
+
+            // Slow drag, no key.
+            let start = POINT { x: 800, y: 500 };
+            let mut model = dragging_model(start, 1_000);
+            model.loupe.mode = mode;
+            let mut point = start;
+            let mut now = 1_000;
+            for _ in 0..4 {
+                point = glide(&mut model, point, 2, 50, now);
+                now += 50;
+            }
+            assert_eq!(
+                loupe_visible(&model),
+                auto_after_slow_drag,
+                "{mode:?} on a slow drag"
+            );
+            assert_eq!(
+                loupe_timer_wanted(&model),
+                mode == LoupeMode::Auto,
+                "{mode:?} timer"
+            );
+        }
+    }
+
+    #[test]
+    fn the_toolbar_and_a_missing_pointer_both_suppress_it() {
+        let mut model = region_model();
+        model.pointer_local = Some(point(400, 400));
+        transition(&mut model, OverlayInput::LoupeKeyChanged { held: true });
+        assert!(loupe_visible(&model));
+
+        // Over a toolbar control there is nothing to magnify and the loupe would cover the very
+        // button being aimed at.
+        let layout = layout_for(&model);
+        transition(
+            &mut model,
+            OverlayInput::PointerMoved {
+                point: center(layout.capture),
+                window_hover: None,
+                modifiers: Modifiers::default(),
+                time_ms: 10,
+            },
+        );
+        assert_eq!(model.hovered_control, Some(ToolbarControl::Capture));
+        assert!(!loupe_visible(&model));
+
+        // And before the pointer has ever been seen there is no position to magnify around.
+        let mut model = region_model();
+        model.loupe.key_held = true;
+        assert_eq!(model.pointer_local, None);
+        assert!(!loupe_visible(&model));
+    }
+
+    #[test]
+    fn the_message_clock_wrapping_does_not_make_the_pointer_look_stationary() {
+        // `GetMessageTime` is a 32-bit millisecond counter and rolls over about every 49 days. A
+        // saturating subtraction would report one enormous interval and therefore a speed of
+        // zero, showing the loupe in the middle of a fast drag.
+        let start = POINT { x: 800, y: 500 };
+        let mut model = dragging_model(start, u32::MAX - 20);
+        let mut point = start;
+        let mut now = u32::MAX - 20;
+        // Four samples of 40 px per 50 ms - 800 px/s, comfortably fast - straddling the rollover.
+        for _ in 0..4 {
+            point = glide(&mut model, point, 40, 50, now);
+            now = now.wrapping_add(50);
+        }
+        assert!(!model.loupe.auto_visible, "a fast drag across the rollover");
+        assert!(!loupe_visible(&model));
+    }
+
+    #[test]
+    fn messages_sharing_a_millisecond_accumulate_rather_than_dividing_by_zero() {
+        let start = POINT { x: 800, y: 500 };
+        let mut model = dragging_model(start, 1_000);
+        // Three moves all stamped 1_000: together they cover 60 px, and the sample they are
+        // measured against must stay the press so the next real interval sees the whole distance.
+        for offset in [20, 40, 60] {
+            transition(
+                &mut model,
+                OverlayInput::PointerMoved {
+                    point: POINT {
+                        x: start.x + offset,
+                        y: start.y,
+                    },
+                    window_hover: None,
+                    modifiers: Modifiers::default(),
+                    time_ms: 1_000,
+                },
+            );
+        }
+        assert!(!model.loupe.auto_visible);
+        // 60 px in the next 50 ms is 1200 px/s, which is decisively fast rather than slow.
+        transition(
+            &mut model,
+            OverlayInput::PointerMoved {
+                point: POINT {
+                    x: start.x + 60,
+                    y: start.y,
+                },
+                window_hover: None,
+                modifiers: Modifiers::default(),
+                time_ms: 1_050,
+            },
+        );
+        assert!(!model.loupe.auto_visible);
+    }
+
+    #[test]
+    fn starting_and_ending_an_adjustment_forgets_what_the_pointer_was_doing() {
+        // The speed either side of a press or a release is not one movement. Carrying it across
+        // would show the loupe for a press that followed a pause, or leave it up after the drag
+        // it belonged to had ended.
+        let start = POINT { x: 800, y: 500 };
+        for ending in ["up", "capture-lost", "tool"] {
+            let mut model = dragging_model(start, 1_000);
+            let mut point = start;
+            let mut now = 1_000;
+            for _ in 0..4 {
+                point = glide(&mut model, point, 2, 50, now);
+                now += 50;
+            }
+            assert!(model.loupe.auto_visible, "{ending}");
+            match ending {
+                "up" => {
+                    transition(
+                        &mut model,
+                        OverlayInput::PointerUp {
+                            point,
+                            modifiers: Modifiers::default(),
+                        },
+                    );
+                }
+                "capture-lost" => {
+                    transition(&mut model, OverlayInput::PointerCaptureLost);
+                }
+                _ => {
+                    activate_tool(&mut model, CaptureTool::FullDisplay);
+                }
+            }
+            assert!(!model.loupe.auto_visible, "{ending}");
+            assert!(!loupe_visible(&model), "{ending}");
+            assert!(!loupe_timer_wanted(&model), "{ending}");
+        }
+
+        // A press after a long pause must not inherit the pause.
+        let mut model = dragging_model(start, 1_000);
+        let mut point = start;
+        let mut now = 1_000;
+        for _ in 0..4 {
+            point = glide(&mut model, point, 2, 50, now);
+            now += 50;
+        }
+        assert!(model.loupe.auto_visible);
+        transition(
+            &mut model,
+            OverlayInput::PointerUp {
+                point,
+                modifiers: Modifiers::default(),
+            },
+        );
+        transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point,
+                window_slot: None,
+                time_ms: now + 5_000,
+            },
+        );
+        assert!(!model.loupe.auto_visible);
+    }
+
+    #[test]
+    fn the_speed_thresholds_scale_with_the_display() {
+        // 150 DIP/s is 300 px/s at 200 %. A pointer moving 250 physical px/s is slow on a 200 %
+        // display and not slow on a 100 % one, which is the whole point of scaling them.
+        for (dpi, expected_slow) in [(96, false), (192, true)] {
+            let start = POINT { x: 800, y: 500 };
+            let mut model = dragging_model(start, 1_000);
+            model.display_environment.metrics = UiMetrics::new(dpi);
+            let mut point = start;
+            let mut now = 1_000;
+            // 50 px every 200 ms is 250 px/s.
+            for _ in 0..3 {
+                point = glide(&mut model, point, 50, 200, now);
+                now += 200;
+            }
+            assert_eq!(model.loupe.auto_visible, expected_slow, "{dpi} DPI");
+        }
+    }
+
     mod snap_properties {
         use super::*;
         use proptest::prelude::*;
@@ -3028,7 +3695,11 @@ mod tests {
                 model.selection_kind = Some(SelectionKind::Region);
                 transition(
                     &mut model,
-                    OverlayInput::PointerDown { point: point(200, 150), window_slot: None },
+                    OverlayInput::PointerDown {
+                        point: point(200, 150),
+                        window_slot: None,
+                        time_ms: 0,
+                    },
                 );
                 transition(
                     &mut model,
@@ -3036,6 +3707,7 @@ mod tests {
                         point: to,
                         window_hover: None,
                         modifiers: Modifiers { ctrl, shift: false },
+                        time_ms: 0,
                     },
                 );
                 let moved = model.selection.expect("a moved region");
@@ -3081,6 +3753,7 @@ mod tests {
                         point: to,
                         window_hover: None,
                         modifiers: Modifiers::default(),
+                        time_ms: 0,
                     },
                 );
                 prop_assert_eq!((model.selection, model.active_snaps), once);
@@ -3098,6 +3771,7 @@ mod tests {
             OverlayInput::PointerDown {
                 point: point(100, 100),
                 window_slot: None,
+                time_ms: 0,
             },
         );
         assert!(has_effect(&effects, |e| matches!(
@@ -3120,6 +3794,7 @@ mod tests {
             OverlayInput::PointerDown {
                 point: point(400, 400),
                 window_slot: None,
+                time_ms: 0,
             },
         );
         assert!(!has_effect(&effects, |e| matches!(

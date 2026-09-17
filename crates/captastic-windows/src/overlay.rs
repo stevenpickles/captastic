@@ -29,10 +29,11 @@ use raster::{
 pub use shell::flush_desktop_composition;
 use shell::{
     capture_pointer, consume_self_initiated_capture_change, drain_pending_quit, duration_ns,
-    invalid_frame, invalidate, last_error, modifiers, overlay_error, query_display_environment,
-    release_pointer_capture, restore_input_context, screen_point, set_arrow_cursor,
-    set_move_cursor, ClassRegistration, FrozenSurface, PrivateFontResource, RegionCursor,
-    ThreadDpiContext, REGION_CURSOR_CENTER,
+    invalid_frame, invalidate, key_is_autorepeat, last_error, message_time_ms, modifiers,
+    overlay_error, query_display_environment, release_pointer_capture, restore_input_context,
+    screen_point, set_arrow_cursor, set_move_cursor, start_loupe_timer, stop_loupe_timer,
+    ClassRegistration, FrozenSurface, PrivateFontResource, RegionCursor, ThreadDpiContext,
+    LOUPE_TIMER_ID, REGION_CURSOR_CENTER,
 };
 use snap::{SnapAxis, SnapTarget, SnapTargetKind, SnapTargets, NO_SNAPS};
 use window_enumeration::{enumerate_visible_windows, WindowCandidate};
@@ -66,7 +67,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SetFocus, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP,
+    SetFocus, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP, VK_Z,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClassNameW,
@@ -76,10 +77,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     UpdateLayeredWindow, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
     IDC_CROSS, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, MSG, SPI_SETLOGICALDPIOVERRIDE,
     SPI_SETWORKAREA, SW_SHOW, ULW_ALPHA, WDA_EXCLUDEFROMCAPTURE, WM_APP, WM_CAPTURECHANGED,
-    WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY,
-    WM_PAINT, WM_RBUTTONDOWN, WM_SETTINGCHANGE, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP,
+    WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
+    WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_LAYERED,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 #[cfg(test)]
 use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, PM_NOREMOVE, WM_QUIT};
@@ -574,6 +575,11 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
             hovered: None,
             snap_to_windows: remembered_ui.snap_to_windows.unwrap_or(true),
             snap_targets: None,
+            loupe: machine::LoupeState::new(
+                remembered_ui
+                    .region_zoom
+                    .map_or_else(Default::default, machine::LoupeMode::from_config),
+            ),
             active_snaps: NO_SNAPS,
         },
         overlay_hwnd: HWND(0),
@@ -1259,6 +1265,7 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                         point,
                         window_hover: None,
                         modifiers: modifiers(),
+                        time_ms: message_time_ms(),
                     },
                 );
             }
@@ -1282,6 +1289,7 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                         point,
                         window_hover,
                         modifiers: modifiers(),
+                        time_ms: message_time_ms(),
                     },
                     (
                         state.model.hovered.map(|candidate| candidate.handle),
@@ -1316,7 +1324,11 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                 let window_slot = (state.model.tool == CaptureTool::Window)
                     .then(|| hit_test_window_thumbnail(state, local))
                     .flatten();
-                OverlayInput::PointerDown { point, window_slot }
+                OverlayInput::PointerDown {
+                    point,
+                    window_slot,
+                    time_ms: message_time_ms(),
+                }
             };
             run_machine(hwnd, state_pointer, input)
         }
@@ -1349,6 +1361,40 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
         WM_KEYDOWN if wparam.0 == usize::from(VK_ESCAPE.0) => {
             run_machine(hwnd, state_pointer, OverlayInput::CancelRequested)
         }
+        WM_KEYDOWN if wparam.0 == usize::from(VK_Z.0) => {
+            if key_is_autorepeat(lparam) {
+                // The key is already down and the machine already knows. Restating it thirty
+                // times a second would only churn the visibility comparison.
+                return LRESULT(0);
+            }
+            run_machine(
+                hwnd,
+                state_pointer,
+                OverlayInput::LoupeKeyChanged { held: true },
+            )
+        }
+        WM_KEYUP if wparam.0 == usize::from(VK_Z.0) => run_machine(
+            hwnd,
+            state_pointer,
+            OverlayInput::LoupeKeyChanged { held: false },
+        ),
+        WM_KILLFOCUS => {
+            // A key released while another window has focus is delivered to that window, not to
+            // this one. Without this the magnifier would still be up after an Alt+Tab away and
+            // back, with nothing holding it there.
+            run_machine(
+                hwnd,
+                state_pointer,
+                OverlayInput::LoupeKeyChanged { held: false },
+            )
+        }
+        WM_TIMER if wparam.0 == LOUPE_TIMER_ID => run_machine(
+            hwnd,
+            state_pointer,
+            OverlayInput::Tick {
+                time_ms: message_time_ms(),
+            },
+        ),
         WM_KEYDOWN if arrow_direction(wparam).is_some() => {
             let (x, y) = arrow_direction(wparam).unwrap_or((0, 0));
             let modifiers = modifiers();
@@ -1375,6 +1421,8 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             }) {
                 return LRESULT(0);
             }
+            // A real loss ends the drag, so the rest timer has nothing left to watch.
+            stop_loupe_timer(hwnd);
             run_machine(hwnd, state_pointer, OverlayInput::PointerCaptureLost)
         }
         WM_RBUTTONDOWN | WM_CLOSE => {
@@ -1507,12 +1555,22 @@ fn apply_overlay_effects(
                 }
             }
             OverlayEffect::Invalidate => invalidate(hwnd),
-            OverlayEffect::CapturePointer => capture_pointer(hwnd),
+            OverlayEffect::CapturePointer => {
+                capture_pointer(hwnd);
+                // The timer's lifetime is exactly the drag's, which is exactly the pointer
+                // capture's: started here, stopped on release and on a real capture loss. There
+                // is no path that takes capture without this effect.
+                // SAFETY: Shared borrow released at the block's end.
+                if machine::loupe_timer_wanted(unsafe { &(*state_pointer).model }) {
+                    start_loupe_timer(hwnd);
+                }
+            }
             OverlayEffect::ReleasePointer => {
                 // ReleaseCapture synchronously sends WM_CAPTURECHANGED back to this window. Arm
                 // the protocol flag first so that reentrant notification is recognized as
                 // self-initiated; the model transition has already committed its work, so the
                 // reentrant callback can never erase state the caller still needs.
+                stop_loupe_timer(hwnd);
                 // SAFETY: This single-field mutation ends before ReleaseCapture can re-enter.
                 unsafe { (*state_pointer).releasing_pointer_capture = true };
                 release_pointer_capture();
@@ -1742,8 +1800,10 @@ fn prune_dead_window_sources(state: &mut OverlayState) -> Vec<NativeWindowHandle
 fn compose_overlay_state(state: &mut OverlayState) {
     let width = state.surface.width;
     if state.model.tool == CaptureTool::Window {
-        // Destroyed sources are pruned once per paint (the overlay runs no timers), and any
-        // model state pointing at them is cleared before the chooser surface is rebuilt.
+        // Destroyed sources are pruned once per paint. The overlay's only timer is the region
+        // tool's rest timer, which never runs under the Window tool, so a paint is still the one
+        // and only moment this inventory is revisited. Any model state pointing at a pruned
+        // window is cleared before the chooser surface is rebuilt.
         let dead = prune_dead_window_sources(state);
         if !dead.is_empty() {
             for effect in machine::window_sources_pruned(&mut state.model, &dead) {

@@ -363,6 +363,21 @@ pub struct DisplayUiState {
     /// per-display: it is a statement about how the user wants to work, not about one monitor.
     /// `None` means the user has never said, and the overlay's default stands.
     pub snap_to_windows: Option<bool>,
+    /// When the region tool's magnifier appears. Global, for the same reason.
+    pub region_zoom: Option<RegionZoom>,
+}
+
+/// When the region tool's magnifier appears.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RegionZoom {
+    /// On the Z key, and by itself whenever the pointer slows while a region is being adjusted.
+    #[default]
+    Auto,
+    /// Only while Z is held.
+    Key,
+    /// Never.
+    Off,
 }
 
 pub(crate) fn prepare_config_path_for_open(

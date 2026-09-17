@@ -20,13 +20,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateIconIndirect, DestroyCursor, IsWindow, LoadCursorW, PeekMessageW, SetCursor,
-    SetForegroundWindow, UnregisterClassW, HCURSOR, ICONINFO, IDC_ARROW, IDC_CROSS, IDC_SIZEALL,
-    MSG, PM_REMOVE, WM_QUIT,
+    CreateIconIndirect, DestroyCursor, GetMessageTime, IsWindow, KillTimer, LoadCursorW,
+    PeekMessageW, SetCursor, SetForegroundWindow, SetTimer, UnregisterClassW, HCURSOR, ICONINFO,
+    IDC_ARROW, IDC_CROSS, IDC_SIZEALL, MSG, PM_REMOVE, WM_QUIT,
 };
 
 use super::layout::{DisplayEnvironment, UiMetrics, UiRect};
-use super::machine::Modifiers;
+use super::machine::{Modifiers, LOUPE_TICK_MS};
 use super::raster::{high_contrast_cursor_pixels, top_down_bitmap_info};
 
 pub(super) const REGION_CURSOR_SIZE: u32 = 64;
@@ -430,6 +430,51 @@ pub(super) fn consume_self_initiated_capture_change(releasing_pointer_capture: &
     std::mem::take(releasing_pointer_capture)
 }
 
+/// The overlay's one and only timer. The window has no others, so the id is a constant rather
+/// than an allocation.
+pub(super) const LOUPE_TIMER_ID: usize = 1;
+
+/// Starts the rest timer that tells the machine the pointer has stopped moving.
+///
+/// Idempotent: `SetTimer` with an existing id resets that timer rather than creating a second.
+pub(super) fn start_loupe_timer(hwnd: HWND) {
+    // SAFETY: hwnd is the live overlay window on this thread. A null callback posts WM_TIMER to
+    // its window procedure instead of calling back directly.
+    let started = unsafe { SetTimer(hwnd, LOUPE_TIMER_ID, LOUPE_TICK_MS, None) };
+    if started == 0 {
+        log::debug!(
+            "overlay rest timer could not be started; the magnifier will not appear on its own"
+        );
+    }
+}
+
+/// Stops the rest timer. Harmless when none is running.
+pub(super) fn stop_loupe_timer(hwnd: HWND) {
+    // SAFETY: hwnd is the live overlay window on this thread; an absent timer is a no-op failure.
+    let _ = unsafe { KillTimer(hwnd, LOUPE_TIMER_ID) };
+}
+
+/// Whether a `WM_KEYDOWN` is the keyboard repeating a key that is already down.
+///
+/// Bit 30 of the message's `lparam` is the previous key state: set means the key was already
+/// down. A hold-to-show key must ignore these — the first press is the only transition, and
+/// treating every repeat as a fresh press would restate the same fact thirty times a second.
+pub(super) const fn key_is_autorepeat(lparam: LPARAM) -> bool {
+    lparam.0 & (1 << 30) != 0
+}
+
+/// The timestamp of the message currently being handled, in milliseconds since the system
+/// started.
+///
+/// `GetMessageTime` rather than a clock read: two mouse messages that arrive together in the
+/// queue must not appear to have crossed the distance between them in zero time, and a paint that
+/// delayed dispatch must not make the pointer look slower than it was. The counter is 32-bit and
+/// rolls over about every 49 days, so every interval derived from it is a wrapping subtraction.
+pub(super) fn message_time_ms() -> u32 {
+    // SAFETY: Reads the timestamp of this thread's message being dispatched. No arguments.
+    unsafe { GetMessageTime() as u32 }
+}
+
 /// The modifier keys held as this message is being handled.
 ///
 /// Read here rather than carried in the model because the machine owns no input device.
@@ -545,6 +590,19 @@ mod tests {
     use super::super::UI_FONT_HEIGHT;
     use super::*;
     use windows::Win32::Graphics::Gdi::GetTextFaceW;
+
+    #[test]
+    fn a_repeated_key_press_is_distinguishable_from_a_fresh_one() {
+        // Bit 30 is the previous key state. Everything below it is the repeat count and the scan
+        // code, which a fresh press carries just as a repeat does.
+        assert!(!key_is_autorepeat(LPARAM(0x0001_0001)));
+        assert!(key_is_autorepeat(LPARAM(0x4001_0001)));
+        // Bit 31 is the transition state, set on key-up, and must not be mistaken for it.
+        assert!(!key_is_autorepeat(LPARAM(
+            0xC001_0001_u32 as i32 as isize & !(1 << 30)
+        )));
+        assert!(key_is_autorepeat(LPARAM(0xC001_0001_u32 as i32 as isize)));
+    }
 
     #[test]
     fn window_paint_surface_premultiplies_straight_alpha() {
