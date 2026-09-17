@@ -749,6 +749,18 @@ mod tests {
     }
 
     #[test]
+    fn a_spread_percentage_reads_back_as_the_number_it_was() {
+        // Found by CI, which produced a repeat set whose CPU spread was 15.384615384615385 % and
+        // read it back as ...383 %. serde_json's default parser is allowed to land one ULP off
+        // what it wrote, so without the `float_roundtrip` feature a run compared against its own
+        // artifact differs from itself — in a tool whose entire job is comparing artifacts.
+        let value: f64 = (2.0_f64 / 13.0) * 100.0;
+        let text = serde_json::to_string(&value).expect("the spread serializes");
+        let parsed: f64 = serde_json::from_str(&text).expect("the spread reads back");
+        assert_eq!(value, parsed, "{text}");
+    }
+
+    #[test]
     fn a_spread_needs_a_floor_to_be_a_percentage_of() {
         assert_eq!(spread_percent(&[]), 0.0);
         assert_eq!(spread_percent(&[100, 100, 100]), 0.0);

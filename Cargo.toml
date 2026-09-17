@@ -26,7 +26,11 @@ png = "=0.18.1"
 # are pure arithmetic, so a failure is a failed assertion and none of that machinery is needed.
 proptest = { version = "=1.11.0", default-features = false, features = ["std", "bit-set"] }
 serde = { version = "=1.0.195", features = ["derive"] }
-serde_json = "=1.0.111"
+# `float_roundtrip` because benchmark baselines are floats written to a file and read back to be
+# compared. Without it serde_json's fast parser can land one ULP off what it wrote, so a spread of
+# 15.384615384615385 % reads back as ...383 % and a run compared against its own artifact differs
+# from itself. Pure Rust, no extra crate; it only makes parsing correctly rounded.
+serde_json = { version = "=1.0.111", features = ["float_roundtrip"] }
 thiserror = "=1.0.56"
 toml = "=0.7.4"
 toml_edit = "=0.19.10"
