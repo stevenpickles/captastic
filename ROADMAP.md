@@ -2,9 +2,9 @@
 
 Captastic now has a fast Windows-native DXGI capture engine, clipboard output, region and window
 selection, persistent UI state, a notification-area desktop experience, current-user installation,
-and release packaging. The immediate work is the first formal release, v0.1.0; after it, the work
-should make Captastic more useful on real workstations while preserving the low-latency, native
-design.
+and release packaging. v0.1.0 and v0.1.1 have shipped and v0.2.0 is merged to `dev` awaiting its
+release branch; the work after it should make Captastic more useful on real workstations while
+preserving the low-latency, native design.
 
 This roadmap is ordered by user impact and architectural dependency, with release readiness placed
 first because it is the only time-bound section. Closed investigations have moved to
@@ -40,15 +40,27 @@ public release, but it gates neither v0.1.0 nor the capture milestones below.
 - Live selection previews (`selection.preview = auto|live|frozen`) with confirmation-anchored
   capture, per-pixel-alpha live overlays, and a DWM-thumbnail window chooser with static fallback
   surfaces (ADR 0004, PR #14).
+- Pixel-precise region adjustment: edges snapping to window frames, the work area, and the display
+  with a Ctrl override and accent guides, arrow-key nudging, and a pointer magnifier, both
+  preferences remembered globally in `state.toml` (PR #89).
+- A capture taken at every overlay press, with `F` or Options -> View switching between the live
+  desktop and that frame and confirmation materializing from the view on screen (ADR 0004
+  amendment, PR #92).
+- PNG, JPEG, and BMP file output with a validated filename template and a notification-area
+  **Save Captures to Disk** toggle that starts and stops the file worker without a restart
+  (PRs #88 and #90).
+- Benchmark evidence tooling: a host fingerprint in every report, run compatibility and budget
+  hosts keyed on it, raw per-repeat artifacts, and `benchmark compare` (PRs #87 and #91).
 
 ## Release readiness — v0.1.0
 
 **Status:** v0.1.0 shipped on 2026-09-03: `release/v0.1.0` merged to `main` by PR #81, the tag on
 that merge commit ran the tagged path of the release workflow, and the GitHub release carries the
 archive, checksum, Chocolatey package, and manifest. The manual Chocolatey community push has not
-been made. v0.1.1 is a patch release cut from `dev` after PR #83 (the dock-switch first-capture
-fixes), following the same branch model; its notes are `docs/release-notes-v0.1.1.md`. The gates
-below are kept as the record of what v0.1.0 had to satisfy.
+been made. v0.1.1 shipped on 2026-09-16, a patch release cut from `dev` after PR #83 (the
+dock-switch first-capture fixes) under the same branch model; its notes are
+`docs/release-notes-v0.1.1.md`. The gates below are kept as the record of what v0.1.0 had to
+satisfy.
 v0.1.0 is a deliberately unsigned first tag whose purpose is to exercise the release mechanics end
 to end and to describe honestly what Captastic is and is not. It is not gated on the capture
 milestones below, and it makes no performance claim.
@@ -122,6 +134,40 @@ that they are unverified.
 - **Milestone 3's follow-ups** (retained sessions, the backend trait, richer metrics) — internal
   quality, no user-visible contract.
 - **Milestones 6 and 7** — post-release by the existing decision gate.
+
+## Release readiness — v0.2.0
+
+**Status:** every v0.2.0 slice is merged to `dev` as of 2026-09-17 — PRs #87 and #91 (benchmark
+evidence), #88 (output formats), #89 (region precision), #90 (the notification-area file-output
+toggle), and #92 (the frozen-view toggle). The release branch has not been cut, and the notes are
+a draft: [docs/release-notes-v0.2.0.md](docs/release-notes-v0.2.0.md). What remains needs a human
+at the machine, which is why none of it was done by the work that merged.
+
+### Gates — before the tag
+
+- **The manual checklists in PRs #89, #90 and #92.** None of the overlay behaviour this release is
+  about has been watched working: no agent drove a pointer or read the screen, and no second daemon
+  could take the session control event from the running one. The region-precision and frozen-view
+  matrices are in [docs/overlay-ui-verification.md](docs/overlay-ui-verification.md); the
+  file-output toggle's steps are in PR #90. The one check nothing else can substitute for is the
+  live-view magnifier sample coming back free of the overlay, which rests on
+  `WDA_EXCLUDEFROMCAPTURE` rather than on a test.
+- **The benchmark claim run is optional and gates only a number.** Running
+  [benchmarks/README.md](benchmarks/README.md) produces the accepted sets a published figure has to
+  rest on; skipping it is fine, and then the notes quote no figure. It is not a release blocker
+  either way.
+
+### Then the release itself
+
+The v0.1.0 branch model, unchanged: cut `release/v0.2.0` from `dev`, merge it to `main` by pull
+request, tag `v0.2.0` on `main`, run the disposable-VM checklist in
+[docs/chocolatey.md](docs/chocolatey.md), push to Chocolatey manually once the release URLs and
+hashes verify, merge the release branch back to `dev`, and bump the workspace version to 0.3.0.
+
+**The standing rule, restated because v0.2.0 is the first release with the tooling to break it:**
+release notes quote no millisecond unless the claim procedure has been run and the sets that
+support the figure are committed. As drafted, v0.2.0 publishes no absolute number, which satisfies
+Milestone 5's deferred criterion the same way v0.1.0 did — vacuously, and on purpose.
 
 ## Milestone 1 — Multi-monitor and topology support
 
@@ -294,6 +340,22 @@ capture critical path.
   in logs.
 - Add **Open Last Capture**, **Show in Folder**, and history pruning commands before considering a
   larger history UI.
+- ~~Make `output.format` a real choice rather than a value with one legal spelling.~~ **Done in
+  v0.2.0** (PR #88): `png`, `jpeg` with `jpeg_quality`, or `bmp`, encoded through one entry point
+  that asks the frame the same questions once; JPEG cannot carry alpha, so a window capture's
+  transparent pixels are composited over opaque white and the configuration comment, the README,
+  and a debug line all say so (ADR 0008 addendum). `captastic config validate` now also rejects a
+  filename template the daemon would refuse at startup, and a one-shot `capture` honours `--config`.
+- ~~Let the destination be switched without a restart.~~ **Done in v0.2.0** (PR #90):
+  **Save Captures to Disk** in the notification area starts and stops the file worker on the daemon
+  thread and writes the choice back to `output.enabled`, preserving the rest of the document. The
+  rest of `[output]` is still read at startup. A runtime toggle makes a missed stop deadline
+  repeatable rather than a once-per-process shutdown event, so ADR 0005 gains
+  `DetachKind::FileOutputWorker` with a ceiling of one: while a written-off worker may still be
+  writing into the output directory, starting file output again is refused — with the reason in the
+  notification area — until its thread returns and gives the slot back. Captures queued when the
+  destination stops are abandoned, but now named at warn level and counted rather than dropped
+  silently.
 
 ### Exit criteria
 
@@ -528,6 +590,68 @@ platforms as equivalent when they are not.
 After capture quality and history are stable, choose annotation/pinning or the first cross-platform
 proof based on the intended audience. Neither should delay the Windows workstation milestones.
 
+## Milestone 8 — Precision region selection
+
+**Status:** Complete (v0.2.0, PRs #89 and #92). Shipped with its exit criteria met by test and
+unobserved on a desktop; the manual matrices are listed under
+[Release readiness — v0.2.0](#release-readiness--v020).
+
+**Outcome:** A region can be placed on the exact pixel the user means, over a picture that holds
+still when the desktop will not.
+
+- Region edges snap to the visible frames of the windows on that display, to the work area, and to
+  the display itself, within 8 DIPs scaled for the monitor's DPI so the reach is the same physical
+  distance at every scaling. A snapped edge is the target's exclusive edge — a region snapped to a
+  window's right border ends on that window's last pixel column, never one short — and an accent
+  hairline along the target says what it caught. The nearest edge wins, ties go to the topmost
+  window, and the display can only win when nothing else is in reach. **Ctrl** suppresses snapping
+  for the rest of a drag; **Options -> Snap to Edges** turns it off for good.
+- The arrow keys nudge the region one physical pixel, ten with **Shift**, and resize its right and
+  bottom edges with **Ctrl**. Nudging never snaps, which is how an edge reaches a pixel no window
+  sits on.
+- A magnifier shows the 31 physical pixels around the pointer enlarged six times (more at higher
+  scaling), with a grid, the pointer's pixel outlined, the selection's edges drawn on the exact
+  boundaries they occupy, and the desktop coordinate underneath. It is held up on **Z** and, in its
+  default mode, also appears by itself when the pointer slows to a deliberate pace during a drag.
+  It samples whichever view is showing, so it never enlarges pixels the capture will not contain,
+  and it never covers the pixels it is magnifying. **Options -> Zoom** cycles Auto, Hold Z, and Off.
+- Every overlay press captures the screen at the press. The overlay opens in the view
+  `selection.preview` names and **F** or **Options -> View** switches between the live desktop and
+  the frame from the press, with a **FROZEN · pixels from hotkey press** tag while the latter is
+  showing; confirmation materializes from the view that was on screen. One layered window now
+  serves both views, so `WDA_EXCLUDEFROMCAPTURE` covers a `frozen`-configured overlay that was
+  never excluded before, and a failed first present falls back in place instead of re-dispatching
+  the whole selection across threads (ADR 0004 amendment).
+- The snap and zoom preferences are global in `state.toml` (`snap_to_windows`, `region_zoom`),
+  written with `skip_serializing_if` and no `STATE_SCHEMA_VERSION` bump, so an older binary that
+  refuses the newer file loses that run's remembered layout and nothing else. The view toggle is
+  deliberately not persisted and has no configuration knob: which view suits a capture is a
+  property of that capture.
+
+### Exit criteria
+
+- A snapped edge lands on the target's exact pixel column or row and the guide describes the edge
+  the region really sits on. **Met by test** — unit and property coverage pins the half-open
+  relationship, including the case where the minimum-size clamp invalidates a guide and it is
+  dropped. **Not yet observed live** (PR #89 checklist 1–4).
+- The keyboard can place an edge the pointer cannot, and never fights the snap that put it there.
+  **Met by test** — nudges of any length and order leave a legal region, never snap, and stop
+  repainting at a display edge. **Not yet observed live** (PR #89 checklist 5–6).
+- The magnifier shows the pixels the capture will contain, stays on the monitor, and never covers
+  its own source square. **Met by test** at all four scalings, including a real GDI blit proving
+  the nearest-neighbour enlargement invents no colour. **Not yet observed live**, and the live-view
+  sample coming back with no trace of the overlay in it is the one check nothing here substitutes
+  for (PR #89 checklist 7–10).
+- The user can stop the picture without losing the press, and gets the picture they were looking
+  at. **Met by test** — the fake backend stamps `request.id & 0xff` into every pixel, so a
+  frozen-view confirmation is proved to crop the capture taken at the press and a live-view
+  confirmation the capture taken at the confirmation. **Not yet observed live** (PR #92
+  checklist 1–6).
+- Both preferences survive a daemon restart and the view toggle does not. **Met by test** at the
+  store and the live-cache level, including a display this process has never drawn on. **The full
+  round trip through a running daemon is not yet observed** (PR #89 checklist 11, PR #92
+  checklist 7).
+
 ## Architecture hardening backlog
 
 These items were deliberately separated from the code-review remediation branch because each
@@ -619,14 +743,17 @@ disposition are recorded in
 [docs/investigations.md](docs/investigations.md#the-2026-08-code-architecture-and-roadmap-review).
 The order below reflects what remains.
 
-1. Ship v0.1.0: the gates above, then the operator-run live verifications, then the tag, the
-   disposable-VM check, the manual `choco push`, and the workspace version bump. First because it
-   is time-bound and because the release mechanics are exercised by nothing else.
+1. Ship v0.2.0: the manual checklists from PRs #89, #90 and #92, the optional benchmark claim run,
+   then `release/v0.2.0` to `main`, the tag, the disposable-VM check, the manual `choco push`, the
+   back-merge, and the bump to 0.3.0. First because it is time-bound and because everything the
+   release exercises — the checklists especially — is exercised by nothing else.
 2. Complete Milestone 1 (multi-adapter composition and the hardware validation matrix). The only
    milestone in progress, and the one whose remaining work needs hardware rather than design.
-3. Build capture-quality completeness and performance evidence (Milestone 5), whose pre-work
-   (issue #19) is complete: the sequence-marker workload, and the environment fingerprints and
-   repeat-run automation that the deferred published-claim criterion waits on.
+3. Finish Milestone 5's evidence work, which is now measurement rather than code: the operator
+   claim runs from [benchmarks/README.md](benchmarks/README.md), after which the absolute budget
+   ceilings can be set and a figure can be published. The sequence-marker workload and Milestone 3's
+   window-capture backend trait stay deferred — the first needs a desk, a mouse and a rotatable
+   display and gates no release claim; the second changes no user-visible contract.
 4. Settle the outstanding design decisions — latest-mode currency on an idle desktop,
    `fresh` + `virtual_desktop`, and control-event hardening. Milestone 4's two product questions are
    answered (ADR 0008), and the mouse-capture/software-KVM contract is settled in ADR 0009: each use
@@ -649,18 +776,22 @@ not reproduced on demand, is in
 
 ## Recommended next branch
 
-`release/v0.1.1`, cut from `dev` after PR #83. v0.1.0 is shipped, so the branch exists only to carry
-the patch release through `main`, the tag, and the merge back to `dev` as described under
-[Release readiness](#release-readiness--v010); the workspace version returns to the 0.2.0 line on
-`dev` once the back-merge lands.
+`release/v0.2.0`, cut from `dev` once the manual checklists have been run. Everything v0.2.0
+contains is merged; the branch exists only to carry the release through `main`, the tag, and the
+merge back to `dev` as described under
+[Release readiness — v0.2.0](#release-readiness--v020), after which the workspace version moves to
+the 0.3.0 line.
 
-Before cutting it, the operator-run live verifications are the work most likely to find something, because
-they exercise the recovery paths that shipped with the least live verification: sleep/wake, Remote
-Desktop, and the `DEVICE_REMOVED`/`DEVICE_RESET` limb of GPU-reset recovery through the elevated
-adapter cycle. Lock/unlock is closed at both ends and GPU reset is closed for its `AccessLost` limb
-against a real driver restart, so those three are what is left, and all three are testable on this
-machine — unlike the multi-adapter work, and unlike HDR tone mapping, which needs an HDR display to
-judge rather than merely to compile.
+Before cutting it, the checklists are the work most likely to find something, because this is a
+release about overlay behaviour and none of that behaviour has been watched working: snapping and
+its guide, the arrow keys, the magnifier — the live-view sample above all — the two new Options
+rows, the `F` toggle and its tag, and the notification-area file-output toggle with a capture
+landing on disk after it. Each is a table in
+[docs/overlay-ui-verification.md](docs/overlay-ui-verification.md) or a numbered list in its pull
+request. The operator-run live verifications from v0.1.0 — sleep/wake, Remote Desktop, and the
+`DEVICE_REMOVED`/`DEVICE_RESET` limb of GPU-reset recovery through the elevated adapter cycle — are
+still outstanding and still deferrable, and the benchmark claim run is optional and gates only
+whether the notes may quote a number.
 
 Then the release itself: the release branch to `main` by pull request, the tag on `main`, the
 disposable-VM checklist, the manual `choco push` once the release URLs and hashes verify, the
