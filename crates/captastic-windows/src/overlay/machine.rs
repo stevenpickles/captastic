@@ -1371,6 +1371,12 @@ fn snap_anchor(model: &OverlayModel, anchor: POINT, modifiers: Modifiers) -> POI
 }
 
 /// A rubber-band drag's rectangle with its free corner snapped, and the guides that justifies.
+///
+/// Both corners are in play. The anchor was pulled onto an edge when the drag latched and is
+/// still sitting on it, so its own hit is recomputed here (at zero distance, which is why no
+/// extra state is needed) and used as the guide for an axis the free corner has not snapped on —
+/// otherwise a band started pinned to a window's edge would show no line for the very edge it is
+/// pinned to.
 pub(super) fn rect_from_points_snapped(
     model: &OverlayModel,
     anchor: POINT,
@@ -1380,17 +1386,48 @@ pub(super) fn rect_from_points_snapped(
     let Some(targets) = active_targets(model, modifiers) else {
         return (rect_from_points(model.source, anchor, pointer), NO_SNAPS);
     };
-    let ((x, y), hits) = snap_point(
+    let threshold = snap_threshold(model);
+    let (_, anchor_hits) = snap_point(i64::from(anchor.x), i64::from(anchor.y), targets, threshold);
+    let (_, pointer_hits) = snap_point(
         i64::from(pointer.x),
         i64::from(pointer.y),
         targets,
-        snap_threshold(model),
+        threshold,
     );
+    let mut corner = [i64::from(pointer.x), i64::from(pointer.y)];
+    let mut hits = pointer_hits;
+    for (axis, fixed) in [
+        (SnapAxis::X, i64::from(anchor.x)),
+        (SnapAxis::Y, i64::from(anchor.y)),
+    ] {
+        let index = axis.index();
+        let Some(hit) = hits[index] else { continue };
+        if hit.position == fixed {
+            // Dragging along a window's edge puts both corners within reach of the same
+            // coordinate. Snapping the free one onto it would collapse the band to zero on this
+            // axis, `rect_from_points` would return None, and the selection would simply vanish
+            // until the pointer left the snap radius. The pointer's own position wins instead,
+            // and there is no guide because nothing was snapped.
+            hits[index] = None;
+            continue;
+        }
+        corner[index] = hit.position;
+    }
     // Snap first, clamp second: `rect_from_points` is what keeps the band inside the display, and
     // an edge it pulls back in is an edge no longer sitting on a target, which `guides_for` then
     // refuses to draw a line for.
-    let rect = rect_from_points(model.source, anchor, as_point(x, y));
-    (rect, rect.map_or(NO_SNAPS, |rect| guides_for(rect, hits)))
+    let rect = rect_from_points(
+        model.source,
+        anchor,
+        as_point(corner[SnapAxis::X.index()], corner[SnapAxis::Y.index()]),
+    );
+    // One guide per axis, and the moving corner's is the one that answers the question being
+    // asked; the fixed corner's only speaks when the moving one is silent.
+    let guides = [
+        hits[SnapAxis::X.index()].or(anchor_hits[SnapAxis::X.index()]),
+        hits[SnapAxis::Y.index()].or(anchor_hits[SnapAxis::Y.index()]),
+    ];
+    (rect, rect.map_or(NO_SNAPS, |rect| guides_for(rect, guides)))
 }
 
 /// A resize with the handle's own edges snapped, and the guides that justifies.
@@ -2957,6 +2994,96 @@ mod tests {
                 width: 50,
                 height: 50,
             })
+        );
+    }
+
+    #[test]
+    fn a_band_dragged_along_a_window_edge_does_not_vanish() {
+        // Press two pixels inside the window's left edge, then drag straight down along it. Both
+        // corners are within the snap radius of x == 400, so snapping the free one there too
+        // would collapse the band to zero width: `rect_from_points` returns None and the
+        // selection disappears until the pointer leaves the band.
+        let mut model = snapping_model();
+        transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point: point(402, 320),
+                window_slot: None,
+                time_ms: 0,
+            },
+        );
+        transition(
+            &mut model,
+            OverlayInput::PointerMoved {
+                point: point(403, 420),
+                window_hover: None,
+                modifiers: Modifiers::default(),
+                time_ms: 20,
+            },
+        );
+        assert_eq!(model.anchor, Some(point(400, 320)), "the anchor snapped");
+        let region = model
+            .selection
+            .expect("a band dragged along an edge is still a band");
+        assert_eq!(region.x, 400);
+        assert_eq!(
+            region.width, 3,
+            "the free corner keeps the pixel the pointer is on: 403 - 400"
+        );
+        assert!(region.height > 0);
+    }
+
+    #[test]
+    fn a_band_pinned_to_an_edge_draws_a_guide_for_it() {
+        // The anchor is the corner sitting on the window; the free corner is out in open space
+        // with nothing near it. Without the anchor's own hit there would be no line at all, and
+        // the user would have no way to see that the band really is pinned to the border.
+        let mut model = snapping_model();
+        transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point: point(402, 302),
+                window_slot: None,
+                time_ms: 0,
+            },
+        );
+        transition(
+            &mut model,
+            OverlayInput::PointerMoved {
+                point: point(900, 800),
+                window_hover: None,
+                modifiers: Modifiers::default(),
+                time_ms: 20,
+            },
+        );
+        assert_eq!(model.anchor, Some(point(400, 300)));
+        let region = model.selection.expect("a region");
+        assert_eq!((region.x, region.y), (400, 300));
+        assert_eq!(
+            guide(&model, SnapAxis::X).map(|guide| (guide.position, guide.trailing)),
+            Some((400, false)),
+            "the pinned left edge"
+        );
+        assert_eq!(
+            guide(&model, SnapAxis::Y).map(|guide| (guide.position, guide.trailing)),
+            Some((300, false)),
+            "the pinned top edge"
+        );
+
+        // And the moving corner still wins the axis when it has something of its own to say.
+        transition(
+            &mut model,
+            OverlayInput::PointerMoved {
+                point: point(597, 800),
+                window_hover: None,
+                modifiers: Modifiers::default(),
+                time_ms: 40,
+            },
+        );
+        assert_eq!(
+            guide(&model, SnapAxis::X).map(|guide| (guide.position, guide.trailing)),
+            Some((600, true)),
+            "the moving right edge, on the window's exclusive right edge"
         );
     }
 
