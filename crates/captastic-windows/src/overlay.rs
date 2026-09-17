@@ -3985,11 +3985,13 @@ const FROZEN_VIEW_TAG: &str = "FROZEN · pixels from hotkey press";
 
 /// Draws the tag that says the overlay is showing the snapshot rather than the desktop.
 ///
-/// Only while the frozen view is up, and only outside the Window tool, where the view means
-/// nothing. The live view carries no tag: an overlay showing what is really there is the
-/// unremarkable case, and labelling it would put a permanent pill on every capture.
+/// Only while the frozen view is up, only outside the Window tool where the view means nothing,
+/// and only while the pointer is off the toolbar - the tooltips claim the same band and, being
+/// painted later, would sit on top of this. The live view carries no tag at all: an overlay
+/// showing what is really there is the unremarkable case, and labelling it would put a permanent
+/// pill on every capture.
 fn draw_view_tag(state: &OverlayState, layout: ToolbarLayout) {
-    if state.model.view != PreviewView::Frozen || state.model.tool == CaptureTool::Window {
+    if !machine::view_tag_visible(&state.model) {
         return;
     }
     let device = state.back_buffer.device;

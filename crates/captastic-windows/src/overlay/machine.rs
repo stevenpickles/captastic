@@ -918,6 +918,20 @@ fn pointer_up(model: &mut OverlayModel, point: POINT, modifiers: Modifiers) -> V
     effects
 }
 
+/// Whether the frozen-view tag should be on screen.
+///
+/// Three conditions, and the third is not obvious. The tag says the picture has stopped, so it is
+/// only interesting in the frozen view, and it means nothing under the Window tool where a click
+/// renders its window fresh either way. And it sits in the band above the toolbar - which is
+/// exactly where the toolbar's own hover tooltips go. Painting both put the tooltip on top of the
+/// tag, so the toolbar owns that band whenever the pointer is on it: hovering any control hides
+/// the tag until the pointer leaves, rather than covering it with something else.
+pub(super) fn view_tag_visible(model: &OverlayModel) -> bool {
+    model.view == PreviewView::Frozen
+        && model.tool != CaptureTool::Window
+        && model.hovered_control.is_none()
+}
+
 /// Whether this run can switch views at all right now.
 ///
 /// Two reasons it cannot. A run with no snapshot has nothing to switch to, and a run whose
@@ -2661,6 +2675,27 @@ mod tests {
 
         assert_eq!(model.view, PreviewView::Frozen);
         assert!(view_toggle_enabled(&model));
+    }
+
+    #[test]
+    fn the_frozen_tag_yields_the_band_above_the_toolbar_to_the_tooltips() {
+        let mut model = region_model();
+        assert!(!view_tag_visible(&model), "the live view carries no tag");
+
+        transition(&mut model, OverlayInput::ToggleView);
+        assert!(view_tag_visible(&model));
+
+        // Tooltips are laid out in the same band and painted later, so they would sit on top of
+        // the tag. The toolbar owns that band while the pointer is on it.
+        model.hovered_control = Some(ToolbarControl::Capture);
+        assert!(!view_tag_visible(&model));
+        model.hovered_control = None;
+        assert!(view_tag_visible(&model), "the tag returns with the pointer");
+
+        // Under the Window tool the view means nothing, so neither does a tag about it.
+        activate_tool(&mut model, CaptureTool::Window);
+        assert_eq!(model.view, PreviewView::Frozen);
+        assert!(!view_tag_visible(&model));
     }
 
     #[test]
