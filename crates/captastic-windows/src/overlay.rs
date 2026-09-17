@@ -68,7 +68,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SetFocus, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP, VK_Z,
+    SetFocus, VK_DOWN, VK_ESCAPE, VK_F, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP, VK_Z,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClassNameW,
@@ -1605,6 +1605,14 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                 OverlayInput::LoupeKeyChanged { held: true },
             )
         }
+        WM_KEYDOWN if wparam.0 == usize::from(VK_F.0) => {
+            if key_is_autorepeat(lparam) {
+                // Holding F is not a request to flicker between the two views thirty times a
+                // second. Only the transition from up to down means anything here.
+                return LRESULT(0);
+            }
+            run_machine(hwnd, state_pointer, OverlayInput::ToggleView)
+        }
         WM_KEYUP if wparam.0 == usize::from(VK_Z.0) => run_machine(
             hwnd,
             state_pointer,
@@ -1776,8 +1784,19 @@ const fn confirm_preview_split(kind: SelectionKind, live: usize, total: usize) -
 /// transition ends before any effect executes, so effects that reenter this window procedure
 /// (`ReleaseCapture`, `DestroyWindow`) can never observe a live `&mut` of the state.
 fn run_machine(hwnd: HWND, state_pointer: *mut OverlayState, input: OverlayInput) -> LRESULT {
+    // SAFETY: Single-field read; the borrow ends on this line.
+    let view_before = unsafe { (*state_pointer).model.view };
     // SAFETY: The Box remains alive for the message loop; this borrow ends at the semicolon.
     let effects = transition(unsafe { &mut (*state_pointer).model }, input);
+    // Observed here rather than announced by an effect, and latched rather than compared at the
+    // end: whether the *user* changed the view is telemetry about the run, not a decision the
+    // machine makes anything of, and a run switched twice ends where it started while still
+    // having been switched. One place covers both the `F` key and the Options row.
+    // SAFETY: Single-field borrow, released on this line.
+    unsafe {
+        let state = &mut *state_pointer;
+        state.view_switched |= state.model.view != view_before;
+    }
     apply_overlay_effects(hwnd, state_pointer, effects);
     LRESULT(0)
 }
@@ -3696,6 +3715,10 @@ fn draw_toolbar(state: &OverlayState) {
         state.model.display_environment,
         state.model.toolbar_position,
     );
+    // First, so the Options menu paints over it when both want the space above the toolbar: an
+    // open menu is what the user is looking at, and the tag is still readable the moment it
+    // closes.
+    draw_view_tag(state, layout);
     if state.model.options_open {
         draw_options_menu(device, state, layout);
     }
@@ -3934,6 +3957,79 @@ fn draw_hover_tooltip(device: HDC, state: &OverlayState, layout: ToolbarLayout) 
         },
         &value,
         rgb(248, 248, 250),
+        TextAlignment::Center,
+        font_height,
+    );
+}
+
+/// The label on the tag that shows while the frozen view is on screen.
+///
+/// Named once so the glyph-fit test measures the string the overlay paints, and worded to answer
+/// the question the user will actually be asking - not "which mode is this" but "why has the
+/// video stopped".
+const FROZEN_VIEW_TAG: &str = "FROZEN · pixels from hotkey press";
+
+/// Draws the tag that says the overlay is showing the snapshot rather than the desktop.
+///
+/// Only while the frozen view is up, and only outside the Window tool, where the view means
+/// nothing. The live view carries no tag: an overlay showing what is really there is the
+/// unremarkable case, and labelling it would put a permanent pill on every capture.
+fn draw_view_tag(state: &OverlayState, layout: ToolbarLayout) {
+    if state.model.view != PreviewView::Frozen || state.model.tool == CaptureTool::Window {
+        return;
+    }
+    let device = state.back_buffer.device;
+    let metrics = state.model.display_environment.metrics;
+    let work_area = state.model.display_environment.work_area;
+    let tokens = metrics.toolbar_tokens();
+    let font_height = tokens.font_height;
+    let measured = measure_ui_text(device, FROZEN_VIEW_TAG, font_height);
+    let width = measured
+        .cx
+        .saturating_add(tokens.tooltip_padding_x.saturating_mul(2))
+        .min((work_area.width() - metrics.px(16)).max(1));
+    let height = (measured.cy + tokens.tooltip_padding_y * 2).max(metrics.px(32));
+    let left = ((layout.bounds.left + layout.bounds.right - width) / 2).clamp(
+        work_area.left + metrics.px(8),
+        (work_area.right - width - metrics.px(8)).max(work_area.left + metrics.px(8)),
+    );
+    // Above the toolbar, which is where the eye already is, and below it only when there is no
+    // room above - the same rule the tooltips follow, so the two never argue about which side of
+    // the toolbar its chrome belongs on.
+    let preferred_top = if layout.bounds.top >= work_area.top + height + metrics.px(16) {
+        layout.bounds.top - height - metrics.px(8)
+    } else {
+        layout.bounds.bottom + metrics.px(8)
+    };
+    let top = preferred_top.clamp(
+        work_area.top + metrics.px(8),
+        (work_area.bottom - height - metrics.px(8)).max(work_area.top + metrics.px(8)),
+    );
+    let bounds = UiRect {
+        left,
+        top,
+        right: left + width,
+        bottom: top + height,
+    };
+    // The accent border rather than the toolbar's grey: this is a statement about the pixels, not
+    // another control, and it has to be noticed without being alarming.
+    draw_round_box(
+        device,
+        bounds,
+        rgb(28, 42, 66),
+        rgb(86, 156, 255),
+        tokens.tooltip_corner_radius,
+    );
+    draw_text(
+        device,
+        UiRect {
+            left: bounds.left + tokens.tooltip_padding_x,
+            top: bounds.top,
+            right: bounds.right - tokens.tooltip_padding_x,
+            bottom: bounds.bottom,
+        },
+        FROZEN_VIEW_TAG,
+        rgb(198, 220, 255),
         TextAlignment::Center,
         font_height,
     );
@@ -5506,6 +5602,16 @@ mod tests {
                     "{label} is {measured:?} at {dpi} DPI but only {available_height} px are available"
                 );
             }
+            // The view tag sizes its pill around the measurement rather than fitting inside a
+            // fixed row, so the constraint is the display: a tag wider than the work area is
+            // clipped, and a clipped explanation of why the desktop has stopped moving is worse
+            // than none. 1280 DIPs is the narrowest configuration the verification doc covers.
+            let tag = measure_ui_text(surface.device, FROZEN_VIEW_TAG, tokens.font_height);
+            let narrowest = metrics.px(1280) - metrics.px(16);
+            assert!(
+                tag.cx + tokens.tooltip_padding_x * 2 <= narrowest,
+                "the frozen view tag is {tag:?} at {dpi} DPI but only {narrowest} px are available"
+            );
         }
     }
 

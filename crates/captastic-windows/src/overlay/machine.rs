@@ -314,6 +314,10 @@ pub(super) enum OverlayInput {
     LoupeKeyChanged { held: bool },
     /// The shell's rest timer fired: no pointer message has arrived, so the pointer is stationary.
     Tick { time_ms: u32 },
+    /// The user asked to switch between the live desktop and the snapshot taken at the hotkey
+    /// press. Inert when this run has nothing to switch to, and under the Window tool, whose
+    /// click renders its window fresh either way.
+    ToggleView,
     /// An arrow key adjusted the region by `(dx, dy)` physical pixels. `resize` moves the right
     /// and bottom edges instead of the whole rectangle.
     ///
@@ -462,6 +466,7 @@ pub(super) fn transition(model: &mut OverlayModel, input: OverlayInput) -> Vec<O
         OverlayInput::PointerCaptureLost => pointer_capture_lost(model),
         OverlayInput::LoupeKeyChanged { held } => loupe_key_changed(model, held),
         OverlayInput::Tick { time_ms } => loupe_tick(model, time_ms),
+        OverlayInput::ToggleView => toggle_view(model),
         OverlayInput::Nudge { dx, dy, resize } => nudge(model, dx, dy, resize),
         OverlayInput::ConfirmRequested => confirm(model),
         OverlayInput::CancelRequested => cancel(model),
@@ -904,6 +909,34 @@ fn pointer_up(model: &mut OverlayModel, point: POINT, modifiers: Modifiers) -> V
     }
     effects.push(OverlayEffect::Invalidate);
     effects
+}
+
+/// Whether this run can switch views at all right now.
+///
+/// Two reasons it cannot. A run with no snapshot has nothing to switch to, and a run whose
+/// layered presenter had to be abandoned can only show the snapshot; both clear
+/// `view_toggle_available`. And under the Window tool the question does not arise: clicking a
+/// tile renders that window fresh whichever view is behind it, so switching would change nothing
+/// the user would get while implying that it had.
+pub(super) fn view_toggle_enabled(model: &OverlayModel) -> bool {
+    model.view_toggle_available && model.tool != CaptureTool::Window
+}
+
+/// Switches between the live desktop and the snapshot taken at the hotkey press.
+///
+/// Inert rather than refused when switching is unavailable: the key and the menu row are both
+/// always live, and a request that cannot be honoured changes nothing and repaints nothing.
+fn toggle_view(model: &mut OverlayModel) -> Vec<OverlayEffect> {
+    if !view_toggle_enabled(model) {
+        return Vec::new();
+    }
+    model.view = match model.view {
+        PreviewView::Live => PreviewView::Frozen,
+        PreviewView::Frozen => PreviewView::Live,
+    };
+    // Every pixel on screen is about to mean something else, including the magnifier's, so the
+    // whole overlay is repainted rather than any part of it patched.
+    vec![OverlayEffect::Invalidate]
 }
 
 /// Whether an adjustment of the region is in flight: a rubber band, a move, or a resize.
@@ -2533,6 +2566,94 @@ mod tests {
             e,
             OverlayEffect::BuildSnapTargets
         )));
+    }
+
+    #[test]
+    fn f_switches_the_view_and_switching_twice_returns_to_where_the_run_opened() {
+        let mut model = region_model();
+        assert_eq!(model.view, PreviewView::Live);
+
+        let effects = transition(&mut model, OverlayInput::ToggleView);
+        assert_eq!(model.view, PreviewView::Frozen);
+        assert!(has_effect(&effects, |e| matches!(
+            e,
+            OverlayEffect::Invalidate
+        )));
+
+        let effects = transition(&mut model, OverlayInput::ToggleView);
+        assert_eq!(
+            model.view, model.initial_view,
+            "switching twice returns to the view the run opened in, not to a default"
+        );
+        assert!(has_effect(&effects, |e| matches!(
+            e,
+            OverlayEffect::Invalidate
+        )));
+    }
+
+    #[test]
+    fn a_run_that_opened_frozen_switches_back_to_frozen() {
+        // The configuration chooses the opening view, and `initial_view` is what "back" means.
+        let mut model = region_model();
+        model.view = PreviewView::Frozen;
+        model.initial_view = PreviewView::Frozen;
+
+        transition(&mut model, OverlayInput::ToggleView);
+        assert_eq!(model.view, PreviewView::Live);
+        transition(&mut model, OverlayInput::ToggleView);
+        assert_eq!(model.view, PreviewView::Frozen);
+    }
+
+    #[test]
+    fn switching_the_view_is_inert_under_the_window_tool() {
+        // A window click renders that window fresh whichever view is behind it, so switching
+        // would change nothing the user gets while implying that it had.
+        let mut model = region_model();
+        let effects = activate_tool(&mut model, CaptureTool::Window);
+        assert!(!effects.is_empty());
+        let view = model.view;
+
+        let effects = transition(&mut model, OverlayInput::ToggleView);
+
+        assert_eq!(model.view, view);
+        assert!(
+            effects.is_empty(),
+            "an inert toggle must not even repaint the overlay"
+        );
+    }
+
+    #[test]
+    fn switching_the_view_is_inert_when_this_run_has_nothing_to_switch_to() {
+        // Either there was no snapshot, or the layered presenter had to be abandoned and only
+        // the snapshot can be shown. Both leave one view possible, and the request is dropped
+        // rather than refused: the key is always live and there is nothing to report.
+        let mut model = region_model();
+        model.view_toggle_available = false;
+        model.view = PreviewView::Frozen;
+
+        let effects = transition(&mut model, OverlayInput::ToggleView);
+
+        assert_eq!(model.view, PreviewView::Frozen);
+        assert!(effects.is_empty());
+        assert!(!view_toggle_enabled(&model));
+    }
+
+    #[test]
+    fn a_tool_round_trip_keeps_the_view_the_user_chose() {
+        // The view is a property of the run, not of the tool. Going out to the Window chooser
+        // and back must not quietly put the user back on the live desktop.
+        let mut model = region_model();
+        transition(&mut model, OverlayInput::ToggleView);
+        assert_eq!(model.view, PreviewView::Frozen);
+
+        activate_tool(&mut model, CaptureTool::Window);
+        assert_eq!(model.view, PreviewView::Frozen);
+        activate_tool(&mut model, CaptureTool::FullDisplay);
+        assert_eq!(model.view, PreviewView::Frozen);
+        activate_tool(&mut model, CaptureTool::Region);
+
+        assert_eq!(model.view, PreviewView::Frozen);
+        assert!(view_toggle_enabled(&model));
     }
 
     #[test]
