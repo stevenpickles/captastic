@@ -2069,7 +2069,11 @@ fn prepare_live_layer_pixels(state: &OverlayState) {
             )
             .unwrap_or(state.back_buffer.height),
         });
-    let loupe = state.loupe_layout.map(|layout| layout.bounds);
+    // The view, not the whole box. Only the magnified pixels arrive by StretchBlt; every other
+    // part of the magnifier - the round box, the grid, the edges, the label - is GDI-drawn and
+    // is already opaque through the coverage sentinel. Forcing the bounding box opaque painted
+    // the four corner wedges *outside* the rounded border solid black.
+    let loupe = state.loupe_layout.map(|layout| layout.view);
     // SAFETY: The back buffer uniquely owns this writable DIB on the overlay thread.
     let pixels = unsafe {
         std::slice::from_raw_parts_mut(state.back_buffer.bits, state.back_buffer.byte_length)
@@ -2110,10 +2114,12 @@ const fn live_pixel_alpha(
     drawn: bool,
     in_loupe: bool,
 ) -> u8 {
-    // The magnifier is opaque by fiat rather than by coverage. Its magnified pixels arrive by
-    // StretchBlt, which copies the source's alpha byte rather than zeroing it the way GDI's
-    // drawing calls do, so the coverage sentinel cannot classify them - and a see-through
-    // magnifier over the very pixels it is magnifying would be worse than none.
+    // The magnified pixels are opaque by fiat rather than by coverage. They arrive by StretchBlt,
+    // which copies the source's alpha byte rather than zeroing it the way GDI's drawing calls do,
+    // so the coverage sentinel cannot classify them - and a see-through magnifier over the very
+    // pixels it is magnifying would be worse than none. `in_loupe` is deliberately the magnified
+    // view alone: the chrome around it is drawn, and the rounded box's corner wedges are not part
+    // of the magnifier at all.
     if in_loupe || matches!(tool, CaptureTool::Window) || drawn {
         u8::MAX
     } else if in_selection || !dim_background {
@@ -4491,6 +4497,29 @@ mod tests {
         assert_eq!(
             live_pixel_alpha(CaptureTool::Region, false, false, false, false),
             LIVE_HIT_TEST_ALPHA
+        );
+    }
+
+    #[test]
+    fn the_magnifier_chrome_obeys_the_coverage_sentinel_like_every_other_control() {
+        // The rounded box, grid, selection edges and label are GDI draws, so the sentinel has
+        // already classified them as chrome. The pixels in the box's corner wedges are outside
+        // the rounded border and were never drawn, so they must dim like their surroundings -
+        // forcing the whole bounding box opaque painted four black corners around the magnifier.
+        assert_eq!(
+            live_pixel_alpha(CaptureTool::Region, true, false, true, false),
+            u8::MAX,
+            "drawn chrome is opaque without any magnifier override"
+        );
+        assert_eq!(
+            live_pixel_alpha(CaptureTool::Region, true, false, false, false),
+            DIM_ALPHA,
+            "an undrawn corner wedge dims like the desktop around it"
+        );
+        assert_eq!(
+            live_pixel_alpha(CaptureTool::Region, true, true, false, false),
+            LIVE_HIT_TEST_ALPHA,
+            "and inside the selection it stays see-through"
         );
     }
 
