@@ -77,12 +77,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, SetWindowDisplayAffinity, SetWindowLongPtrW, ShowWindow, TranslateMessage,
     UpdateLayeredWindow, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
     IDC_CROSS, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, MSG, SPI_SETLOGICALDPIOVERRIDE,
-    SPI_SETWORKAREA, SW_SHOW, ULW_ALPHA, ULW_OPAQUE, WDA_EXCLUDEFROMCAPTURE, WM_APP,
-    WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND,
-    WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WM_SETFOCUS,
-    WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP,
+    SPI_SETWORKAREA, SW_SHOW, ULW_ALPHA, WDA_EXCLUDEFROMCAPTURE, WM_APP, WM_CAPTURECHANGED,
+    WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP,
+    WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
+    WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WM_SETFOCUS, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW,
+    WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 #[cfg(test)]
 use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, PM_NOREMOVE, WM_QUIT};
@@ -173,7 +172,7 @@ impl PreviewView {
 /// How the overlay window gets its pixels onto the screen.
 ///
 /// `Layered` is the only presenter that can show the live desktop, and it shows the frozen
-/// snapshot just as well (with `ULW_OPAQUE` and no alpha pass). `Opaque` is the in-process
+/// snapshot just as well (with every alpha byte forced opaque first). `Opaque` is the in-process
 /// fallback for a machine where establishing the layered presenter fails: it can only ever show
 /// the frozen view, which is why falling back also locks the view and hides the toggle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2303,23 +2302,21 @@ fn paint_live_selection_background(state: &OverlayState) {
 
 /// Puts the composed back buffer on the screen through the layered window.
 ///
-/// Both views present through this one path. The live view needs per-pixel alpha, so it runs the
-/// alpha pass and asks for `ULW_ALPHA`. The frozen view is a still image with nothing behind it
-/// worth seeing: it asks for `ULW_OPAQUE` and skips the alpha pass entirely, which is both
-/// correct — every pixel of a frozen overlay is Captastic's — and a full-screen per-pixel loop
-/// saved on every paint.
+/// Both views present through this one path, and both hand the compositor per-pixel alpha. The
+/// live view's alpha pass decides which pixels show the desktop through; the frozen view's pass
+/// sets every alpha byte opaque, because the bytes it would otherwise hand over are not a
+/// picture of anything: the snapshot arrives with whatever alpha the desktop duplication frame
+/// carried, GDI zeroes the alpha of every pixel it draws chrome on, and the dim wash blends the
+/// alpha channel along with the colour. Presenting that buffer as `ULW_OPAQUE` was meant to
+/// make the compositor ignore all of it; on Windows 11 it did not, and the frozen view came up
+/// with its chrome see-through and its colours skewed. Forcing the alpha byte is the one way to
+/// be opaque under every reading of the flags, and it costs the same full-screen loop the live
+/// view already pays on every paint.
 fn present_layer(hwnd: HWND, state: &OverlayState) -> Result<(), CaptureError> {
-    let live = state.model.view == PreviewView::Live;
-    if live {
+    if state.model.view == PreviewView::Live {
         prepare_live_layer_pixels(state);
     } else {
-        // The frozen view skips the alpha pass, and with it the `GdiFlush` that pass performs
-        // before touching the DIB bytes. The flush is still required: `UpdateLayeredWindow` reads
-        // the back buffer's bits directly, and GDI drawing this thread has queued but not yet
-        // executed would otherwise land after the compositor had taken its copy.
-        // SAFETY: Flushes the calling thread's own GDI batch. It takes no arguments, touches no
-        // handle this function owns, and cannot fail in a way that matters here.
-        let _ = unsafe { GdiFlush() };
+        prepare_frozen_layer_pixels(state);
     }
     let destination = POINT {
         x: state.model.source.x,
@@ -2330,13 +2327,11 @@ fn present_layer(hwnd: HWND, state: &OverlayState) -> Result<(), CaptureError> {
         cx: state.back_buffer.width,
         cy: state.back_buffer.height,
     };
-    // The opaque blend is stated rather than left to `ULW_OPAQUE` ignoring it: were the flag ever
-    // honoured together with a blend, this one still composes the layer exactly as drawn.
     let blend = BLENDFUNCTION {
         BlendOp: 0,
         BlendFlags: 0,
         SourceConstantAlpha: u8::MAX,
-        AlphaFormat: if live { AC_SRC_ALPHA as u8 } else { 0 },
+        AlphaFormat: AC_SRC_ALPHA as u8,
     };
     // SAFETY: A null HWND obtains the desktop DC used only for palette matching during this call.
     let screen = unsafe { GetDC(None) };
@@ -2355,12 +2350,30 @@ fn present_layer(hwnd: HWND, state: &OverlayState) -> Result<(), CaptureError> {
             Some(&source),
             COLORREF(0),
             Some(&blend),
-            if live { ULW_ALPHA } else { ULW_OPAQUE },
+            ULW_ALPHA,
         )
     };
     // SAFETY: Balances the successful GetDC(None) above on this thread.
     unsafe { ReleaseDC(None, screen) };
     result.map_err(|error| overlay_error("present_overlay_layer", error))
+}
+
+/// Makes every pixel of the composed frozen view opaque before the compositor reads it.
+fn prepare_frozen_layer_pixels(state: &OverlayState) {
+    // SAFETY: Flushes this thread's queued GDI drawing before the CPU updates the DIB alpha bytes.
+    let _ = unsafe { GdiFlush() };
+    // SAFETY: The back buffer uniquely owns this writable DIB on the overlay thread.
+    let pixels = unsafe {
+        std::slice::from_raw_parts_mut(state.back_buffer.bits, state.back_buffer.byte_length)
+    };
+    force_opaque_alpha(pixels);
+}
+
+/// Sets the alpha byte of every BGRA pixel to opaque and leaves the colour bytes alone.
+fn force_opaque_alpha(pixels: &mut [u8]) {
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel[3] = u8::MAX;
+    }
 }
 
 fn prepare_live_layer_pixels(state: &OverlayState) {
@@ -5114,6 +5127,23 @@ mod tests {
         assert_eq!(
             live_pixel_alpha(CaptureTool::Region, false, true, false, false),
             LIVE_HIT_TEST_ALPHA
+        );
+    }
+
+    #[test]
+    fn the_frozen_view_hands_the_compositor_nothing_but_opaque_pixels() {
+        // Alpha bytes as the frozen back buffer really carries them: a duplication frame's
+        // arbitrary value, GDI's zero on drawn chrome, and the dim wash's blended remainder.
+        let mut pixels = [
+            10, 20, 30, 0, // chrome drawn by GDI
+            40, 50, 60, 255, // an opaque snapshot pixel
+            70, 80, 90, 128, // a dim-washed pixel
+            1, 2, 3, 7, // whatever the frame carried
+        ];
+        force_opaque_alpha(&mut pixels);
+        assert_eq!(
+            pixels,
+            [10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 1, 2, 3, 255]
         );
     }
 
