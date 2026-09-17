@@ -16,15 +16,16 @@ mod snap;
 mod window_enumeration;
 
 use layout::{
-    layout_dimension_label, DimensionLabelPlacement, DisplayEnvironment, OverviewLayoutTokens,
-    ToolbarControl, ToolbarLayout, UiMetrics, UiRect, UiSize,
+    layout_dimension_label, layout_loupe, loupe_edge_lines, DimensionLabelPlacement,
+    DisplayEnvironment, LoupeLayout, OverviewLayoutTokens, ToolbarControl, ToolbarLayout,
+    UiMetrics, UiRect, UiSize, LOUPE_SOURCE_HALF, LOUPE_SOURCE_SPAN,
 };
 use raster::{
     apply_dim_wash, build_blurred_background, draw_antialiased_rounded_outline, draw_camera_icon,
     draw_checkmark, draw_display_icon, draw_filled_ellipse, draw_lines, draw_outline,
-    draw_region_icon, draw_resize_handles, draw_round_box, draw_text, draw_window_icon,
-    draw_window_surface, fill_device_rect, fill_live_background, fitted_surface_rect,
-    measure_ui_text, rgb, scaled_corner_radius, TextAlignment,
+    draw_outline_rect, draw_region_icon, draw_resize_handles, draw_round_box, draw_surface_nearest,
+    draw_text, draw_window_icon, draw_window_surface, fill_device_rect, fill_live_background,
+    fitted_surface_rect, measure_ui_text, rgb, scaled_corner_radius, TextAlignment,
 };
 pub use shell::flush_desktop_composition;
 use shell::{
@@ -592,6 +593,8 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
         window_assets_ready: false,
         windows: None,
         dimension_label_placement: None,
+        loupe_sample: None,
+        loupe_layout: None,
         selected_window_frame: None,
         releasing_pointer_capture: false,
         controller: controller.clone(),
@@ -635,6 +638,13 @@ struct OverlayState {
     window_assets_ready: bool,
     windows: Option<Vec<WindowCandidate>>,
     dimension_label_placement: Option<DimensionLabelPlacement>,
+    /// The 31x31 square of real pixels the magnifier is showing, resampled every paint. A single
+    /// allocation for the life of the run; the pixels in it are replaced, never appended to.
+    loupe_sample: Option<FrozenSurface>,
+    /// Where the magnifier is this paint, or `None` when it is not showing. Computed before the
+    /// dimension badge is placed, so the badge can treat it as an obstacle, and consumed again by
+    /// the live presenter's alpha pass.
+    loupe_layout: Option<LoupeLayout>,
     selected_window_frame: Option<CpuFrame>,
     /// Shell-side protocol flag distinguishing a self-initiated `ReleaseCapture` round trip from
     /// an externally stolen pointer capture. Never part of the model.
@@ -710,6 +720,19 @@ impl OverlayResources {
         self.cache.take().filter(|resources| {
             resources.surface.width == width as i32 && resources.surface.height == height as i32
         })
+    }
+}
+
+impl OverlayState {
+    /// Whether the pixels in `surface` are what the user is looking at.
+    ///
+    /// The one place the magnifier's sampling decision is made. In the frozen presenter the
+    /// overlay is painting a still image and that image is authoritative; in the live presenter
+    /// the layered window is showing the real desktop through itself and `surface` holds nothing
+    /// but a pre-overlay backdrop captured for the window chooser, which is stale the moment
+    /// anything on screen moves. Magnifying that would show the user pixels that are not there.
+    fn showing_frozen_pixels(&self) -> bool {
+        !self.live_preview
     }
 }
 
@@ -1870,6 +1893,9 @@ fn compose_overlay_state(state: &mut OverlayState) {
             DIM_ALPHA,
         );
     }
+    // Placed before anything is drawn so the dimension badge can avoid it, and painted after the
+    // selection chrome so it sits on top of the outline it is magnifying.
+    state.loupe_layout = plan_loupe(state);
     if state.model.tool != CaptureTool::Window {
         if let Some(rect) = state.model.selection {
             if !state.live_preview {
@@ -1888,7 +1914,25 @@ fn compose_overlay_state(state: &mut OverlayState) {
             }
         }
     }
+    draw_loupe(state);
     draw_toolbar(state);
+}
+
+/// Where the magnifier goes this paint, or `None` when it is not showing.
+fn plan_loupe(state: &OverlayState) -> Option<LoupeLayout> {
+    let pointer = state.model.pointer_local?;
+    machine::loupe_visible(&state.model).then(|| {
+        layout_loupe(
+            UiRect {
+                left: 0,
+                top: 0,
+                right: state.surface.width,
+                bottom: state.surface.height,
+            },
+            pointer,
+            state.model.display_environment.metrics.loupe_tokens(),
+        )
+    })
 }
 
 /// Draws the guide line for each snapped axis: a hairline in the accent colour running the full
@@ -2007,6 +2051,7 @@ fn prepare_live_layer_pixels(state: &OverlayState) {
             )
             .unwrap_or(state.back_buffer.height),
         });
+    let loupe = state.loupe_layout.map(|layout| layout.bounds);
     // SAFETY: The back buffer uniquely owns this writable DIB on the overlay thread.
     let pixels = unsafe {
         std::slice::from_raw_parts_mut(state.back_buffer.bits, state.back_buffer.byte_length)
@@ -2029,6 +2074,12 @@ fn prepare_live_layer_pixels(state: &OverlayState) {
                 state.model.dim_background,
                 in_selection,
                 drawn,
+                loupe.is_some_and(|bounds| {
+                    x >= bounds.left.max(0) as usize
+                        && x < bounds.right.max(0) as usize
+                        && y >= bounds.top.max(0) as usize
+                        && y < bounds.bottom.max(0) as usize
+                }),
             );
         }
     }
@@ -2039,8 +2090,13 @@ const fn live_pixel_alpha(
     dim_background: bool,
     in_selection: bool,
     drawn: bool,
+    in_loupe: bool,
 ) -> u8 {
-    if matches!(tool, CaptureTool::Window) || drawn {
+    // The magnifier is opaque by fiat rather than by coverage. Its magnified pixels arrive by
+    // StretchBlt, which copies the source's alpha byte rather than zeroing it the way GDI's
+    // drawing calls do, so the coverage sentinel cannot classify them - and a see-through
+    // magnifier over the very pixels it is magnifying would be worse than none.
+    if in_loupe || matches!(tool, CaptureTool::Window) || drawn {
         u8::MAX
     } else if in_selection || !dim_background {
         LIVE_HIT_TEST_ALPHA
@@ -2988,6 +3044,11 @@ fn draw_region_dimensions(state: &mut OverlayState, rect: Rect) {
         state.model.toolbar_position,
     );
     let mut reserved = vec![toolbar.bounds];
+    // The magnifier is drawn after the badge and would simply cover it; reserving it here moves
+    // the badge instead, which is the only one of the two that has anywhere else to go.
+    if let Some(loupe) = state.loupe_layout {
+        reserved.push(loupe.bounds);
+    }
     // The tooltip paints after the label and would occlude it; reserve its whole potential
     // band so the label's placement stays stable across hover changes.
     reserved.push(tooltip_band(state.model.display_environment, toolbar));
@@ -3041,6 +3102,205 @@ fn draw_region_dimensions(state: &mut OverlayState, rect: Rect) {
         TextAlignment::Center,
         tokens.label_font_height,
     );
+}
+
+/// Samples the pixels under the pointer and paints the magnifier over them.
+///
+/// Nothing here decides *whether* to show it; that is the machine's, and it has already been
+/// asked by the time `loupe_layout` was set.
+fn draw_loupe(state: &mut OverlayState) {
+    let Some(layout) = state.loupe_layout else {
+        return;
+    };
+    if !sample_loupe_source(state, layout) {
+        // Without pixels there is nothing honest to show. Drop the layout so the live presenter's
+        // alpha pass does not carve an opaque hole where a magnifier is not.
+        state.loupe_layout = None;
+        return;
+    }
+    let device = state.back_buffer.device;
+    let tokens = layout.tokens;
+    draw_round_box(
+        device,
+        layout.bounds,
+        rgb(24, 24, 27),
+        rgb(104, 104, 110),
+        tokens.corner_radius,
+    );
+    if let Some(sample) = state.loupe_sample.as_ref() {
+        draw_surface_nearest(device, sample, layout.view);
+    }
+    draw_loupe_grid(device, layout);
+    draw_loupe_selection_edges(device, state, layout);
+    draw_loupe_centre_cell(device, layout);
+    // The desktop coordinate of the pixel under the pointer: the number the user is aiming for,
+    // stated plainly rather than left to be counted off the badge.
+    if let Some(pointer) = state.model.pointer_local {
+        draw_text(
+            device,
+            layout.label,
+            &format!(
+                "{}, {}",
+                pointer.x.saturating_add(state.model.source.x),
+                pointer.y.saturating_add(state.model.source.y)
+            ),
+            rgb(220, 220, 224),
+            TextAlignment::Center,
+            tokens.label_font_height,
+        );
+    }
+}
+
+/// A hairline between every magnified pixel, so the blocks read as pixels rather than as a blur.
+/// Skipped when the zoom is too small for a grid to be anything but noise.
+fn draw_loupe_grid(device: HDC, layout: LoupeLayout) {
+    let zoom = layout.tokens.zoom;
+    if zoom < 4 {
+        return;
+    }
+    let grid = rgb(64, 64, 70);
+    for step in 1..LOUPE_SOURCE_SPAN {
+        let x = layout.view.left + step * zoom;
+        draw_lines(
+            device,
+            &[(x, layout.view.top), (x, layout.view.bottom)],
+            grid,
+            1,
+        );
+        let y = layout.view.top + step * zoom;
+        draw_lines(
+            device,
+            &[(layout.view.left, y), (layout.view.right, y)],
+            grid,
+            1,
+        );
+    }
+}
+
+/// The selection's edges, drawn synthetically at the exact pixel boundaries they occupy.
+///
+/// Not sampled: the live view's sample is the bare desktop with no overlay in it, and the frozen
+/// view's is the untouched capture, so the outline being dragged is in neither. Drawing it here
+/// is also what makes it exact — a right edge at `right` is the boundary *before* the pixel at
+/// `right`, which is the one question the magnifier exists to answer.
+fn draw_loupe_selection_edges(device: HDC, state: &OverlayState, layout: LoupeLayout) {
+    let Some(rect) = state.model.selection else {
+        return;
+    };
+    if state.model.selection_kind != Some(SelectionKind::Region) {
+        return;
+    }
+    let source = state.model.source;
+    let selection = UiRect {
+        left: rect.x.saturating_sub(source.x),
+        top: rect.y.saturating_sub(source.y),
+        right: i32::try_from(rect.right().saturating_sub(i64::from(source.x))).unwrap_or(i32::MAX),
+        bottom: i32::try_from(rect.bottom().saturating_sub(i64::from(source.y)))
+            .unwrap_or(i32::MAX),
+    };
+    let accent = rgb(86, 156, 255);
+    for line in loupe_edge_lines(selection, layout) {
+        let points = if line.vertical {
+            [
+                (line.position, layout.view.top),
+                (line.position, layout.view.bottom),
+            ]
+        } else {
+            [
+                (layout.view.left, line.position),
+                (layout.view.right, line.position),
+            ]
+        };
+        draw_lines(device, &points, accent, layout.tokens.edge_stroke);
+    }
+}
+
+/// Outlines the one magnified cell that is the pixel under the pointer.
+fn draw_loupe_centre_cell(device: HDC, layout: LoupeLayout) {
+    let zoom = layout.tokens.zoom;
+    let left = layout.view.left + LOUPE_SOURCE_HALF * zoom;
+    let top = layout.view.top + LOUPE_SOURCE_HALF * zoom;
+    draw_outline_rect(
+        device,
+        left,
+        top,
+        left + zoom,
+        top + zoom,
+        rgb(255, 255, 255),
+        1,
+    );
+}
+
+/// Copies the 31x31 square of real pixels centred on the pointer into `loupe_sample`.
+///
+/// Returns false when no pixels could be obtained, which is the only honest reason not to draw.
+fn sample_loupe_source(state: &mut OverlayState, layout: LoupeLayout) -> bool {
+    if state.loupe_sample.is_none() {
+        match FrozenSurface::empty(LOUPE_SOURCE_SPAN as u32, LOUPE_SOURCE_SPAN as u32) {
+            Ok(surface) => state.loupe_sample = Some(surface),
+            Err(error) => {
+                log::warn!("magnifier sample surface could not be allocated: {error}");
+                return false;
+            }
+        }
+    }
+    let Some(sample) = state.loupe_sample.as_ref() else {
+        return false;
+    };
+    // A square that runs off the edge of the display must not smear the last row across the gap.
+    sample.clear();
+    let source = state.model.source;
+    if state.showing_frozen_pixels() {
+        // The composed still image is what the user is looking at, and `surface` holds it
+        // untouched by the overlay's own chrome - which is exactly what should be magnified.
+        // SAFETY: Both are live memory DIBs owned by this thread. GDI clips a source rectangle
+        // that runs past the edge of the frozen surface rather than reading out of bounds.
+        let copied = unsafe {
+            BitBlt(
+                sample.device,
+                0,
+                0,
+                LOUPE_SOURCE_SPAN,
+                LOUPE_SOURCE_SPAN,
+                state.surface.device,
+                layout.source.left,
+                layout.source.top,
+                SRCCOPY,
+            )
+        };
+        return copied.is_ok();
+    }
+    // Live: read the desktop itself. `surface` in this mode holds a backdrop captured before the
+    // overlay existed, kept only so the window chooser has something to blur; it is stale the
+    // moment anything on screen moves, and magnifying it would show pixels that are not there.
+    //
+    // No CAPTUREBLT: it would pull layered windows into the copy, and this overlay is one. The
+    // overlay is also marked WDA_EXCLUDEFROMCAPTURE, so neither route should put it in the
+    // sample; the synthetic selection edges mean correctness does not depend on that holding.
+    // SAFETY: A null HWND obtains the desktop DC, released immediately after the copy.
+    let screen = unsafe { GetDC(None) };
+    if screen.0 == 0 {
+        log::debug!("magnifier could not obtain a desktop device context");
+        return false;
+    }
+    // SAFETY: The sample DIB is exactly LOUPE_SOURCE_SPAN square and both DCs stay live for this
+    // synchronous copy. Physical desktop coordinates may legitimately be negative.
+    let copied = unsafe {
+        BitBlt(
+            sample.device,
+            0,
+            0,
+            LOUPE_SOURCE_SPAN,
+            LOUPE_SOURCE_SPAN,
+            screen,
+            source.x.saturating_add(layout.source.left),
+            source.y.saturating_add(layout.source.top),
+            SRCCOPY,
+        )
+    };
+    // SAFETY: Balances the successful GetDC(None) above on this thread.
+    unsafe { ReleaseDC(None, screen) };
+    copied.is_ok()
 }
 
 fn draw_window_overview_static(destination: &FrozenSurface, state: &OverlayState) {
@@ -4170,17 +4430,32 @@ mod tests {
     #[test]
     fn live_selection_pixels_remain_hit_testable() {
         assert_eq!(
-            live_pixel_alpha(CaptureTool::Region, true, true, false),
+            live_pixel_alpha(CaptureTool::Region, true, true, false, false),
             LIVE_HIT_TEST_ALPHA
         );
         assert_eq!(
-            live_pixel_alpha(CaptureTool::Region, true, false, false),
+            live_pixel_alpha(CaptureTool::Region, true, false, false, false),
             DIM_ALPHA
         );
         assert_eq!(
-            live_pixel_alpha(CaptureTool::Region, false, false, false),
+            live_pixel_alpha(CaptureTool::Region, false, false, false, false),
             LIVE_HIT_TEST_ALPHA
         );
+    }
+
+    #[test]
+    fn the_magnifier_is_opaque_over_pixels_that_would_otherwise_show_through() {
+        // Its magnified pixels arrive by StretchBlt, which copies the source's alpha byte instead
+        // of zeroing it the way GDI's drawing calls do, so the coverage sentinel cannot classify
+        // them. Without the explicit override a magnifier inside the selection would be
+        // see-through over the very pixels it exists to magnify.
+        for (in_selection, dim) in [(true, true), (false, true), (false, false)] {
+            assert_eq!(
+                live_pixel_alpha(CaptureTool::Region, dim, in_selection, false, true),
+                u8::MAX,
+                "in_selection={in_selection} dim={dim}"
+            );
+        }
     }
 
     #[test]
@@ -4231,15 +4506,15 @@ mod tests {
         // color heuristic left it at background alpha; genuinely undrawn areas keep the
         // reserved dim and hit-test values.
         assert_eq!(
-            live_pixel_alpha(CaptureTool::Region, true, false, true),
+            live_pixel_alpha(CaptureTool::Region, true, false, true, false),
             u8::MAX
         );
         assert_eq!(
-            live_pixel_alpha(CaptureTool::Region, true, false, false),
+            live_pixel_alpha(CaptureTool::Region, true, false, false, false),
             DIM_ALPHA
         );
         assert_eq!(
-            live_pixel_alpha(CaptureTool::Region, false, true, false),
+            live_pixel_alpha(CaptureTool::Region, false, true, false, false),
             LIVE_HIT_TEST_ALPHA
         );
     }
@@ -4247,11 +4522,11 @@ mod tests {
     #[test]
     fn live_window_chooser_and_drawn_controls_are_opaque() {
         assert_eq!(
-            live_pixel_alpha(CaptureTool::Window, true, false, false),
+            live_pixel_alpha(CaptureTool::Window, true, false, false, false),
             u8::MAX
         );
         assert_eq!(
-            live_pixel_alpha(CaptureTool::Region, true, true, true),
+            live_pixel_alpha(CaptureTool::Region, true, true, true, false),
             u8::MAX
         );
     }
