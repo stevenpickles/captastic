@@ -13,7 +13,11 @@ mod dwm_thumbnail;
 #[cfg(windows)]
 mod dxgi;
 #[cfg(windows)]
+mod host;
+#[cfg(windows)]
 mod hotkey;
+#[cfg(windows)]
+mod known_folders;
 #[cfg(windows)]
 mod overlay;
 #[cfg(windows)]
@@ -41,14 +45,21 @@ pub use display_manager::{display_containing_pointer, DxgiDisplayManager};
 #[cfg(windows)]
 pub use dxgi::{enumerate_displays, materialize_native_region, DxgiBackend, GpuMaterialization};
 #[cfg(windows)]
+pub use host::{
+    adapters, display_hardware, os_build, power_status, processor_name, AdapterInfo,
+    DisplayHardware, PowerStatus,
+};
+#[cfg(windows)]
 pub use hotkey::{HotkeyListener, HotkeySpec};
+#[cfg(windows)]
+pub use known_folders::known_pictures_folder;
 #[cfg(windows)]
 pub use overlay::{
     flush_desktop_composition, select_from_frozen_frame, select_from_frozen_frame_with_controller,
     select_from_frozen_frame_with_initial_tool, select_from_frozen_frame_with_initial_tool_and_ui,
     select_from_preview_source_with_initial_tool_and_ui, InitialSelectionTool, NativeWindowHandle,
-    OverlayController, OverlayResources, OverlaySelection, OverlayUiUpdate, SelectionKind,
-    SelectionOutcome, SelectionPreviewSource, DISPLAY_CHANGE_MONITORS,
+    OverlayController, OverlayResources, OverlaySelection, OverlayUiUpdate, PreviewView,
+    SelectionKind, SelectionOutcome, SelectionPreviewSource, DISPLAY_CHANGE_MONITORS,
 };
 #[cfg(windows)]
 pub use session::{desktop_state, DesktopState};

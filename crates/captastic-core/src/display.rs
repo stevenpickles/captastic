@@ -42,6 +42,54 @@ impl Rect {
         i64::from(self.y) + i64::from(self.height)
     }
 
+    /// The rectangle spanning the half-open edges `[left, right) × [top, bottom)`.
+    ///
+    /// Every edge Captastic snaps to is expressed this way, and the one mistake this constructor
+    /// exists to make impossible is the off-by-one that comes from treating `right` as the last
+    /// pixel: a rectangle built here always reports back exactly the `right`/`bottom` it was given.
+    /// `None` for an empty or unrepresentable span, so a caller never gets a rectangle whose edges
+    /// disagree with the ones it asked for.
+    pub fn from_edges(left: i64, top: i64, right: i64, bottom: i64) -> Option<Self> {
+        if right <= left || bottom <= top {
+            return None;
+        }
+        Some(Self {
+            x: i32::try_from(left).ok()?,
+            y: i32::try_from(top).ok()?,
+            width: u32::try_from(right - left).ok()?,
+            height: u32::try_from(bottom - top).ok()?,
+        })
+    }
+
+    /// This rectangle moved — never stretched — until it lies inside `bounds`.
+    ///
+    /// A rectangle larger than `bounds` on an axis is shrunk to fit on that axis first, because
+    /// there is no position that would contain it otherwise. Everything else keeps its exact
+    /// pixel dimensions, which is what a remembered region and a snapped region both rely on.
+    pub fn clamp_within(self, bounds: Self) -> Self {
+        let width = self.width.min(bounds.width);
+        let height = self.height.min(bounds.height);
+        let maximum_x = (bounds.right() - i64::from(width)).max(i64::from(bounds.x));
+        let maximum_y = (bounds.bottom() - i64::from(height)).max(i64::from(bounds.y));
+        Self {
+            x: clamp_to_i32(i64::from(self.x).clamp(i64::from(bounds.x), maximum_x)),
+            y: clamp_to_i32(i64::from(self.y).clamp(i64::from(bounds.y), maximum_y)),
+            width,
+            height,
+        }
+    }
+
+    /// This rectangle moved by `(dx, dy)`, saturating at the coordinate limits and preserving
+    /// its dimensions exactly.
+    pub fn translated(self, dx: i64, dy: i64) -> Self {
+        Self {
+            x: clamp_to_i32(i64::from(self.x).saturating_add(dx)),
+            y: clamp_to_i32(i64::from(self.y).saturating_add(dy)),
+            width: self.width,
+            height: self.height,
+        }
+    }
+
     pub fn contains(self, x: i32, y: i32) -> bool {
         let x = i64::from(x);
         let y = i64::from(y);
@@ -80,6 +128,10 @@ impl Rect {
             height: u32::try_from(bottom - top).ok()?,
         })
     }
+}
+
+fn clamp_to_i32(value: i64) -> i32 {
+    value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -555,6 +607,71 @@ mod tests {
                     .intersection(right)
                     .is_some_and(|intersection| intersection.contains(x, y));
                 prop_assert_eq!(in_both, in_intersection);
+            }
+
+            /// `from_edges` is the constructor every snap computation ends in, and the whole point
+            /// of it is that the edges come back out unchanged. A rectangle built from a right
+            /// edge that then reported `right() == edge - 1` would put every snapped selection one
+            /// pixel short of the window it was snapped to.
+            #[test]
+            fn edges_survive_a_round_trip_through_from_edges(rect in any_rect()) {
+                let rebuilt = Rect::from_edges(
+                    i64::from(rect.x),
+                    i64::from(rect.y),
+                    rect.right(),
+                    rect.bottom(),
+                )
+                .expect("a non-empty rectangle rebuilds from its own edges");
+                prop_assert_eq!(rebuilt, rect);
+            }
+
+            /// The inverse direction: whatever edges go in are exactly the edges that come back.
+            #[test]
+            fn from_edges_reports_the_edges_it_was_given(
+                rect in any_rect(),
+                right_extra in 1i64..=20_000,
+                bottom_extra in 1i64..=20_000,
+            ) {
+                let left = i64::from(rect.x);
+                let top = i64::from(rect.y);
+                let right = left + right_extra;
+                let bottom = top + bottom_extra;
+                let built = Rect::from_edges(left, top, right, bottom)
+                    .expect("a positive span is representable in this coordinate range");
+                prop_assert_eq!(i64::from(built.x), left);
+                prop_assert_eq!(i64::from(built.y), top);
+                prop_assert_eq!(built.right(), right);
+                prop_assert_eq!(built.bottom(), bottom);
+                // Empty and inverted spans are refused rather than normalized.
+                prop_assert_eq!(Rect::from_edges(left, top, left, bottom), None);
+                prop_assert_eq!(Rect::from_edges(left, top, right, top), None);
+                prop_assert_eq!(Rect::from_edges(right, top, left, bottom), None);
+            }
+
+            /// Moving a region never changes how many pixels it copies, and clamping it into a
+            /// display moves it rather than trimming it — unless it does not fit at all, in which
+            /// case it is trimmed to the display on that axis and no further.
+            #[test]
+            fn translation_preserves_size_and_clamping_only_shrinks_to_fit(
+                rect in any_rect(),
+                bounds in any_rect(),
+                dx in -20_000i64..=20_000,
+                dy in -20_000i64..=20_000,
+            ) {
+                let moved = rect.translated(dx, dy);
+                prop_assert_eq!(moved.width, rect.width);
+                prop_assert_eq!(moved.height, rect.height);
+                prop_assert_eq!(moved.translated(-dx, -dy), rect);
+
+                let clamped = rect.clamp_within(bounds);
+                prop_assert_eq!(clamped.width, rect.width.min(bounds.width));
+                prop_assert_eq!(clamped.height, rect.height.min(bounds.height));
+                prop_assert!(i64::from(clamped.x) >= i64::from(bounds.x));
+                prop_assert!(i64::from(clamped.y) >= i64::from(bounds.y));
+                prop_assert!(clamped.right() <= bounds.right());
+                prop_assert!(clamped.bottom() <= bounds.bottom());
+                // Idempotent: a rectangle already inside its bounds is left exactly alone.
+                prop_assert_eq!(clamped.clamp_within(bounds), clamped);
             }
 
             /// An empty overlap has to be reported as `None` rather than as a zero-area rectangle,

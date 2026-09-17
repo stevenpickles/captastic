@@ -2,10 +2,11 @@
 
 Captastic is a fast, native screenshot tool for Windows, written in Rust. It runs as a resident
 daemon behind configurable global hotkeys, opens a live overlay for full-display, window, or
-resizable-region selection, and publishes the result to the Windows clipboard, to a PNG file, or to
-both. It keeps a bounded history of recent captures, targets the display the user means across
-multi-monitor and mixed-DPI layouts, and installs, upgrades, and uninstalls for the current user from
-a portable archive that needs no administrator privileges, or from a Chocolatey package.
+resizable-region selection, and publishes the result to the Windows clipboard, to a PNG, JPEG, or
+BMP file, or to both. It keeps a bounded history of recent captures, targets the display the user
+means across multi-monitor and mixed-DPI layouts, and installs, upgrades, and uninstalls for the
+current user from a portable archive that needs no administrator privileges, or from a Chocolatey
+package.
 Windows is the only supported platform: capture, overlay, hotkeys, and clipboard output are native
 Windows implementations rather than a portable abstraction, and other platforms are roadmap work
 rather than shipped code.
@@ -17,7 +18,23 @@ native frame, CPU readback, selection, clipboard, encoding, and file output — 
 rather than collapsed into one number, and every capture carries its own freshness and timing
 provenance.
 
-The DXGI backend supports two deliberately different modes. `latest` is the resident-daemon default: when a capture is triggered, it drains any immediately available desktop frame and otherwise reuses the last retained image, so the daemon performs no DXGI acquisition while idle. Only the first capture may wait briefly when no retained image exists yet. `fresh` waits for a desktop frame presented after the trigger and is intended for controlled latency experiments. Both modes report frame age/timing provenance, and BGRA8 CPU readback uses preallocated staging and CPU buffers. By default, the resident daemon opens a native live overlay before acquiring pixels. Its floating toolbar provides full-display, window, and resizable-region modes, an Options menu, and a Capture button. Region and full-display selection leave the desktop visible and changing until confirmation, then remove the overlay and request the output frame. Window mode uses DWM compositor relationships so animations and video keep updating in the chooser; clicking still performs a fresh isolated native window render. Results are published to the Windows clipboard as uncompressed DIBV5 images; straight-alpha window captures also include a registered PNG compatibility representation. Captures are marked so Windows keeps them out of the Win+V clipboard history and off the sync to the signed-in Microsoft account; `clipboard.allow_history` and `clipboard.allow_cloud_sync` opt back in.
+The DXGI backend supports two deliberately different modes. `latest` is the resident-daemon
+default: when a capture is triggered, it drains any immediately available desktop frame and
+otherwise reuses the last retained image, so the daemon performs no DXGI acquisition while idle.
+Only the first capture may wait briefly when no retained image exists yet. `fresh` waits for a
+desktop frame presented after the trigger and is intended for controlled latency experiments. Both
+modes report frame age/timing provenance, and BGRA8 CPU readback uses preallocated staging and CPU
+buffers. By default, the resident daemon captures the screen at the moment the hotkey is pressed
+and opens a native live overlay over those pixels. Its floating toolbar provides full-display,
+window, and resizable-region modes, an Options menu, and a Capture button. Region and full-display
+selection leave the desktop visible and changing until confirmation — or hold still on the frame
+from the press, when the view has been switched to it — then remove the overlay and publish
+whichever view was showing. Window mode uses DWM compositor relationships so animations and video
+keep updating in the chooser; clicking still performs a fresh isolated native window render.
+Results are published to the Windows clipboard as uncompressed DIBV5 images; straight-alpha window
+captures also include a registered PNG compatibility representation. Captures are marked so Windows
+keeps them out of the Win+V clipboard history and off the sync to the signed-in Microsoft account;
+`clipboard.allow_history` and `clipboard.allow_cloud_sync` opt back in.
 
 ## Build and verify
 
@@ -48,6 +65,23 @@ Use `captastic --version` for the compact identity or `captastic version --json`
 version, full commit, revision count, channel, dirty state, target, profile, and CI provenance.
 Windows builds carry the same version and commit in their executable properties, and daemon startup
 logs and benchmark reports include the embedded identity.
+
+## Benchmark evidence
+
+Every benchmark report carries an environment fingerprint — OS build, CPU, adapters with their
+driver versions, displays with scale and refresh, session, power source, and the full build
+identity including its dirty flag — and two runs are comparable only if all of that matches. A
+driver update or a hundred commits between two runs moves a latency figure without moving anything
+the numbers say, so a mismatch stops the comparison and names every differing field instead of
+producing a percentage that reads like a regression.
+
+`captastic benchmark --repeat 3 --output-dir <dir>` writes the artifacts a claim rests on: a full
+report per run, the raw per-capture event stream per run with `--raw-events`, and a `repeated.json`
+carrying every stage's spread at p50, p95, and p99. `captastic benchmark compare <baseline>
+<candidate>` holds a later run against a committed one and prints the per-stage deltas with a
+`within_noise`/`slower`/`faster` verdict. The operator procedure for turning those into a
+publishable number — console session, AC power, a repainting display, the acceptance criteria, and
+where accepted sets are committed — is [benchmarks/README.md](benchmarks/README.md).
 
 ## Continuous integration
 
@@ -90,11 +124,12 @@ Running Captastic without a subcommand starts the resident desktop capture daemo
 configuration. The explicit `daemon` form remains available for scripts, diagnostics, and CLI
 overrides. A named per-session control event prevents more than one daemon instance from running.
 While the daemon is active, Captastic places an icon in the Windows notification area. Double-click
-the icon to capture, or right-click it to capture, open the most recent capture or show it in its
-folder (**Open Last Capture** and **Show in Folder**), pause/resume the global hotkey, open
-`captastic.toml`, open the persistent log, toggle **Start with Windows**, or exit cleanly. If Windows
-Explorer restarts, Captastic restores its notification icon automatically. Tray initialization
-failures are logged and do not disable the capture daemon.
+the icon to capture, or right-click it to capture, turn **Save Captures to Disk** on or off,
+open the most recent capture, show it in its folder, or prune the capture history (**Open Last
+Capture**, **Show in Folder**, and **Prune Capture History**), pause/resume the global hotkey, open
+`captastic.toml`, open the persistent log, toggle **Start with Windows**, or exit cleanly. If
+Windows Explorer restarts, Captastic restores its notification icon automatically. Tray
+initialization failures are logged and do not disable the capture daemon.
 
 Release builds also contain `captastic-desktop.exe`, a console-free launcher intended for shortcuts
 and login startup. It starts the sibling `captastic.exe` daemon without creating a terminal window
@@ -158,12 +193,14 @@ preserves `~/.captastic` on upgrades and uninstall. See
 behavior, and the manual community publishing procedure.
 
 When `--config` is omitted, the daemon automatically loads
-`%USERPROFILE%\.captastic\captastic.toml` if it exists. The same file stores Captastic-managed UI
-state under `[ui.displays.<persistent-id>]`, including an independent toolbar position, last
-selected capture tool, and last adjusted region for every monitor. These preferences are retained
-after cancellation. Region coordinates are monitor-local, so negative origins do not leak into persisted state. Updates
-preserve the rest of the TOML document and its comments. Existing global `[ui]` values remain a
-backward-compatible fallback until that monitor records its own state.
+`%USERPROFILE%\.captastic\captastic.toml` if it exists. What Captastic remembers about how you last
+used it is not kept in that file: it lives beside it in `state.toml`, which Captastic owns and
+writes whole. That is an independent toolbar position, last selected capture tool, and last
+adjusted region for every monitor under `[displays.<persistent-id>]`, plus the global **Snap to
+Edges** and **Zoom** preferences. All of them are retained after cancellation. Region coordinates
+are monitor-local, so negative origins do not leak into persisted state. A `[ui]` section in
+`captastic.toml` predates the split: it is read once to carry those values across and ignored from
+then on, and Captastic says so at startup when it finds one that no longer does anything.
 
 The implicit default profile is startup-recoverable: syntactically damaged TOML or invalid UTF-8
 is renamed beside the original with a `.corrupt-*` suffix, Captastic starts from safe defaults,
@@ -174,11 +211,13 @@ Captastic retains the five newest corrupt backups and removes abandoned atomic-w
 siblings after seven days, preventing recovery artifacts from growing without bound.
 
 When the daemon is started with `--config <path>`, that path is also the sole destination for tray
-Open Config and managed UI-state updates; the default profile is not read or written. The daemon
-loads behavioral and remembered UI settings at startup, so hand edits take effect after a restart.
-Background UI saves re-read the current document and preserve unrelated edits and comments. The
-one-shot `captastic capture --selection true` command uses the default profile and flushes its UI
-updates before exiting.
+Open Config and the **Save Captures to Disk** setting, and the `state.toml` beside it holds that
+profile's remembered state; the default profile is not read or written. The daemon loads behavioral
+and remembered UI settings at startup, so hand edits take effect after a restart. Background saves
+rewrite `state.toml` alone, so they cannot disturb a configuration you are editing, and the one
+setting the notification area does write back — `output.enabled` — is edited in place, preserving
+every other value and comment. The one-shot `captastic capture --selection true` command uses the
+default profile unless `--config <path>` names another, and flushes its UI updates before exiting.
 
 ## Configurable hotkeys
 
@@ -204,17 +243,110 @@ action bindings, and one chord assigned to multiple actions are errors. Existing
 `[hotkey] binding = "Ctrl+Shift+F9"` remains a compatibility alias for `last_workflow`; defining
 both forms for that action is rejected as ambiguous.
 
-`last_workflow`, `region`, and `window` open the frozen-frame overlay with the remembered, Region,
-or Window tool respectively. `full_display` publishes the resolved display directly without
-constructing overlay resources. `repeat_last_region` uses only that display's last confirmed Region
-selection, validates its persistent display identity and source geometry, and uses GPU region
-materialization with checked CPU fallback. Missing, stale, or invalid confirmed state opens Region
-mode from daemon-cached restored/default UI state and logs a structured fallback reason; it never
-captures unrelated state or reads TOML after the trigger. All actions retain the configured display
-policy and `latest`/`fresh` mode. Daemon triggers, selection, clipboard, and logging use bounded
-worker queues. UI-state changes update the controller-owned in-memory snapshot synchronously and
-use a dedicated unbounded disk channel; its traffic is limited to compact overlay session-end
-events, and the persistence worker coalesces equivalent updates before writing.
+`last_workflow`, `region`, and `window` capture the screen and open the selection overlay over
+those pixels, with the remembered, Region, or Window tool respectively. `full_display` publishes
+the resolved display directly without constructing overlay resources. `repeat_last_region` uses
+only that display's last confirmed Region selection, validates its persistent display identity and
+source geometry, and uses GPU region materialization with checked CPU fallback. Missing, stale, or
+invalid confirmed state opens Region mode from daemon-cached restored/default UI state and logs a
+structured fallback reason; it never captures unrelated state or reads TOML after the trigger. All
+actions retain the configured display policy and `latest`/`fresh` mode. Daemon triggers, selection,
+clipboard, and logging use bounded worker queues. UI-state changes update the controller-owned
+in-memory snapshot synchronously and use a dedicated unbounded disk channel; its traffic is limited
+to compact overlay session-end events, and the persistence worker coalesces equivalent updates
+before writing.
+
+## File output
+
+Captastic can write every capture to disk as well as, or instead of, the clipboard. It is off by
+default, and the notification area's **Save Captures to Disk** turns it on and off without a
+restart:
+
+```toml
+[output]
+enabled = true
+format = "png"
+jpeg_quality = 90
+# directory = 'C:\Users\you\Pictures\Captastic'
+filename_template = "{timestamp}-{application}-{title}"
+```
+
+`directory` must be absolute — a daemon's working directory is whatever launched it, so a relative
+path would put captures somewhere unpredictable. It is created when the daemon starts rather than
+at the first capture, so a directory that cannot be created is a startup error instead of a
+surprise at the hotkey.
+
+Omit it and captures go to `Captastic` inside **the Pictures folder Windows shows you** — including
+when OneDrive's Known Folder Move, a roaming profile, or a group policy has moved it somewhere like
+`C:\Users\you\OneDrive\Pictures`. Captastic asks the shell where Pictures is rather than assuming
+`%USERPROFILE%\Pictures`, which on a redirected machine is usually an empty directory that still
+exists — captures written there land somewhere Explorer no longer calls Pictures. The exact path is
+logged at info when the daemon starts with file output on, and again when **Save Captures to Disk**
+turns it on, so a log line and the Pictures folder in Explorer are always comparable. If Windows
+will not name a Pictures folder at all, the fallback is `<home>\Pictures\Captastic`.
+
+`format` chooses the encoder:
+
+- **`png`** — lossless, compressed, and it keeps the straight alpha of a window capture. The
+  default, and the right answer for a screenshot of text or an interface.
+- **`jpeg`** — lossy and much smaller, written with a `.jpg` extension. `jpeg_quality` is 1–100 and
+  defaults to 90. **JPEG cannot carry an alpha channel**, so the transparent corners and shadow of
+  a window capture are composited over opaque white. That is inherent to the format rather than
+  something Captastic decides on your behalf, and the log says so at debug level each time it
+  happens; use `png` or `bmp` to keep them.
+- **`bmp`** — uncompressed and alpha-preserving: a `BITMAPV5HEADER` with an alpha mask when the
+  capture has alpha, a plain 24-bpp bitmap when it does not. A 4K capture is 33 MB and stays that
+  way.
+
+All three refuse a half-float or scRGB frame by name rather than narrowing it silently; see
+[ADR 0006](docs/adr/0006-hdr-source-handling.md).
+
+`filename_template` names each capture, without its extension. The tokens are `{timestamp}`,
+`{date}`, `{time}`, `{display}`, `{mode}`, `{width}`, `{height}`, `{application}`, and `{title}`;
+the two window tokens expand to nothing for a display or region capture, and the separators around
+them collapse rather than leaving gaps behind. Values that come from a window are sanitized —
+forbidden characters, control characters, parent hops, reserved device names, and length — and a
+name can never place a capture outside the output directory.
+`captastic config validate --path <file>` rejects an unknown token, a path separator, or a template
+with no token at all, which is the same check the daemon makes at startup. A window title is
+content; see [ADR 0008](docs/adr/0008-what-a-capture-reveals-by-default.md) for why the default
+names it anyway.
+
+A capture never overwrites a file it did not create: a name already taken is retried as `name-2`,
+`name-3`, and so on, and the write itself refuses rather than replaces. Each written capture is
+reported with its format, path, byte count, and encode/write timings — as a log line, or as a
+`file_output_written` JSON event under `--json`.
+
+**Save Captures to Disk** in the notification-area menu is checked while captures are being
+written, and takes effect on the next capture rather than on the next start: turning it on starts
+the file worker — creating the output directory and rejecting a bad `filename_template` there and
+then — and turning it off stops it, leaving the clipboard untouched either way. The choice is
+written back to `output.enabled` in the configuration this daemon is running on, preserving the
+rest of the document and its comments, so it survives a restart; the file is created if the
+default profile has never been written. If that write fails the notification area says so and the
+setting still applies for this session. A start that fails — an output directory that cannot be
+created, say — leaves the item unchecked and reports why, because the checkmark states where the
+next capture will go, and so does a start refused because a previous file worker missed its stop
+deadline and may still be writing into that directory; it is allowed again as soon as that worker
+returns. Captures already queued when file output is switched off are not written — that is
+inherent to stopping a destination — but each one is named in the log with its capture id and
+counted as abandoned in the destination's summary. Everything else under `[output]` (format,
+directory, template) is read at startup as before, so changing those still means a restart.
+
+Captastic remembers recent captures under `[history]` (`max_items`, `max_age_days`,
+`max_total_bytes`; `max_items = 0` turns it off). The notification-area menu uses that history for
+**Open Last Capture**, **Show in Folder**, and **Prune Capture History**, each greyed until there
+is something to open.
+
+One-shot captures write to disk from the same configuration: `captastic capture --backend dxgi`
+honours `[output]`, and `--config <file>` points it at a configuration other than the default.
+
+JPEG encoding uses the [`jpeg-encoder`](https://crates.io/crates/jpeg-encoder) crate, which is
+MIT or Apache-2.0 licensed with IJG-licensed portions: this software is based in part on the work
+of the Independent JPEG Group.
+
+## Logging and diagnostics
+
 Daemon, capture, and benchmark commands write operational output through Rust's `log` facade to
 both stderr and a persistent file. Read-only utility commands use stderr only unless `--log-file`
 is supplied.
@@ -232,14 +364,16 @@ Windows terminal and strips all color escapes when stderr is redirected or color
 Persistent log files remain plain text. JSON logging is never colorized.
 
 Machine-readable command results continue to use stdout, so `--json` can be redirected or parsed
-without mixing in diagnostics. Captastic keeps its per-user configuration, UI state, and logs in
-`%USERPROFILE%\.captastic` on Windows (or `$HOME/.captastic` elsewhere). Configuration and UI state
-share `%USERPROFILE%\.captastic\captastic.toml`. The default log file is
-`%USERPROFILE%\.captastic\logs\captastic.log`; the resolved path is logged when the process starts and
-is included in daemon ready JSON. File writes run on a bounded background queue and never block the
-capture or overlay threads. Configure `logging.level` (`off`, `error`, `warn`, `info`, `debug`, or
-`trace`), `logging.format` (`compact` or `json`), and optional `logging.file` in TOML, or override
-them with the global `--log-level`, `--log-format`, and `--log-file` flags. The active log rotates
+without mixing in diagnostics. Captastic keeps its per-user configuration, remembered state, and
+logs in `%USERPROFILE%\.captastic` on Windows (or `$HOME/.captastic` elsewhere). The configuration
+is `captastic.toml`; Captastic's own memory is `state.toml` and the capture history is
+`history.toml`, both beside it and both written by Captastic rather than by hand. The default log
+file is `%USERPROFILE%\.captastic\logs\captastic.log`; the resolved path is logged when the process
+starts and is included in daemon ready JSON. File writes run on a bounded background queue and
+never block the capture or overlay threads. Configure `logging.level` (`off`, `error`, `warn`,
+`info`, `debug`, or `trace`), `logging.format` (`compact` or `json`), and optional `logging.file`
+in TOML, or override them with the global `--log-level`, `--log-format`, and `--log-file` flags.
+The active log rotates
 at `logging.max_file_bytes` (5 MiB by default), retaining `logging.retained_files` archives (three
 by default) as `captastic.log.1`, `captastic.log.2`, and `captastic.log.3`.
 
@@ -265,9 +399,9 @@ editing configuration by passing `--display display:windows-monitor-0123456789ab
 actionable error listing the IDs that remain attached. Note that only the daemon defaults to the
 pointer display; the one-shot `capture` and `benchmark` commands default `--display` to `primary`.
 
-Selection and clipboard output are enabled by default. Choose full display, window, or region from the toolbar. The `selection.preview` policy defaults to `auto`: it prefers the live presenter and reopens with a bounded frozen capture if live overlay setup fails. `live` requires confirmation-time behavior; `frozen` preserves trigger-time selection. A live selection first validates the capture engine's display list — against the display-configuration generation, and against a fingerprint of the monitor arrangement that is re-sampled from Windows on each press and so notices a dock or undock that no window of Captastic's was running to be told about — and rebuilds the engine before placing the overlay, so a monitor change (dock/undock, resolution, or arrangement) cannot open it on a stale arrangement; a confirmation capture that comes back describing different display bounds or rotation than the overlay covered is refused with a notification-area balloon rather than cropped incorrectly. A confirmation capture that fails outright because the layout moved under it — the engine refusing a display list a monitor change has outdated, or an engine rebuilt onto a display the overlay was not drawn on — raises the same balloon instead of ending in the log. A display change while the overlay is still open closes it, which is not a cancellation and is no longer reported as one: the log and the balloon name what changed — the display layout when a monitor arrives, leaves, or moves, the display settings for a DPI or work-area change such as a taskbar resizing — because the press is lost and pressing the hotkey again is the only remedy. In `--json` output that press reports the event `selection_display_changed` rather than `selection_cancelled`, under the same `schema_version`, so a script that counts cancellations does not silently absorb it. Each monitor restores its last selected tool across daemon restarts, including a selection followed by cancellation. Region mode likewise restores that monitor's last adjusted rectangle whether or not it was captured; when no region has been adjusted on it yet, Captastic starts with a rectangle centered on the display at half its width and half its height. Saved rectangles keep their pixel dimensions and relative center after a resolution change; rotating a monitor rotates the center and swaps width and height before clamping the result to the new bounds. Switching away from Region mode preserves the live rectangle, and switching back restores it immediately. Drag the three-dot grip or any empty toolbar background to reposition the toolbar. Captastic stores its normalized center within that monitor's work area, scales the controls for the monitor's effective DPI, avoids taskbars, and restores the relative placement across resolution or scaling changes. Window mode arranges eligible application windows as independent, aspect-correct DWM thumbnails. A per-window static surface remains available when DWM registration fails; those fallback surfaces are capped at 1.2 megapixels to bound memory. Clicking a preview requests a fresh full-resolution native frame for clipboard output. DWM-cloaked placeholders, shell surfaces, the desktop, minimized windows, and windows rejected by both native capture backends are excluded. Captastic first requests `PrintWindow`; when Windows integrity isolation rejects that request, it uses programmatic Windows Graphics Capture so Task Manager and elevated command shells remain unoccluded and selectable without elevating Captastic. Region mode supports drawing, moving, and resizing with eight side/corner handles and displays exact pixel dimensions. Click **Capture** or press Enter to copy the selection; Esc or right-click cancels without discarding the selected tool or adjusted region. **Options** can toggle background dimming or cancel capture. Captastic takes Win32 mouse capture only for an active toolbar, draw, move, or resize drag and releases it at button-up; losing capture cancels the unfinished drag. This preserves completion when the pointer crosses the overlay edge, but software KVM behavior should be verified for the deployed input stack. Selection, materialization, PNG/DIB clipboard preparation, and clipboard timing remain outside native/CPU capture latency. Window rendering is isolated behind a 700 ms timeout and a two-slot active-work admission gate. A timed-out foreign call is detached and its active slot reclaimed so one bad target cannot permanently disable later captures. A separate eight-worker lifetime cap includes detached calls and rejects additional native renders until a worker exits, preventing permanently hung targets from creating an unbounded thread backlog. The WGC fallback waits for its first frame and performs bounded GPU readback entirely within that worker.
+Selection and clipboard output are enabled by default. Choose full display, window, or region from the toolbar. Every press of an overlay hotkey captures the screen at the moment of the press, and the overlay opens on the live desktop with those pixels held behind it. Press **F**, or use **Options -> View**, to switch between the two: "View: Live" is the desktop as it is, changing; "View: Frozen" is the frame from the press, and while it is showing a **FROZEN · pixels from hotkey press** tag sits above the toolbar so a stopped video is never a mystery. Confirming captures whatever view was on screen — the frozen view publishes the frame from the press, the live view captures again at the moment you confirm — so the picture you are looking at is the picture you get. Switching costs nothing and is not remembered: every press starts in the view `selection.preview` names. That policy now chooses only which view the overlay opens in. `auto` (the default) and `live` open live; `frozen` opens on the frame from the press. They differ in what happens if the layered presenter cannot be established: `auto` re-opens the same run in an opaque window showing that frame, with the View row greyed because there is nothing to switch to, while `live` fails rather than silently giving you trigger-time pixels. The Window tool is unaffected by the view and its row is greyed there: clicking a preview has always requested a fresh full-resolution render of that window. A selection first validates the capture engine's display list — against the display-configuration generation, and against a fingerprint of the monitor arrangement that is re-sampled from Windows on each press and so notices a dock or undock that no window of Captastic's was running to be told about — and rebuilds the engine before placing the overlay, so a monitor change (dock/undock, resolution, or arrangement) cannot open it on a stale arrangement; a confirmation capture that comes back describing different display bounds or rotation than the overlay covered is refused with a notification-area balloon rather than cropped incorrectly. A confirmation capture that fails outright because the layout moved under it — the engine refusing a display list a monitor change has outdated, or an engine rebuilt onto a display the overlay was not drawn on — raises the same balloon instead of ending in the log. A display change while the overlay is still open closes it, which is not a cancellation and is no longer reported as one: the log and the balloon name what changed — the display layout when a monitor arrives, leaves, or moves, the display settings for a DPI or work-area change such as a taskbar resizing — because the press is lost and pressing the hotkey again is the only remedy. In `--json` output that press reports the event `selection_display_changed` rather than `selection_cancelled`, under the same `schema_version`, so a script that counts cancellations does not silently absorb it. Each monitor restores its last selected tool across daemon restarts, including a selection followed by cancellation. Region mode likewise restores that monitor's last adjusted rectangle whether or not it was captured; when no region has been adjusted on it yet, Captastic starts with a rectangle centered on the display at half its width and half its height. Saved rectangles keep their pixel dimensions and relative center after a resolution change; rotating a monitor rotates the center and swaps width and height before clamping the result to the new bounds. Switching away from Region mode preserves the live rectangle, and switching back restores it immediately. Drag the three-dot grip or any empty toolbar background to reposition the toolbar. Captastic stores its normalized center within that monitor's work area, scales the controls for the monitor's effective DPI, avoids taskbars, and restores the relative placement across resolution or scaling changes. Window mode arranges eligible application windows as independent, aspect-correct DWM thumbnails. A per-window static surface remains available when DWM registration fails; those fallback surfaces are capped at 1.2 megapixels to bound memory. Clicking a preview requests a fresh full-resolution native frame for clipboard output. DWM-cloaked placeholders, shell surfaces, the desktop, minimized windows, and windows rejected by both native capture backends are excluded. Captastic first requests `PrintWindow`; when Windows integrity isolation rejects that request, it uses programmatic Windows Graphics Capture so Task Manager and elevated command shells remain unoccluded and selectable without elevating Captastic. Region mode supports drawing, moving, and resizing with eight side/corner handles and displays exact pixel dimensions. While a region is being drawn, moved, or resized its edges snap to the edges of the windows on that display, to the work area, and to the display itself once they come within 8 DIPs (scaled for the monitor's DPI, so it is the same physical distance at every scaling). A snapped edge lands exactly on the target: a region snapped to a window's right edge ends on that window's last pixel column, never one short, and a hairline accent guide along the target edge shows what it snapped to. The nearest edge wins, ties go to the topmost window, and the display — which every region is inside of — can only win when nothing else is in reach. Hold **Ctrl** while dragging to suppress snapping and place the edge exactly under the pointer; **Options -> Snap to Edges** turns it off for good and is remembered across restarts. The window list is enumerated once per overlay run, so a window moved or closed while the overlay is open is still snapped to where it was when the overlay opened; close and reopen the overlay to refresh it. The arrow keys nudge the selected region one physical pixel at a time, ten with **Shift** held, and resize its right and bottom edges instead of moving it with **Ctrl** held; holding a key repeats. Nudging never snaps, so it is the way to place an edge on a pixel no window sits on. Because the pointer covers the pixel an edge is landing on, a magnifier shows it: hold **Z** to bring it up, and in its default mode it also appears by itself whenever the pointer slows to a deliberate pace during a region drag, disappearing again as soon as the pointer travels. The magnifier samples whichever view is showing — the desktop itself in the live view, the frame from the press in the frozen one — so it never enlarges pixels the capture will not contain. It shows the 31 physical pixels around the pointer enlarged six times (more at higher scaling), with a grid between them, the pixel under the pointer outlined, the selection's edges drawn at the exact pixel boundaries they occupy, and the pointer's desktop coordinate underneath. It sits beside the pointer and never covers the pixels it is magnifying. **Options -> Zoom** cycles Auto, Hold Z, and Off, and the choice is remembered across restarts. Click **Capture** or press Enter to copy the selection; Esc or right-click cancels without discarding the selected tool or adjusted region. **Options** can toggle background dimming, toggle edge snapping, choose when the magnifier appears, switch between the live and frozen views, or cancel capture. Captastic takes Win32 mouse capture only for an active toolbar, draw, move, or resize drag and releases it at button-up; losing capture cancels the unfinished drag. This preserves completion when the pointer crosses the overlay edge, but software KVM behavior should be verified for the deployed input stack. Selection, materialization, PNG/DIB clipboard preparation, and clipboard timing remain outside native/CPU capture latency. Window rendering is isolated behind a 700 ms timeout and a two-slot active-work admission gate. A timed-out foreign call is detached and its active slot reclaimed so one bad target cannot permanently disable later captures. A separate eight-worker lifetime cap includes detached calls and rejects additional native renders until a worker exits, preventing permanently hung targets from creating an unbounded thread backlog. The WGC fallback waits for its first frame and performs bounded GPU readback entirely within that worker.
 
-The region-dimension badge reports exact physical pixels. It remains inside a comfortable selection, moves to a stable outside side for a small selection, avoids the pointer, resize handles, and capture controls where practical, and stays clamped to the active monitor. See the [overlay UI verification guide](docs/overlay-ui-verification.md) for the layout contract and DPI/monitor matrix.
+The region-dimension badge reports exact physical pixels. It treats the magnifier as an obstacle and moves out of its way, because the badge is the only one of the two with anywhere else to go. It remains inside a comfortable selection, moves to a stable outside side for a small selection, avoids the pointer, resize handles, and capture controls where practical, and stays clamped to the active monitor. See the [overlay UI verification guide](docs/overlay-ui-verification.md) for the layout contract and DPI/monitor matrix.
 
 Window ownership is display-local and deterministic. The display with the largest visible window
 intersection owns the chooser entry; an exact tie prefers the window's native monitor and then the
@@ -315,20 +449,28 @@ Ctrl+C or `captastic stop` requests an orderly shutdown, stops admitting capture
 
 ## Performance implementation notes
 
-- Region-mode overlay startup does not enumerate application windows or construct the blurred chooser background; both are created only if Window is selected.
+- The magnifier samples 31x31 pixels per paint and enlarges them with GDI, and its rest timer only runs during a region drag with Zoom set to Auto. A run that never adjusts a region never allocates its sample surface and never arms a timer.
+- Region-mode overlay startup constructs neither the window list nor the blurred chooser background. Enumeration is deferred until the Window tool is selected or the first region adjustment needs edges to snap to, whichever comes first, and then happens once per run; the blurred backdrop is built only for the Window tool. A run with snapping switched off never enumerates at all.
 - Full-screen overlay DIBs, the private font registration, and the native region cursor are reused by the persistent selection worker for captures made within 30 seconds. The cache is released after an idle interval.
 - Window thumbnails are rendered two at a time, downscaled inside the bounded native render worker, and never materialized as an additional full-resolution overview surface.
 - Tightly pitched DXGI staging textures use one contiguous CPU copy; padded textures retain the checked row-copy fallback.
 - Transparent-window PNG is streamed directly into its final byte vector with one 64 KiB scratch block. PNG and all clipboard allocations remain after CPU-frame readiness.
 - Selection JSON reports `overlay_preparation_ns`, `window_overview_ns`, retained preview count/bytes, and clipboard JSON reports `png_encode_ns`.
-- DXGI selection captures now retain an opt-in immutable GPU snapshot. Confirmed regions use
+- The CPU readback pool holds `capture.buffer_slots` plus `selection.queue_capacity` plus one
+  frames, because an open overlay pins the frame from its hotkey press for the whole interaction
+  rather than for the length of a capture. Slots are allocated on first use; at 4K each is
+  31.6 MiB, so the default ceiling is five slots and is reached only when that many frames really
+  are live. Exhausting it on a press or a confirmation raises a notification-area balloon.
+- DXGI selection captures retain an immutable GPU snapshot for the life of the overlay — every
+  overlay press but a direct full-display capture asks for one, because a tool switch inside the
+  overlay can still land on Region. Confirmed regions use
   `CopySubresourceRegion` and read back only the selected pixels; JSON identifies
   `dxgi_gpu_region` materialization and reports GPU copy submission, map wait, CPU copy, byte
   count, and total materialization time. A native error falls back to the checked CPU crop.
 
 For a smaller distributable binary without changing the profiled release build, use `cargo build --profile dist -p captastic-app`.
 
-See [ROADMAP.md](ROADMAP.md) for prioritized work after v0.1.0 — the remaining milestones, their
+See [ROADMAP.md](ROADMAP.md) for prioritized work after v0.2.0 — the remaining milestones, their
 status, and the release signing and distribution backlog — and
 [outputs/Captastic-Specification.md](outputs/Captastic-Specification.md) for the complete original
 implementation plan.

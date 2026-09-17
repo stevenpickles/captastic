@@ -16,14 +16,17 @@ use windows::Win32::UI::HiDpi::{
     GetDpiForMonitor, SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT,
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, MDT_EFFECTIVE_DPI,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_SHIFT, VK_Z,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateIconIndirect, DestroyCursor, IsWindow, LoadCursorW, PeekMessageW, SetCursor,
-    SetForegroundWindow, UnregisterClassW, HCURSOR, ICONINFO, IDC_ARROW, IDC_CROSS, IDC_SIZEALL,
-    MSG, PM_REMOVE, WM_QUIT,
+    CreateIconIndirect, DestroyCursor, GetMessageTime, IsWindow, KillTimer, LoadCursorW,
+    PeekMessageW, SetCursor, SetForegroundWindow, SetTimer, UnregisterClassW, HCURSOR, ICONINFO,
+    IDC_ARROW, IDC_CROSS, IDC_SIZEALL, MSG, PM_REMOVE, WM_QUIT,
 };
 
 use super::layout::{DisplayEnvironment, UiMetrics, UiRect};
+use super::machine::{Modifiers, LOUPE_TICK_MS};
 use super::raster::{high_contrast_cursor_pixels, top_down_bitmap_info};
 
 pub(super) const REGION_CURSOR_SIZE: u32 = 64;
@@ -427,6 +430,88 @@ pub(super) fn consume_self_initiated_capture_change(releasing_pointer_capture: &
     std::mem::take(releasing_pointer_capture)
 }
 
+/// The overlay's one and only timer. The window has no others, so the id is a constant rather
+/// than an allocation.
+pub(super) const LOUPE_TIMER_ID: usize = 1;
+
+/// Starts the rest timer that tells the machine the pointer has stopped moving.
+///
+/// Idempotent: `SetTimer` with an existing id resets that timer rather than creating a second.
+pub(super) fn start_loupe_timer(hwnd: HWND) {
+    // SAFETY: hwnd is the live overlay window on this thread. A null callback posts WM_TIMER to
+    // its window procedure instead of calling back directly.
+    let started = unsafe { SetTimer(hwnd, LOUPE_TIMER_ID, LOUPE_TICK_MS, None) };
+    if started == 0 {
+        log::debug!(
+            "overlay rest timer could not be started; the magnifier will not appear on its own"
+        );
+    }
+}
+
+/// Stops the rest timer. Harmless when none is running.
+pub(super) fn stop_loupe_timer(hwnd: HWND) {
+    // SAFETY: hwnd is the live overlay window on this thread; an absent timer is a no-op failure.
+    let _ = unsafe { KillTimer(hwnd, LOUPE_TIMER_ID) };
+}
+
+/// Whether a `WM_KEYDOWN` is the keyboard repeating a key that is already down.
+///
+/// Bit 30 of the message's `lparam` is the previous key state: set means the key was already
+/// down. A hold-to-show key must ignore these — the first press is the only transition, and
+/// treating every repeat as a fresh press would restate the same fact thirty times a second.
+pub(super) const fn key_is_autorepeat(lparam: LPARAM) -> bool {
+    lparam.0 & (1 << 30) != 0
+}
+
+/// The timestamp of the message currently being handled, in milliseconds since the system
+/// started.
+///
+/// `GetMessageTime` rather than a clock read: two mouse messages that arrive together in the
+/// queue must not appear to have crossed the distance between them in zero time, and a paint that
+/// delayed dispatch must not make the pointer look slower than it was. The counter is 32-bit and
+/// rolls over about every 49 days, so every interval derived from it is a wrapping subtraction.
+pub(super) fn message_time_ms() -> u32 {
+    // SAFETY: Reads the timestamp of this thread's message being dispatched. No arguments.
+    unsafe { GetMessageTime() as u32 }
+}
+
+/// The modifier keys held as this message is being handled.
+///
+/// Read here rather than carried in the model because the machine owns no input device.
+/// `GetKeyState` reports the state as of the message currently being processed rather than the
+/// live hardware state, which is exactly what a pointer message wants: the answer belongs to the
+/// move that was posted, not to whatever the user has done since.
+pub(super) fn modifiers() -> Modifiers {
+    // SAFETY: Reads this thread's queued keyboard state for the message being dispatched. No
+    // pointer arguments, no retained state.
+    Modifiers {
+        ctrl: key_is_down(VK_CONTROL.0),
+        shift: key_is_down(VK_SHIFT.0),
+    }
+}
+
+/// The key state the magnifier should adopt when the overlay's focus changes.
+///
+/// One rule in one place, used by both the gain and the loss. Losing focus always disarms: a key
+/// released while another window has focus is delivered to that window, so a held Z would
+/// otherwise stay held forever. Gaining focus re-reads the keyboard, which is the half that was
+/// missing — after an Alt+Tab away and back, Windows delivers only autorepeat `WM_KEYDOWN`s for a
+/// key that was already down, and those are discarded as repeats, so Z could never re-arm. The
+/// same read covers a Z that was already held at the moment the overlay opened.
+pub(super) fn loupe_key_after_focus_change(gained_focus: bool) -> bool {
+    gained_focus && key_is_down(VK_Z.0)
+}
+
+/// Whether a virtual key is held as of the message being dispatched.
+///
+/// `GetKeyState` returns the "currently down" answer in the high-order bit and a toggle state —
+/// Caps Lock and friends — in the low-order one. Testing the sign is the documented way to read
+/// the first without ever seeing the second.
+fn key_is_down(virtual_key: u16) -> bool {
+    // SAFETY: Reads this thread's queued keyboard state. No pointer arguments, nothing retained.
+    unsafe { GetKeyState(i32::from(virtual_key)) < 0 }
+}
+
 pub(super) fn screen_point(source: Rect, lparam: LPARAM) -> POINT {
     let packed = lparam.0 as u32;
     let x = (packed as u16) as i16 as i32;
@@ -517,6 +602,30 @@ mod tests {
     use super::super::UI_FONT_HEIGHT;
     use super::*;
     use windows::Win32::Graphics::Gdi::GetTextFaceW;
+
+    #[test]
+    fn losing_focus_always_disarms_the_magnifier_key() {
+        // The half that can be asserted without a keyboard. Gaining focus re-reads the key, which
+        // is what makes a return from Alt+Tab recover; losing it is unconditional, because a key
+        // released over another window is never reported to this one.
+        assert!(!loupe_key_after_focus_change(false));
+        // And the read on focus gain is the live key state rather than a latched value, so a Z
+        // that is not held cannot be re-armed by the focus change itself.
+        assert_eq!(loupe_key_after_focus_change(true), key_is_down(VK_Z.0));
+    }
+
+    #[test]
+    fn a_repeated_key_press_is_distinguishable_from_a_fresh_one() {
+        // Bit 30 is the previous key state. Everything below it is the repeat count and the scan
+        // code, which a fresh press carries just as a repeat does.
+        assert!(!key_is_autorepeat(LPARAM(0x0001_0001)));
+        assert!(key_is_autorepeat(LPARAM(0x4001_0001)));
+        // Bit 31 is the transition state, set on key-up, and must not be mistaken for it.
+        assert!(!key_is_autorepeat(LPARAM(
+            0xC001_0001_u32 as i32 as isize & !(1 << 30)
+        )));
+        assert!(key_is_autorepeat(LPARAM(0xC001_0001_u32 as i32 as isize)));
+    }
 
     #[test]
     fn window_paint_surface_premultiplies_straight_alpha() {

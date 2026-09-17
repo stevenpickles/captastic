@@ -49,6 +49,41 @@ pub struct HostMatch {
     pub debug_assertions: Option<bool>,
     /// Display geometry as `WIDTHxHEIGHT`, matched against any attached display.
     pub display_resolution: Option<String>,
+    /// Part of a graphics adapter's name, e.g. `RTX 3070`, matched case-insensitively against any
+    /// adapter the host enumerates.
+    ///
+    /// A fragment rather than the full string because the full string is a marketing name that
+    /// changes with a driver package — `NVIDIA GeForce RTX 3070` today — and a budget that stopped
+    /// applying after a driver update would be a budget nobody noticed had stopped.
+    pub gpu: Option<String>,
+    /// An exact user-mode driver version, e.g. `32.0.15.9186`.
+    ///
+    /// Exact, unlike `gpu`: this is for pinning a calibration to the driver it was measured on
+    /// when a regression is being chased, and "roughly this driver" would defeat the purpose.
+    pub driver_version: Option<String>,
+    /// Part of the CPU's name, matched case-insensitively.
+    pub cpu: Option<String>,
+    /// A prefix of the OS build, e.g. `26200` — the build without pinning the monthly revision.
+    pub os_build: Option<String>,
+    /// The session state the budget was measured in, e.g. `interactive`.
+    ///
+    /// A run over Remote Desktop composes onto a virtual adapter DXGI will not duplicate, and a
+    /// locked session measures a desktop nobody is looking at. Neither is the machine the budget
+    /// describes, however identical the hardware underneath is.
+    pub session: Option<String>,
+    /// `ac` or `battery`. The same laptop meets a different budget on each.
+    pub power_source: Option<String>,
+    /// Whether the adapter the run went through is a software rasterizer.
+    ///
+    /// `false` is the one that matters: it is what keeps a GPU acquisition budget from being
+    /// judged on a hosted CI runner, where the figures describe a CPU emulating a GPU. Matched
+    /// against the adapter driving the run's displays rather than against every adapter
+    /// enumerated, because every real desktop also enumerates the Microsoft Basic Render Driver.
+    ///
+    /// Pair it with `synthetic = false`. A synthetic run went through no adapter at all, so there
+    /// is nothing for this to describe; it is reported as unjudgeable rather than matched against
+    /// whatever hardware happens to be in the machine the fake backend ran on.
+    pub software_adapter: Option<bool>,
 }
 
 /// Ceilings in nanoseconds. Absent means unbudgeted.
@@ -78,7 +113,7 @@ pub struct RelativeBudgets {
 }
 
 /// One budget that was checked, and what it found.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BudgetCheck {
     pub name: String,
     pub limit: String,
@@ -87,7 +122,11 @@ pub struct BudgetCheck {
 }
 
 /// The outcome of applying a budget file to a run.
-#[derive(Debug, Serialize)]
+///
+/// Deserializable because it is written into `repeated.json` beside the runs it judged, and a
+/// baseline whose budget verdict cannot be read back is a baseline that has to be re-judged from
+/// scratch to be understood.
+#[derive(Debug, Deserialize, Serialize)]
 pub struct BudgetOutcome {
     pub host: String,
     /// Empty when the budget applied. Populated when it did not, saying why.
@@ -189,16 +228,9 @@ pub fn any_breached(outcomes: &[BudgetOutcome]) -> bool {
 
 fn host_mismatches(host: &HostMatch, report: &BenchmarkReport) -> Vec<String> {
     let mut mismatches = Vec::new();
-    let mut compare = |field: &str, expected: Option<&str>, actual: &str| {
-        if let Some(expected) = expected {
-            if expected != actual {
-                mismatches.push(format!("{field} is {actual}, budget describes {expected}"));
-            }
-        }
-    };
-    compare("backend", host.backend.as_deref(), report.backend);
-    compare("mode", host.mode.as_deref(), &report.mode);
-    compare("cursor", host.cursor.as_deref(), report.cursor);
+    mismatches.extend(compare("backend", host.backend.as_deref(), &report.backend));
+    mismatches.extend(compare("mode", host.mode.as_deref(), &report.mode));
+    mismatches.extend(compare("cursor", host.cursor.as_deref(), &report.cursor));
     if let Some(expected) = host.synthetic {
         if expected != report.synthetic {
             mismatches.push(format!(
@@ -229,7 +261,102 @@ fn host_mismatches(host: &HostMatch, report: &BenchmarkReport) -> Vec<String> {
             ));
         }
     }
+    let adapters = &report.environment.adapters;
+    if let Some(expected) = host.gpu.as_deref() {
+        let wanted = expected.to_lowercase();
+        if !adapters
+            .iter()
+            .any(|adapter| adapter.description.to_lowercase().contains(&wanted))
+        {
+            mismatches.push(format!(
+                "no adapter matches {expected}; this run had [{}]",
+                describe(adapters.iter().map(|adapter| adapter.description.clone()))
+            ));
+        }
+    }
+    if let Some(expected) = host.driver_version.as_deref() {
+        if !adapters
+            .iter()
+            .any(|adapter| adapter.driver_version.as_deref() == Some(expected))
+        {
+            mismatches.push(format!(
+                "no adapter is on driver {expected}; this run had [{}]",
+                describe(
+                    adapters
+                        .iter()
+                        .map(|adapter| adapter.driver_version.clone().unwrap_or_else(unknown))
+                )
+            ));
+        }
+    }
+    if let Some(expected) = host.cpu.as_deref() {
+        let actual = report.environment.cpu.clone().unwrap_or_else(unknown);
+        if !actual.to_lowercase().contains(&expected.to_lowercase()) {
+            mismatches.push(format!("cpu is {actual}, budget describes {expected}"));
+        }
+    }
+    if let Some(expected) = host.os_build.as_deref() {
+        let actual = report.environment.os_build.clone().unwrap_or_else(unknown);
+        if !actual.starts_with(expected) {
+            mismatches.push(format!("os_build is {actual}, budget describes {expected}"));
+        }
+    }
+    mismatches.extend(compare(
+        "session",
+        host.session.as_deref(),
+        &report.environment.session.clone().unwrap_or_else(unknown),
+    ));
+    mismatches.extend(compare(
+        "power_source",
+        host.power_source.as_deref(),
+        &report
+            .environment
+            .power_source
+            .clone()
+            .unwrap_or_else(unknown),
+    ));
+    if let Some(expected) = host.software_adapter {
+        // A synthetic run's frames came from `FakeBackend`, not from any adapter. The fingerprint
+        // still describes the machine it ran on — a real desktop with a real GPU — so without this
+        // the check would answer "not a software adapter" about hardware the run never touched,
+        // and a budget could be judged as applying to a measurement of nothing. Reported rather
+        // than skipped silently, because a budget file that asked for this deserves to be told its
+        // question could not be answered.
+        if report.synthetic {
+            mismatches.push(format!(
+                "this run was synthetic, so it went through no graphics adapter and software_adapter = {expected} cannot be checked"
+            ));
+        } else {
+            match report.environment.primary_adapter() {
+                Some(adapter) if adapter.software != expected => {
+                    mismatches.push(format!(
+                        "the adapter this run used ({}) {} a software rasterizer, budget describes software_adapter = {expected}",
+                        adapter.description,
+                        if adapter.software { "is" } else { "is not" }
+                    ));
+                }
+                Some(_) => {}
+                None => mismatches.push(format!(
+                    "this run named no graphics adapter, so software_adapter = {expected} cannot be checked"
+                )),
+            }
+        }
+    }
     mismatches
+}
+
+/// One field's mismatch, in the wording every skip reason shares, or `None` when it matched.
+fn compare(field: &str, expected: Option<&str>, actual: &str) -> Option<String> {
+    let expected = expected?;
+    (expected != actual).then(|| format!("{field} is {actual}, budget describes {expected}"))
+}
+
+fn unknown() -> String {
+    "unknown".to_owned()
+}
+
+fn describe(values: impl Iterator<Item = String>) -> String {
+    values.collect::<Vec<_>>().join(", ")
 }
 
 fn checks(budget: &BudgetFile, report: &BenchmarkReport) -> Vec<BudgetCheck> {
@@ -480,6 +607,323 @@ mod tests {
         let mixed = evaluate_each(&budget, &[good.clone(), bad, good]);
         assert!(any_breached(&mixed));
         assert_eq!(mixed.iter().filter(|outcome| outcome.breached()).count(), 1);
+    }
+
+    /// A report describing a real run on a real desktop: a GPU, and the Basic Render Driver every
+    /// desktop has beside it.
+    ///
+    /// `synthetic` is cleared because these tests exercise the adapter checks, and a synthetic run
+    /// is deliberately unjudgeable on its adapter — it went through none.
+    fn report_on_a_gpu() -> BenchmarkReport {
+        use crate::fingerprint::AdapterFingerprint;
+        let mut report = report();
+        report.backend = "dxgi".to_owned();
+        report.synthetic = false;
+        report.environment.adapters = vec![
+            AdapterFingerprint {
+                description: "NVIDIA GeForce RTX 3070".to_owned(),
+                vendor_id: 0x10de,
+                device_id: 0x2484,
+                luid: 62_908,
+                software: false,
+                dedicated_video_memory_mb: 8_018,
+                driver_version: Some("32.0.15.9186".to_owned()),
+            },
+            AdapterFingerprint {
+                description: "Microsoft Basic Render Driver".to_owned(),
+                vendor_id: 0x1414,
+                device_id: 0x8c,
+                luid: 69_935,
+                software: true,
+                dedicated_video_memory_mb: 0,
+                driver_version: Some("10.0.26100.9278".to_owned()),
+            },
+        ];
+        report.environment.cpu = Some("AMD Ryzen 9 5900X 12-Core Processor".to_owned());
+        report.environment.os_build = Some("26200.9457 (25H2)".to_owned());
+        report.environment.session = Some("interactive".to_owned());
+        report.environment.power_source = Some("ac".to_owned());
+        report
+    }
+
+    fn documented_host() -> HostMatch {
+        HostMatch {
+            description: "the bench box".to_owned(),
+            gpu: Some("RTX 3070".to_owned()),
+            cpu: Some("ryzen 9 5900x".to_owned()),
+            os_build: Some("26200".to_owned()),
+            session: Some("interactive".to_owned()),
+            power_source: Some("ac".to_owned()),
+            software_adapter: Some(false),
+            ..HostMatch::default()
+        }
+    }
+
+    #[test]
+    fn the_documented_host_matches_the_machine_it_documents() {
+        // Including the detail that made "is any adapter a software one" the wrong question: this
+        // desktop enumerates the Basic Render Driver beside its GPU, as every desktop does, and a
+        // budget that read that as "software rasterizer" would never apply anywhere real.
+        let budget = BudgetFile {
+            host: documented_host(),
+            absolute: AbsoluteBudgets::default(),
+            relative: RelativeBudgets {
+                failure_percent: Some(0.0),
+                ..RelativeBudgets::default()
+            },
+        };
+        let outcome = evaluate(&budget, &report_on_a_gpu());
+        assert!(outcome.applied(), "{outcome:?}");
+        // A fragment of the marketing name matches, so a driver package rewording it does not
+        // unpin the budget.
+        let mut renamed = report_on_a_gpu();
+        renamed.environment.adapters[0].description = "NVIDIA GeForce RTX 3070 Ti".to_owned();
+        assert!(evaluate(&budget, &renamed).applied());
+    }
+
+    #[test]
+    fn a_run_on_a_software_adapter_is_skipped_loudly_and_told_why() {
+        // The hosted CI case, which is why `software_adapter` exists at all: every GPU acquisition
+        // figure there describes a CPU emulating a GPU, so nothing may be judged and the reason
+        // has to be visible rather than absorbed into a pass.
+        let mut report = report_on_a_gpu();
+        report.environment.adapters.remove(0);
+        let budget = BudgetFile {
+            host: documented_host(),
+            absolute: AbsoluteBudgets {
+                native_frame_p50_ns: Some(1),
+                ..AbsoluteBudgets::default()
+            },
+            relative: RelativeBudgets::default(),
+        };
+
+        let outcome = evaluate(&budget, &report);
+        assert!(!outcome.applied());
+        // Emphatically not a breach: nothing was judged, so nothing failed.
+        assert!(!outcome.breached());
+        assert!(outcome.checks.is_empty());
+        let text = outcome.to_string();
+        assert!(text.contains("Microsoft Basic Render Driver"), "{text}");
+        assert!(text.contains("software_adapter = false"), "{text}");
+        // And the GPU the budget names is missing too, which is said rather than implied.
+        assert!(text.contains("RTX 3070"), "{text}");
+        assert!(text.contains("nothing was judged"), "{text}");
+    }
+
+    #[test]
+    fn every_new_host_field_can_refuse_a_run_and_says_which_one_did() {
+        let reasons = |host: HostMatch, report: &BenchmarkReport| {
+            let budget = BudgetFile {
+                host,
+                absolute: AbsoluteBudgets::default(),
+                relative: RelativeBudgets::default(),
+            };
+            evaluate(&budget, report).skipped_because
+        };
+        let report = report_on_a_gpu();
+
+        for (host, expected) in [
+            (
+                HostMatch {
+                    gpu: Some("RX 7900".to_owned()),
+                    ..HostMatch::default()
+                },
+                "RX 7900",
+            ),
+            (
+                HostMatch {
+                    driver_version: Some("31.0.15.7270".to_owned()),
+                    ..HostMatch::default()
+                },
+                "31.0.15.7270",
+            ),
+            (
+                HostMatch {
+                    cpu: Some("Core i9".to_owned()),
+                    ..HostMatch::default()
+                },
+                "cpu is",
+            ),
+            (
+                HostMatch {
+                    os_build: Some("22631".to_owned()),
+                    ..HostMatch::default()
+                },
+                "os_build is",
+            ),
+            (
+                HostMatch {
+                    power_source: Some("battery".to_owned()),
+                    ..HostMatch::default()
+                },
+                "power_source is",
+            ),
+        ] {
+            let skipped = reasons(host, &report);
+            assert_eq!(skipped.len(), 1, "{skipped:?}");
+            assert!(skipped[0].contains(expected), "{skipped:?}");
+        }
+
+        // The session is checked against a run that was not at the desk, which is the mismatch
+        // that actually happens: the same machine, over Remote Desktop.
+        let mut remote = report;
+        remote.environment.session = Some("remote".to_owned());
+        let skipped = reasons(
+            HostMatch {
+                session: Some("interactive".to_owned()),
+                ..HostMatch::default()
+            },
+            &remote,
+        );
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert!(skipped[0].contains("session is remote"), "{skipped:?}");
+    }
+
+    #[test]
+    fn a_host_fact_the_machine_would_not_answer_does_not_pass_by_default() {
+        // Absence is not agreement. A budget that names a session must not apply to a run whose
+        // session could not be determined, or the skip it exists to cause never happens.
+        let mut report = report_on_a_gpu();
+        report.environment.session = None;
+        report.environment.power_source = None;
+        let skipped = evaluate(
+            &BudgetFile {
+                host: HostMatch {
+                    session: Some("interactive".to_owned()),
+                    power_source: Some("ac".to_owned()),
+                    ..HostMatch::default()
+                },
+                absolute: AbsoluteBudgets::default(),
+                relative: RelativeBudgets::default(),
+            },
+            &report,
+        )
+        .skipped_because;
+        assert_eq!(skipped.len(), 2, "{skipped:?}");
+    }
+
+    #[test]
+    fn the_committed_budget_file_still_parses() {
+        // `deny_unknown_fields` is the point of this test. The file is hand-edited and nothing
+        // else in the suite reads it, so a renamed or mistyped host field would first be noticed
+        // by whoever was mid-way through a measuring session with the machine set up for it.
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/budgets.toml");
+        let budget = load(&path).expect("the committed budget file parses");
+        assert_eq!(budget.host.gpu.as_deref(), Some("RTX 3070"));
+        assert_eq!(budget.host.session.as_deref(), Some("interactive"));
+        assert_eq!(budget.host.power_source.as_deref(), Some("ac"));
+        assert_eq!(budget.host.software_adapter, Some(false));
+        // The description is prose for the skip message; nothing is derived from it.
+        assert!(budget.host.description.contains("RTX 3070"));
+    }
+
+    #[test]
+    fn the_software_adapter_reasons_read_as_sentences() {
+        // Asserted whole rather than by substring, because the defect this catches was invisible
+        // to a substring: a line-continuation in the source left a twenty-space gap mid-sentence,
+        // and every `contains` assertion around it passed. A skip reason is read by a person
+        // deciding whether a number may be published, so the text is the feature.
+        let budget = |host: HostMatch| BudgetFile {
+            host,
+            absolute: AbsoluteBudgets::default(),
+            relative: RelativeBudgets::default(),
+        };
+        let wants_a_gpu = HostMatch {
+            software_adapter: Some(false),
+            ..HostMatch::default()
+        };
+
+        let mut on_a_rasterizer = report_on_a_gpu();
+        on_a_rasterizer.environment.adapters.remove(0);
+        assert_eq!(
+            evaluate(&budget(wants_a_gpu.clone()), &on_a_rasterizer).skipped_because,
+            vec![
+                "the adapter this run used (Microsoft Basic Render Driver) is a software \
+                 rasterizer, budget describes software_adapter = false"
+                    .to_owned()
+            ]
+        );
+
+        let mut nameless = report_on_a_gpu();
+        nameless.environment.adapters.clear();
+        assert_eq!(
+            evaluate(&budget(wants_a_gpu), &nameless).skipped_because,
+            vec![
+                "this run named no graphics adapter, so software_adapter = false cannot be checked"
+                    .to_owned()
+            ]
+        );
+
+        // And the other direction: a budget that asks for a software adapter and finds a GPU.
+        assert_eq!(
+            evaluate(
+                &budget(HostMatch {
+                    software_adapter: Some(true),
+                    ..HostMatch::default()
+                }),
+                &report_on_a_gpu()
+            )
+            .skipped_because,
+            vec![
+                "the adapter this run used (NVIDIA GeForce RTX 3070) is not a software rasterizer, \
+                 budget describes software_adapter = true"
+                    .to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_synthetic_run_is_not_judged_on_hardware_it_never_touched() {
+        // `captastic benchmark --backend fake` on a real desktop produces a fingerprint full of
+        // real hardware — that is the point of the fingerprint — but the frames came from
+        // `FakeBackend`. Judging `software_adapter` on the GPU sitting beside it would have the
+        // budget apply to a measurement of configured delays.
+        //
+        // The committed budget file pins `synthetic = false` and so skips such a run anyway; this
+        // is about the budget that forgets to, which is the one that would quietly mislead.
+        let mut synthetic = report_on_a_gpu();
+        synthetic.backend = "fake".to_owned();
+        synthetic.synthetic = true;
+        let outcome = evaluate(
+            &BudgetFile {
+                host: HostMatch {
+                    software_adapter: Some(false),
+                    ..HostMatch::default()
+                },
+                absolute: AbsoluteBudgets {
+                    native_frame_p50_ns: Some(1),
+                    ..AbsoluteBudgets::default()
+                },
+                relative: RelativeBudgets::default(),
+            },
+            &synthetic,
+        );
+
+        assert!(!outcome.applied());
+        assert!(!outcome.breached());
+        assert_eq!(
+            outcome.skipped_because,
+            vec![
+                "this run was synthetic, so it went through no graphics adapter and \
+                  software_adapter = false cannot be checked"
+                    .to_owned()
+            ]
+        );
+        // The same fingerprint on a real run is judged normally, so this is a statement about the
+        // backend rather than about the machine.
+        assert!(evaluate(
+            &BudgetFile {
+                host: HostMatch {
+                    software_adapter: Some(false),
+                    ..HostMatch::default()
+                },
+                absolute: AbsoluteBudgets::default(),
+                relative: RelativeBudgets::default(),
+            },
+            &report_on_a_gpu()
+        )
+        .applied());
     }
 
     #[test]

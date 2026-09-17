@@ -38,7 +38,7 @@ use captastic_config::{
 use captastic_core::{
     validate_event_order, CaptureBackend, CaptureError, CaptureErrorKind, CaptureId, CaptureMode,
     CaptureRequest, CaptureSource, CpuFrame, CursorAbsence, CursorCapture, CursorMode, DisplayId,
-    DisplayInfo, EventRecorder, FrameMetadata, NativeFrame, PerfEventKind, Rect, TimingProvenance,
+    EncodeOptions, EventRecorder, FrameMetadata, NativeFrame, OutputFormat, PerfEventKind, Rect,
 };
 #[cfg(windows)]
 use serde_json::json;
@@ -78,10 +78,14 @@ struct ResolvedDaemonArgs {
     output_directory: std::path::PathBuf,
     output_queue_capacity: usize,
     output_filename_template: String,
+    output_format: OutputFormat,
+    output_encode_options: EncodeOptions,
     history_store: captastic_config::HistoryStore,
     history_retention: captastic_config::RetentionPolicy,
     selection: bool,
     selection_preview: PreviewMode,
+    /// Readback slots the capture engine is built with; see `crate::cpu_slot_count`.
+    cpu_slots: usize,
     trigger_queue_capacity: usize,
     hotkey_bindings: Vec<HotkeyBinding>,
     confirmed_regions: BTreeMap<String, ConfirmedRegion>,
@@ -173,6 +177,10 @@ fn resolve_daemon_args_with_default(
             max_age_ms: (maximum_age != 0).then_some(maximum_age),
         },
     };
+    // The same resolution a one-shot capture uses, so `captastic capture` and the daemon cannot
+    // disagree about where a capture went. Resolved before the struct below starts consuming
+    // `config`.
+    let output_directory = super::configured_output_directory(&config)?;
     Ok(ResolvedDaemonArgs {
         backend: args.backend.unwrap_or(config.daemon.backend),
         display_policy: super::resolve_display_policy(
@@ -187,17 +195,16 @@ fn resolve_daemon_args_with_default(
         cpu_frame: args.cpu_frame.unwrap_or(config.capture.cpu_frame),
         clipboard: args.clipboard.unwrap_or(config.clipboard.enabled),
         file_output: config.output.enabled,
-        output_directory: config
-            .output
-            .directory
-            .clone()
-            .or_else(captastic_config::default_output_directory)
-            .ok_or(AppError::BackendUnavailable(
-                "unable to determine a default output directory from USERPROFILE or HOME"
-                    .to_owned(),
-            ))?,
+        output_directory,
         output_queue_capacity: config.output.queue_capacity,
         output_filename_template: config.output.filename_template.clone(),
+        output_format: config.output.format,
+        // PNG effort stays at the default `Compact`: a file write happens on a worker thread where
+        // bytes on disk matter more than microseconds, and that is not a user's decision to make.
+        output_encode_options: EncodeOptions {
+            jpeg_quality: config.output.jpeg_quality,
+            ..EncodeOptions::default()
+        },
         history_store: args.config.as_ref().map_or_else(
             captastic_config::HistoryStore::for_default_storage,
             captastic_config::HistoryStore::for_config,
@@ -205,6 +212,11 @@ fn resolve_daemon_args_with_default(
         history_retention: config.history.retention(),
         selection: args.selection.unwrap_or(config.selection.enabled),
         selection_preview: config.selection.preview,
+        cpu_slots: crate::cpu_slot_count(
+            config.capture.buffer_slots,
+            args.selection.unwrap_or(config.selection.enabled),
+            config.selection.queue_capacity,
+        ),
         trigger_queue_capacity: config.daemon.trigger_queue_capacity,
         clipboard_queue_capacity: config.clipboard.queue_capacity,
         clipboard_retention: captastic_windows::ClipboardRetention {
@@ -224,6 +236,34 @@ fn resolve_daemon_args_with_default(
     })
 }
 
+/// Starts the file destination from the resolved configuration.
+///
+/// One function for both the daemon's startup and the notification area's "Save Captures to
+/// Disk", so a worker started an hour into a session is configured exactly like one started with
+/// the daemon. The settings come from the configuration as it was read at startup, which is the
+/// same rule every other behavioural setting follows: hand edits take effect on the next start.
+///
+/// `start` validates the filename template and creates the output directory before it spawns, so
+/// both of those happen on whichever thread calls this — the main thread at startup, the daemon
+/// thread for a tray toggle. Never the capture thread, which is what ADR 0002 is about.
+#[cfg(windows)]
+fn start_file_output(
+    args: &ResolvedDaemonArgs,
+) -> Result<crate::file_output::FileOutputWorker, AppError> {
+    crate::file_output::FileOutputWorker::start(
+        args.output_directory.clone(),
+        args.output_filename_template.clone(),
+        args.output_format,
+        args.output_encode_options,
+        crate::file_output::HistoryRecorder::new(
+            args.history_store.clone(),
+            args.history_retention,
+        ),
+        args.json,
+        args.output_queue_capacity,
+    )
+}
+
 /// Everything the capture thread needs, gathered so the thread body can be a named function.
 ///
 /// It used to be a 560-line closure inside `run`, which is most of why `run` was unreadable: the
@@ -238,6 +278,7 @@ struct CaptureWorkerContext {
     cpu_frame: bool,
     selection_enabled: bool,
     selection_preview: PreviewMode,
+    cpu_slots: usize,
     max_captures: Option<usize>,
     json_output: bool,
     confirmed_regions: crate::selection::ConfirmedRegionCache,
@@ -248,8 +289,9 @@ struct CaptureWorkerContext {
     done: mpsc::SyncSender<Result<(), AppError>>,
     commands: mpsc::Receiver<CaptureCommand>,
     selection_sender: Option<mpsc::SyncSender<crate::selection::SelectionJob>>,
-    /// Every destination a finished capture is offered to, in the order they were configured.
-    destinations: Vec<crate::output::ChannelSink>,
+    /// Every destination a finished capture is offered to, read per capture because the set can
+    /// change while the daemon runs.
+    destinations: crate::output::OutputDestinations,
 }
 
 #[cfg(windows)]
@@ -262,6 +304,7 @@ fn run_capture_worker(context: CaptureWorkerContext) {
         cpu_frame,
         selection_enabled,
         selection_preview,
+        cpu_slots,
         max_captures,
         json_output,
         confirmed_regions: capture_confirmed_regions,
@@ -274,14 +317,8 @@ fn run_capture_worker(context: CaptureWorkerContext) {
         selection_sender,
         destinations,
     } = context;
-    // Resolved once: the loop offers every capture to the same set, and building the trait-object
-    // view per capture would allocate on the path this worker exists to keep clear.
-    let destination_refs: Vec<&dyn crate::output::OutputSink> = destinations
-        .iter()
-        .map(|sink| sink as &dyn crate::output::OutputSink)
-        .collect();
     let mut recovery: Option<BackendRecovery> = None;
-    let mut backend = match super::create_backend(&backend_name, &display_policy) {
+    let mut backend = match super::create_backend(&backend_name, &display_policy, cpu_slots) {
         Ok(backend) => Some(backend),
         // A desktop that is not ours yet is not a reason to give up on the whole daemon. The user
         // is at a lock screen and will come back; a resident tool that exits because of that is
@@ -365,7 +402,7 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                 }
             } else {
                 backend.take();
-                match super::create_backend(&backend_name, &display_policy) {
+                match super::create_backend(&backend_name, &display_policy, cpu_slots) {
                     Ok(replacement) => {
                         let waited = recovery
                             .as_ref()
@@ -469,22 +506,23 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                     }
                     continue;
                 }
-                if selection_enabled
-                    && selection_preview != PreviewMode::Frozen
-                    && matches!(action_route(trigger.action), ActionRoute::Overlay(_))
-                {
-                    // The overlay is placed from the engine's display list and nothing captures
-                    // until the user confirms, so this is the only chance to notice that a
-                    // monitor change has left the list stale. Rebuild first; the frozen path gets
-                    // the same protection from its immediate capture.
+                if trigger_may_open_an_overlay(selection_enabled, trigger.action) {
+                    // Runs for *every* press that could open an overlay, not only the ones that
+                    // would capture after confirmation. The overlay is placed from the engine's
+                    // display list, and the confirmation capture a live-view confirm takes is
+                    // asked for against whatever list the engine holds by then; a monitor change
+                    // between two presses used to open the overlay on the previous arrangement
+                    // and produce a capture describing bounds the drawn region no longer fit
+                    // inside. Since any press can now end in a confirmation capture, any press
+                    // that can reach the overlay needs this check.
                     let (validation, recovery_attempts, reinitialize_error) =
                         ensure_current_display_configuration(
                             &mut backend,
-                            || super::create_backend(&backend_name, &display_policy),
+                            || super::create_backend(&backend_name, &display_policy, cpu_slots),
                             |delay| wait_for_backoff(delay, &worker_stop_requested),
                             |attempt, delay, error| {
                                 crate::logging::warn(format_args!(
-                                    "live selection {} found the capture engine's display list stale; rebuilding it {}/{} in {:.0} ms: {error}",
+                                    "selection {} found the capture engine's display list stale; rebuilding it {}/{} in {:.0} ms: {error}",
                                     capture_id.0,
                                     attempt,
                                     CAPTURE_RECOVERY_RETRIES,
@@ -494,7 +532,7 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                         );
                     if let Some(reinitialize_error) = reinitialize_error {
                         crate::logging::warn(format_args!(
-                            "capture engine reinitialization failed before live selection {}: {reinitialize_error}",
+                            "capture engine reinitialization failed before selection {}: {reinitialize_error}",
                             capture_id.0
                         ));
                         recovery = Some(BackendRecovery::after_failure(
@@ -508,7 +546,7 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                             recovery = Some(BackendRecovery::immediate());
                         }
                         crate::logging::error(format_args!(
-                            "live selection {} could not verify the display configuration: {error}",
+                            "selection {} could not verify the display configuration: {error}",
                             capture_id.0
                         ));
                         // The hotkey was pressed and no overlay will appear. A dock event is a
@@ -523,77 +561,11 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                     }
                     if recovery_attempts > 0 {
                         log::info!(
-                            "capture engine rebuilt for live selection {} after {} attempt(s)",
+                            "capture engine rebuilt for selection {} after {} attempt(s)",
                             capture_id.0,
                             recovery_attempts
                         );
                     }
-                    let active_backend = backend.as_ref().expect("a validated backend is present");
-                    let source = match super::resolve_capture_source(
-                        &display_policy,
-                        active_backend.displays(),
-                    ) {
-                        Ok(source) => source,
-                        Err(error) => {
-                            crate::logging::error(format_args!(
-                                "live selection {} could not resolve its display: {error}",
-                                capture_id.0
-                            ));
-                            continue;
-                        }
-                    };
-                    let metadata = match preview_metadata(
-                        capture_id,
-                        &source,
-                        active_backend.displays(),
-                        mode.clone(),
-                    ) {
-                        Ok(metadata) => metadata,
-                        Err(error) => {
-                            crate::logging::error(format_args!(
-                                "live selection {} could not describe its display: {error}",
-                                capture_id.0
-                            ));
-                            continue;
-                        }
-                    };
-                    let Some(sender) = selection_sender.as_ref() else {
-                        crate::logging::error(format_args!(
-                            "live selection {} has no selection worker",
-                            capture_id.0
-                        ));
-                        continue;
-                    };
-                    let recorder = trigger_recorder(capture_id, &trigger);
-                    let output_status = match output_status_or_fatal(
-                        capture_id,
-                        dispatch_live_selection(
-                            sender,
-                            capture_id,
-                            &trigger,
-                            action_route(trigger.action),
-                            metadata,
-                            &cached_ui,
-                            selection_preview,
-                            recorder,
-                        ),
-                    ) {
-                        Ok(status) => status,
-                        Err(error) => {
-                            let _ = done_sender.send(Err(error));
-                            break;
-                        }
-                    };
-                    if queued_to_selection_worker(output_status) {
-                        selections_in_flight = selections_in_flight.saturating_add(1);
-                    }
-                    log::info!(
-                        "capture {} action={} output={}",
-                        capture_id.0,
-                        trigger.action,
-                        output_status
-                    );
-                    continue;
                 }
                 let (capture_result, mut recorder, recovery_attempts, reinitialize_error) =
                     capture_with_backend_recovery(
@@ -624,7 +596,7 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                             });
                             (capture_result, recorder)
                         },
-                        || super::create_backend(&backend_name, &display_policy),
+                        || super::create_backend(&backend_name, &display_policy, cpu_slots),
                         |delay| wait_for_backoff(delay, &worker_stop_requested),
                         |attempt, delay, error| {
                             crate::logging::warn(format_args!(
@@ -660,11 +632,15 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                             .as_ref()
                             .map(captastic_core::CpuFrame::required_bytes);
                         let native_frame_retained = outcome.native_frame.is_some();
+                        // Read here rather than once outside the loop: the notification area
+                        // can start or stop the file worker between two captures, and this
+                        // capture is offered to the set that exists now. One atomic increment.
+                        let destinations = destinations.current();
                         let output_status = match output_status_or_fatal(
                             capture_id,
                             dispatch_output(
                                 selection_sender.as_ref(),
-                                &destination_refs,
+                                &destinations,
                                 capture_id,
                                 trigger.received_at,
                                 trigger.source,
@@ -729,6 +705,23 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                             "capture {} action={} failed: {error}",
                             capture_id.0, trigger.action
                         ));
+                        // A press that was going to open an overlay and instead opened nothing is
+                        // a loss the user is standing right there for, and the log is not where
+                        // they are looking. Narrow on purpose: the pipeline's own transient
+                        // failures are absorbed and retried, and a balloon for each would train
+                        // the user to ignore the one that means their capture is gone.
+                        if capture_failure_denies_an_overlay(&error)
+                            && trigger_may_open_an_overlay(selection_enabled, trigger.action)
+                        {
+                            report_selection_lost_before_the_overlay(
+                                &capture_notices,
+                                capture_id,
+                                trigger.source,
+                                CAPTURE_BUFFERS_EXHAUSTED_REASON,
+                                &error.to_string(),
+                                json_output,
+                            );
+                        }
                         if requires_backend_recovery(&error) && recovery.is_none() {
                             backend.take();
                             recovery = Some(BackendRecovery::immediate());
@@ -790,7 +783,7 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                                 active_backend.capture(&capture_request, &mut request.job.recorder);
                             (result, ())
                         },
-                        || super::create_backend(&backend_name, &display_policy),
+                        || super::create_backend(&backend_name, &display_policy, cpu_slots),
                         |delay| wait_for_backoff(delay, &worker_stop_requested),
                         |attempt, delay, error| {
                             crate::logging::warn(format_args!(
@@ -856,6 +849,16 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                                 capture_id,
                                 reason: DISPLAY_LAYOUT_CHANGED_REASON,
                             });
+                        } else if capture_failure_denies_an_overlay(&error) {
+                            // The user drew a region, pressed Capture, and got nothing. The
+                            // selection worker will file the `selection_failed` JSON from the
+                            // terminal error; the balloon is raised here because its failures
+                            // otherwise reach only the log, and this one is the user's own doing
+                            // and their own to fix.
+                            let _ = capture_notices.try_send(DaemonNotice::DroppedSelection {
+                                capture_id,
+                                reason: CAPTURE_BUFFERS_EXHAUSTED_REASON,
+                            });
                         }
                         request.job.terminal_error = Some(error.to_string());
                         request.job.confirmed_selection = Some(request.selection);
@@ -873,112 +876,6 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                             &capture_notices,
                             job,
                             "it could not resume after its confirmation capture",
-                        );
-                    }
-                }
-            }
-            CaptureCommand::FrozenSelectionFallback(mut request) => {
-                let capture_id = request.job.capture_id;
-                let capture_source =
-                    if request.job.metadata.display_id == DisplayId::virtual_desktop() {
-                        CaptureSource::VirtualDesktop
-                    } else {
-                        CaptureSource::Display(request.job.metadata.display_id.clone())
-                    };
-                if backend.is_none() {
-                    request.job.terminal_error = Some(
-                        "capture engine is recovering during automatic preview fallback".to_owned(),
-                    );
-                    match crate::selection::try_submit(
-                        selection_sender
-                            .as_ref()
-                            .expect("preview fallback requires its selection worker"),
-                        request.job,
-                    ) {
-                        Ok(()) => {}
-                        Err(crate::selection::SubmitError::Full(job))
-                        | Err(crate::selection::SubmitError::Disconnected(job)) => {
-                            // The attempt ends here, so it can no longer report completion.
-                            selections_in_flight = selections_in_flight.saturating_sub(1);
-                            report_dropped_selection(
-                                    &capture_notices,
-                                    job,
-                                    "its preview fallback could not be queued while the capture engine was recovering",
-                                );
-                        }
-                    }
-                    continue;
-                }
-                let capture_request = CaptureRequest {
-                    id: capture_id,
-                    triggered_at: request.requested_at,
-                    source: capture_source,
-                    mode: mode.clone(),
-                    cpu_frame: true,
-                    retain_native_frame: true,
-                    // A frozen preview is captured before the overlay exists, so its pointer is
-                    // the user's own and the configured policy applies unchanged.
-                    cursor,
-                };
-                let (capture_result, (), recovery_attempts, reinitialize_error) =
-                    capture_with_backend_recovery(
-                        &mut backend,
-                        |active_backend| {
-                            let result =
-                                active_backend.capture(&capture_request, &mut request.job.recorder);
-                            (result, ())
-                        },
-                        || super::create_backend(&backend_name, &display_policy),
-                        |delay| wait_for_backoff(delay, &worker_stop_requested),
-                        |attempt, delay, error| {
-                            crate::logging::warn(format_args!(
-                                    "preview fallback capture {} lost the engine; retrying {}/{} in {:.0} ms: {error}",
-                                    capture_id.0,
-                                    attempt,
-                                    CAPTURE_RECOVERY_RETRIES,
-                                    delay.as_secs_f64() * 1_000.0
-                                ));
-                        },
-                    );
-                if let Some(reinitialize_error) = reinitialize_error {
-                    recovery = Some(BackendRecovery::after_failure(
-                        recovery_attempts,
-                        waiting_for_desktop(&reinitialize_error),
-                    ));
-                    crate::logging::warn(format_args!(
-                            "capture engine reinitialization failed during preview fallback {}: {reinitialize_error}",
-                            capture_id.0
-                        ));
-                }
-                match capture_result {
-                    Ok(outcome) => {
-                        request.job.cpu_ready_offset_ns =
-                            Some(duration_ns(request.job.triggered_at, Instant::now()));
-                        request.job.metadata = outcome.metadata;
-                        request.job.frame = outcome.frame;
-                        request.job.native_frame = outcome.native_frame;
-                        request.job.confirmation_anchored = false;
-                    }
-                    Err(error) => {
-                        if requires_backend_recovery(&error) && recovery.is_none() {
-                            backend.take();
-                            recovery = Some(BackendRecovery::immediate());
-                        }
-                        request.job.terminal_error = Some(error.to_string());
-                    }
-                }
-                let sender = selection_sender
-                    .as_ref()
-                    .expect("preview fallback requires its selection worker");
-                match crate::selection::try_submit(sender, request.job) {
-                    Ok(()) => {}
-                    Err(crate::selection::SubmitError::Full(job))
-                    | Err(crate::selection::SubmitError::Disconnected(job)) => {
-                        selections_in_flight = selections_in_flight.saturating_sub(1);
-                        report_dropped_selection(
-                            &capture_notices,
-                            job,
-                            "it could not resume with its frozen preview fallback",
                         );
                     }
                 }
@@ -1065,19 +962,15 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     }
     let mut file_output_worker = args
         .file_output
-        .then(|| {
-            crate::file_output::FileOutputWorker::start(
-                args.output_directory.clone(),
-                args.output_filename_template.clone(),
-                crate::file_output::HistoryRecorder::new(
-                    args.history_store.clone(),
-                    args.history_retention,
-                ),
-                args.json,
-                args.output_queue_capacity,
-            )
-        })
+        .then(|| start_file_output(&args))
         .transpose()?;
+    if let Some(worker) = file_output_worker.as_ref() {
+        // The tray toggle already says this when it starts a worker an hour into a session. A
+        // daemon that started with file output on said nothing, which is precisely the case where
+        // the directory is a default nobody chose — and, when the shell's Pictures folder has been
+        // redirected, not the one a user would guess. One line, once, naming the resolved path.
+        log::info!("saving captures to {}", worker.directory().display());
+    }
     let mut clipboard_worker = args
         .clipboard
         .then(|| {
@@ -1089,16 +982,20 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         })
         .transpose()?;
     // Clipboard first so it keeps its place in the logs when file output joins it.
-    let destinations: Vec<crate::output::ChannelSink> = clipboard_worker
-        .as_ref()
-        .map(crate::clipboard::ClipboardWorker::sink)
-        .into_iter()
-        .chain(
-            file_output_worker
-                .as_ref()
-                .map(crate::file_output::FileOutputWorker::sink),
-        )
-        .collect();
+    let destinations = crate::output::OutputDestinations::new(
+        clipboard_worker
+            .as_ref()
+            .map(crate::clipboard::ClipboardWorker::sink)
+            .map(|sink| Arc::new(sink) as Arc<dyn crate::output::OutputSink>)
+            .into_iter()
+            .chain(
+                file_output_worker
+                    .as_ref()
+                    .map(crate::file_output::FileOutputWorker::sink)
+                    .map(|sink| Arc::new(sink) as Arc<dyn crate::output::OutputSink>),
+            )
+            .collect(),
+    );
     let (command_sender, command_receiver) = mpsc::sync_channel(args.trigger_queue_capacity);
     // Both workers can be forced to abandon work the user asked for; the main thread owns the
     // notification area, so notices travel to it on their own bounded channel rather than through
@@ -1111,13 +1008,12 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         .then(|| {
             crate::selection::SelectionWorker::start(
                 // Every destination, so a capture confirmed in the overlay reaches the same
-                // places a direct one does. No `.expect` here any more either: an empty list is a
-                // thing the type can say, and the configuration validator already rejects a
-                // selection with nowhere to send its result.
-                destinations
-                    .iter()
-                    .map(|sink| Box::new(sink.clone()) as Box<dyn crate::output::OutputSink>)
-                    .collect(),
+                // places a direct one does — and the same live set, so a selection confirmed
+                // after the user turned file output on lands on disk like a direct capture
+                // would. No `.expect` here either: an empty set is a thing the type can say, and
+                // the configuration validator already rejects a selection with nowhere to send
+                // its result.
+                destinations.clone(),
                 command_sender.clone(),
                 notice_sender.clone(),
                 args.json,
@@ -1142,6 +1038,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         cpu_frame: args.cpu_frame,
         selection_enabled: args.selection,
         selection_preview: args.selection_preview,
+        cpu_slots: args.cpu_slots,
         max_captures: args.max_captures,
         json_output: args.json,
         confirmed_regions: confirmed_regions.clone(),
@@ -1152,7 +1049,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         done: done_sender,
         commands: command_receiver,
         selection_sender,
-        destinations,
+        destinations: destinations.clone(),
     };
     let capture_join = thread::Builder::new()
         .name("captastic-capture".to_owned())
@@ -1229,7 +1126,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             false
         }
     };
-    let tray = match captastic_windows::TrayIcon::start(startup_enabled) {
+    let tray = match captastic_windows::TrayIcon::start(startup_enabled, args.file_output) {
         Ok(tray) => Some(tray),
         Err(error) => {
             crate::logging::warn(format_args!(
@@ -1281,6 +1178,9 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         "output_directory": workers
             .file_output()
             .map(|worker| worker.directory().display().to_string()),
+        // Stated at startup rather than only per capture, so a user reading the ready line can see
+        // what the next hotkey press will leave on disk.
+        "output_format": args.file_output.then(|| args.output_format.as_str()),
         "output_queue_capacity": args.file_output.then_some(args.output_queue_capacity),
         "tray": tray.is_some(),
         "log_file": crate::logging::path().map(|path| path.display().to_string()),
@@ -1507,6 +1407,15 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                     &args.history_store,
                                     args.history_retention,
                                     tray,
+                                );
+                            }
+                            captastic_windows::TrayEvent::ToggleFileOutput => {
+                                toggle_file_output_from_tray(
+                                    &args,
+                                    &mut workers,
+                                    &destinations,
+                                    tray,
+                                    &mut last_persistence_notification,
                                 );
                             }
                             captastic_windows::TrayEvent::ToggleStartup => {
@@ -1780,6 +1689,223 @@ fn open_logs_from_tray() {
     };
     if let Err(error) = captastic_windows::open_path(path) {
         crate::logging::warn(format_args!("failed to open persistent log: {error}"));
+    }
+}
+
+/// How long a runtime stop of the file worker may wait for it, before the daemon carries on
+/// without it.
+///
+/// Shorter than the shutdown budget on purpose: this runs while the daemon is otherwise healthy
+/// and a person is waiting on a menu click, not at teardown where the alternative to waiting is
+/// losing a capture. A worker that overruns is detached exactly as it would be at shutdown, and
+/// it has already been removed from the destination set, so nothing new reaches it.
+#[cfg(windows)]
+const FILE_OUTPUT_TOGGLE_STOP_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// The detach standing in the way of starting a file destination, if one is.
+///
+/// Takes the ledger rather than reading the process-wide one, so this can be exercised against a
+/// ledger a test owns instead of against a number every other test in the binary shares.
+#[cfg(windows)]
+fn detached_file_output_blocking_start(
+    ledger: &captastic_core::DetachLedger,
+) -> Option<captastic_core::DetachCount> {
+    let count = ledger.count(captastic_core::DetachKind::FileOutputWorker);
+    count
+        .at_ceiling(captastic_core::DetachKind::FileOutputWorker)
+        .then_some(count)
+}
+
+/// Starts or stops writing captures to disk, and remembers which the user chose.
+///
+/// Runs on the daemon thread, never the capture thread: starting the worker validates the
+/// filename template and creates the output directory, and stopping it joins a thread. Both are
+/// fine here and neither may ever sit on the capture path (ADR 0002).
+///
+/// The order matters in both directions. Enabling starts the worker before the sink joins the
+/// destination set, so no capture is ever offered a destination that does not exist yet.
+/// Disabling removes the sink first, so no capture is queued to a worker that is already
+/// stopping.
+#[cfg(windows)]
+fn toggle_file_output_from_tray(
+    args: &ResolvedDaemonArgs,
+    workers: &mut crate::worker_registry::WorkerRegistry,
+    destinations: &crate::output::OutputDestinations,
+    tray: &captastic_windows::TrayIcon,
+    last_persistence_notification: &mut Option<String>,
+) {
+    let enabled = if workers.file_output().is_some() {
+        destinations.remove(crate::file_output::DESTINATION_NAME);
+        let mut abandoned = 0_u64;
+        if let Some(worker) = workers.take_file_output() {
+            let teardown = worker.stop_before(Instant::now() + FILE_OUTPUT_TOGGLE_STOP_TIMEOUT);
+            abandoned = teardown.abandoned;
+            for failure in teardown.failures {
+                crate::logging::warn(format_args!(
+                    "file output was switched off holding a failure for capture {}: {}",
+                    failure.capture_id.0, failure.message
+                ));
+            }
+            // Reported on the way out for the same reason teardown reports it: the totals belong
+            // to the run of the worker that just ended, and nothing else will state them.
+            if let Some(summary) = teardown.summary {
+                if args.json {
+                    println!("{}", summary.to_json());
+                } else {
+                    log::info!("{}", summary.to_line());
+                }
+            }
+        }
+        // The count is stated here as well as in the summary: a user who has just switched
+        // file output off is the one person who needs to know a capture was still in the queue.
+        if abandoned > 0 {
+            log::warn!(
+                "captures are no longer saved to disk (notification area); {abandoned} capture(s) were still queued and were not written"
+            );
+        } else {
+            log::info!("captures are no longer saved to disk (notification area)");
+        }
+        false
+    } else if workers.is_shutting_down() {
+        // A click that arrived while the daemon is winding down. Starting a worker now would
+        // spawn a thread the teardown has already walked past.
+        log::info!("ignoring a request to save captures to disk during shutdown");
+        return;
+    } else if let Some(detached) =
+        detached_file_output_blocking_start(captastic_core::process_detach_ledger())
+    {
+        // A previous worker missed its deadline and was left running. It may still be writing
+        // into the output directory, and a second worker there would race it for names. Refused
+        // rather than queued: it is the user's click, it is not happening, and the item stays
+        // unchecked because the checkmark states where the next capture will go.
+        let message = format!(
+            "A previous file-output worker is still running after it was left behind at its deadline ({} of {} allowed, {} in this session). Captures can be saved again once it exits.",
+            detached.live,
+            captastic_core::DetachKind::FileOutputWorker.ceiling(),
+            detached.total
+        );
+        crate::logging::error(format_args!("refusing to start file output: {message}"));
+        if let Err(error) =
+            tray.show_error_with_title("Captastic could not save captures to disk", message)
+        {
+            crate::logging::warn(format_args!(
+                "failed to surface a refused file-output start in the notification area: {error}"
+            ));
+        }
+        return;
+    } else {
+        match start_file_output(args) {
+            Ok(worker) => {
+                destinations.insert(std::sync::Arc::new(worker.sink()));
+                log::info!(
+                    "saving captures to {} (notification area)",
+                    worker.directory().display()
+                );
+                workers.register_file_output(Some(worker));
+                true
+            }
+            Err(error) => {
+                // The item stays unchecked, because it reports where the next capture will go and
+                // the answer is still "not to disk". The reason is the user's to see: an
+                // unwritable directory or a template the validator refuses is something only they
+                // can fix.
+                let message = format!("Captastic could not start saving captures to disk. {error}");
+                crate::logging::warn(format_args!("{message}"));
+                if let Err(error) =
+                    tray.show_error_with_title("Captastic could not save captures to disk", message)
+                {
+                    crate::logging::warn(format_args!(
+                        "failed to surface a file-output start failure in the notification area: {error}"
+                    ));
+                }
+                return;
+            }
+        }
+    };
+    if let Err(error) = tray.set_file_output_enabled(enabled) {
+        crate::logging::warn(format_args!(
+            "file output changed but the tray menu did not update: {error}"
+        ));
+    }
+    if destinations.is_empty() {
+        // Not refused. The user switched off the only destination this daemon had — a legitimate
+        // configuration, since the clipboard can be disabled — and a menu item that quietly
+        // declines is worse than one that does what it says and then says what it cost.
+        let message = "Captures are no longer delivered anywhere: saving to disk is off and the clipboard is disabled in this configuration.".to_owned();
+        crate::logging::warn(format_args!("{message}"));
+        if let Err(error) =
+            tray.show_error_with_title("Captastic has nowhere to put a capture", message)
+        {
+            crate::logging::warn(format_args!(
+                "failed to surface the empty-destination warning in the notification area: {error}"
+            ));
+        }
+    } else {
+        log::info!(
+            "captures are now delivered to [{}]",
+            destinations.names().join(", ")
+        );
+    }
+    persist_file_output_preference(args, enabled, tray, last_persistence_notification);
+}
+
+/// Writes the choice into the configuration file this daemon is running on, so it survives a
+/// restart.
+///
+/// The runtime state has already changed by the time this runs and is not rolled back if the
+/// write fails: the user asked for captures to go to disk, that is now true, and a read-only
+/// configuration file is no reason to undo it. What they lose is the memory of the choice, which
+/// is exactly what the notification says.
+#[cfg(windows)]
+fn persist_file_output_preference(
+    args: &ResolvedDaemonArgs,
+    enabled: bool,
+    tray: &captastic_windows::TrayIcon,
+    last_notification: &mut Option<String>,
+) {
+    // The profile this daemon is actually running on: an explicit `--config` path, or the default
+    // one. The same rule the tray's Open Config and the UI-state writes follow, so a daemon
+    // started on an alternate profile never edits the default one behind it.
+    let Some(path) = args.ui_state_store.config_path() else {
+        notify_preference_not_saved(
+            "Captastic could not find a configuration file to record the choice in.".to_owned(),
+            tray,
+            last_notification,
+        );
+        return;
+    };
+    match captastic_config::set_output_enabled(path, enabled) {
+        Ok(()) => log::info!("recorded output.enabled = {enabled} in {}", path.display()),
+        Err(error) => notify_preference_not_saved(
+            format!(
+                "Captastic could not record the choice in {}. {error}",
+                path.display()
+            ),
+            tray,
+            last_notification,
+        ),
+    }
+}
+
+/// Says once that a preference was not written down, sharing the deduplication the selection
+/// worker's persistence failures already use: a failing configuration write usually keeps
+/// failing, and the same balloon twice teaches nothing the first did not.
+#[cfg(windows)]
+fn notify_preference_not_saved(
+    message: String,
+    tray: &captastic_windows::TrayIcon,
+    last_notification: &mut Option<String>,
+) {
+    crate::logging::warn(format_args!("{message}"));
+    if last_notification.as_deref() == Some(message.as_str()) {
+        return;
+    }
+    *last_notification = Some(message.clone());
+    if let Err(error) = tray.show_error_with_title("Captastic preferences were not saved", message)
+    {
+        crate::logging::warn(format_args!(
+            "failed to surface a preference-persistence error in the notification area: {error}"
+        ));
     }
 }
 
@@ -2252,6 +2378,55 @@ const DISPLAY_LAYOUT_CHANGED_REASON: &str =
 const ENGINE_NOT_REBUILT_FOR_LAYOUT_REASON: &str =
     "the capture engine could not be rebuilt for the current display layout";
 
+/// The clause for a press the capture engine had no free frame buffer for.
+///
+/// Every overlay press now pins a pooled frame for the length of a human interaction, so running
+/// out is a thing a user can cause by leaving overlays open rather than a pipeline hiccup they
+/// cannot see. The pool is sized to make it unlikely; when it happens anyway, the press is gone
+/// and saying so beats a log line nobody reads.
+#[cfg(windows)]
+const CAPTURE_BUFFERS_EXHAUSTED_REASON: &str =
+    "the capture engine had no free frame buffer; close any open selection and try again";
+
+/// Whether a capture failure denied the user the overlay they pressed a hotkey for.
+///
+/// Deliberately just the one kind. Everything else on this path is either retried, recovered
+/// from, or already reported where it belongs.
+#[cfg(windows)]
+fn capture_failure_denies_an_overlay(error: &CaptureError) -> bool {
+    error.kind == CaptureErrorKind::BufferExhausted
+}
+
+/// Tells the user, in the notification area and on the JSON stream, that a press which would have
+/// opened an overlay produced nothing.
+///
+/// The JSON event is `selection_failed`, the same one the selection worker emits for a selection
+/// that ends without pixels: from a script's point of view this is the same outcome, and it
+/// arrived earlier only because the overlay never got as far as opening.
+#[cfg(windows)]
+fn report_selection_lost_before_the_overlay(
+    notices: &mpsc::SyncSender<DaemonNotice>,
+    capture_id: CaptureId,
+    source: &'static str,
+    reason: &'static str,
+    message: &str,
+    json_output: bool,
+) {
+    let _ = notices.try_send(DaemonNotice::DroppedSelection { capture_id, reason });
+    if json_output {
+        println!(
+            "{}",
+            json!({
+                "schema_version": 1,
+                "event": "selection_failed",
+                "capture_id": capture_id,
+                "source": source,
+                "message": message,
+            })
+        );
+    }
+}
+
 #[cfg(windows)]
 fn action_requires_selection(action: HotkeyAction) -> bool {
     matches!(
@@ -2283,6 +2458,24 @@ fn action_route(action: HotkeyAction) -> ActionRoute {
         HotkeyAction::FullDisplay => ActionRoute::FullDisplay,
         HotkeyAction::RepeatLastRegion => ActionRoute::RepeatLastRegion,
     }
+}
+
+/// Whether this press could end up with an overlay on screen, and therefore needs the capture
+/// engine's display list verified before anything is placed from it.
+///
+/// `repeat_last_region` is included even though it usually publishes without an overlay at all.
+/// Missing, stale, or invalid confirmed state sends it to the overlay instead, and that overlay
+/// is now as capable of taking a confirmation capture as any other - the user can press `F`,
+/// switch to the live view, and confirm. A confirmation capture asked for against a display list
+/// a monitor change has outdated is exactly what this check exists to prevent, and the route that
+/// reaches the overlay by accident needs it just as much as the ones that mean to.
+#[cfg(windows)]
+fn trigger_may_open_an_overlay(selection_enabled: bool, action: HotkeyAction) -> bool {
+    selection_enabled
+        && matches!(
+            action_route(action),
+            ActionRoute::Overlay(_) | ActionRoute::RepeatLastRegion
+        )
 }
 
 /// Reports whether `--max-captures` has been satisfied. `attempts` counts triggers the capture
@@ -2344,151 +2537,10 @@ fn output_status_or_fatal(
 }
 
 #[cfg(windows)]
-pub(crate) fn preview_metadata(
-    capture_id: CaptureId,
-    source: &CaptureSource,
-    displays: &[DisplayInfo],
-    mode: CaptureMode,
-) -> Result<FrameMetadata, AppError> {
-    let (display_id, source_rect, rotation_degrees) = match source {
-        CaptureSource::Display(requested) => {
-            let display = if requested.is_primary_alias() {
-                displays
-                    .iter()
-                    .find(|display| display.is_primary)
-                    .or_else(|| displays.first())
-            } else {
-                displays.iter().find(|display| display.id == *requested)
-            }
-            .ok_or_else(|| {
-                AppError::BackendUnavailable(format!(
-                    "display {} disappeared before live selection",
-                    requested.0
-                ))
-            })?;
-            (display.id.clone(), display.bounds, display.rotation_degrees)
-        }
-        CaptureSource::VirtualDesktop => {
-            let first = displays.first().ok_or_else(|| {
-                AppError::BackendUnavailable(
-                    "no attached displays are available for live selection".to_owned(),
-                )
-            })?;
-            let mut left = i64::from(first.bounds.x);
-            let mut top = i64::from(first.bounds.y);
-            let mut right = first.bounds.right();
-            let mut bottom = first.bounds.bottom();
-            for display in &displays[1..] {
-                left = left.min(i64::from(display.bounds.x));
-                top = top.min(i64::from(display.bounds.y));
-                right = right.max(display.bounds.right());
-                bottom = bottom.max(display.bounds.bottom());
-            }
-            let source_rect = Rect {
-                x: i32::try_from(left).map_err(|_| {
-                    AppError::BackendUnavailable("virtual desktop x origin overflowed".to_owned())
-                })?,
-                y: i32::try_from(top).map_err(|_| {
-                    AppError::BackendUnavailable("virtual desktop y origin overflowed".to_owned())
-                })?,
-                width: u32::try_from(right.saturating_sub(left)).map_err(|_| {
-                    AppError::BackendUnavailable("virtual desktop width overflowed".to_owned())
-                })?,
-                height: u32::try_from(bottom.saturating_sub(top)).map_err(|_| {
-                    AppError::BackendUnavailable("virtual desktop height overflowed".to_owned())
-                })?,
-            };
-            (DisplayId::virtual_desktop(), source_rect, 0)
-        }
-    };
-
-    Ok(FrameMetadata {
-        capture_id,
-        backend: "selection-preview".to_owned(),
-        display_id,
-        source_rect,
-        rotation_degrees,
-        capture_mode: mode,
-        presentation_offset_ns: None,
-        timing_provenance: TimingProvenance::Unavailable,
-        native_ready_offset_ns: 0,
-        cpu_ready_offset_ns: None,
-        frame_age_ns: None,
-        verified_current_offset_ns: None,
-        frame_generation: None,
-        copy_count: 0,
-        pool_slot: None,
-        cursor: None,
-    })
-}
-
-#[cfg(windows)]
-#[allow(clippy::too_many_arguments)]
-fn dispatch_live_selection(
-    sender: &mpsc::SyncSender<crate::selection::SelectionJob>,
-    capture_id: CaptureId,
-    trigger: &TriggerEvent,
-    route: ActionRoute,
-    metadata: FrameMetadata,
-    cached_ui: &UiState,
-    preview_mode: PreviewMode,
-    recorder: EventRecorder,
-) -> Result<&'static str, AppError> {
-    let ActionRoute::Overlay(initial_tool) = route else {
-        return Err(AppError::InvalidArgument(
-            "live selection requires an overlay action".to_owned(),
-        ));
-    };
-    let remembered_ui = Some(captastic_config::resolve_display_ui_state(
-        cached_ui,
-        &metadata.display_id.0,
-    ));
-    let job = crate::selection::SelectionJob {
-        capture_id,
-        triggered_at: trigger.received_at,
-        action: trigger.action,
-        chord: trigger.chord,
-        initial_tool,
-        cpu_ready_offset_ns: None,
-        remembered_ui,
-        source: trigger.source,
-        metadata,
-        frame: None,
-        native_frame: None,
-        recorder,
-        confirmed_selection: None,
-        terminal_error: None,
-        selection_offset_ns: None,
-        confirmation_anchored: true,
-        preview_mode,
-        preview_fallback_reason: None,
-    };
-    match crate::selection::try_submit(sender, job) {
-        Ok(()) => Ok("live_selection_queued"),
-        Err(crate::selection::SubmitError::Full(job)) => {
-            let capture_id = crate::selection::finish_rejected(*job)?;
-            crate::logging::warn(format_args!(
-                "live selection {} skipped because the selection queue is full",
-                capture_id.0
-            ));
-            Ok("selection_queue_full")
-        }
-        Err(crate::selection::SubmitError::Disconnected(job)) => {
-            let capture_id = crate::selection::finish_rejected(*job)?;
-            crate::logging::warn(format_args!(
-                "live selection {} skipped because the selection worker stopped",
-                capture_id.0
-            ));
-            Ok("selection_worker_disconnected")
-        }
-    }
-}
-
-#[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 fn dispatch_output(
     selection_sender: Option<&mpsc::SyncSender<crate::selection::SelectionJob>>,
-    destinations: &[&dyn crate::output::OutputSink],
+    destinations: &[Arc<dyn crate::output::OutputSink>],
     capture_id: CaptureId,
     triggered_at: Instant,
     source: &'static str,
@@ -2599,7 +2651,12 @@ fn dispatch_output(
                     frame,
                     native_frame,
                     recorder,
-                    PreviewMode::Frozen,
+                    // The configured mode, not a hard-coded `Frozen`. That literal meant "use the
+                    // frozen presenter, the frame is already in hand" back when the mode decided
+                    // which pixels got published; it now decides only which view the overlay
+                    // opens in, and a user who has asked for live selections should not get a
+                    // frozen one because their remembered region happened to be stale.
+                    preview_mode,
                 );
             }
         }
@@ -2663,7 +2720,6 @@ fn dispatch_selection(
         selection_offset_ns: None,
         confirmation_anchored: false,
         preview_mode,
-        preview_fallback_reason: None,
     };
     match crate::selection::try_submit(sender, job) {
         Ok(()) => Ok("selection_queued"),
@@ -2689,7 +2745,7 @@ fn dispatch_selection(
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 fn dispatch_repeat_region(
-    destinations: &[&dyn crate::output::OutputSink],
+    destinations: &[Arc<dyn crate::output::OutputSink>],
     capture_id: CaptureId,
     triggered_at: Instant,
     source: &'static str,
@@ -2822,7 +2878,7 @@ fn repeat_region_rect(
 /// one gave — a capture nobody accepted is still a valid capture, just an undelivered one.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_destinations(
-    sinks: &[&dyn crate::output::OutputSink],
+    sinks: &[Arc<dyn crate::output::OutputSink>],
     capture_id: CaptureId,
     triggered_at: Instant,
     source: &'static str,
@@ -2912,7 +2968,6 @@ pub fn run(_args: DaemonArgs) -> Result<(), AppError> {
 pub(crate) enum CaptureCommand {
     Trigger(TriggerEvent),
     LiveSelection(Box<crate::selection::LiveSelectionRequest>),
-    FrozenSelectionFallback(Box<crate::selection::FrozenSelectionFallbackRequest>),
     /// Reports that an attempt handed to the selection worker reached a terminal state, including
     /// cancellation, which produces no other command. Without it the capture worker could never
     /// observe that a `--max-captures` attempt had finished.
@@ -3030,6 +3085,32 @@ fn ns_to_ms(ns: u64) -> f64 {
 
 #[cfg(all(test, windows))]
 mod tests {
+    #[test]
+    fn a_detached_file_worker_blocks_the_next_one_until_it_returns() {
+        // The ceiling exists because a detached worker may still be writing into the output
+        // directory. Two workers there would race each other for names, which is exactly what
+        // the no-clobber write cannot protect against — it refuses to replace a file, so the
+        // loser of the race abandons a capture the user asked for.
+        use captastic_core::{DetachKind, DetachLedger};
+
+        let ledger = DetachLedger::new();
+        assert!(
+            super::detached_file_output_blocking_start(&ledger).is_none(),
+            "nothing is detached on a healthy daemon"
+        );
+
+        let detached = ledger.detached(DetachKind::FileOutputWorker);
+        let blocking = super::detached_file_output_blocking_start(&ledger)
+            .expect("a detached worker blocks the next one");
+        assert_eq!(blocking, detached);
+        assert_eq!(blocking.live, 1);
+
+        // The wedged write finishes and the thread exits: the slot is free and the next click
+        // starts a worker again, rather than the daemon refusing for the rest of the run.
+        ledger.rejoined(DetachKind::FileOutputWorker);
+        assert!(super::detached_file_output_blocking_start(&ledger).is_none());
+    }
+
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -3039,6 +3120,8 @@ mod tests {
         FrameMetadata, FrameOrigin, PixelFormat, Rect, TimingProvenance,
     };
 
+    use captastic_core::DisplayInfo;
+
     use super::*;
 
     struct TempConfig {
@@ -3047,72 +3130,6 @@ mod tests {
     }
 
     static NEXT_TEMP_CONFIG: AtomicU64 = AtomicU64::new(0);
-
-    fn preview_display(id: &str, bounds: Rect, primary: bool) -> DisplayInfo {
-        DisplayInfo {
-            id: DisplayId(id.to_owned()),
-            name: id.to_owned(),
-            bounds,
-            scale_factor: 1.0,
-            rotation_degrees: 0,
-            is_primary: primary,
-        }
-    }
-
-    #[test]
-    fn live_preview_metadata_preserves_display_identity_and_virtual_bounds() {
-        let displays = [
-            preview_display(
-                "left",
-                Rect {
-                    x: -1280,
-                    y: 0,
-                    width: 1280,
-                    height: 1024,
-                },
-                false,
-            ),
-            preview_display(
-                "primary-id",
-                Rect {
-                    x: 0,
-                    y: -200,
-                    width: 1920,
-                    height: 1080,
-                },
-                true,
-            ),
-        ];
-        let mode = CaptureMode::Latest { max_age_ms: None };
-
-        let primary = preview_metadata(
-            CaptureId(1),
-            &CaptureSource::Display(DisplayId::primary()),
-            &displays,
-            mode.clone(),
-        )
-        .expect("primary preview metadata");
-        assert_eq!(primary.display_id.0, "primary-id");
-        assert_eq!(primary.source_rect, displays[1].bounds);
-
-        let desktop = preview_metadata(
-            CaptureId(2),
-            &CaptureSource::VirtualDesktop,
-            &displays,
-            mode,
-        )
-        .expect("virtual preview metadata");
-        assert_eq!(desktop.display_id, DisplayId::virtual_desktop());
-        assert_eq!(
-            desktop.source_rect,
-            Rect {
-                x: -1280,
-                y: -200,
-                width: 3200,
-                height: 1224,
-            }
-        );
-    }
 
     impl TempConfig {
         fn with_contents(contents: &str) -> Self {
@@ -3284,8 +3301,65 @@ mod tests {
             selection_offset_ns: None,
             confirmation_anchored: true,
             preview_mode: PreviewMode::Live,
-            preview_fallback_reason: None,
         })
+    }
+
+    #[test]
+    fn a_press_with_no_free_frame_buffer_reaches_the_user() {
+        // Every overlay press pins a pooled frame for the length of a human interaction, so
+        // running out is something a user can cause by leaving overlays open - not a pipeline
+        // hiccup they could not see. The press is simply gone, and a log line is not where the
+        // person who just pressed the hotkey is looking.
+        assert!(capture_failure_denies_an_overlay(&refusal(
+            CaptureErrorKind::BufferExhausted,
+            "readback",
+            "all preallocated CPU frame slots are still in use"
+        )));
+        // Everything else on this path is retried, recovered from, or reported where it belongs.
+        // A balloon for each would train the user to ignore the one that means something.
+        for kind in [
+            CaptureErrorKind::Timeout,
+            CaptureErrorKind::AccessLost,
+            CaptureErrorKind::DeviceRemoved,
+            CaptureErrorKind::TopologyChanged,
+            CaptureErrorKind::DesktopUnavailable,
+            CaptureErrorKind::PermissionDenied,
+            CaptureErrorKind::Unsupported,
+            CaptureErrorKind::SourceUnavailable,
+        ] {
+            assert!(
+                !capture_failure_denies_an_overlay(&refusal(kind, "capture", "scripted")),
+                "{kind:?} must not raise a balloon of its own"
+            );
+        }
+    }
+
+    #[test]
+    fn every_press_that_can_reach_the_overlay_verifies_the_display_list() {
+        // `repeat_last_region` usually publishes without an overlay, but missing or stale
+        // confirmed state sends it to one - and that overlay can now take a confirmation capture,
+        // because the user can press F and confirm in the live view. A capture asked for against
+        // a display list a monitor change has outdated is exactly what this check prevents, so
+        // the route that reaches the overlay by accident needs it too.
+        for action in [
+            HotkeyAction::LastWorkflow,
+            HotkeyAction::Region,
+            HotkeyAction::Window,
+            HotkeyAction::RepeatLastRegion,
+        ] {
+            assert!(
+                trigger_may_open_an_overlay(true, action),
+                "{action} can reach the overlay"
+            );
+            // With no selection worker there is no overlay to place, and the immediate capture
+            // catches a stale engine for itself.
+            assert!(!trigger_may_open_an_overlay(false, action), "{action}");
+        }
+        // The only action that never constructs overlay resources at all.
+        assert!(!trigger_may_open_an_overlay(
+            true,
+            HotkeyAction::FullDisplay
+        ));
     }
 
     #[test]
@@ -4264,9 +4338,10 @@ mod tests {
         .expect("valid frame");
         let (sender, receiver) = mpsc::sync_channel::<crate::clipboard::ClipboardJob>(1);
         drop(receiver);
-        let sink = crate::output::ChannelSink::new("clipboard", sender);
+        let sink: Arc<dyn crate::output::OutputSink> =
+            Arc::new(crate::output::ChannelSink::new("clipboard", sender));
         let status = dispatch_destinations(
-            &[&sink],
+            &[sink],
             capture_id,
             triggered_at,
             "test",

@@ -10,7 +10,7 @@ display = "pointer"
 trigger_queue_capacity = 4
 
 [hotkey]
-# "coalesce" is not implemented yet (roadmap milestone 4); repeat must remain "ignore".
+# "coalesce" is not implemented yet; repeat must remain "ignore".
 repeat = "ignore"
 
 # Omit an action to leave it disabled. The default registers only last_workflow.
@@ -29,7 +29,10 @@ cpu_frame = true
 # "include" composites the mouse pointer into the capture, shape and all. It is off by default
 # because a screenshot of a window is usually wanted without a cursor sitting in it.
 cursor = "exclude"
-# The CPU readback pool is currently fixed at three slots; buffer_slots must remain 3.
+# The base of the CPU readback pool, currently fixed at three slots; buffer_slots must remain 3.
+# When selection is enabled the engine adds slots of its own on top of this base - an open overlay
+# holds the frame from its hotkey press for the whole interaction, and the selection queue can
+# hold more behind it - so there is nothing here to tune for it.
 buffer_slots = 3
 fake_width = 64
 fake_height = 64
@@ -40,8 +43,15 @@ fake_frame_age_us = 1000
 [selection]
 enabled = true
 queue_capacity = 1
-# "auto" prefers a live compositor preview and falls back to the frozen capture path.
-# Use "live" to require confirmation-time capture or "frozen" for trigger-time pixels.
+# Every press of an overlay hotkey captures the screen at that moment, and the overlay can show
+# either those pixels or the live desktop. Press F (or use Options -> View) to switch; confirming
+# captures whichever view is showing. This setting chooses only which view the overlay *opens* in,
+# per run - the switch is never remembered.
+#   "auto"   (default) opens live, and if the layered presenter cannot be established it reopens
+#            the same run showing the captured frame instead, with the switch unavailable.
+#   "live"   opens live and fails rather than silently showing trigger-time pixels.
+#   "frozen" opens on the frame captured at the press.
+# The Window tool is unaffected either way: clicking a preview always renders that window fresh.
 preview = "auto"
 
 [clipboard]
@@ -55,12 +65,31 @@ allow_cloud_sync = false
 
 [output]
 # Write every capture to disk, alongside the clipboard or instead of it.
+# Also a notification-area command: "Save Captures to Disk" starts and stops writing without a
+# restart and writes your choice back here. The settings below it are read at startup only.
 enabled = false
-# "png" is the only supported format today.
+# "png", "jpeg", or "bmp".
+#   png  - lossless and compressed, and it keeps the transparent corners and shadow of a window
+#          capture. The default, and the right answer for a screenshot of text or an interface.
+#   jpeg - lossy and much smaller, written with a .jpg extension. Worth it for a photograph, a map,
+#          or a video frame; it rings along the hard edges that make up most of a screenshot.
+#   bmp  - uncompressed, keeps alpha, and large: a 4K capture is 33 MB and stays that way. Useful
+#          where a tool has to read the file without a decoder.
+# JPEG cannot carry an alpha channel at all, so the transparent pixels of a window capture are
+# composited over opaque white. That is inherent to the format rather than a choice Captastic
+# makes on your behalf, and the log says so at debug level each time it happens - but if you
+# capture windows and want their corners and shadows, use "png" or "bmp".
 format = "png"
+# How hard a JPEG is compressed, 1-100. Ignored by the other two formats. 90 keeps the text in a
+# screenshot legible; much below 70 the ringing around hard edges becomes easy to see.
+jpeg_quality = 90
 queue_capacity = 2
-# Absolute path. Omit to use <home>/Pictures/Captastic. A daemon's working directory is whatever
-# launched it, so a relative path would put captures somewhere you could not predict.
+# Absolute path. A daemon's working directory is whatever launched it, so a relative path would put
+# captures somewhere you could not predict.
+# Omit this to use "Captastic" inside the Pictures folder Windows shows you - which is where
+# OneDrive, a roaming profile, or a policy has put it if one of those has moved it, not necessarily
+# <home>\Pictures. Captastic asks the shell rather than assuming, and logs the directory it settled
+# on when it starts saving captures, so you can always see where they are going.
 # directory = 'C:\Users\you\Pictures\Captastic'
 # Names each capture, without the extension. Tokens: {timestamp} {date} {time} {display} {mode}
 # {width} {height} {application} {title}. Values coming from a window are sanitized, and a name can

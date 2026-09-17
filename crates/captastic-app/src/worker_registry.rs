@@ -141,6 +141,17 @@ impl WorkerRegistry {
         self.file_output.as_ref()
     }
 
+    /// Takes the file worker out of the registry so the caller can stop it, leaving the registry
+    /// with nothing to tear down under that name.
+    ///
+    /// The one worker that can come and go while the daemon runs: the notification area's
+    /// "Save Captures to Disk" starts it and stops it. Registering the replacement goes through
+    /// `register_file_output`, so a worker started an hour after startup is torn down by the same
+    /// accounting as one started with the daemon.
+    pub(crate) fn take_file_output(&mut self) -> Option<crate::file_output::FileOutputWorker> {
+        self.file_output.take()
+    }
+
     pub(crate) fn is_shutting_down(&self) -> bool {
         self.deadline.is_some()
     }

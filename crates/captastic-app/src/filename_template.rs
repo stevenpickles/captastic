@@ -39,72 +39,13 @@ pub struct TemplateContext<'a> {
     pub title: Option<&'a str>,
 }
 
-/// Every token a template may use. Anything else is rejected when the configuration loads, so a
-/// typo is a startup error rather than a literal `{tilte}` appearing in a file name forever.
-pub const TOKENS: &[&str] = &[
-    "timestamp",
-    "date",
-    "time",
-    "display",
-    "mode",
-    "width",
-    "height",
-    "application",
-    "title",
-];
-
-/// Reports what is wrong with a template, for the configuration validator.
-pub fn validate_template(template: &str) -> Result<(), String> {
-    if template.trim().is_empty() {
-        return Err("output.filename_template must not be empty".to_owned());
-    }
-    // A separator in the *template* is the user asking for a subdirectory, which this does not
-    // support: the output directory is the boundary, and honouring it here would make the
-    // traversal guarantee a matter of how carefully the template was written.
-    if template.contains('/') || template.contains('\\') {
-        return Err(
-            "output.filename_template must not contain path separators; it names a file, not a path"
-                .to_owned(),
-        );
-    }
-    let mut rest = template;
-    let mut has_token = false;
-    while let Some(open) = rest.find('{') {
-        let after = &rest[open + 1..];
-        let Some(close) = after.find('}') else {
-            return Err(format!(
-                "output.filename_template has an unclosed '{{' in {template:?}"
-            ));
-        };
-        let token = &after[..close];
-        if !TOKENS.contains(&token) {
-            return Err(format!(
-                "output.filename_template uses unknown token {{{token}}}; known tokens are {}",
-                TOKENS
-                    .iter()
-                    .map(|token| format!("{{{token}}}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-        has_token = true;
-        rest = &after[close + 1..];
-    }
-    if rest.contains('}') {
-        return Err(format!(
-            "output.filename_template has an unmatched '}}' in {template:?}"
-        ));
-    }
-    // A template of pure literal text names every capture the same thing, and every capture after
-    // the first would land on the collision path forever.
-    if !has_token {
-        return Err(
-            "output.filename_template must use at least one token, or every capture would compete for one name"
-                .to_owned(),
-        );
-    }
-    Ok(())
-}
+/// Whether a template says only things this module knows how to expand.
+///
+/// The rule and the token list live in `captastic-config` now, so `captastic config validate`
+/// refuses a template the daemon would refuse at startup. Re-exported rather than
+/// re-implemented: two copies would be two chances for the validator and the worker to disagree
+/// about a name.
+pub use captastic_config::validate_template;
 
 /// Expands a validated template into a file-name stem, sanitizing as it goes.
 pub fn expand(template: &str, context: &TemplateContext<'_>) -> String {
@@ -435,20 +376,6 @@ mod tests {
         assert!(stem.chars().count() <= MAX_STEM_CHARS, "{}", stem.len());
         // Each field is capped before the whole is, so one long value cannot crowd out the rest.
         assert!(stem.starts_with(&"x".repeat(MAX_FIELD_CHARS)));
-    }
-
-    #[test]
-    fn unknown_tokens_are_rejected_when_the_configuration_loads() {
-        // A typo should be a startup error, not a literal `{tilte}` in every file name.
-        assert!(validate_template("captastic-{tilte}").is_err());
-        assert!(validate_template("captastic-{timestamp}").is_ok());
-        assert!(validate_template("{date}/{time}").is_err(), "separators");
-        assert!(validate_template("{date}").is_ok());
-        assert!(validate_template("").is_err(), "empty");
-        assert!(validate_template("   ").is_err(), "blank");
-        assert!(validate_template("screenshot").is_err(), "no token");
-        assert!(validate_template("{timestamp").is_err(), "unclosed");
-        assert!(validate_template("timestamp}").is_err(), "unmatched close");
     }
 
     #[test]

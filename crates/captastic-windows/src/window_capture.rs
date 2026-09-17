@@ -970,11 +970,11 @@ impl Drop for WindowRenderPermit<'_> {
 /// Both backends must crop the same `content` rectangle and rebuild the same border ring around
 /// it, or the same window comes out with different margins depending on which one ran, and the
 /// overlay preview lands a border width away from the frame that is finally published.
-struct WindowGeometry {
+pub(crate) struct WindowGeometry {
     /// `GetWindowRect`: the whole window, including the invisible resize frame around it.
     window: Rect,
     /// The DWM extended frame bounds clipped to `window`: the window as the user sees it.
-    frame: Rect,
+    pub(crate) frame: Rect,
     /// `frame` inset by `border_thickness`: the pixels copied out of a render.
     content: Rect,
     /// The width of the visible DWM border, rebuilt synthetically around `content`.
@@ -995,7 +995,11 @@ impl WindowGeometry {
     }
 }
 
-fn window_geometry(hwnd: HWND, window: Rect) -> WindowGeometry {
+/// The rectangles a window capture — and the region tool's edge snapping — are derived from.
+///
+/// Read-only Win32/DWM queries against a foreign window: `DwmGetWindowAttribute` reads compositor
+/// state rather than sending a message, so this is safe to call from inside window enumeration.
+pub(crate) fn window_geometry(hwnd: HWND, window: Rect) -> WindowGeometry {
     let mut native = RECT::default();
     // SAFETY: hwnd is a live top-level window and native is writable for the exact RECT size.
     let result = unsafe {
@@ -1014,7 +1018,7 @@ fn window_geometry(hwnd: HWND, window: Rect) -> WindowGeometry {
             border_thickness: 0,
         };
     };
-    let frame = intersect_rect(window, dwm_bounds).unwrap_or(window);
+    let frame = window.intersection(dwm_bounds).unwrap_or(window);
     let border_thickness = visible_frame_border_thickness(hwnd)
         .min(frame.width / 4)
         .min(frame.height / 4);
@@ -1129,21 +1133,6 @@ fn inset_rect(rect: Rect, inset: u32) -> Option<Rect> {
         y: rect.y.checked_add(i32::try_from(inset).ok()?)?,
         width,
         height,
-    })
-}
-
-fn intersect_rect(first: Rect, second: Rect) -> Option<Rect> {
-    let left = i64::from(first.x).max(i64::from(second.x));
-    let top = i64::from(first.y).max(i64::from(second.y));
-    let right = (i64::from(first.x) + i64::from(first.width))
-        .min(i64::from(second.x) + i64::from(second.width));
-    let bottom = (i64::from(first.y) + i64::from(first.height))
-        .min(i64::from(second.y) + i64::from(second.height));
-    (right > left && bottom > top).then_some(Rect {
-        x: left as i32,
-        y: top as i32,
-        width: (right - left) as u32,
-        height: (bottom - top) as u32,
     })
 }
 
@@ -1696,11 +1685,51 @@ fn capture_error(
 
 #[cfg(test)]
 mod tests {
+    /// The DWM frame is clipped to the window rect through `Rect::intersection`, which is the
+    /// single half-open implementation in the workspace and is property-tested against
+    /// `Rect::contains` in `captastic-core`. This pins the clipping this module depends on: a
+    /// frame that overhangs the window rect comes back trimmed on exactly the overhanging side,
+    /// and one that misses it entirely comes back as nothing rather than as an empty rectangle.
+    #[test]
+    fn the_visible_frame_is_the_dwm_bounds_clipped_to_the_window_rect() {
+        let window = Rect {
+            x: 100,
+            y: 100,
+            width: 400,
+            height: 300,
+        };
+        let overhanging = Rect {
+            x: 108,
+            y: 100,
+            width: 400,
+            height: 300,
+        };
+        assert_eq!(
+            window.intersection(overhanging),
+            Some(Rect {
+                x: 108,
+                y: 100,
+                width: 392,
+                height: 300,
+            })
+        );
+        assert_eq!(
+            window.intersection(Rect {
+                x: 600,
+                y: 100,
+                width: 100,
+                height: 100,
+            }),
+            None
+        );
+    }
+
     use std::sync::Arc;
     use std::time::Instant;
 
     use super::*;
     use crate::session::{DesktopState, HRESULT_ACCESS_DENIED};
+    use crate::PreviewView;
     use captastic_core::{
         CaptureId, CaptureMode, ColorSpace, DisplayId, FrameOrigin, PixelFormat, TimingProvenance,
     };
@@ -2710,6 +2739,9 @@ mod tests {
                 window_live_preview_count: 0,
                 window_frozen_preview_count: 0,
                 window_preview_bytes: 0,
+                view: PreviewView::Frozen,
+                view_switched: false,
+                presenter_fallback_reason: None,
                 window_frame: None,
             },
         )
@@ -2739,6 +2771,9 @@ mod tests {
                 window_live_preview_count: 0,
                 window_frozen_preview_count: 0,
                 window_preview_bytes: 0,
+                view: PreviewView::Frozen,
+                view_switched: false,
+                presenter_fallback_reason: None,
                 window_frame: None,
             },
         )
@@ -2766,6 +2801,9 @@ mod tests {
                 window_live_preview_count: 0,
                 window_frozen_preview_count: 0,
                 window_preview_bytes: 0,
+                view: PreviewView::Frozen,
+                view_switched: false,
+                presenter_fallback_reason: None,
                 window_frame: Some(preview.clone()),
             },
         )
@@ -2789,6 +2827,9 @@ mod tests {
                 window_live_preview_count: 0,
                 window_frozen_preview_count: 0,
                 window_preview_bytes: 0,
+                view: PreviewView::Frozen,
+                view_switched: false,
+                presenter_fallback_reason: None,
                 window_frame: Some(preview.clone()),
             })
             .expect("window confirmation should expose its native frame")

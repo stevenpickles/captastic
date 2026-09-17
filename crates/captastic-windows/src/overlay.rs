@@ -12,27 +12,31 @@ mod layout;
 mod machine;
 mod raster;
 mod shell;
+mod snap;
 mod window_enumeration;
 
 use layout::{
-    layout_dimension_label, DimensionLabelPlacement, DisplayEnvironment, OverviewLayoutTokens,
-    ToolbarControl, ToolbarLayout, UiMetrics, UiRect, UiSize,
+    layout_dimension_label, layout_loupe, loupe_edge_lines, DimensionLabelPlacement,
+    DisplayEnvironment, LoupeLayout, OverviewLayoutTokens, ToolbarControl, ToolbarLayout,
+    UiMetrics, UiRect, UiSize, LOUPE_SOURCE_HALF, LOUPE_SOURCE_SPAN,
 };
 use raster::{
     apply_dim_wash, build_blurred_background, draw_antialiased_rounded_outline, draw_camera_icon,
     draw_checkmark, draw_display_icon, draw_filled_ellipse, draw_lines, draw_outline,
-    draw_region_icon, draw_resize_handles, draw_round_box, draw_text, draw_window_icon,
-    draw_window_surface, fill_device_rect, fill_live_background, fitted_surface_rect,
-    measure_ui_text, rgb, scaled_corner_radius, TextAlignment,
+    draw_outline_rect, draw_region_icon, draw_resize_handles, draw_round_box, draw_surface_nearest,
+    draw_text, draw_window_icon, draw_window_surface, fill_device_rect, fill_live_background,
+    fitted_surface_rect, measure_ui_text, rgb, scaled_corner_radius, TextAlignment,
 };
 pub use shell::flush_desktop_composition;
 use shell::{
     capture_pointer, consume_self_initiated_capture_change, drain_pending_quit, duration_ns,
-    invalid_frame, invalidate, last_error, overlay_error, query_display_environment,
-    release_pointer_capture, restore_input_context, screen_point, set_arrow_cursor,
-    set_move_cursor, ClassRegistration, FrozenSurface, PrivateFontResource, RegionCursor,
-    ThreadDpiContext, REGION_CURSOR_CENTER,
+    invalid_frame, invalidate, key_is_autorepeat, last_error, loupe_key_after_focus_change,
+    message_time_ms, modifiers, overlay_error, query_display_environment, release_pointer_capture,
+    restore_input_context, screen_point, set_arrow_cursor, set_move_cursor, start_loupe_timer,
+    stop_loupe_timer, ClassRegistration, FrozenSurface, PrivateFontResource, RegionCursor,
+    ThreadDpiContext, LOUPE_TIMER_ID, REGION_CURSOR_CENTER,
 };
+use snap::{SnapAxis, SnapTarget, SnapTargetKind, SnapTargets, NO_SNAPS};
 use window_enumeration::{enumerate_visible_windows, WindowCandidate};
 
 #[cfg(test)]
@@ -63,7 +67,9 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentProcessId;
-use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE, VK_RETURN};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    SetFocus, VK_DOWN, VK_ESCAPE, VK_F, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP, VK_Z,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClassNameW,
     GetForegroundWindow, GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
@@ -72,10 +78,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     UpdateLayeredWindow, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
     IDC_CROSS, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, MSG, SPI_SETLOGICALDPIOVERRIDE,
     SPI_SETWORKAREA, SW_SHOW, ULW_ALPHA, WDA_EXCLUDEFROMCAPTURE, WM_APP, WM_CAPTURECHANGED,
-    WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY,
-    WM_PAINT, WM_RBUTTONDOWN, WM_SETTINGCHANGE, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP,
+    WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
+    WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WM_SETFOCUS, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW,
+    WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 #[cfg(test)]
 use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, PM_NOREMOVE, WM_QUIT};
@@ -104,6 +110,12 @@ const LIVE_UNDRAWN_ALPHA: u8 = u8::MAX;
 const _: () = assert!(LIVE_UNDRAWN_ALPHA != 0);
 const WINDOW_THUMBNAIL_MAX_PIXELS: u64 = 1_200_000;
 const UI_FONT_HEIGHT: i32 = 21;
+/// The Options row for edge snapping. Named once so the glyph-fit test measures the same string
+/// the menu paints — an Options row whose label overruns its row is the failure this guards.
+///
+/// "Snap to Window Edges" would be plainer but measures 200 px against the 192 px a menu row has
+/// for text at 96 DPI, and widening the menu for one row is a worse trade than the shorter name.
+const SNAP_TO_WINDOWS_LABEL: &str = "Snap to Edges";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SelectionKind {
@@ -117,6 +129,56 @@ pub enum InitialSelectionTool {
     Remembered,
     Region,
     Window,
+}
+
+/// Which pixels the overlay is showing the user *right now*.
+///
+/// Not the same question as which presenter is on screen. One layered window serves both views:
+/// [`PreviewView::Live`] lets the real desktop through and keeps changing, [`PreviewView::Frozen`]
+/// paints the snapshot taken at the hotkey press. The view is what the user sees, and therefore
+/// what the confirmation must materialize from; the presenter is only how the window gets there.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PreviewView {
+    /// The desktop as it is, seen through the overlay. Confirmation captures fresh pixels.
+    #[default]
+    Live,
+    /// The frame captured at the hotkey press. Confirmation crops that frame.
+    Frozen,
+}
+
+impl PreviewView {
+    /// The name this view goes by in logs and JSON.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Frozen => "frozen",
+        }
+    }
+
+    /// The Options row's label, which states the view that is showing rather than the action.
+    ///
+    /// "View: Frozen at hotkey" would say *when* the picture stopped, which is the part that
+    /// matters, but it measures 220 px against the 192 px a menu row has for text at 96 DPI - and
+    /// widening the whole menu for one row is the same trade the snap row already declined. The
+    /// tag on screen carries the full sentence; this row only has to name the state.
+    pub(crate) const fn menu_label(self) -> &'static str {
+        match self {
+            Self::Live => "View: Live",
+            Self::Frozen => "View: Frozen",
+        }
+    }
+}
+
+/// How the overlay window gets its pixels onto the screen.
+///
+/// `Layered` is the only presenter that can show the live desktop, and it shows the frozen
+/// snapshot just as well (with every alpha byte forced opaque first). `Opaque` is the in-process
+/// fallback for a machine where establishing the layered presenter fails: it can only ever show
+/// the frozen view, which is why falling back also locks the view and hides the toggle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Presenter {
+    Layered,
+    Opaque,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -150,7 +212,48 @@ pub struct OverlaySelection {
     pub window_live_preview_count: usize,
     pub window_frozen_preview_count: usize,
     pub window_preview_bytes: usize,
+    /// The view that was on screen when the user confirmed. The caller materializes from this and
+    /// nothing else: it is the only record of which pixels the user was actually looking at.
+    pub view: PreviewView,
+    /// Whether the user changed the view at least once during the run. Reported rather than
+    /// inferred, because a run that ends in the view it opened in is indistinguishable from one
+    /// that was switched and switched back.
+    pub view_switched: bool,
+    /// Why the layered presenter could not be established, when it could not. `None` on every
+    /// machine where it worked, which is expected to be all of them.
+    pub presenter_fallback_reason: Option<String>,
     pub(crate) window_frame: Option<CpuFrame>,
+}
+
+impl OverlaySelection {
+    /// A selection shaped exactly as an overlay run reports one, for tests in dependent crates
+    /// that have to exercise materialization without a desktop to draw on.
+    ///
+    /// Not part of the product surface - nothing in Captastic builds one of these outside
+    /// `build_overlay_selection` - but the alternative was making the captured window frame
+    /// public, and a crate that cannot construct the value it is handed cannot test what it does
+    /// with it.
+    #[doc(hidden)]
+    pub fn for_test(kind: SelectionKind, rect: Rect, view: PreviewView) -> Self {
+        Self {
+            rect,
+            kind,
+            window: None,
+            window_title: None,
+            window_application: None,
+            selection_ns: 0,
+            preparation_ns: 0,
+            window_overview_ns: None,
+            window_preview_count: 0,
+            window_live_preview_count: 0,
+            window_frozen_preview_count: 0,
+            window_preview_bytes: 0,
+            view,
+            view_switched: false,
+            presenter_fallback_reason: None,
+            window_frame: None,
+        }
+    }
 }
 
 /// The close reason an overlay reports for `WM_DISPLAYCHANGE`: the monitors themselves changed —
@@ -231,6 +334,11 @@ pub enum OverlayUiUpdate {
         region: captastic_config::CaptureRegion,
         source: captastic_config::CaptureRegionSource,
     },
+    /// Whether the region tool snaps to window edges. Carries no display id: it is one answer for
+    /// the whole installation, and a toggle made on one monitor applies on the next.
+    SnapToWindows { enabled: bool },
+    /// When the region tool's magnifier appears. Global, for the same reason.
+    RegionZoom { mode: captastic_config::RegionZoom },
 }
 
 #[derive(Clone, Default)]
@@ -248,7 +356,20 @@ struct OverlayControllerInner {
 #[derive(Clone)]
 struct OverlayUiSink {
     sender: Sender<OverlayUiUpdate>,
-    live_ui: Arc<Mutex<BTreeMap<String, captastic_config::DisplayUiState>>>,
+    live_ui: Arc<Mutex<LiveUiState>>,
+}
+
+/// What this process has learned about remembered UI state since it started, so a second overlay
+/// opened before the persistence worker has written anything still sees the first one's choices.
+///
+/// Split into per-display entries and the handful of preferences that are not about a display at
+/// all: a global kept in the map would only be visible on monitors this process had already drawn
+/// on, which is exactly the bug it exists to prevent.
+#[derive(Default)]
+struct LiveUiState {
+    displays: BTreeMap<String, captastic_config::DisplayUiState>,
+    snap_to_windows: Option<bool>,
+    region_zoom: Option<captastic_config::RegionZoom>,
 }
 
 impl OverlayController {
@@ -261,7 +382,7 @@ impl OverlayController {
             inner: Arc::new(OverlayControllerInner {
                 ui_updates: Some(OverlayUiSink {
                     sender: ui_updates,
-                    live_ui: Arc::new(Mutex::new(BTreeMap::new())),
+                    live_ui: Arc::new(Mutex::new(LiveUiState::default())),
                 }),
                 ..OverlayControllerInner::default()
             }),
@@ -280,7 +401,20 @@ impl OverlayController {
             .live_ui
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *live_ui.entry(display_id.to_owned()).or_insert(fallback)
+        let snap_to_windows = live_ui.snap_to_windows;
+        let region_zoom = live_ui.region_zoom;
+        let mut remembered = *live_ui
+            .displays
+            .entry(display_id.to_owned())
+            .or_insert(fallback);
+        // A global answers for every display, including one whose stored entry predates it.
+        if let Some(enabled) = snap_to_windows {
+            remembered.snap_to_windows = Some(enabled);
+        }
+        if let Some(mode) = region_zoom {
+            remembered.region_zoom = Some(mode);
+        }
+        remembered
     }
 
     pub fn submit_ui_update(&self, update: OverlayUiUpdate) {
@@ -377,24 +511,48 @@ pub fn select_from_frozen_frame_with_initial_tool_and_ui(
     )
 }
 
+/// What an overlay run has to present from, and which view it opens in.
+///
+/// A run with a `snapshot` can show either view and lets the user switch between them; a run
+/// without one can only ever show the live desktop.
 #[derive(Clone, Copy, Debug)]
 pub struct SelectionPreviewSource<'a> {
     metadata: &'a FrameMetadata,
-    frozen_frame: Option<&'a CpuFrame>,
+    /// The frame captured at the hotkey press, when there is one.
+    snapshot: Option<&'a CpuFrame>,
+    /// The view the overlay opens in. Only honoured when a snapshot backs it: without one,
+    /// `Frozen` has nothing to paint.
+    initial_view: PreviewView,
+    /// Whether the layered presenter is a requirement rather than a preference. Set when the
+    /// caller asked for the live view explicitly, where an opaque window showing trigger-time
+    /// pixels would be the wrong answer rather than a degraded one.
+    require_layered: bool,
 }
 
 impl<'a> SelectionPreviewSource<'a> {
-    pub fn frozen(frame: &'a CpuFrame) -> Self {
+    /// A run backed by the trigger-time snapshot, opening in `initial_view`.
+    pub fn snapshot(frame: &'a CpuFrame, initial_view: PreviewView, require_layered: bool) -> Self {
         Self {
             metadata: &frame.metadata,
-            frozen_frame: Some(frame),
+            snapshot: Some(frame),
+            initial_view,
+            require_layered,
         }
     }
 
+    /// A run backed by a snapshot and opening on it. The layered presenter is preferred but not
+    /// required: an opaque window shows exactly these pixels.
+    pub fn frozen(frame: &'a CpuFrame) -> Self {
+        Self::snapshot(frame, PreviewView::Frozen, false)
+    }
+
+    /// A run with no pixels of its own, which can only present the live desktop.
     pub fn live(metadata: &'a FrameMetadata) -> Self {
         Self {
             metadata,
-            frozen_frame: None,
+            snapshot: None,
+            initial_view: PreviewView::Live,
+            require_layered: true,
         }
     }
 
@@ -402,8 +560,13 @@ impl<'a> SelectionPreviewSource<'a> {
         self.metadata
     }
 
-    pub fn is_live(self) -> bool {
-        self.frozen_frame.is_none()
+    /// The view this run will actually open in: `Frozen` needs a snapshot to paint.
+    fn resolved_initial_view(self) -> PreviewView {
+        if self.snapshot.is_some() {
+            self.initial_view
+        } else {
+            PreviewView::Live
+        }
     }
 }
 
@@ -419,7 +582,7 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
         return Ok(SelectionOutcome::Cancelled);
     }
     let _dpi_context = ThreadDpiContext::enter_per_monitor_v2()?;
-    if let Some(frame) = preview_source.frozen_frame {
+    if let Some(frame) = preview_source.snapshot {
         validate_frame(frame)?;
     }
     let metadata = preview_source.metadata;
@@ -431,7 +594,7 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
     }
     // SAFETY: Reads the current foreground window without retaining or mutating it.
     let previous_foreground = unsafe { GetForegroundWindow() };
-    let pixels = preview_source.frozen_frame.map(tight_pixels).transpose()?;
+    let pixels = preview_source.snapshot.map(tight_pixels).transpose()?;
     let cached = resources.take_matching(source.width, source.height);
     let (
         surface,
@@ -472,10 +635,13 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
             PrivateFontResource::register()?,
         )
     };
-    if preview_source.is_live() {
-        // Live region selection exposes the desktop through the layered window and does not use
-        // this surface. Retain one pre-overlay desktop image, though, so switching to the opaque
-        // window chooser has real pixels from which to build its blurred backdrop.
+    if preview_source.snapshot.is_none() {
+        // No snapshot was written into `surface`, so it holds nothing at all. Retain one
+        // pre-overlay desktop image so switching to the window chooser has real pixels from
+        // which to build its blurred backdrop. A run that *does* have a snapshot already has
+        // better pixels there — taken at the press, by the capture engine — and re-reading the
+        // desktop over them would both cost a full-screen BitBlt and overwrite the one image
+        // the frozen view exists to show.
         if let Err(error) = capture_live_window_backdrop(&surface, source) {
             log::warn!("live window backdrop capture failed: {error}; using a neutral background");
             fill_device_rect(
@@ -518,9 +684,16 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
         InitialSelectionTool::Window => CaptureTool::Window,
     };
     let (selection, selection_kind) = initial_selection(tool, last_region, source);
+    let initial_view = preview_source.resolved_initial_view();
     let state = Box::new(OverlayState {
         model: OverlayModel {
             source,
+            view: initial_view,
+            initial_view,
+            // Both views need pixels to switch between: the snapshot for the frozen one and a
+            // layered window for the live one. A run with a snapshot has the first; the second
+            // is retracted below if the layered presenter has to be abandoned.
+            view_toggle_available: preview_source.snapshot.is_some(),
             display_environment,
             tool,
             selection,
@@ -539,9 +712,21 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
             hovered_control: None,
             pointer_local: None,
             hovered: None,
+            snap_to_windows: remembered_ui.snap_to_windows.unwrap_or(true),
+            snap_targets: None,
+            loupe: machine::LoupeState::new(
+                remembered_ui
+                    .region_zoom
+                    .map_or_else(Default::default, machine::LoupeMode::from_config),
+            ),
+            active_snaps: NO_SNAPS,
         },
         overlay_hwnd: HWND(0),
-        live_preview: preview_source.is_live(),
+        presenter: Presenter::Layered,
+        presenter_fallback_reason: None,
+        require_layered: preview_source.require_layered,
+        snapshot_present: preview_source.snapshot.is_some(),
+        view_switched: false,
         surface,
         back_buffer,
         dimmer,
@@ -550,6 +735,8 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
         window_assets_ready: false,
         windows: None,
         dimension_label_placement: None,
+        loupe_sample: None,
+        loupe_layout: None,
         selected_window_frame: None,
         releasing_pointer_capture: false,
         controller: controller.clone(),
@@ -584,7 +771,20 @@ struct OverlayState {
     /// The pure product-state machine; every transition-owned field lives here.
     model: OverlayModel,
     overlay_hwnd: HWND,
-    live_preview: bool,
+    /// How this run is getting its pixels onto the screen. Always starts `Layered`; only the
+    /// first-present fallback in [`run_overlay`] ever changes it.
+    presenter: Presenter,
+    /// Why the layered presenter was abandoned, when it was.
+    presenter_fallback_reason: Option<String>,
+    /// Whether the caller demanded the layered presenter. `true` makes a first-present failure
+    /// an error rather than a fallback.
+    require_layered: bool,
+    /// Whether `surface` holds the trigger-time snapshot. An opaque window has nothing else to
+    /// show, so this is half of what makes the presenter fallback possible at all.
+    snapshot_present: bool,
+    /// Whether the user switched the view during this run. Shell-side because it is telemetry
+    /// about the run, not a product decision the machine makes anything of.
+    view_switched: bool,
     surface: FrozenSurface,
     back_buffer: FrozenSurface,
     dimmer: FrozenSurface,
@@ -593,6 +793,13 @@ struct OverlayState {
     window_assets_ready: bool,
     windows: Option<Vec<WindowCandidate>>,
     dimension_label_placement: Option<DimensionLabelPlacement>,
+    /// The 31x31 square of real pixels the magnifier is showing, resampled every paint. A single
+    /// allocation for the life of the run; the pixels in it are replaced, never appended to.
+    loupe_sample: Option<FrozenSurface>,
+    /// Where the magnifier is this paint, or `None` when it is not showing. Computed before the
+    /// dimension badge is placed, so the badge can treat it as an obstacle, and consumed again by
+    /// the live presenter's alpha pass.
+    loupe_layout: Option<LoupeLayout>,
     selected_window_frame: Option<CpuFrame>,
     /// Shell-side protocol flag distinguishing a self-initiated `ReleaseCapture` round trip from
     /// an externally stolen pointer capture. Never part of the model.
@@ -668,6 +875,23 @@ impl OverlayResources {
         self.cache.take().filter(|resources| {
             resources.surface.width == width as i32 && resources.surface.height == height as i32
         })
+    }
+}
+
+impl OverlayState {
+    /// Whether the pixels in `surface` are what the user is looking at.
+    ///
+    /// The one place the magnifier's sampling decision is made. In the frozen view the overlay is
+    /// painting a still image and that image is authoritative; in the live view the layered
+    /// window is showing the real desktop through itself and `surface` holds trigger-time pixels
+    /// that are *not* what will be captured — stale the moment anything on screen moves.
+    /// Magnifying those would show the user pixels that are not there.
+    ///
+    /// Keyed on the view rather than the presenter for exactly that reason: a run that has a
+    /// snapshot in `surface` and is showing the live desktop over it must still sample the
+    /// desktop.
+    fn showing_frozen_pixels(&self) -> bool {
+        self.model.view == PreviewView::Frozen
     }
 }
 
@@ -924,18 +1148,17 @@ impl OverlayUiSink {
     }
 }
 
-fn apply_overlay_ui_update(
-    state: &mut BTreeMap<String, captastic_config::DisplayUiState>,
-    update: &OverlayUiUpdate,
-) {
+fn apply_overlay_ui_update(state: &mut LiveUiState, update: &OverlayUiUpdate) {
     match update {
+        OverlayUiUpdate::SnapToWindows { enabled } => state.snap_to_windows = Some(*enabled),
+        OverlayUiUpdate::RegionZoom { mode } => state.region_zoom = Some(*mode),
         OverlayUiUpdate::Interaction {
             display_id,
             tool,
             region,
             source,
         } => {
-            let display = state.entry(display_id.clone()).or_default();
+            let display = state.displays.entry(display_id.clone()).or_default();
             display.tool = Some(*tool);
             if let Some(region) = region {
                 display.region = Some(*region);
@@ -948,8 +1171,11 @@ fn apply_overlay_ui_update(
             center_x,
             center_y,
         } => {
-            state.entry(display_id.clone()).or_default().overlay_center =
-                Some((*center_x, *center_y));
+            state
+                .displays
+                .entry(display_id.clone())
+                .or_default()
+                .overlay_center = Some((*center_x, *center_y));
         }
         OverlayUiUpdate::ConfirmedRegion {
             display_id,
@@ -957,6 +1183,7 @@ fn apply_overlay_ui_update(
             source,
         } => {
             state
+                .displays
                 .entry(display_id.clone())
                 .or_default()
                 .confirmed_region = Some(captastic_config::ConfirmedRegion {
@@ -1000,72 +1227,26 @@ fn run_overlay(
         instance,
     };
     let source = state.model.source;
-    let live_preview = state.live_preview;
     let width = i32::try_from(source.width)
         .map_err(|_| invalid_frame("overlay width exceeds Win32 limits"))?;
     let height = i32::try_from(source.height)
         .map_err(|_| invalid_frame("overlay height exceeds Win32 limits"))?;
     let state_pointer = Box::into_raw(state);
-    // SAFETY: The registered class and callback are valid. state_pointer remains allocated until
-    // the message loop exits; WM_NCCREATE stores it as window user data.
-    let hwnd = unsafe {
-        CreateWindowExW(
-            WS_EX_TOPMOST
-                | WS_EX_TOOLWINDOW
-                | if live_preview {
-                    WS_EX_LAYERED
-                } else {
-                    Default::default()
-                },
-            CLASS_NAME,
-            w!("Captastic Selection"),
-            WS_POPUP,
-            source.x,
-            source.y,
-            width,
-            height,
-            None,
-            None,
-            instance,
-            Some(state_pointer.cast()),
-        )
-    };
-    if hwnd.0 == 0 {
-        // SAFETY: Window creation failed, so Win32 did not retain the state allocation.
-        let state = unsafe { Box::from_raw(state_pointer) };
-        let _ = cache_overlay_state(state, resources);
-        return Err(last_error("create_overlay_window"));
-    }
-    // SAFETY: state_pointer remains exclusively owned by this overlay thread. Recording the HWND
-    // lets tool transitions register compositor previews against this top-level destination.
-    unsafe {
-        (*state_pointer).overlay_hwnd = hwnd;
-        if (*state_pointer).model.tool == CaptureTool::Window {
-            start_window_overview_build(hwnd, &mut *state_pointer);
-        }
-    }
-    if live_preview {
-        // Build the first per-pixel layer before showing the window. This both establishes the
-        // layered presenter and validates it early enough for automatic frozen-mode fallback.
-        // SAFETY: state_pointer remains exclusively owned by this overlay thread.
-        let state = unsafe { &mut *state_pointer };
-        compose_overlay_state(state);
-        if let Err(error) = present_live_layer(hwnd, state) {
-            // SAFETY: hwnd and state_pointer were created on this thread and are not published.
-            let _ = unsafe { DestroyWindow(hwnd) };
-            // The synchronous WM_DESTROY posted a quit that no message loop will consume. Leaving
-            // it queued would immediately end the frozen-mode fallback run on this same thread.
-            drain_pending_quit();
-            // SAFETY: no callback can access the state after DestroyWindow returns.
+    let hwnd = match establish_presenter(state_pointer, instance, source, width, height) {
+        Ok(hwnd) => hwnd,
+        Err(error) => {
+            // SAFETY: Presenter setup left no live window holding the state allocation.
             let state = unsafe { Box::from_raw(state_pointer) };
             let _ = cache_overlay_state(state, resources);
             return Err(error);
         }
-        // Capture exclusion is defense in depth. Confirmation still destroys this window before
-        // asking the capture owner for pixels.
-        // SAFETY: hwnd is a live top-level window owned by this process.
-        if let Err(error) = unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) } {
-            log::warn!("live selection overlay could not be excluded from capture: {error}");
+    };
+    // SAFETY: state_pointer remains exclusively owned by this overlay thread. The chooser build
+    // starts only once the presenter has settled, so a fallback re-creation cannot strand a
+    // build posting messages at a window that no longer exists.
+    unsafe {
+        if (*state_pointer).model.tool == CaptureTool::Window {
+            start_window_overview_build(hwnd, &mut *state_pointer);
         }
     }
     controller.inner.hwnd.store(hwnd.0, Ordering::SeqCst);
@@ -1119,6 +1300,116 @@ fn run_overlay(
     restore_input_context(previous_foreground);
     drop(class_guard);
     Ok(outcome)
+}
+
+/// Creates the overlay window and gets its first frame onto the layer, falling back to an opaque
+/// window when the layered presenter cannot be established and the run can live without it.
+///
+/// One layered window serves both views, so this runs for every run rather than only live ones:
+/// the first `UpdateLayeredWindow` is what proves the presenter works, and doing it before the
+/// window is shown is what makes a fallback invisible rather than a flash of a broken overlay.
+///
+/// The fallback is only available to a run that has a snapshot to paint and did not demand the
+/// layered presenter. It destroys the window, drains the quit that `WM_DESTROY` latched — leaving
+/// it queued would end the replacement run's message loop immediately — locks the view to
+/// `Frozen`, and re-creates without `WS_EX_LAYERED`. An explicit `live` request fails hard
+/// instead: an opaque window showing trigger-time pixels is the wrong answer to it, not a
+/// degraded one.
+///
+/// # Safety-relevant ownership
+///
+/// `state_pointer` is owned by the caller for the whole call: on the error return no window holds
+/// it, and on success exactly one live window does.
+fn establish_presenter(
+    state_pointer: *mut OverlayState,
+    instance: HINSTANCE,
+    source: Rect,
+    width: i32,
+    height: i32,
+) -> Result<HWND, CaptureError> {
+    loop {
+        // SAFETY: state_pointer is exclusively owned by this overlay thread; no window is live
+        // at this point in the loop, so no callback can be reading it.
+        let layered = unsafe { (*state_pointer).presenter } == Presenter::Layered;
+        // SAFETY: The registered class and callback are valid. state_pointer remains allocated
+        // until the message loop exits; WM_NCCREATE stores it as window user data.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_TOPMOST
+                    | WS_EX_TOOLWINDOW
+                    | if layered {
+                        WS_EX_LAYERED
+                    } else {
+                        Default::default()
+                    },
+                CLASS_NAME,
+                w!("Captastic Selection"),
+                WS_POPUP,
+                source.x,
+                source.y,
+                width,
+                height,
+                None,
+                None,
+                instance,
+                Some(state_pointer.cast()),
+            )
+        };
+        if hwnd.0 == 0 {
+            return Err(last_error("create_overlay_window"));
+        }
+        // SAFETY: state_pointer remains exclusively owned by this overlay thread. Recording the
+        // HWND lets tool transitions register compositor previews against this destination.
+        unsafe { (*state_pointer).overlay_hwnd = hwnd };
+        // Every overlay, including the opaque fallback. Capture exclusion is defence in depth -
+        // confirmation still destroys this window before asking the capture owner for pixels -
+        // but a window that can be showing the live desktop one keystroke from now has no
+        // business appearing in somebody else's screen recording, and the fallback window is
+        // only locked to the frozen view by a decision this code made, not by anything Windows
+        // knows.
+        // SAFETY: hwnd is a live top-level window owned by this process.
+        let excluded = unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) };
+        if let Err(error) = excluded {
+            log::warn!("selection overlay could not be excluded from capture: {error}");
+        }
+        if !layered {
+            return Ok(hwnd);
+        }
+        // Build the first layer before showing the window: this both establishes the layered
+        // presenter and validates it early enough to fall back invisibly.
+        // SAFETY: state_pointer remains exclusively owned by this overlay thread.
+        let state = unsafe { &mut *state_pointer };
+        compose_overlay_state(state);
+        let present = present_layer(hwnd, state);
+        let fallback_allowed = !state.require_layered && state.snapshot_present;
+        match present {
+            Ok(()) => return Ok(hwnd),
+            Err(error) => {
+                // SAFETY: hwnd and state_pointer were created on this thread and are not
+                // published to any other.
+                let _ = unsafe { DestroyWindow(hwnd) };
+                // The synchronous WM_DESTROY posted a quit that no message loop will consume.
+                drain_pending_quit();
+                // SAFETY: no callback can access the state after DestroyWindow returns.
+                let state = unsafe { &mut *state_pointer };
+                state.overlay_hwnd = HWND(0);
+                if !fallback_allowed {
+                    return Err(error);
+                }
+                log::warn!(
+                    "layered selection presenter failed; showing the frozen view in an opaque window: {error}"
+                );
+                state.presenter = Presenter::Opaque;
+                state.presenter_fallback_reason = Some(error.to_string());
+                // An opaque window can only ever show the snapshot, so the view is not a choice
+                // any more and offering to switch it would be offering something that cannot
+                // happen.
+                state.model.view = PreviewView::Frozen;
+                state.model.initial_view = PreviewView::Frozen;
+                state.model.view_toggle_available = false;
+            }
+        }
+    }
 }
 
 unsafe extern "system" fn overlay_window_proc(
@@ -1220,6 +1511,8 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                     OverlayInput::PointerMoved {
                         point,
                         window_hover: None,
+                        modifiers: modifiers(),
+                        time_ms: message_time_ms(),
                     },
                 );
             }
@@ -1242,6 +1535,8 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                     OverlayInput::PointerMoved {
                         point,
                         window_hover,
+                        modifiers: modifiers(),
+                        time_ms: message_time_ms(),
                     },
                     (
                         state.model.hovered.map(|candidate| candidate.handle),
@@ -1276,7 +1571,11 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                 let window_slot = (state.model.tool == CaptureTool::Window)
                     .then(|| hit_test_window_thumbnail(state, local))
                     .flatten();
-                OverlayInput::PointerDown { point, window_slot }
+                OverlayInput::PointerDown {
+                    point,
+                    window_slot,
+                    time_ms: message_time_ms(),
+                }
             };
             run_machine(hwnd, state_pointer, input)
         }
@@ -1286,7 +1585,14 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                 let state = unsafe { &*state_pointer };
                 screen_point(state.model.source, lparam)
             };
-            run_machine(hwnd, state_pointer, OverlayInput::PointerUp { point })
+            run_machine(
+                hwnd,
+                state_pointer,
+                OverlayInput::PointerUp {
+                    point,
+                    modifiers: modifiers(),
+                },
+            )
         }
         WM_LBUTTONDBLCLK => {
             let point = {
@@ -1302,6 +1608,75 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
         WM_KEYDOWN if wparam.0 == usize::from(VK_ESCAPE.0) => {
             run_machine(hwnd, state_pointer, OverlayInput::CancelRequested)
         }
+        WM_KEYDOWN if wparam.0 == usize::from(VK_Z.0) => {
+            if key_is_autorepeat(lparam) {
+                // The key is already down and the machine already knows. Restating it thirty
+                // times a second would only churn the visibility comparison.
+                return LRESULT(0);
+            }
+            run_machine(
+                hwnd,
+                state_pointer,
+                OverlayInput::LoupeKeyChanged { held: true },
+            )
+        }
+        WM_KEYDOWN if wparam.0 == usize::from(VK_F.0) => {
+            if key_is_autorepeat(lparam) {
+                // Holding F is not a request to flicker between the two views thirty times a
+                // second. Only the transition from up to down means anything here.
+                return LRESULT(0);
+            }
+            run_machine(hwnd, state_pointer, OverlayInput::ToggleView)
+        }
+        WM_KEYUP if wparam.0 == usize::from(VK_Z.0) => run_machine(
+            hwnd,
+            state_pointer,
+            OverlayInput::LoupeKeyChanged { held: false },
+        ),
+        WM_SETFOCUS | WM_KILLFOCUS => {
+            // Losing focus disarms the magnifier key, because a key released while another window
+            // has focus is delivered to that window and would otherwise stay held forever.
+            // Gaining it re-reads the keyboard: after an Alt+Tab away and back, Windows sends
+            // only autorepeat WM_KEYDOWNs for a key that was already down and those are discarded
+            // as repeats, so without this Z could never re-arm. The same read is what makes a Z
+            // already held when the overlay opens work at all - SetFocus in run_overlay sends
+            // this message synchronously, after the state pointer is installed.
+            run_machine(
+                hwnd,
+                state_pointer,
+                OverlayInput::LoupeKeyChanged {
+                    held: loupe_key_after_focus_change(message == WM_SETFOCUS),
+                },
+            );
+            // Focus notifications are the system's, not ours: consuming them would deny the
+            // default procedure its caret and accessibility bookkeeping.
+            // SAFETY: Default focus handling for this live window.
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+        }
+        WM_TIMER if wparam.0 == LOUPE_TIMER_ID => run_machine(
+            hwnd,
+            state_pointer,
+            OverlayInput::Tick {
+                time_ms: message_time_ms(),
+            },
+        ),
+        WM_KEYDOWN if arrow_direction(wparam).is_some() => {
+            let (x, y) = arrow_direction(wparam).unwrap_or((0, 0));
+            let modifiers = modifiers();
+            // Autorepeat is not filtered here: holding an arrow down is exactly how a user walks
+            // an edge across a few pixels, and Windows' own repeat rate is the right cadence for
+            // it. Ctrl turns the same keys into a resize of the right and bottom edges.
+            let step = modifiers.nudge_step();
+            run_machine(
+                hwnd,
+                state_pointer,
+                OverlayInput::Nudge {
+                    dx: x * step,
+                    dy: y * step,
+                    resize: modifiers.ctrl,
+                },
+            )
+        }
         WM_CAPTURECHANGED => {
             // A self-initiated ReleaseCapture round trip is protocol, not product state: consume
             // the shell's flag and never involve the machine.
@@ -1311,6 +1686,8 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             }) {
                 return LRESULT(0);
             }
+            // A real loss ends the drag, so the rest timer has nothing left to watch.
+            stop_loupe_timer(hwnd);
             run_machine(hwnd, state_pointer, OverlayInput::PointerCaptureLost)
         }
         WM_RBUTTONDOWN | WM_CLOSE => {
@@ -1336,6 +1713,22 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             // SAFETY: Standard handling for messages Captastic does not consume.
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
+    }
+}
+
+/// The unit step an arrow key asks for, or `None` for any other key.
+const fn arrow_direction(wparam: WPARAM) -> Option<(i32, i32)> {
+    let key = wparam.0 as u16;
+    if key == VK_LEFT.0 {
+        Some((-1, 0))
+    } else if key == VK_RIGHT.0 {
+        Some((1, 0))
+    } else if key == VK_UP.0 {
+        Some((0, -1))
+    } else if key == VK_DOWN.0 {
+        Some((0, 1))
+    } else {
+        None
     }
 }
 
@@ -1381,6 +1774,11 @@ fn build_overlay_selection(
             .filter_map(|thumbnail| thumbnail.surface.as_ref())
             .map(|surface| surface.byte_length)
             .sum(),
+        // The view that is on screen at this instant, not the one the run opened in: the whole
+        // point of the toggle is that the user confirms what they are looking at.
+        view: state.model.view,
+        view_switched: state.view_switched,
+        presenter_fallback_reason: state.presenter_fallback_reason.clone(),
         window_frame,
     }
 }
@@ -1401,10 +1799,40 @@ const fn confirm_preview_split(kind: SelectionKind, live: usize, total: usize) -
 /// transition ends before any effect executes, so effects that reenter this window procedure
 /// (`ReleaseCapture`, `DestroyWindow`) can never observe a live `&mut` of the state.
 fn run_machine(hwnd: HWND, state_pointer: *mut OverlayState, input: OverlayInput) -> LRESULT {
+    // SAFETY: Single-field read; the borrow ends on this line.
+    let view_before = unsafe { (*state_pointer).model.view };
     // SAFETY: The Box remains alive for the message loop; this borrow ends at the semicolon.
     let effects = transition(unsafe { &mut (*state_pointer).model }, input);
+    // Observed here rather than announced by an effect, and latched rather than compared at the
+    // end: whether the *user* changed the view is telemetry about the run, not a decision the
+    // machine makes anything of, and a run switched twice ends where it started while still
+    // having been switched. One place covers both the `F` key and the Options row.
+    // SAFETY: This takes a whole-struct `&mut` to read `model.view` and write `view_switched`.
+    // The Box remains alive for the message loop, `transition` has already returned so no other
+    // borrow of the state is live, and nothing inside this block can reenter the window
+    // procedure: it is two field accesses and no call. The borrow ends at the closing brace,
+    // before `apply_overlay_effects` derives its own.
+    unsafe {
+        let state = &mut *state_pointer;
+        state.view_switched = latch_view_switch(state.view_switched, view_before, state.model.view);
+    }
     apply_overlay_effects(hwnd, state_pointer, effects);
     LRESULT(0)
+}
+
+/// Whether the user has changed the view at any point in this run, given what it was before an
+/// input and what it is after.
+///
+/// Latched, never recomputed: a run switched to the frozen view and back ends in the view it
+/// opened in, and comparing the two at the end would report it as never switched - which is
+/// exactly the case the flag exists to tell apart.
+const fn latch_view_switch(switched: bool, before: PreviewView, after: PreviewView) -> bool {
+    // `PreviewView` is not `const`-comparable through `PartialEq`, so the match spells it out.
+    switched
+        || !matches!(
+            (before, after),
+            (PreviewView::Live, PreviewView::Live) | (PreviewView::Frozen, PreviewView::Frozen)
+        )
 }
 
 fn apply_overlay_effects(
@@ -1427,12 +1855,22 @@ fn apply_overlay_effects(
                 }
             }
             OverlayEffect::Invalidate => invalidate(hwnd),
-            OverlayEffect::CapturePointer => capture_pointer(hwnd),
+            OverlayEffect::CapturePointer => {
+                capture_pointer(hwnd);
+                // The timer's lifetime is exactly the drag's, which is exactly the pointer
+                // capture's: started here, stopped on release and on a real capture loss. There
+                // is no path that takes capture without this effect.
+                // SAFETY: Shared borrow released at the block's end.
+                if machine::loupe_timer_wanted(unsafe { &(*state_pointer).model }) {
+                    start_loupe_timer(hwnd);
+                }
+            }
             OverlayEffect::ReleasePointer => {
                 // ReleaseCapture synchronously sends WM_CAPTURECHANGED back to this window. Arm
                 // the protocol flag first so that reentrant notification is recognized as
                 // self-initiated; the model transition has already committed its work, so the
                 // reentrant callback can never erase state the caller still needs.
+                stop_loupe_timer(hwnd);
                 // SAFETY: This single-field mutation ends before ReleaseCapture can re-enter.
                 unsafe { (*state_pointer).releasing_pointer_capture = true };
                 release_pointer_capture();
@@ -1469,6 +1907,23 @@ fn apply_overlay_effects(
                 // SAFETY: The borrow ends before the next effect.
                 let state = unsafe { &mut *state_pointer };
                 start_window_overview_build(hwnd, state);
+            }
+            OverlayEffect::BuildSnapTargets => {
+                // Enumeration happens here, in an effect handler, and never inside the machine:
+                // the model borrow taken for the transition has already ended, so the Win32 calls
+                // below cannot observe a live `&mut` of the state. The same shape as
+                // UpdateWindowPreview -> WindowPreviewResolved.
+                let targets = {
+                    // SAFETY: The borrow ends before the feedback transition derives its own.
+                    let state = unsafe { &mut *state_pointer };
+                    build_snap_targets(state)
+                };
+                // SAFETY: The Box remains alive; this borrow ends at the semicolon.
+                let effects = transition(
+                    unsafe { &mut (*state_pointer).model },
+                    OverlayInput::SnapTargetsReady { targets },
+                );
+                apply_overlay_effects(hwnd, state_pointer, effects);
             }
             OverlayEffect::UpdateWindowPreview { window } => {
                 let rect = {
@@ -1510,6 +1965,22 @@ fn apply_overlay_effects(
                     position,
                     state.model.display_environment,
                 );
+            }
+            OverlayEffect::PersistSnapPreference { enabled } => {
+                // SAFETY: Shared borrow released at the block's end.
+                let state = unsafe { &*state_pointer };
+                if let Some(sink) = state.ui_updates.as_ref() {
+                    sink.submit(OverlayUiUpdate::SnapToWindows { enabled });
+                }
+            }
+            OverlayEffect::PersistRegionZoom { mode } => {
+                // SAFETY: Shared borrow released at the block's end.
+                let state = unsafe { &*state_pointer };
+                if let Some(sink) = state.ui_updates.as_ref() {
+                    sink.submit(OverlayUiUpdate::RegionZoom {
+                        mode: mode.to_config(),
+                    });
+                }
             }
             OverlayEffect::PersistInteraction { region } => {
                 // SAFETY: Shared borrow released at the block's end.
@@ -1580,12 +2051,13 @@ fn paint(hwnd: HWND, state_pointer: *mut OverlayState) {
         // borrow is created, and the borrow ends before EndPaint can synchronously send messages.
         let state = unsafe { &mut *state_pointer };
         compose_overlay_state(state);
-        if state.live_preview {
-            if let Err(error) = present_live_layer(hwnd, state) {
-                log::error!("live overlay presentation failed: {error}");
+        match state.presenter {
+            Presenter::Layered => {
+                if let Err(error) = present_layer(hwnd, state) {
+                    log::error!("overlay presentation failed: {error}");
+                }
             }
-        } else {
-            copy_overlay_to_paint_device(device, state);
+            Presenter::Opaque => copy_overlay_to_paint_device(device, state),
         }
     }
     // SAFETY: Balances BeginPaint for this exact hwnd/paint structure after releasing state.
@@ -1638,8 +2110,10 @@ fn prune_dead_window_sources(state: &mut OverlayState) -> Vec<NativeWindowHandle
 fn compose_overlay_state(state: &mut OverlayState) {
     let width = state.surface.width;
     if state.model.tool == CaptureTool::Window {
-        // Destroyed sources are pruned once per paint (the overlay runs no timers), and any
-        // model state pointing at them is cleared before the chooser surface is rebuilt.
+        // Destroyed sources are pruned once per paint. The overlay's only timer is the region
+        // tool's rest timer, which never runs under the Window tool, so a paint is still the one
+        // and only moment this inventory is revisited. Any model state pointing at a pruned
+        // window is cleared before the chooser surface is rebuilt.
         let dead = prune_dead_window_sources(state);
         if !dead.is_empty() {
             for effect in machine::window_sources_pruned(&mut state.model, &dead) {
@@ -1675,7 +2149,7 @@ fn compose_overlay_state(state: &mut OverlayState) {
             draw_window_overview_static(&state.back_buffer, state);
         }
         draw_window_overview_interactive(state);
-    } else if state.live_preview {
+    } else if state.model.view == PreviewView::Live {
         paint_live_selection_background(state);
     } else {
         // SAFETY: Both memory contexts are live, compatible GDI DCs with selected DIBs. Compose
@@ -1696,7 +2170,9 @@ fn compose_overlay_state(state: &mut OverlayState) {
     }
     // Window mode's dim wash is already part of its static overview cache. Other tools compose it
     // here so the selected region can subsequently restore its original frozen pixels.
-    if state.model.tool != CaptureTool::Window && state.model.dim_background && !state.live_preview
+    if state.model.tool != CaptureTool::Window
+        && state.model.dim_background
+        && state.model.view == PreviewView::Frozen
     {
         let _ = apply_dim_wash(
             state.back_buffer.device,
@@ -1706,12 +2182,19 @@ fn compose_overlay_state(state: &mut OverlayState) {
             DIM_ALPHA,
         );
     }
+    // Laid out *and sampled* before anything is drawn, so the dimension badge can avoid it, and
+    // painted after the selection chrome so it sits on top of the outline it is magnifying. The
+    // sampling has to happen on this side of the badge: a sample that fails cancels the
+    // magnifier, and a badge that had already reserved space for one would sit off to the side
+    // avoiding nothing.
+    prepare_loupe(state);
     if state.model.tool != CaptureTool::Window {
         if let Some(rect) = state.model.selection {
-            if !state.live_preview {
+            if state.model.view == PreviewView::Frozen {
                 restore_highlight(state, rect);
             }
             draw_outline(state.back_buffer.device, state.model.source, rect);
+            draw_snap_guides(state);
             if state.model.selection_kind == Some(SelectionKind::Region) {
                 draw_resize_handles(
                     state.back_buffer.device,
@@ -1723,7 +2206,75 @@ fn compose_overlay_state(state: &mut OverlayState) {
             }
         }
     }
+    draw_loupe(state);
     draw_toolbar(state);
+}
+
+/// Decides where the magnifier goes this paint and gets its pixels, or settles that there is no
+/// magnifier this paint.
+///
+/// Both halves belong together, and ahead of every draw. `loupe_layout` is what the dimension
+/// badge treats as an obstacle, so it has to be final before the badge is placed — a sample that
+/// fails cancels the magnifier, and a badge that had already moved aside for one would be
+/// avoiding nothing.
+fn prepare_loupe(state: &mut OverlayState) {
+    state.loupe_layout = plan_loupe(state);
+    let Some(layout) = state.loupe_layout else {
+        return;
+    };
+    if !sample_loupe_source(state, layout) {
+        // Without pixels there is nothing honest to show, and the live presenter's alpha pass
+        // must not carve an opaque hole where a magnifier is not.
+        state.loupe_layout = None;
+    }
+}
+
+/// Where the magnifier goes this paint, or `None` when it is not showing.
+fn plan_loupe(state: &OverlayState) -> Option<LoupeLayout> {
+    let pointer = state.model.pointer_local?;
+    machine::loupe_visible(&state.model).then(|| {
+        layout_loupe(
+            UiRect {
+                left: 0,
+                top: 0,
+                right: state.surface.width,
+                bottom: state.surface.height,
+            },
+            pointer,
+            state.model.display_environment.metrics.loupe_tokens(),
+        )
+    })
+}
+
+/// Draws the guide line for each snapped axis: a hairline in the accent colour running the full
+/// length of the target edge the selection landed on, so it is obvious *what* it snapped to.
+///
+/// A trailing guide is painted at `position - 1`. `position` is the selection's exclusive right or
+/// bottom edge, so the last pixel it actually covers is the one before it; drawing at `position`
+/// would put the line outside the very selection it is explaining. `draw_lines` uses `LineTo`,
+/// which excludes its end point, so the span is painted half-open exactly as it is stored.
+fn draw_snap_guides(state: &OverlayState) {
+    let source = state.model.source;
+    for guide in state.model.active_snaps.iter().flatten() {
+        let position = guide.position - if guide.trailing { 1 } else { 0 };
+        let points = match guide.axis {
+            SnapAxis::X => {
+                let x = position.saturating_sub(source.x);
+                [
+                    (x, guide.span.0.saturating_sub(source.y)),
+                    (x, guide.span.1.saturating_sub(source.y)),
+                ]
+            }
+            SnapAxis::Y => {
+                let y = position.saturating_sub(source.y);
+                [
+                    (guide.span.0.saturating_sub(source.x), y),
+                    (guide.span.1.saturating_sub(source.x), y),
+                ]
+            }
+        };
+        draw_lines(state.back_buffer.device, &points, rgb(86, 156, 255), 1);
+    }
 }
 
 fn copy_overlay_to_paint_device(device: HDC, state: &OverlayState) {
@@ -1749,8 +2300,24 @@ fn paint_live_selection_background(state: &OverlayState) {
     fill_live_background(&state.back_buffer);
 }
 
-fn present_live_layer(hwnd: HWND, state: &OverlayState) -> Result<(), CaptureError> {
-    prepare_live_layer_pixels(state);
+/// Puts the composed back buffer on the screen through the layered window.
+///
+/// Both views present through this one path, and both hand the compositor per-pixel alpha. The
+/// live view's alpha pass decides which pixels show the desktop through; the frozen view's pass
+/// sets every alpha byte opaque, because the bytes it would otherwise hand over are not a
+/// picture of anything: the snapshot arrives with whatever alpha the desktop duplication frame
+/// carried, GDI zeroes the alpha of every pixel it draws chrome on, and the dim wash blends the
+/// alpha channel along with the colour. Presenting that buffer as `ULW_OPAQUE` was meant to
+/// make the compositor ignore all of it; on Windows 11 it did not, and the frozen view came up
+/// with its chrome see-through and its colours skewed. Forcing the alpha byte is the one way to
+/// be opaque under every reading of the flags, and it costs the same full-screen loop the live
+/// view already pays on every paint.
+fn present_layer(hwnd: HWND, state: &OverlayState) -> Result<(), CaptureError> {
+    if state.model.view == PreviewView::Live {
+        prepare_live_layer_pixels(state);
+    } else {
+        prepare_frozen_layer_pixels(state);
+    }
     let destination = POINT {
         x: state.model.source.x,
         y: state.model.source.y,
@@ -1788,7 +2355,25 @@ fn present_live_layer(hwnd: HWND, state: &OverlayState) -> Result<(), CaptureErr
     };
     // SAFETY: Balances the successful GetDC(None) above on this thread.
     unsafe { ReleaseDC(None, screen) };
-    result.map_err(|error| overlay_error("present_live_overlay", error))
+    result.map_err(|error| overlay_error("present_overlay_layer", error))
+}
+
+/// Makes every pixel of the composed frozen view opaque before the compositor reads it.
+fn prepare_frozen_layer_pixels(state: &OverlayState) {
+    // SAFETY: Flushes this thread's queued GDI drawing before the CPU updates the DIB alpha bytes.
+    let _ = unsafe { GdiFlush() };
+    // SAFETY: The back buffer uniquely owns this writable DIB on the overlay thread.
+    let pixels = unsafe {
+        std::slice::from_raw_parts_mut(state.back_buffer.bits, state.back_buffer.byte_length)
+    };
+    force_opaque_alpha(pixels);
+}
+
+/// Sets the alpha byte of every BGRA pixel to opaque and leaves the colour bytes alone.
+fn force_opaque_alpha(pixels: &mut [u8]) {
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel[3] = u8::MAX;
+    }
 }
 
 fn prepare_live_layer_pixels(state: &OverlayState) {
@@ -1811,6 +2396,11 @@ fn prepare_live_layer_pixels(state: &OverlayState) {
             )
             .unwrap_or(state.back_buffer.height),
         });
+    // The view, not the whole box. Only the magnified pixels arrive by StretchBlt; every other
+    // part of the magnifier - the round box, the grid, the edges, the label - is GDI-drawn and
+    // is already opaque through the coverage sentinel. Forcing the bounding box opaque painted
+    // the four corner wedges *outside* the rounded border solid black.
+    let loupe = state.loupe_layout.map(|layout| layout.view);
     // SAFETY: The back buffer uniquely owns this writable DIB on the overlay thread.
     let pixels = unsafe {
         std::slice::from_raw_parts_mut(state.back_buffer.bits, state.back_buffer.byte_length)
@@ -1833,6 +2423,12 @@ fn prepare_live_layer_pixels(state: &OverlayState) {
                 state.model.dim_background,
                 in_selection,
                 drawn,
+                loupe.is_some_and(|bounds| {
+                    x >= bounds.left.max(0) as usize
+                        && x < bounds.right.max(0) as usize
+                        && y >= bounds.top.max(0) as usize
+                        && y < bounds.bottom.max(0) as usize
+                }),
             );
         }
     }
@@ -1843,8 +2439,15 @@ const fn live_pixel_alpha(
     dim_background: bool,
     in_selection: bool,
     drawn: bool,
+    in_loupe: bool,
 ) -> u8 {
-    if matches!(tool, CaptureTool::Window) || drawn {
+    // The magnified pixels are opaque by fiat rather than by coverage. They arrive by StretchBlt,
+    // which copies the source's alpha byte rather than zeroing it the way GDI's drawing calls do,
+    // so the coverage sentinel cannot classify them - and a see-through magnifier over the very
+    // pixels it is magnifying would be worse than none. `in_loupe` is deliberately the magnified
+    // view alone: the chrome around it is drawn, and the rounded box's corner wedges are not part
+    // of the magnifier at all.
+    if in_loupe || matches!(tool, CaptureTool::Window) || drawn {
         u8::MAX
     } else if in_selection || !dim_background {
         LIVE_HIT_TEST_ALPHA
@@ -1923,7 +2526,23 @@ fn ensure_window_mode_assets(state: &mut OverlayState) {
     if state.window_assets_ready {
         return;
     }
-    if state.windows.is_none() {
+    ensure_window_inventory(state);
+    let reusable = state.cached_blurred_background.take();
+    state.blurred_background = build_blurred_background(&state.surface, 24, reusable).ok();
+    state.window_assets_ready = true;
+}
+
+/// Enumerates the capturable windows on this display, once per run.
+///
+/// Split out of [`ensure_window_mode_assets`] because the region tool needs the same inventory
+/// for edge snapping and emphatically does not need the blurred chooser backdrop that used to
+/// come with it — building that costs a full-display downscale the region tool would never look
+/// at. Whichever tool asks first pays; the other then finds the list already there.
+fn ensure_window_inventory(state: &mut OverlayState) {
+    if state.windows.is_some() {
+        return;
+    }
+    {
         let displays = match crate::dxgi::enumerate_displays() {
             Ok(displays)
                 if displays
@@ -1963,9 +2582,89 @@ fn ensure_window_mode_assets(state: &mut OverlayState) {
             },
         );
     }
-    let reusable = state.cached_blurred_background.take();
-    state.blurred_background = build_blurred_background(&state.surface, 24, reusable).ok();
-    state.window_assets_ready = true;
+}
+
+/// The ordered edge inventory the region tool snaps against, built once per run.
+///
+/// Windows come first, in the front-to-back order `EnumWindows` reports, so the topmost window
+/// wins a distance tie; then the work area (the taskbar's inner edge, which is where a region
+/// meant to exclude the taskbar belongs); then the display itself, last, so it can only ever win
+/// when nothing else is in reach. Every frame is clipped to the captured display, because an edge
+/// off the side of it is not an edge the user can put a region on.
+fn build_snap_targets(state: &mut OverlayState) -> SnapTargets {
+    let started = Instant::now();
+    ensure_window_inventory(state);
+    let source = state.model.source;
+    // The work area arrives overlay-local (it is measured against the captured display's origin);
+    // every other target here is in desktop coordinates.
+    let work_area = state.model.display_environment.work_area;
+    let work_area = Rect::from_edges(
+        i64::from(work_area.left) + i64::from(source.x),
+        i64::from(work_area.top) + i64::from(source.y),
+        i64::from(work_area.right) + i64::from(source.x),
+        i64::from(work_area.bottom) + i64::from(source.y),
+    );
+    let targets = snap_targets_from(
+        state
+            .windows
+            .iter()
+            .flatten()
+            .map(|candidate| candidate.frame),
+        work_area,
+        source,
+    );
+    log::debug!(
+        "region snap inventory for display {}: {} targets in {} ns",
+        state.reference_metadata.display_id.0,
+        targets.len(),
+        duration_ns(started.elapsed()),
+    );
+    if log::log_enabled!(log::Level::Trace) {
+        for target in targets.iter() {
+            log::trace!(
+                "snap target kind={:?} rect={}x{}{:+}{:+}",
+                target.kind,
+                target.rect.width,
+                target.rect.height,
+                target.rect.x,
+                target.rect.y,
+            );
+        }
+    }
+    targets
+}
+
+/// Assembles the inventory from geometry alone, so the ordering rule that the whole tie-break
+/// rests on is testable without a desktop.
+fn snap_targets_from(
+    frames: impl IntoIterator<Item = Rect>,
+    work_area: Option<Rect>,
+    source: Rect,
+) -> SnapTargets {
+    let mut targets: Vec<SnapTarget> = frames
+        .into_iter()
+        .filter_map(|frame| frame.intersection(source))
+        .map(|rect| SnapTarget {
+            rect,
+            kind: SnapTargetKind::Window,
+        })
+        .collect();
+    // A work area equal to the display carries no edge the display does not already carry, and
+    // listing it twice would only make a duplicate line appear under the guide.
+    if let Some(rect) = work_area
+        .and_then(|rect| rect.intersection(source))
+        .filter(|rect| *rect != source)
+    {
+        targets.push(SnapTarget {
+            rect,
+            kind: SnapTargetKind::WorkArea,
+        });
+    }
+    targets.push(SnapTarget {
+        rect: source,
+        kind: SnapTargetKind::Display,
+    });
+    SnapTargets::new(targets)
 }
 
 fn fallback_display_info(state: &OverlayState) -> DisplayInfo {
@@ -2190,17 +2889,21 @@ fn render_overview_batch(hwnd: HWND, state: &mut OverlayState, generation: usize
 
 /// Builds a tile for each window, and reports which of them still need pixels.
 ///
-/// In live mode a tile needs only the shape of its window, which `DwmQueryThumbnailSourceSize`
-/// answers in about a millisecond without capturing anything. In frozen mode there is no
-/// compositor drawing tiles for us, so every window needs a render.
+/// Under the layered presenter a tile needs only the shape of its window, which
+/// `DwmQueryThumbnailSourceSize` answers in about a millisecond without capturing anything.
+/// Without it there is no compositor drawing tiles for us, so every window needs a render.
+///
+/// Keyed on the presenter, not the view: DWM composes its thumbnails against the destination
+/// window regardless of which pixels Captastic is painting underneath, and the Window tool is
+/// unaffected by the view in any case — clicking a tile always renders the window fresh.
 fn seed_window_tiles(
     state: &mut OverlayState,
     handles: &[NativeWindowHandle],
 ) -> Vec<NativeWindowHandle> {
     let mut needs_render = Vec::new();
+    let layered = state.presenter == Presenter::Layered;
     for handle in handles {
-        let source = state
-            .live_preview
+        let source = layered
             .then(|| dwm_source_size(state.overlay_hwnd, *handle))
             .flatten()
             .or_else(|| native_window_size(*handle));
@@ -2212,8 +2915,8 @@ fn seed_window_tiles(
             );
             continue;
         };
-        // Frozen mode draws every tile itself, so every tile needs pixels.
-        if !state.live_preview {
+        // Without DWM every tile is drawn here, so every tile needs pixels.
+        if !layered {
             needs_render.push(*handle);
         }
         state.window_thumbnails.push(WindowThumbnail {
@@ -2264,7 +2967,10 @@ fn ensure_overview_batch_posted(hwnd: HWND, state: &OverlayState) {
 
 fn refresh_live_window_thumbnails(state: &mut OverlayState) {
     state.live_window_thumbnails.clear();
-    if !state.live_preview || state.model.tool != CaptureTool::Window || state.overlay_hwnd.0 == 0 {
+    if state.presenter != Presenter::Layered
+        || state.model.tool != CaptureTool::Window
+        || state.overlay_hwnd.0 == 0
+    {
         return;
     }
 
@@ -2642,7 +3348,7 @@ fn ready_window_preview(
 }
 
 fn restore_highlight(state: &OverlayState, rect: Rect) {
-    let Some(visible) = intersect_rect(rect, state.model.source) else {
+    let Some(visible) = rect.intersection(state.model.source) else {
         return;
     };
     let x = visible.x - state.model.source.x;
@@ -2696,6 +3402,11 @@ fn draw_region_dimensions(state: &mut OverlayState, rect: Rect) {
         state.model.toolbar_position,
     );
     let mut reserved = vec![toolbar.bounds];
+    // The magnifier is drawn after the badge and would simply cover it; reserving it here moves
+    // the badge instead, which is the only one of the two that has anywhere else to go. Read
+    // rather than computed, because `prepare_loupe` has already settled whether there will be
+    // one at all - a magnifier whose sample failed is not an obstacle.
+    reserved.extend(loupe_obstacle(state.loupe_layout));
     // The tooltip paints after the label and would occlude it; reserve its whole potential
     // band so the label's placement stays stable across hover changes.
     reserved.push(tooltip_band(state.model.display_environment, toolbar));
@@ -2749,6 +3460,209 @@ fn draw_region_dimensions(state: &mut OverlayState, rect: Rect) {
         TextAlignment::Center,
         tokens.label_font_height,
     );
+}
+
+/// Paints the magnifier over the pixels [`prepare_loupe`] sampled.
+///
+/// Takes a shared borrow on purpose: by this point `loupe_layout` is settled, the badge has
+/// already been placed against it, and nothing here is allowed to change its mind.
+fn draw_loupe(state: &OverlayState) {
+    let Some(layout) = state.loupe_layout else {
+        return;
+    };
+    let device = state.back_buffer.device;
+    let tokens = layout.tokens;
+    draw_round_box(
+        device,
+        layout.bounds,
+        rgb(24, 24, 27),
+        rgb(104, 104, 110),
+        tokens.corner_radius,
+    );
+    if let Some(sample) = state.loupe_sample.as_ref() {
+        draw_surface_nearest(device, sample, layout.view);
+    }
+    draw_loupe_grid(device, layout);
+    draw_loupe_selection_edges(device, state, layout);
+    draw_loupe_centre_cell(device, layout);
+    // The desktop coordinate of the pixel under the pointer: the number the user is aiming for,
+    // stated plainly rather than left to be counted off the badge.
+    if let Some(pointer) = state.model.pointer_local {
+        draw_text(
+            device,
+            layout.label,
+            &format!(
+                "{}, {}",
+                pointer.x.saturating_add(state.model.source.x),
+                pointer.y.saturating_add(state.model.source.y)
+            ),
+            rgb(220, 220, 224),
+            TextAlignment::Center,
+            tokens.label_font_height,
+        );
+    }
+}
+
+/// A hairline between every magnified pixel, so the blocks read as pixels rather than as a blur.
+/// Skipped when the zoom is too small for a grid to be anything but noise.
+fn draw_loupe_grid(device: HDC, layout: LoupeLayout) {
+    let zoom = layout.tokens.zoom;
+    if zoom < 4 {
+        return;
+    }
+    let grid = rgb(64, 64, 70);
+    for step in 1..LOUPE_SOURCE_SPAN {
+        let x = layout.view.left + step * zoom;
+        draw_lines(
+            device,
+            &[(x, layout.view.top), (x, layout.view.bottom)],
+            grid,
+            1,
+        );
+        let y = layout.view.top + step * zoom;
+        draw_lines(
+            device,
+            &[(layout.view.left, y), (layout.view.right, y)],
+            grid,
+            1,
+        );
+    }
+}
+
+/// The selection's edges, drawn synthetically at the exact pixel boundaries they occupy.
+///
+/// Not sampled: the live view's sample is the bare desktop with no overlay in it, and the frozen
+/// view's is the untouched capture, so the outline being dragged is in neither. Drawing it here
+/// is also what makes it exact — a right edge at `right` is the boundary *before* the pixel at
+/// `right`, which is the one question the magnifier exists to answer.
+fn draw_loupe_selection_edges(device: HDC, state: &OverlayState, layout: LoupeLayout) {
+    let Some(rect) = state.model.selection else {
+        return;
+    };
+    if state.model.selection_kind != Some(SelectionKind::Region) {
+        return;
+    }
+    let source = state.model.source;
+    let selection = UiRect {
+        left: rect.x.saturating_sub(source.x),
+        top: rect.y.saturating_sub(source.y),
+        right: i32::try_from(rect.right().saturating_sub(i64::from(source.x))).unwrap_or(i32::MAX),
+        bottom: i32::try_from(rect.bottom().saturating_sub(i64::from(source.y)))
+            .unwrap_or(i32::MAX),
+    };
+    let accent = rgb(86, 156, 255);
+    for line in loupe_edge_lines(selection, layout) {
+        let points = if line.vertical {
+            [
+                (line.position, layout.view.top),
+                (line.position, layout.view.bottom),
+            ]
+        } else {
+            [
+                (layout.view.left, line.position),
+                (layout.view.right, line.position),
+            ]
+        };
+        draw_lines(device, &points, accent, layout.tokens.edge_stroke);
+    }
+}
+
+/// Outlines the one magnified cell that is the pixel under the pointer.
+fn draw_loupe_centre_cell(device: HDC, layout: LoupeLayout) {
+    let zoom = layout.tokens.zoom;
+    let left = layout.view.left + LOUPE_SOURCE_HALF * zoom;
+    let top = layout.view.top + LOUPE_SOURCE_HALF * zoom;
+    draw_outline_rect(
+        device,
+        left,
+        top,
+        left + zoom,
+        top + zoom,
+        rgb(255, 255, 255),
+        1,
+    );
+}
+
+/// Copies the 31x31 square of real pixels centred on the pointer into `loupe_sample`.
+///
+/// Returns false when no pixels could be obtained, which is the only honest reason not to draw.
+fn sample_loupe_source(state: &mut OverlayState, layout: LoupeLayout) -> bool {
+    if state.loupe_sample.is_none() {
+        match FrozenSurface::empty(LOUPE_SOURCE_SPAN as u32, LOUPE_SOURCE_SPAN as u32) {
+            Ok(surface) => state.loupe_sample = Some(surface),
+            Err(error) => {
+                log::warn!("magnifier sample surface could not be allocated: {error}");
+                return false;
+            }
+        }
+    }
+    let Some(sample) = state.loupe_sample.as_ref() else {
+        return false;
+    };
+    // A square that runs off the edge of the display must not smear the last row across the gap.
+    sample.clear();
+    let source = state.model.source;
+    if state.showing_frozen_pixels() {
+        // The composed still image is what the user is looking at, and `surface` holds it
+        // untouched by the overlay's own chrome - which is exactly what should be magnified.
+        // SAFETY: Both are live memory DIBs owned by this thread. GDI clips a source rectangle
+        // that runs past the edge of the frozen surface rather than reading out of bounds.
+        let copied = unsafe {
+            BitBlt(
+                sample.device,
+                0,
+                0,
+                LOUPE_SOURCE_SPAN,
+                LOUPE_SOURCE_SPAN,
+                state.surface.device,
+                layout.source.left,
+                layout.source.top,
+                SRCCOPY,
+            )
+        };
+        return copied.is_ok();
+    }
+    // Live: read the desktop itself. `surface` in this mode holds a backdrop captured before the
+    // overlay existed, kept only so the window chooser has something to blur; it is stale the
+    // moment anything on screen moves, and magnifying it would show pixels that are not there.
+    //
+    // No CAPTUREBLT: it would pull layered windows into the copy, and this overlay is one. The
+    // overlay is also marked WDA_EXCLUDEFROMCAPTURE, so neither route should put it in the
+    // sample; the synthetic selection edges mean correctness does not depend on that holding.
+    // SAFETY: A null HWND obtains the desktop DC, released immediately after the copy.
+    let screen = unsafe { GetDC(None) };
+    if screen.0 == 0 {
+        log::debug!("magnifier could not obtain a desktop device context");
+        return false;
+    }
+    // SAFETY: The sample DIB is exactly LOUPE_SOURCE_SPAN square and both DCs stay live for this
+    // synchronous copy. Physical desktop coordinates may legitimately be negative.
+    let copied = unsafe {
+        BitBlt(
+            sample.device,
+            0,
+            0,
+            LOUPE_SOURCE_SPAN,
+            LOUPE_SOURCE_SPAN,
+            screen,
+            source.x.saturating_add(layout.source.left),
+            source.y.saturating_add(layout.source.top),
+            SRCCOPY,
+        )
+    };
+    // SAFETY: Balances the successful GetDC(None) above on this thread.
+    unsafe { ReleaseDC(None, screen) };
+    copied.is_ok()
+}
+
+/// What the dimension badge must avoid on account of the magnifier: its box, or nothing at all.
+///
+/// A named function so the "or nothing at all" half is testable. The badge is placed once per
+/// paint and cannot be moved afterwards, so reserving space for a magnifier that turns out not to
+/// be drawn pushes the badge aside for nothing - which is why this reads the settled layout
+/// rather than recomputing whether one was wanted.
+fn loupe_obstacle(layout: Option<LoupeLayout>) -> Option<UiRect> {
+    layout.map(|layout| layout.bounds)
 }
 
 fn draw_window_overview_static(destination: &FrozenSurface, state: &OverlayState) {
@@ -2853,6 +3767,10 @@ fn draw_toolbar(state: &OverlayState) {
         state.model.display_environment,
         state.model.toolbar_position,
     );
+    // First, so the Options menu paints over it when both want the space above the toolbar: an
+    // open menu is what the user is looking at, and the tag is still readable the moment it
+    // closes.
+    draw_view_tag(state, layout);
     if state.model.options_open {
         draw_options_menu(device, state, layout);
     }
@@ -3096,6 +4014,81 @@ fn draw_hover_tooltip(device: HDC, state: &OverlayState, layout: ToolbarLayout) 
     );
 }
 
+/// The label on the tag that shows while the frozen view is on screen.
+///
+/// Named once so the glyph-fit test measures the string the overlay paints, and worded to answer
+/// the question the user will actually be asking - not "which mode is this" but "why has the
+/// video stopped".
+const FROZEN_VIEW_TAG: &str = "FROZEN · pixels from hotkey press";
+
+/// Draws the tag that says the overlay is showing the snapshot rather than the desktop.
+///
+/// Only while the frozen view is up, only outside the Window tool where the view means nothing,
+/// and only while the pointer is off the toolbar - the tooltips claim the same band and, being
+/// painted later, would sit on top of this. The live view carries no tag at all: an overlay
+/// showing what is really there is the unremarkable case, and labelling it would put a permanent
+/// pill on every capture.
+fn draw_view_tag(state: &OverlayState, layout: ToolbarLayout) {
+    if !machine::view_tag_visible(&state.model) {
+        return;
+    }
+    let device = state.back_buffer.device;
+    let metrics = state.model.display_environment.metrics;
+    let work_area = state.model.display_environment.work_area;
+    let tokens = metrics.toolbar_tokens();
+    let font_height = tokens.font_height;
+    let measured = measure_ui_text(device, FROZEN_VIEW_TAG, font_height);
+    let width = measured
+        .cx
+        .saturating_add(tokens.tooltip_padding_x.saturating_mul(2))
+        .min((work_area.width() - metrics.px(16)).max(1));
+    let height = (measured.cy + tokens.tooltip_padding_y * 2).max(metrics.px(32));
+    let left = ((layout.bounds.left + layout.bounds.right - width) / 2).clamp(
+        work_area.left + metrics.px(8),
+        (work_area.right - width - metrics.px(8)).max(work_area.left + metrics.px(8)),
+    );
+    // Above the toolbar, which is where the eye already is, and below it only when there is no
+    // room above - the same rule the tooltips follow, so the two never argue about which side of
+    // the toolbar its chrome belongs on.
+    let preferred_top = if layout.bounds.top >= work_area.top + height + metrics.px(16) {
+        layout.bounds.top - height - metrics.px(8)
+    } else {
+        layout.bounds.bottom + metrics.px(8)
+    };
+    let top = preferred_top.clamp(
+        work_area.top + metrics.px(8),
+        (work_area.bottom - height - metrics.px(8)).max(work_area.top + metrics.px(8)),
+    );
+    let bounds = UiRect {
+        left,
+        top,
+        right: left + width,
+        bottom: top + height,
+    };
+    // The accent border rather than the toolbar's grey: this is a statement about the pixels, not
+    // another control, and it has to be noticed without being alarming.
+    draw_round_box(
+        device,
+        bounds,
+        rgb(28, 42, 66),
+        rgb(86, 156, 255),
+        tokens.tooltip_corner_radius,
+    );
+    draw_text(
+        device,
+        UiRect {
+            left: bounds.left + tokens.tooltip_padding_x,
+            top: bounds.top,
+            right: bounds.right - tokens.tooltip_padding_x,
+            bottom: bounds.bottom,
+        },
+        FROZEN_VIEW_TAG,
+        rgb(198, 220, 255),
+        TextAlignment::Center,
+        font_height,
+    );
+}
+
 fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
     let metrics = state.model.display_environment.metrics;
     let tokens = metrics.toolbar_tokens();
@@ -3108,6 +4101,9 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
     );
     let rows = [
         (ToolbarControl::DimBackground, layout.dim_background),
+        (ToolbarControl::SnapToWindows, layout.snap_to_windows),
+        (ToolbarControl::RegionZoom, layout.region_zoom),
+        (ToolbarControl::PreviewView, layout.preview_view),
         (
             ToolbarControl::ClipboardDestination,
             layout.clipboard_destination,
@@ -3144,6 +4140,64 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
         },
         "Dim Background",
         rgb(245, 245, 247),
+        TextAlignment::Left,
+        tokens.font_height,
+    );
+    if state.model.snap_to_windows {
+        draw_checkmark(
+            device,
+            layout.snap_to_windows.left + tokens.menu_check_offset,
+            (layout.snap_to_windows.top + layout.snap_to_windows.bottom) / 2,
+            rgb(86, 156, 255),
+            metrics,
+        );
+    }
+    draw_text(
+        device,
+        UiRect {
+            left: layout.snap_to_windows.left + tokens.menu_text_offset,
+            top: layout.snap_to_windows.top,
+            right: layout.snap_to_windows.right - tokens.text_padding,
+            bottom: layout.snap_to_windows.bottom,
+        },
+        SNAP_TO_WINDOWS_LABEL,
+        rgb(245, 245, 247),
+        TextAlignment::Left,
+        tokens.font_height,
+    );
+    // No checkmark: this row cycles through three states rather than being on or off, so its
+    // label states the current one and a tick beside it would only be ambiguous.
+    draw_text(
+        device,
+        UiRect {
+            left: layout.region_zoom.left + tokens.menu_text_offset,
+            top: layout.region_zoom.top,
+            right: layout.region_zoom.right - tokens.text_padding,
+            bottom: layout.region_zoom.bottom,
+        },
+        state.model.loupe.mode.label(),
+        rgb(245, 245, 247),
+        TextAlignment::Left,
+        tokens.font_height,
+    );
+    // No checkmark here either: two views cycle rather than one setting being on or off, and the
+    // label states which one is showing. Greyed - the same grey the clipboard row uses for a
+    // destination the user cannot turn off - when the run has nothing to switch to, or under the
+    // Window tool, where a click renders its window fresh whichever view is behind it.
+    draw_text(
+        device,
+        UiRect {
+            left: layout.preview_view.left + tokens.menu_text_offset,
+            top: layout.preview_view.top,
+            right: layout.preview_view.right - tokens.text_padding,
+            bottom: layout.preview_view.bottom,
+        },
+        state.model.view.menu_label(),
+        if machine::view_toggle_enabled(&state.model) {
+            rgb(245, 245, 247)
+        } else {
+            rgb(130, 130, 136)
+        },
         TextAlignment::Left,
         tokens.font_height,
     );
@@ -3191,36 +4245,13 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
     );
 }
 
+/// The part of a native window rectangle that lies on the captured display.
+///
+/// A thin adapter over [`Rect::intersection`], which is the single implementation of half-open
+/// rectangle overlap in the workspace and is property-tested against `Rect::contains` there. The
+/// two hand-rolled copies that used to live here agreed with it by inspection only.
 fn intersect_with_source(native: RECT, source: Rect) -> Option<Rect> {
-    let source_right = i64::from(source.x) + i64::from(source.width);
-    let source_bottom = i64::from(source.y) + i64::from(source.height);
-    let left = i64::from(native.left).max(i64::from(source.x));
-    let top = i64::from(native.top).max(i64::from(source.y));
-    let right = i64::from(native.right).min(source_right);
-    let bottom = i64::from(native.bottom).min(source_bottom);
-    (right > left && bottom > top).then_some(Rect {
-        x: left as i32,
-        y: top as i32,
-        width: (right - left) as u32,
-        height: (bottom - top) as u32,
-    })
-}
-
-fn intersect_rect(rect: Rect, source: Rect) -> Option<Rect> {
-    let rect_right = i64::from(rect.x) + i64::from(rect.width);
-    let rect_bottom = i64::from(rect.y) + i64::from(rect.height);
-    let source_right = i64::from(source.x) + i64::from(source.width);
-    let source_bottom = i64::from(source.y) + i64::from(source.height);
-    let left = i64::from(rect.x).max(i64::from(source.x));
-    let top = i64::from(rect.y).max(i64::from(source.y));
-    let right = rect_right.min(source_right);
-    let bottom = rect_bottom.min(source_bottom);
-    (right > left && bottom > top).then_some(Rect {
-        x: left as i32,
-        y: top as i32,
-        width: (right - left) as u32,
-        height: (bottom - top) as u32,
-    })
+    window_enumeration::rect_from_native(native)?.intersection(source)
 }
 
 fn update_cursor(handle: Option<ResizeHandle>, region_cursor: &RegionCursor) {
@@ -3314,8 +4345,81 @@ mod tests {
             window_live_preview_count: 0,
             window_frozen_preview_count: 0,
             window_preview_bytes: 0,
+            view: PreviewView::Frozen,
+            view_switched: false,
+            presenter_fallback_reason: None,
             window_frame: None,
         }
+    }
+
+    #[test]
+    fn switching_the_view_and_switching_back_still_counts_as_switched() {
+        // The whole reason this is latched in the shell rather than compared at the end. A run
+        // that ends in the view it opened in is otherwise indistinguishable from one the user
+        // never touched, and `view_switched` exists precisely to tell those two apart.
+        let mut switched = false;
+        switched = latch_view_switch(switched, PreviewView::Live, PreviewView::Live);
+        assert!(
+            !switched,
+            "an input that leaves the view alone changes nothing"
+        );
+
+        switched = latch_view_switch(switched, PreviewView::Live, PreviewView::Frozen);
+        assert!(switched);
+
+        switched = latch_view_switch(switched, PreviewView::Frozen, PreviewView::Live);
+        assert!(
+            switched,
+            "switching back does not unsay that it was switched"
+        );
+
+        // And every later input keeps it set, whatever it does.
+        for (before, after) in [
+            (PreviewView::Live, PreviewView::Live),
+            (PreviewView::Frozen, PreviewView::Frozen),
+        ] {
+            assert!(latch_view_switch(switched, before, after));
+        }
+    }
+
+    #[test]
+    fn a_preview_source_without_a_snapshot_can_only_open_live() {
+        let mut metadata = frame_metadata_for_tests();
+        metadata.source_rect = Rect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        };
+        let frame = CpuFrame::new(
+            Arc::from(vec![0_u8; 4]),
+            1,
+            1,
+            4,
+            PixelFormat::Bgra8Unorm,
+            FrameOrigin::TopLeft,
+            ColorSpace::Srgb,
+            metadata,
+        )
+        .expect("a valid one-pixel frame");
+
+        // A snapshot opens in whichever view it was asked for, and does not insist on the
+        // layered presenter: an opaque window shows exactly those pixels.
+        assert_eq!(
+            SelectionPreviewSource::snapshot(&frame, PreviewView::Live, false)
+                .resolved_initial_view(),
+            PreviewView::Live
+        );
+        assert_eq!(
+            SelectionPreviewSource::frozen(&frame).resolved_initial_view(),
+            PreviewView::Frozen
+        );
+        assert!(!SelectionPreviewSource::frozen(&frame).require_layered);
+        // Without a snapshot there is nothing to paint a frozen view from, and the layered
+        // presenter is the only way to show anything at all.
+        let live = SelectionPreviewSource::live(&frame.metadata);
+        assert_eq!(live.resolved_initial_view(), PreviewView::Live);
+        assert!(live.require_layered);
     }
 
     #[test]
@@ -3450,6 +4554,63 @@ mod tests {
     }
 
     #[test]
+    fn the_snap_preference_is_live_on_a_display_this_process_has_never_drawn_on() {
+        // The reason the global is not kept in the per-display map: a toggle made on the laptop
+        // screen has to apply on the external monitor too, before the persistence worker has
+        // written anything and without that monitor ever having had an entry.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let controller = OverlayController::with_ui_updates(sender);
+        assert_eq!(
+            controller
+                .remembered_ui("display-1", Default::default())
+                .snap_to_windows,
+            None
+        );
+
+        controller.submit_ui_update(OverlayUiUpdate::SnapToWindows { enabled: false });
+
+        for display in ["display-1", "a-monitor-never-seen-before"] {
+            assert_eq!(
+                controller
+                    .remembered_ui(display, Default::default())
+                    .snap_to_windows,
+                Some(false),
+                "{display}"
+            );
+        }
+        // The live answer overrides a stale fallback read off disk before the toggle happened.
+        let stale = captastic_config::DisplayUiState {
+            snap_to_windows: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            controller.remembered_ui("display-2", stale).snap_to_windows,
+            Some(false)
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(OverlayUiUpdate::SnapToWindows { enabled: false })
+        ));
+
+        // The zoom mode is the same kind of answer and takes the same route.
+        controller.submit_ui_update(OverlayUiUpdate::RegionZoom {
+            mode: captastic_config::RegionZoom::Key,
+        });
+        assert_eq!(
+            controller
+                .remembered_ui("another-monitor-never-seen-before", Default::default())
+                .region_zoom,
+            Some(captastic_config::RegionZoom::Key)
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(OverlayUiUpdate::RegionZoom {
+                mode: captastic_config::RegionZoom::Key
+            })
+        ));
+    }
+
+    #[test]
     fn region_from_points_is_normalized_and_clamped() {
         assert_eq!(
             rect_from_points(
@@ -3498,6 +4659,76 @@ mod tests {
     }
 
     #[test]
+    fn the_snap_inventory_is_clipped_and_ordered_windows_work_area_display() {
+        let source = Rect {
+            x: -1920,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let on_display = Rect {
+            x: -1800,
+            y: 100,
+            width: 400,
+            height: 300,
+        };
+        let straddling = Rect {
+            x: -200,
+            y: 100,
+            width: 400,
+            height: 300,
+        };
+        let elsewhere = Rect {
+            x: 200,
+            y: 100,
+            width: 400,
+            height: 300,
+        };
+        let work_area = Rect {
+            x: -1920,
+            y: 0,
+            width: 1920,
+            height: 1040,
+        };
+        let targets =
+            snap_targets_from([on_display, straddling, elsewhere], Some(work_area), source);
+        let listed: Vec<_> = targets
+            .iter()
+            .map(|target| (target.kind, target.rect))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                // Enumeration order is z-order, and the inventory preserves it.
+                (SnapTargetKind::Window, on_display),
+                // Only the part on this display: an edge off the side of it is not an edge a
+                // region can be put on.
+                (
+                    SnapTargetKind::Window,
+                    Rect {
+                        x: -200,
+                        y: 100,
+                        width: 200,
+                        height: 300,
+                    }
+                ),
+                // `elsewhere` is on the other monitor entirely and is dropped.
+                (SnapTargetKind::WorkArea, work_area),
+                (SnapTargetKind::Display, source),
+            ]
+        );
+
+        // A work area identical to the display adds nothing but a duplicate guide.
+        let without = snap_targets_from([], Some(source), source);
+        assert_eq!(
+            without.iter().map(|target| target.kind).collect::<Vec<_>>(),
+            vec![SnapTargetKind::Display]
+        );
+        // The display is always present, so a run with no windows still snaps to the screen edge.
+        assert_eq!(snap_targets_from([], None, source).len(), 1);
+    }
+
+    #[test]
     fn point_containment_uses_exclusive_bottom_right_edge() {
         let rect = Rect {
             x: 10,
@@ -3512,20 +4743,18 @@ mod tests {
     #[test]
     fn highlight_is_clipped_to_the_captured_display() {
         assert_eq!(
-            intersect_rect(
-                Rect {
-                    x: -20,
-                    y: 40,
-                    width: 80,
-                    height: 100,
-                },
-                Rect {
-                    x: 0,
-                    y: 0,
-                    width: 100,
-                    height: 100,
-                },
-            ),
+            Rect {
+                x: -20,
+                y: 40,
+                width: 80,
+                height: 100,
+            }
+            .intersection(Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            }),
             Some(Rect {
                 x: 0,
                 y: 40,
@@ -3770,17 +4999,74 @@ mod tests {
     #[test]
     fn live_selection_pixels_remain_hit_testable() {
         assert_eq!(
-            live_pixel_alpha(CaptureTool::Region, true, true, false),
+            live_pixel_alpha(CaptureTool::Region, true, true, false, false),
             LIVE_HIT_TEST_ALPHA
         );
         assert_eq!(
-            live_pixel_alpha(CaptureTool::Region, true, false, false),
+            live_pixel_alpha(CaptureTool::Region, true, false, false, false),
             DIM_ALPHA
         );
         assert_eq!(
-            live_pixel_alpha(CaptureTool::Region, false, false, false),
+            live_pixel_alpha(CaptureTool::Region, false, false, false, false),
             LIVE_HIT_TEST_ALPHA
         );
+    }
+
+    #[test]
+    fn a_magnifier_that_was_not_drawn_is_not_an_obstacle_for_the_badge() {
+        // The badge is placed once per paint and cannot be moved afterwards. Sampling used to
+        // happen inside the draw, after the badge had already reserved space, so a sample that
+        // failed left the badge pushed aside to avoid a magnifier that was never painted.
+        assert_eq!(loupe_obstacle(None), None);
+        let layout = layout_loupe(
+            UiRect {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
+            POINT { x: 900, y: 500 },
+            UiMetrics::new(96).loupe_tokens(),
+        );
+        assert_eq!(loupe_obstacle(Some(layout)), Some(layout.bounds));
+    }
+
+    #[test]
+    fn the_magnifier_chrome_obeys_the_coverage_sentinel_like_every_other_control() {
+        // The rounded box, grid, selection edges and label are GDI draws, so the sentinel has
+        // already classified them as chrome. The pixels in the box's corner wedges are outside
+        // the rounded border and were never drawn, so they must dim like their surroundings -
+        // forcing the whole bounding box opaque painted four black corners around the magnifier.
+        assert_eq!(
+            live_pixel_alpha(CaptureTool::Region, true, false, true, false),
+            u8::MAX,
+            "drawn chrome is opaque without any magnifier override"
+        );
+        assert_eq!(
+            live_pixel_alpha(CaptureTool::Region, true, false, false, false),
+            DIM_ALPHA,
+            "an undrawn corner wedge dims like the desktop around it"
+        );
+        assert_eq!(
+            live_pixel_alpha(CaptureTool::Region, true, true, false, false),
+            LIVE_HIT_TEST_ALPHA,
+            "and inside the selection it stays see-through"
+        );
+    }
+
+    #[test]
+    fn the_magnifier_is_opaque_over_pixels_that_would_otherwise_show_through() {
+        // Its magnified pixels arrive by StretchBlt, which copies the source's alpha byte instead
+        // of zeroing it the way GDI's drawing calls do, so the coverage sentinel cannot classify
+        // them. Without the explicit override a magnifier inside the selection would be
+        // see-through over the very pixels it exists to magnify.
+        for (in_selection, dim) in [(true, true), (false, true), (false, false)] {
+            assert_eq!(
+                live_pixel_alpha(CaptureTool::Region, dim, in_selection, false, true),
+                u8::MAX,
+                "in_selection={in_selection} dim={dim}"
+            );
+        }
     }
 
     #[test]
@@ -3831,27 +5117,44 @@ mod tests {
         // color heuristic left it at background alpha; genuinely undrawn areas keep the
         // reserved dim and hit-test values.
         assert_eq!(
-            live_pixel_alpha(CaptureTool::Region, true, false, true),
+            live_pixel_alpha(CaptureTool::Region, true, false, true, false),
             u8::MAX
         );
         assert_eq!(
-            live_pixel_alpha(CaptureTool::Region, true, false, false),
+            live_pixel_alpha(CaptureTool::Region, true, false, false, false),
             DIM_ALPHA
         );
         assert_eq!(
-            live_pixel_alpha(CaptureTool::Region, false, true, false),
+            live_pixel_alpha(CaptureTool::Region, false, true, false, false),
             LIVE_HIT_TEST_ALPHA
+        );
+    }
+
+    #[test]
+    fn the_frozen_view_hands_the_compositor_nothing_but_opaque_pixels() {
+        // Alpha bytes as the frozen back buffer really carries them: a duplication frame's
+        // arbitrary value, GDI's zero on drawn chrome, and the dim wash's blended remainder.
+        let mut pixels = [
+            10, 20, 30, 0, // chrome drawn by GDI
+            40, 50, 60, 255, // an opaque snapshot pixel
+            70, 80, 90, 128, // a dim-washed pixel
+            1, 2, 3, 7, // whatever the frame carried
+        ];
+        force_opaque_alpha(&mut pixels);
+        assert_eq!(
+            pixels,
+            [10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 1, 2, 3, 255]
         );
     }
 
     #[test]
     fn live_window_chooser_and_drawn_controls_are_opaque() {
         assert_eq!(
-            live_pixel_alpha(CaptureTool::Window, true, false, false),
+            live_pixel_alpha(CaptureTool::Window, true, false, false, false),
             u8::MAX
         );
         assert_eq!(
-            live_pixel_alpha(CaptureTool::Region, true, true, true),
+            live_pixel_alpha(CaptureTool::Region, true, true, true, false),
             u8::MAX
         );
     }
@@ -4379,6 +5682,36 @@ mod tests {
                     layout.dim_background.height(),
                 ),
                 (
+                    SNAP_TO_WINDOWS_LABEL,
+                    layout.snap_to_windows.width() - tokens.menu_text_offset - tokens.text_padding,
+                    layout.snap_to_windows.height(),
+                ),
+                (
+                    machine::LoupeMode::Auto.label(),
+                    layout.region_zoom.width() - tokens.menu_text_offset - tokens.text_padding,
+                    layout.region_zoom.height(),
+                ),
+                (
+                    machine::LoupeMode::Key.label(),
+                    layout.region_zoom.width() - tokens.menu_text_offset - tokens.text_padding,
+                    layout.region_zoom.height(),
+                ),
+                (
+                    machine::LoupeMode::Off.label(),
+                    layout.region_zoom.width() - tokens.menu_text_offset - tokens.text_padding,
+                    layout.region_zoom.height(),
+                ),
+                (
+                    PreviewView::Live.menu_label(),
+                    layout.preview_view.width() - tokens.menu_text_offset - tokens.text_padding,
+                    layout.preview_view.height(),
+                ),
+                (
+                    PreviewView::Frozen.menu_label(),
+                    layout.preview_view.width() - tokens.menu_text_offset - tokens.text_padding,
+                    layout.preview_view.height(),
+                ),
+                (
                     "Copy to Clipboard",
                     layout.clipboard_destination.width()
                         - tokens.menu_text_offset
@@ -4402,6 +5735,16 @@ mod tests {
                     "{label} is {measured:?} at {dpi} DPI but only {available_height} px are available"
                 );
             }
+            // The view tag sizes its pill around the measurement rather than fitting inside a
+            // fixed row, so the constraint is the display: a tag wider than the work area is
+            // clipped, and a clipped explanation of why the desktop has stopped moving is worse
+            // than none. 1280 DIPs is the narrowest configuration the verification doc covers.
+            let tag = measure_ui_text(surface.device, FROZEN_VIEW_TAG, tokens.font_height);
+            let narrowest = metrics.px(1280) - metrics.px(16);
+            assert!(
+                tag.cx + tokens.tooltip_padding_x * 2 <= narrowest,
+                "the frozen view tag is {tag:?} at {dpi} DPI but only {narrowest} px are available"
+            );
         }
     }
 

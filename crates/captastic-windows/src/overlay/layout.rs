@@ -4,7 +4,7 @@ const TOOLBAR_WIDTH: i32 = 418;
 const TOOLBAR_HEIGHT: i32 = 56;
 const TOOLBAR_BOTTOM_MARGIN: i32 = 24;
 const MENU_WIDTH: i32 = 248;
-const MENU_HEIGHT: i32 = 132;
+const MENU_HEIGHT: i32 = 252;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ToolbarControl {
@@ -15,6 +15,9 @@ pub(super) enum ToolbarControl {
     Options,
     Capture,
     DimBackground,
+    SnapToWindows,
+    RegionZoom,
+    PreviewView,
     ClipboardDestination,
     Cancel,
 }
@@ -179,6 +182,222 @@ impl OverviewLayoutTokens {
     }
 }
 
+/// How many physical pixels the magnifier samples, on a side.
+///
+/// Odd on purpose: there is exactly one centre pixel, and it is the one under the pointer. An even
+/// span would leave the pointer's pixel half a cell off centre, which is precisely the ambiguity
+/// the magnifier exists to remove. Physical pixels, never DPI-scaled — the point is to show the
+/// pixels the capture will contain, and there are no more of them on a 200 % display.
+pub(super) const LOUPE_SOURCE_SPAN: i32 = 31;
+/// The distance from the centre pixel to the edge of the sampled square.
+pub(super) const LOUPE_SOURCE_HALF: i32 = LOUPE_SOURCE_SPAN / 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct LoupeLayoutTokens {
+    /// Physical pixels per sampled pixel: 6/8/9/12 at 100/125/150/200 %. Small enough that a
+    /// 31-pixel square still fits comfortably beside the pointer, large enough that one pixel is
+    /// an unmistakable block.
+    pub(super) zoom: i32,
+    /// Clearance between the sampled square and the magnifier's own box. 24 DIP puts the near
+    /// edge 40 physical pixels from the pointer at 100 %, clear of the 32-pixel half-width of the
+    /// region cursor, so the loupe never sits under the crosshair it is explaining.
+    pub(super) gap: i32,
+    pub(super) padding: i32,
+    pub(super) corner_radius: i32,
+    pub(super) label_height: i32,
+    pub(super) label_font_height: i32,
+    /// Stroke width for the selection edges drawn inside the view.
+    pub(super) edge_stroke: i32,
+    /// How far the magnifier stays from the edge of the monitor.
+    monitor_inset: i32,
+}
+
+impl LoupeLayoutTokens {
+    fn new(metrics: UiMetrics) -> Self {
+        Self {
+            zoom: metrics.px(6).max(2),
+            gap: metrics.px(24),
+            padding: metrics.px(6),
+            corner_radius: metrics.px(10),
+            label_height: metrics.px(20),
+            label_font_height: metrics.px(13),
+            edge_stroke: metrics.px(2).max(1),
+            monitor_inset: metrics.px(8),
+        }
+    }
+
+    fn view_span(self) -> i32 {
+        LOUPE_SOURCE_SPAN * self.zoom
+    }
+
+    fn outer_width(self) -> i32 {
+        self.view_span() + self.padding * 2
+    }
+
+    fn outer_height(self) -> i32 {
+        self.view_span() + self.padding * 2 + self.label_height
+    }
+}
+
+/// Where the magnifier and its parts sit, all in monitor-local coordinates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct LoupeLayout {
+    /// The whole chrome box.
+    pub(super) bounds: UiRect,
+    /// The magnified pixels.
+    pub(super) view: UiRect,
+    /// The coordinate readout under the view.
+    pub(super) label: UiRect,
+    /// The square of real pixels being magnified, centred on the pointer. Half-open, so it spans
+    /// `[pointer - 15, pointer + 16)`.
+    pub(super) source: UiRect,
+    pub(super) tokens: LoupeLayoutTokens,
+}
+
+/// Places the magnifier beside the pointer without ever covering the pixels it is magnifying.
+///
+/// Below and to the right by default, because that is where a right-handed pointer is not.
+/// Horizontal separation is chosen first and is what guarantees the box never overlaps its own
+/// source square: whichever side has room wins, and only when neither does is the box separated
+/// vertically instead. Clamping to the monitor is last, and on a monitor too small to hold the
+/// magnifier and the square side by side it is the only thing that can be honoured.
+pub(super) fn layout_loupe(
+    monitor: UiRect,
+    pointer: POINT,
+    tokens: LoupeLayoutTokens,
+) -> LoupeLayout {
+    let source = UiRect {
+        left: pointer.x.saturating_sub(LOUPE_SOURCE_HALF),
+        top: pointer.y.saturating_sub(LOUPE_SOURCE_HALF),
+        right: pointer
+            .x
+            .saturating_add(LOUPE_SOURCE_HALF)
+            .saturating_add(1),
+        bottom: pointer
+            .y
+            .saturating_add(LOUPE_SOURCE_HALF)
+            .saturating_add(1),
+    };
+    let width = tokens.outer_width();
+    let height = tokens.outer_height();
+    let safe = UiRect {
+        left: monitor.left.saturating_add(tokens.monitor_inset),
+        top: monitor.top.saturating_add(tokens.monitor_inset),
+        right: monitor.right.saturating_sub(tokens.monitor_inset),
+        bottom: monitor.bottom.saturating_sub(tokens.monitor_inset),
+    };
+
+    let right_of = source.right.saturating_add(tokens.gap);
+    let left_of = source.left.saturating_sub(tokens.gap).saturating_sub(width);
+    let below = source.bottom.saturating_add(tokens.gap);
+    let above = source.top.saturating_sub(tokens.gap).saturating_sub(height);
+
+    // Every branch clamps both axes. The chosen side already fits by construction, so the clamp
+    // is normally a no-op - but the pointer is not always on this monitor. A drag that holds
+    // capture keeps delivering pointer positions after the pointer has left the display, and an
+    // unclamped placement then puts the magnifier off-screen entirely (and, in the frozen view,
+    // samples black). Clamping cannot reintroduce an overlap with the source square, because a
+    // clamp only bites when the pointer is outside the monitor and the square has gone with it.
+    let horizontal =
+        |left: i32| clamp_coordinate(left, safe.left, safe.right.saturating_sub(width));
+    let vertical = |top: i32| clamp_coordinate(top, safe.top, safe.bottom.saturating_sub(height));
+    let (left, top) = if right_of.saturating_add(width) <= safe.right {
+        // Beside it on the right: the vertical position is then free to prefer "below" and clamp.
+        (horizontal(right_of), vertical(below))
+    } else if left_of >= safe.left {
+        (horizontal(left_of), vertical(below))
+    } else if below.saturating_add(height) <= safe.bottom {
+        // No room either side: separate vertically instead and let x clamp where it likes.
+        (horizontal(source.left), vertical(below))
+    } else if above >= safe.top {
+        (horizontal(source.left), vertical(above))
+    } else {
+        // A monitor smaller than the magnifier plus its source square. Stay on screen; there is
+        // no placement left that also avoids the square.
+        (horizontal(right_of), vertical(below))
+    };
+
+    let bounds = UiRect {
+        left,
+        top,
+        right: left.saturating_add(width),
+        bottom: top.saturating_add(height),
+    };
+    let view = UiRect {
+        left: bounds.left.saturating_add(tokens.padding),
+        top: bounds.top.saturating_add(tokens.padding),
+        right: bounds
+            .left
+            .saturating_add(tokens.padding)
+            .saturating_add(tokens.view_span()),
+        bottom: bounds
+            .top
+            .saturating_add(tokens.padding)
+            .saturating_add(tokens.view_span()),
+    };
+    LoupeLayout {
+        bounds,
+        view,
+        label: UiRect {
+            left: bounds.left,
+            top: bounds.bottom.saturating_sub(tokens.label_height),
+            right: bounds.right,
+            bottom: bounds.bottom,
+        },
+        source,
+        tokens,
+    }
+}
+
+/// One edge of the selection, mapped into the magnified view.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct LoupeEdgeLine {
+    /// A vertical line (a left or right edge) rather than a horizontal one.
+    pub(super) vertical: bool,
+    /// Where the line sits in view coordinates. This is a pixel *boundary*, not a pixel.
+    pub(super) position: i32,
+}
+
+/// Maps the selection's half-open edges into the magnified view.
+///
+/// The edges are drawn synthetically rather than relied upon to appear in the sampled pixels. In
+/// the live view the sample is the bare desktop with no overlay in it at all, and even in the
+/// frozen view the sample comes from the untouched capture; either way the outline the user is
+/// dragging is not in those pixels. Drawing it here also makes the result exact: an edge at
+/// `right` is the boundary *before* the pixel at `right`, which is the one pixel-level question
+/// the magnifier exists to answer.
+pub(super) fn loupe_edge_lines(
+    selection: UiRect,
+    layout: LoupeLayout,
+) -> impl Iterator<Item = LoupeEdgeLine> {
+    let LoupeLayout {
+        view,
+        source,
+        tokens,
+        ..
+    } = layout;
+    // The trailing bound is exclusive. An edge exactly on `source.right` maps to `view.right`,
+    // which is one past the last magnified column, so a 2-px stroke centred there would be drawn
+    // half on the chrome outside the view - a line the user would read as a selection edge
+    // sitting a pixel further out than it is. The same edge at `source.left` is the correct
+    // boundary of the first magnified column and is kept.
+    let vertical = [selection.left, selection.right]
+        .into_iter()
+        .filter(move |edge| *edge >= source.left && *edge < source.right)
+        .map(move |edge| LoupeEdgeLine {
+            vertical: true,
+            position: view.left + (edge - source.left) * tokens.zoom,
+        });
+    let horizontal = [selection.top, selection.bottom]
+        .into_iter()
+        .filter(move |edge| *edge >= source.top && *edge < source.bottom)
+        .map(move |edge| LoupeEdgeLine {
+            vertical: false,
+            position: view.top + (edge - source.top) * tokens.zoom,
+        });
+    vertical.chain(horizontal)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct UiMetrics {
     pub(super) dpi: u32,
@@ -210,6 +429,10 @@ impl UiMetrics {
         ToolbarLayoutTokens::new(self)
     }
 
+    pub(super) fn loupe_tokens(self) -> LoupeLayoutTokens {
+        LoupeLayoutTokens::new(self)
+    }
+
     pub(super) fn toolbar_width(self) -> i32 {
         self.px(TOOLBAR_WIDTH)
     }
@@ -236,6 +459,9 @@ pub(super) struct ToolbarLayout {
     pub(super) capture: UiRect,
     pub(super) menu: UiRect,
     pub(super) dim_background: UiRect,
+    pub(super) snap_to_windows: UiRect,
+    pub(super) region_zoom: UiRect,
+    pub(super) preview_view: UiRect,
     pub(super) clipboard_destination: UiRect,
     pub(super) cancel: UiRect,
 }
@@ -368,17 +594,35 @@ impl ToolbarLayout {
                 right: row_right,
                 bottom: menu.top + metrics.px(46),
             },
-            clipboard_destination: UiRect {
+            snap_to_windows: UiRect {
                 left: row_left,
                 top: menu.top + metrics.px(46),
                 right: row_right,
                 bottom: menu.top + metrics.px(86),
             },
-            cancel: UiRect {
+            region_zoom: UiRect {
                 left: row_left,
                 top: menu.top + metrics.px(86),
                 right: row_right,
                 bottom: menu.top + metrics.px(126),
+            },
+            preview_view: UiRect {
+                left: row_left,
+                top: menu.top + metrics.px(126),
+                right: row_right,
+                bottom: menu.top + metrics.px(166),
+            },
+            clipboard_destination: UiRect {
+                left: row_left,
+                top: menu.top + metrics.px(166),
+                right: row_right,
+                bottom: menu.top + metrics.px(206),
+            },
+            cancel: UiRect {
+                left: row_left,
+                top: menu.top + metrics.px(206),
+                right: row_right,
+                bottom: menu.top + metrics.px(246),
             },
             menu,
         }
@@ -388,6 +632,15 @@ impl ToolbarLayout {
         if options_open && self.menu.contains(point) {
             if self.dim_background.contains(point) {
                 return Some(ToolbarControl::DimBackground);
+            }
+            if self.snap_to_windows.contains(point) {
+                return Some(ToolbarControl::SnapToWindows);
+            }
+            if self.region_zoom.contains(point) {
+                return Some(ToolbarControl::RegionZoom);
+            }
+            if self.preview_view.contains(point) {
+                return Some(ToolbarControl::PreviewView);
             }
             if self.clipboard_destination.contains(point) {
                 return Some(ToolbarControl::ClipboardDestination);
@@ -787,11 +1040,11 @@ mod tests {
     }
     #[test]
     fn compact_toolbar_scales_at_supported_dpi_levels() {
-        for (dpi, expected_width, expected_height) in [
-            (96, 418, 56),
-            (120, 523, 70),
-            (144, 627, 84),
-            (192, 836, 112),
+        for (dpi, expected_width, expected_height, expected_menu) in [
+            (96, 418, 56, (248, 252)),
+            (120, 523, 70, (310, 315)),
+            (144, 627, 84, (372, 378)),
+            (192, 836, 112, (496, 504)),
         ] {
             let environment = DisplayEnvironment {
                 work_area: UiRect {
@@ -808,6 +1061,26 @@ mod tests {
             assert_eq!(layout.bounds.height(), expected_height);
             assert_eq!(layout.full_display.width(), environment.metrics.px(44));
             assert_eq!(layout.full_display.height(), environment.metrics.px(44));
+            assert_eq!(
+                (layout.menu.width(), layout.menu.height()),
+                expected_menu,
+                "{dpi} DPI"
+            );
+            // Every row sits inside the menu and none overlaps its neighbour.
+            let rows = [
+                layout.dim_background,
+                layout.snap_to_windows,
+                layout.region_zoom,
+                layout.preview_view,
+                layout.clipboard_destination,
+                layout.cancel,
+            ];
+            for row in rows {
+                assert!(row.top >= layout.menu.top && row.bottom <= layout.menu.bottom);
+            }
+            for pair in rows.windows(2) {
+                assert_eq!(pair[0].bottom, pair[1].top, "{dpi} DPI");
+            }
             assert!(layout.menu.left >= environment.work_area.left);
             assert!(layout.menu.top >= environment.work_area.top);
             assert!(layout.menu.right <= environment.work_area.right);
@@ -1021,6 +1294,235 @@ mod tests {
         assert!(layout.bounds.right <= monitor.right);
         assert!(layout.bounds.bottom <= monitor.bottom);
         assert_eq!(layout.placement, DimensionLabelPlacement::Right);
+    }
+
+    #[test]
+    fn the_magnifier_zooms_by_the_documented_factor_at_every_scaling() {
+        for (dpi, zoom) in [(96, 6), (120, 8), (144, 9), (192, 12)] {
+            let tokens = UiMetrics::new(dpi).loupe_tokens();
+            assert_eq!(tokens.zoom, zoom, "{dpi} DPI");
+            assert_eq!(tokens.view_span(), LOUPE_SOURCE_SPAN * zoom, "{dpi} DPI");
+        }
+        // The sampled square itself is physical pixels and is the same on every display: there
+        // are no more real pixels around the pointer at 200 %.
+        assert_eq!(LOUPE_SOURCE_SPAN, 31);
+        assert_eq!(LOUPE_SOURCE_HALF, 15);
+    }
+
+    #[test]
+    fn the_magnifier_prefers_below_right_and_flips_at_the_edges() {
+        let monitor = UiRect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let tokens = UiMetrics::new(96).loupe_tokens();
+
+        let middle = layout_loupe(monitor, POINT { x: 900, y: 500 }, tokens);
+        assert!(middle.bounds.left > middle.source.right, "to the right");
+        assert!(middle.bounds.top > middle.source.top, "and below");
+
+        let right_edge = layout_loupe(monitor, POINT { x: 1900, y: 500 }, tokens);
+        assert!(
+            right_edge.bounds.right < right_edge.source.left,
+            "flipped to the left"
+        );
+
+        let corner = layout_loupe(monitor, POINT { x: 1900, y: 1070 }, tokens);
+        assert!(corner.bounds.right < corner.source.left);
+        assert!(corner.bounds.bottom <= monitor.bottom);
+        assert!(corner.bounds.top >= monitor.top);
+    }
+
+    #[test]
+    fn the_magnifier_stays_on_screen_when_the_pointer_does_not() {
+        // A drag that holds capture keeps delivering pointer positions after the pointer has left
+        // the display. Placing the magnifier relative to a source square that is off-screen put
+        // the whole thing off-screen too - and in the frozen view it then sampled black.
+        let monitor = UiRect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let tokens = UiMetrics::new(96).loupe_tokens();
+        for pointer in [
+            POINT { x: -500, y: 500 },
+            POINT { x: 2400, y: 500 },
+            POINT { x: 900, y: -500 },
+            POINT { x: 900, y: 1600 },
+            POINT { x: -500, y: -500 },
+        ] {
+            let layout = layout_loupe(monitor, pointer, tokens);
+            assert!(layout.bounds.left >= monitor.left, "{pointer:?} {layout:?}");
+            assert!(layout.bounds.top >= monitor.top, "{pointer:?} {layout:?}");
+            assert!(
+                layout.bounds.right <= monitor.right,
+                "{pointer:?} {layout:?}"
+            );
+            assert!(
+                layout.bounds.bottom <= monitor.bottom,
+                "{pointer:?} {layout:?}"
+            );
+            assert!(
+                !layout.bounds.intersects(layout.source),
+                "{pointer:?} {layout:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_magnifier_parts_tile_its_box() {
+        let tokens = UiMetrics::new(144).loupe_tokens();
+        let layout = layout_loupe(
+            UiRect {
+                left: 0,
+                top: 0,
+                right: 2560,
+                bottom: 1440,
+            },
+            POINT { x: 1000, y: 700 },
+            tokens,
+        );
+        assert_eq!(layout.view.width(), tokens.view_span());
+        assert_eq!(layout.view.height(), tokens.view_span());
+        assert_eq!(layout.label.top, layout.view.bottom + tokens.padding);
+        assert_eq!(layout.label.bottom, layout.bounds.bottom);
+        assert_eq!(layout.label.height(), tokens.label_height);
+        assert_eq!(layout.bounds.left + tokens.padding, layout.view.left);
+        assert_eq!(layout.source.width(), LOUPE_SOURCE_SPAN);
+        assert_eq!(layout.source.height(), LOUPE_SOURCE_SPAN);
+    }
+
+    #[test]
+    fn selection_edges_map_to_pixel_boundaries_in_the_view() {
+        let tokens = UiMetrics::new(96).loupe_tokens();
+        let layout = layout_loupe(
+            UiRect {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
+            POINT { x: 900, y: 500 },
+            tokens,
+        );
+        // A selection whose right edge is the pointer's own pixel: half-open, so `right` is the
+        // boundary *after* the last pixel the capture contains.
+        let selection = UiRect {
+            left: 700,
+            top: 400,
+            right: 901,
+            bottom: 501,
+        };
+        let lines: Vec<_> = loupe_edge_lines(selection, layout).collect();
+        assert_eq!(
+            lines,
+            vec![
+                LoupeEdgeLine {
+                    vertical: true,
+                    // 901 - 885 = 16 cells from the left of the view.
+                    position: layout.view.left + 16 * tokens.zoom,
+                },
+                LoupeEdgeLine {
+                    vertical: false,
+                    position: layout.view.top + 16 * tokens.zoom,
+                },
+            ],
+            "only the edges inside the sampled square are drawn"
+        );
+        // A selection nowhere near the pointer contributes nothing.
+        assert_eq!(
+            loupe_edge_lines(
+                UiRect {
+                    left: 10,
+                    top: 10,
+                    right: 20,
+                    bottom: 20,
+                },
+                layout,
+            )
+            .count(),
+            0
+        );
+
+        // Every line that is drawn marks a boundary of a column the view actually shows. The
+        // trailing bound is the one that matters: an edge exactly on `source.right` maps to
+        // `view.right`, one past the last magnified column, and a stroke centred there straddles
+        // the chrome and reads as an edge a pixel further out than it is. (A line at
+        // `view.left` is the correct boundary of the first column; its stroke spills a pixel into
+        // the round box's own fill, which is chrome either way.)
+        for edge in [
+            layout.source.left,
+            layout.source.right,
+            layout.source.right - 1,
+        ] {
+            let spanning = UiRect {
+                left: edge,
+                top: edge,
+                right: edge + 1,
+                bottom: edge + 1,
+            };
+            for line in loupe_edge_lines(spanning, layout) {
+                let (low, high) = if line.vertical {
+                    (layout.view.left, layout.view.right)
+                } else {
+                    (layout.view.top, layout.view.bottom)
+                };
+                assert!(
+                    line.position >= low && line.position < high,
+                    "edge {edge} put a line at {} outside [{low}, {high})",
+                    line.position
+                );
+            }
+        }
+    }
+
+    proptest::proptest! {
+        /// Wherever the pointer is and whatever the scaling, the magnifier stays on the monitor
+        /// and never covers the pixels it is magnifying. Covering them would be worse than not
+        /// showing it at all: the user would be placing an edge under an opaque box.
+        #[test]
+        fn the_magnifier_stays_on_screen_and_clear_of_its_own_source(
+            dpi in proptest::sample::select(vec![96_u32, 120, 144, 192]),
+            width in 800i32..=3840,
+            height in 600i32..=2160,
+            origin_x in -3840i32..=3840,
+            origin_y in -2160i32..=2160,
+            // Deliberately past both ends: a drag that holds capture keeps delivering pointer
+            // positions after the pointer has left the display, and those are exactly the ones
+            // an unclamped placement put the magnifier off-screen for.
+            fraction_x in -0.6f64..=1.6,
+            fraction_y in -0.6f64..=1.6,
+        ) {
+            let monitor = UiRect {
+                left: origin_x,
+                top: origin_y,
+                right: origin_x + width,
+                bottom: origin_y + height,
+            };
+            let pointer = POINT {
+                x: origin_x + (f64::from(width - 1) * fraction_x).round() as i32,
+                y: origin_y + (f64::from(height - 1) * fraction_y).round() as i32,
+            };
+            let layout = layout_loupe(monitor, pointer, UiMetrics::new(dpi).loupe_tokens());
+            proptest::prop_assert!(layout.bounds.left >= monitor.left, "{:?}", layout.bounds);
+            proptest::prop_assert!(layout.bounds.top >= monitor.top, "{:?}", layout.bounds);
+            proptest::prop_assert!(layout.bounds.right <= monitor.right, "{:?}", layout.bounds);
+            proptest::prop_assert!(layout.bounds.bottom <= monitor.bottom, "{:?}", layout.bounds);
+            proptest::prop_assert!(
+                !layout.bounds.intersects(layout.source),
+                "the magnifier covered its own source square: {:?} vs {:?}",
+                layout.bounds,
+                layout.source
+            );
+            // And the pointer's own pixel is the centre of what is sampled.
+            proptest::prop_assert_eq!(
+                (layout.source.left + layout.source.right - 1) / 2,
+                pointer.x
+            );
+        }
     }
 
     fn test_label_layout(

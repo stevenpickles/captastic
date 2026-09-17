@@ -20,7 +20,7 @@ use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EXTERNAL, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DVI,
     DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HD15, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI,
     DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EMBEDDED,
-    DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EXTERNAL, DISPLAYCONFIG_PATH_INFO,
+    DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EXTERNAL, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_RATIONAL,
     DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME,
     DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY, QDC_ONLY_ACTIVE_PATHS,
 };
@@ -57,6 +57,11 @@ const INITIAL_LATEST_FRAME_TIMEOUT: Duration = Duration::from_millis(100);
 const GPU_MAP_TIMEOUT: Duration = Duration::from_millis(250);
 const GPU_MAP_RETRY_DELAY: Duration = Duration::from_millis(1);
 const BASE_DPI: u32 = 96;
+/// The CPU readback pool's floor: enough for a capture in flight, the frame a destination worker
+/// is still holding, and one spare. Callers that can pin a frame for longer than a capture ask
+/// for more; nobody gets fewer, because below three a single slow clipboard write stalls the
+/// next capture.
+pub(crate) const DEFAULT_CPU_BUFFER_SLOTS: usize = 3;
 
 static DISPLAY_CONFIGURATION_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -378,6 +383,10 @@ pub struct DxgiBackend {
     latest: Option<RetainedFrame>,
     staging: Option<StagingTexture>,
     cpu_pool: CpuBufferPool,
+    /// How many readback slots this backend's pool holds. Kept because the pool is rebuilt
+    /// whenever the staging texture's shape changes, and a rebuild that dropped back to the
+    /// default would silently undo whatever the caller asked for.
+    cpu_slots: usize,
     displays: Vec<DisplayInfo>,
     selected: DisplayInfo,
     capabilities: BackendCapabilities,
@@ -396,6 +405,17 @@ impl DxgiBackend {
     }
 
     pub fn new(display_id: &DisplayId) -> Result<Self, CaptureError> {
+        Self::with_cpu_slots(display_id, DEFAULT_CPU_BUFFER_SLOTS)
+    }
+
+    /// Builds a backend whose CPU readback pool holds `cpu_slots` frames.
+    ///
+    /// A slot is recycled only when nothing else holds its `Arc`, so the pool has to be as large
+    /// as the number of frames a caller can legitimately pin at once. The daemon's selection
+    /// overlay pins one for the length of a human interaction, which is why this is a parameter
+    /// rather than a constant. Slots are allocated on first use, so a larger pool costs nothing
+    /// until that many frames really are in flight.
+    pub fn with_cpu_slots(display_id: &DisplayId, cpu_slots: usize) -> Result<Self, CaptureError> {
         let com = ComApartment::initialize()?;
         // Sample the generation before enumerating so a display change that lands while we are
         // building the backend cannot be swallowed: the stored value stays behind the counter and
@@ -494,7 +514,8 @@ impl DxgiBackend {
                 },
             ),
         )?;
-        let cpu_pool = CpuBufferPool::new(3);
+        let cpu_slots = cpu_slots.max(DEFAULT_CPU_BUFFER_SLOTS);
+        let cpu_pool = CpuBufferPool::new(cpu_slots);
 
         let backend = Self {
             _com: com,
@@ -506,6 +527,7 @@ impl DxgiBackend {
             latest: None,
             staging,
             cpu_pool,
+            cpu_slots,
             displays,
             selected: selected_record.info.clone(),
             capabilities: BackendCapabilities {
@@ -1360,7 +1382,7 @@ impl DxgiBackend {
                     source_desc.SampleDesc,
                 ),
             )?);
-            self.cpu_pool = CpuBufferPool::new(3);
+            self.cpu_pool = CpuBufferPool::new(self.cpu_slots);
         }
         Ok(self
             .staging
@@ -2163,6 +2185,8 @@ struct OutputRecord {
     adapter_luid: i64,
     output: IDXGIOutput1,
     info: DisplayInfo,
+    /// The active refresh rate, for the host fingerprint rather than for capture.
+    refresh_hz: Option<f64>,
 }
 
 fn select_display_index(displays: &[DisplayInfo], display_id: &DisplayId) -> Option<usize> {
@@ -2183,6 +2207,12 @@ struct DisplayConfigIdentity {
     gdi_name: String,
     persistent_id: DisplayId,
     friendly_name: String,
+    /// The path's active refresh rate in Hz, when Windows reports a usable one.
+    ///
+    /// Carried here rather than queried separately because this walk already holds the only
+    /// structure that knows it, and asking Windows twice for the same table is two chances for the
+    /// answers to disagree about which display is which.
+    refresh_hz: Option<f64>,
 }
 
 /// Test-only: reports no attached outputs for the first N milliseconds of the process.
@@ -2276,6 +2306,7 @@ fn enumerate_outputs() -> Result<Vec<OutputRecord>, CaptureError> {
                     adapter: adapter.clone(),
                     adapter_luid: luid_to_i64(adapter_desc.AdapterLuid),
                     output: output1,
+                    refresh_hz: identity.and_then(|identity| identity.refresh_hz),
                     info: DisplayInfo {
                         id,
                         name,
@@ -2419,6 +2450,7 @@ fn display_config_identities() -> Result<Vec<DisplayConfigIdentity>, CaptureErro
                         persistent_id: display_identity(&target_name, &source_name),
                         gdi_name: source_name,
                         friendly_name,
+                        refresh_hz: refresh_hz(path.targetInfo.refreshRate),
                     });
                 }
                 return Ok(identities);
@@ -2476,6 +2508,41 @@ fn display_config_target_name(
         return Err(display_config_error("display_config_target_name", result));
     }
     Ok(name)
+}
+
+/// Converts the rational refresh rate Windows reports into Hz, rejecting the unusable ones.
+///
+/// A zero denominator is how Windows says "this path has no refresh rate" — a virtual or indirect
+/// display driver reports exactly that, and so does an inactive path. Reporting it as `0 Hz`, or
+/// dividing by it, would both turn "not known" into a number, which is the failure a fingerprint
+/// exists to prevent rather than commit.
+fn refresh_hz(rate: DISPLAYCONFIG_RATIONAL) -> Option<f64> {
+    if rate.Denominator == 0 || rate.Numerator == 0 {
+        return None;
+    }
+    Some(f64::from(rate.Numerator) / f64::from(rate.Denominator))
+}
+
+/// Which adapter drives each attached display, and at what refresh rate.
+///
+/// Read-only and best effort: a session that refuses enumeration produces an empty list rather
+/// than an error, because this serves the host fingerprint, where an unanswerable question is a
+/// fact about the run and not a failure of it.
+pub(crate) fn display_hardware() -> Vec<crate::host::DisplayHardware> {
+    match enumerate_outputs() {
+        Ok(records) => records
+            .into_iter()
+            .map(|record| crate::host::DisplayHardware {
+                display_id: record.info.id.0,
+                adapter_luid: Some(record.adapter_luid),
+                refresh_hz: record.refresh_hz,
+            })
+            .collect(),
+        Err(error) => {
+            log::debug!("host fingerprint could not enumerate displays: {error}");
+            Vec::new()
+        }
+    }
 }
 
 fn display_config_error(operation: &'static str, result: i32) -> CaptureError {
@@ -2894,7 +2961,7 @@ fn rotation_degrees(rotation: DXGI_MODE_ROTATION) -> u16 {
     }
 }
 
-fn wide_array_to_string(value: &[u16]) -> String {
+pub(crate) fn wide_array_to_string(value: &[u16]) -> String {
     let end = value
         .iter()
         .position(|character| *character == 0)
@@ -3616,6 +3683,36 @@ mod tests {
             .as_ref()
             .expect("CPU slot is initialized")
             .clone()
+    }
+
+    #[test]
+    fn a_pool_holds_exactly_as_many_pinned_frames_as_it_has_slots() {
+        // The pool's whole contract, and the reason its size is now a parameter: a slot comes
+        // back only when nothing else holds its Arc, so the number of frames that can be pinned
+        // at once *is* the slot count. A selection overlay pins one for the length of a human
+        // interaction, which is what used to exhaust a fixed pool of three.
+        for slots in [DEFAULT_CPU_BUFFER_SLOTS, 5, 8] {
+            let mut pool = CpuBufferPool::new(slots);
+            let pinned: Vec<Arc<[u8]>> = (0..slots)
+                .map(|_| {
+                    let index = pool
+                        .available_index(64)
+                        .expect("a slot is free while any remain");
+                    lease_cpu_slot(&pool, index)
+                })
+                .collect();
+
+            assert!(
+                pool.available_index(64).is_none(),
+                "a pool of {slots} must refuse the {}th simultaneous frame",
+                slots + 1
+            );
+            drop(pinned);
+            assert!(
+                pool.available_index(64).is_some(),
+                "releasing a frame returns its slot"
+            );
+        }
     }
 
     #[test]

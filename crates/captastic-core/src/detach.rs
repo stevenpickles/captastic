@@ -1,8 +1,9 @@
 //! Accounting for native workers that were left running on purpose.
 //!
-//! Two places give up waiting for a worker rather than blocking on it: a window render that
-//! outlives its deadline, and the daemon's capture worker at shutdown. Both are deliberate. A
-//! worker can be blocked inside a foreign window procedure or a display driver, and joining it
+//! Three places give up waiting for a worker rather than blocking on it: a window render that
+//! outlives its deadline, the daemon's capture worker at shutdown, and the file destination when
+//! it is switched off. All three are deliberate. A worker can be blocked inside a foreign window
+//! procedure, a display driver, or a write to a disk that has stopped answering, and joining it
 //! would hand Captastic's responsiveness — or its exit — to whatever is wedged.
 //!
 //! What was missing is the accounting. A detached worker keeps its thread and whatever GPU or GDI
@@ -29,10 +30,17 @@ pub enum DetachKind {
     WindowRender,
     /// The daemon's capture thread, abandoned when it outlives the shutdown budget.
     CaptureWorker,
+    /// The file destination's thread, abandoned when it outlives the budget for stopping it —
+    /// at shutdown, or when the notification area switches file output off.
+    FileOutputWorker,
 }
 
 impl DetachKind {
-    pub const ALL: [Self; 2] = [Self::WindowRender, Self::CaptureWorker];
+    pub const ALL: [Self; 3] = [
+        Self::WindowRender,
+        Self::CaptureWorker,
+        Self::FileOutputWorker,
+    ];
 
     /// How many of this kind may be detached at once before Captastic is out of room.
     ///
@@ -40,11 +48,13 @@ impl DetachKind {
     /// and stating them in one place is what lets those two be checked against each other. A
     /// window render holds one of eight worker slots until it exits, so eight detached renders
     /// means the next one is refused outright; the daemon has exactly one capture worker, and
-    /// detaching it is the last thing that happens before the process exits.
+    /// detaching it is the last thing that happens before the process exits; a detached file
+    /// destination may still be writing into the output directory, so the daemon refuses to start
+    /// a second one until it exits.
     pub const fn ceiling(self) -> usize {
         match self {
             Self::WindowRender => 8,
-            Self::CaptureWorker => 1,
+            Self::CaptureWorker | Self::FileOutputWorker => 1,
         }
     }
 
@@ -52,6 +62,7 @@ impl DetachKind {
         match self {
             Self::WindowRender => "window render",
             Self::CaptureWorker => "capture worker",
+            Self::FileOutputWorker => "file output worker",
         }
     }
 
@@ -59,6 +70,7 @@ impl DetachKind {
         match self {
             Self::WindowRender => 0,
             Self::CaptureWorker => 1,
+            Self::FileOutputWorker => 2,
         }
     }
 }
@@ -89,8 +101,16 @@ pub struct DetachLedger {
 impl DetachLedger {
     pub const fn new() -> Self {
         Self {
-            live: [AtomicUsize::new(0), AtomicUsize::new(0)],
-            total: [AtomicUsize::new(0), AtomicUsize::new(0)],
+            live: [
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+            ],
+            total: [
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+            ],
         }
     }
 
@@ -236,6 +256,24 @@ mod tests {
         let count = ledger.count(DetachKind::WindowRender);
         assert!(!count.at_ceiling(DetachKind::WindowRender));
         assert_eq!(count.total, DetachKind::WindowRender.ceiling());
+    }
+
+    #[test]
+    fn a_detached_file_destination_holds_the_only_slot_there_is_until_it_returns() {
+        // Unlike the capture worker's, this detach is reachable more than once per run: the
+        // notification area can switch file output off and on again. The ceiling is what stops a
+        // second worker writing into the same directory while the first may still be writing.
+        let ledger = DetachLedger::new();
+
+        let after_detach = ledger.detached(DetachKind::FileOutputWorker);
+        assert!(after_detach.at_ceiling(DetachKind::FileOutputWorker));
+
+        // The thread finishes its stalled write and exits. The slot is free, and the history
+        // remembers that it happened.
+        ledger.rejoined(DetachKind::FileOutputWorker);
+        let count = ledger.count(DetachKind::FileOutputWorker);
+        assert!(!count.at_ceiling(DetachKind::FileOutputWorker));
+        assert_eq!(count, DetachCount { live: 0, total: 1 });
     }
 
     #[test]
