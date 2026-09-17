@@ -119,6 +119,12 @@ pub enum PreviewArg {
 
 #[derive(Debug, Args)]
 pub struct CaptureArgs {
+    /// Configuration file (defaults to %USERPROFILE%\.captastic\captastic.toml when present).
+    ///
+    /// One-shot captures read `[capture] cursor`, `[clipboard]`, `[output]`, and `[history]` from
+    /// it, the same settings the daemon reads.
+    #[arg(long)]
+    pub config: Option<PathBuf>,
     #[arg(long, default_value = "fake")]
     pub backend: String,
     /// Display policy: pointer, primary, virtual_desktop, or display:<persistent-id>.
@@ -217,6 +223,8 @@ pub enum StartupCommand {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     #[test]
@@ -233,6 +241,37 @@ mod tests {
         let cli =
             Cli::try_parse_from(["captastic", "status", "--json"]).expect("explicit CLI command");
         assert!(matches!(cli.command, Some(Command::Status { json: true })));
+    }
+
+    #[test]
+    fn a_one_shot_capture_can_be_pointed_at_a_configuration_file() {
+        // `capture` read the default configuration and nothing else, so `--config` was accepted
+        // nowhere and a capture could not be run against a file under test.
+        let cli = Cli::try_parse_from([
+            "captastic",
+            "capture",
+            "--config",
+            "C:/tmp/captastic.toml",
+            "--backend",
+            "fake",
+        ])
+        .expect("capture accepts a configuration file");
+        let Some(Command::Capture(args)) = cli.command else {
+            panic!("expected a capture command");
+        };
+        assert_eq!(
+            args.config.as_deref(),
+            Some(Path::new("C:/tmp/captastic.toml"))
+        );
+
+        let cli = Cli::try_parse_from(["captastic", "capture"]).expect("capture without a config");
+        let Some(Command::Capture(args)) = cli.command else {
+            panic!("expected a capture command");
+        };
+        assert!(
+            args.config.is_none(),
+            "the default file is still the default"
+        );
     }
 
     #[test]

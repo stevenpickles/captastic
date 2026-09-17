@@ -13,12 +13,15 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod filename_template;
 mod fsio;
 mod history;
 mod ui_state;
 
 use fsio::{maintain_config_artifacts, quarantine_config};
 
+pub use captastic_core::OutputFormat;
+pub use filename_template::{validate_template, TOKENS as FILENAME_TEMPLATE_TOKENS};
 pub use fsio::{atomic_write, finalize_new, replace_file};
 pub use history::{
     CaptureHistory, HistoryEntry, HistoryStore, RetentionPolicy, HISTORY_FILE_NAME,
@@ -547,11 +550,19 @@ impl AppConfig {
                 )));
             }
         }
-        if !matches!(self.output.format.as_str(), "png") {
-            return Err(ConfigError::InvalidValue(
-                "output.format must be png".to_owned(),
-            ));
+        // `output.format` is an enum, so a spelling that is not one of the three is refused while
+        // the file is being read, by an error that lists the three. What is left to check is the
+        // knob only one of them reads.
+        if !(1..=100).contains(&self.output.jpeg_quality) {
+            return Err(ConfigError::InvalidValue(format!(
+                "output.jpeg_quality must be between 1 and 100, got {}",
+                self.output.jpeg_quality
+            )));
         }
+        // Checked whether or not file output is enabled: a template is either one Captastic can
+        // expand or it is not, and finding out at the moment the setting is switched on - which is
+        // a tray click away - would be finding out too late.
+        validate_template(&self.output.filename_template).map_err(ConfigError::InvalidValue)?;
         if self.metrics.ring_capacity == 0 || self.metrics.ring_capacity > 10_000_000 {
             return Err(ConfigError::InvalidValue(
                 "metrics.ring_capacity must be between 1 and 10000000".to_owned(),
@@ -1004,7 +1015,10 @@ impl Default for ClipboardConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct OutputConfig {
     pub enabled: bool,
-    pub format: String,
+    pub format: OutputFormat,
+    /// How hard a JPEG is compressed, 1..=100. Read only when `format = "jpeg"`; kept here rather
+    /// than in a `[output.jpeg]` table because one setting is not a section.
+    pub jpeg_quality: u8,
     pub queue_capacity: usize,
     /// Where captures are written. `None` selects [`default_output_directory`].
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1064,7 +1078,8 @@ impl Default for OutputConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            format: "png".to_owned(),
+            format: OutputFormat::Png,
+            jpeg_quality: captastic_core::DEFAULT_JPEG_QUALITY,
             queue_capacity: 2,
             directory: None,
             filename_template: DEFAULT_FILENAME_TEMPLATE.to_owned(),
@@ -1765,13 +1780,62 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_output_format() {
+    fn the_output_format_is_strictly_typed() {
+        // `jpeg` and `bmp` were rejected until the encoders behind them existed. Now the three
+        // that exist are accepted and anything else is refused while the file is being read, by an
+        // error that names them - which is the difference between a typo the user can fix and a
+        // capture silently written in a format they did not choose.
+        for (value, expected) in [
+            ("png", OutputFormat::Png),
+            ("jpeg", OutputFormat::Jpeg),
+            ("bmp", OutputFormat::Bmp),
+        ] {
+            let source = format!("schema_version = 1\n[output]\nformat = \"{value}\"\n");
+            let config: AppConfig = toml::from_str(&source).expect("supported output format");
+            assert_eq!(config.output.format, expected);
+            config.validate().expect("a supported format is valid");
+        }
+
+        let error =
+            toml::from_str::<AppConfig>("schema_version = 1\n[output]\nformat = \"webp\"\n")
+                .expect_err("unknown output formats must be rejected");
+        assert!(error.to_string().contains("webp"), "{error}");
+    }
+
+    #[test]
+    fn a_filename_template_the_daemon_would_refuse_is_invalid_configuration() {
+        // `captastic config validate` used to pass a file that the next daemon launch rejected,
+        // because the template check lived in the file worker. A configuration is valid or it is
+        // not, and the answer cannot depend on which process asked.
         let mut config = AppConfig::default();
-        config.output.format = "jpeg".to_owned();
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigError::InvalidValue(_))
-        ));
+        config.output.filename_template = "captastic-{tilte}".to_owned();
+        let error = config.validate().expect_err("an unknown token is invalid");
+        assert!(error.to_string().contains("unknown token"), "{error}");
+
+        config.output.filename_template = "{date}/{time}".to_owned();
+        let error = config.validate().expect_err("a path separator is invalid");
+        assert!(error.to_string().contains("path separators"), "{error}");
+
+        config.output.filename_template = DEFAULT_FILENAME_TEMPLATE.to_owned();
+        config.validate().expect("the default template is valid");
+    }
+
+    #[test]
+    fn jpeg_quality_is_bounded() {
+        // Zero is not a quality the encoder accepts and 101 is not one it understands. Both are
+        // caught here rather than clamped at the encoder, so the user hears about the value they
+        // wrote instead of quietly getting a different one.
+        let mut config = AppConfig::default();
+        assert_eq!(config.output.jpeg_quality, 90);
+        for value in [0, 101, 255] {
+            config.output.jpeg_quality = value;
+            let error = config.validate().expect_err("out-of-range quality");
+            assert!(error.to_string().contains("jpeg_quality"), "{error}");
+        }
+        for value in [1, 50, 100] {
+            config.output.jpeg_quality = value;
+            config.validate().expect("an in-range quality is accepted");
+        }
     }
 
     #[test]

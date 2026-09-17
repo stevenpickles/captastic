@@ -105,6 +105,7 @@ dependencies = [
 name = "captastic-config"
 version = "0.2.0"
 dependencies = [
+ "captastic-core",
  "log",
  "serde",
  "thiserror",
@@ -117,6 +118,7 @@ dependencies = [
 name = "captastic-core"
 version = "0.2.0"
 dependencies = [
+ "jpeg-encoder",
  "png",
  "proptest",
  "serde",
@@ -254,6 +256,12 @@ name = "itoa"
 version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1a46d1a171d865aa5f83f92695765caa047a9b4cbae2cbf37dbd613a793fd4c"
+
+[[package]]
+name = "jpeg-encoder"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0370574b86f7eca156b9f298392b5e69a23f8c86f3f865add60bbc2e79467a6"
 
 [[package]]
 name = "libc"
