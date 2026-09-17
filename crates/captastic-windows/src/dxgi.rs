@@ -20,7 +20,7 @@ use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EXTERNAL, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DVI,
     DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HD15, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI,
     DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EMBEDDED,
-    DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EXTERNAL, DISPLAYCONFIG_PATH_INFO,
+    DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EXTERNAL, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_RATIONAL,
     DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME,
     DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY, QDC_ONLY_ACTIVE_PATHS,
 };
@@ -2163,6 +2163,8 @@ struct OutputRecord {
     adapter_luid: i64,
     output: IDXGIOutput1,
     info: DisplayInfo,
+    /// The active refresh rate, for the host fingerprint rather than for capture.
+    refresh_hz: Option<f64>,
 }
 
 fn select_display_index(displays: &[DisplayInfo], display_id: &DisplayId) -> Option<usize> {
@@ -2183,6 +2185,12 @@ struct DisplayConfigIdentity {
     gdi_name: String,
     persistent_id: DisplayId,
     friendly_name: String,
+    /// The path's active refresh rate in Hz, when Windows reports a usable one.
+    ///
+    /// Carried here rather than queried separately because this walk already holds the only
+    /// structure that knows it, and asking Windows twice for the same table is two chances for the
+    /// answers to disagree about which display is which.
+    refresh_hz: Option<f64>,
 }
 
 /// Test-only: reports no attached outputs for the first N milliseconds of the process.
@@ -2276,6 +2284,7 @@ fn enumerate_outputs() -> Result<Vec<OutputRecord>, CaptureError> {
                     adapter: adapter.clone(),
                     adapter_luid: luid_to_i64(adapter_desc.AdapterLuid),
                     output: output1,
+                    refresh_hz: identity.and_then(|identity| identity.refresh_hz),
                     info: DisplayInfo {
                         id,
                         name,
@@ -2419,6 +2428,7 @@ fn display_config_identities() -> Result<Vec<DisplayConfigIdentity>, CaptureErro
                         persistent_id: display_identity(&target_name, &source_name),
                         gdi_name: source_name,
                         friendly_name,
+                        refresh_hz: refresh_hz(path.targetInfo.refreshRate),
                     });
                 }
                 return Ok(identities);
@@ -2476,6 +2486,41 @@ fn display_config_target_name(
         return Err(display_config_error("display_config_target_name", result));
     }
     Ok(name)
+}
+
+/// Converts the rational refresh rate Windows reports into Hz, rejecting the unusable ones.
+///
+/// A zero denominator is how Windows says "this path has no refresh rate" — a virtual or indirect
+/// display driver reports exactly that, and so does an inactive path. Reporting it as `0 Hz`, or
+/// dividing by it, would both turn "not known" into a number, which is the failure a fingerprint
+/// exists to prevent rather than commit.
+fn refresh_hz(rate: DISPLAYCONFIG_RATIONAL) -> Option<f64> {
+    if rate.Denominator == 0 || rate.Numerator == 0 {
+        return None;
+    }
+    Some(f64::from(rate.Numerator) / f64::from(rate.Denominator))
+}
+
+/// Which adapter drives each attached display, and at what refresh rate.
+///
+/// Read-only and best effort: a session that refuses enumeration produces an empty list rather
+/// than an error, because this serves the host fingerprint, where an unanswerable question is a
+/// fact about the run and not a failure of it.
+pub(crate) fn display_hardware() -> Vec<crate::host::DisplayHardware> {
+    match enumerate_outputs() {
+        Ok(records) => records
+            .into_iter()
+            .map(|record| crate::host::DisplayHardware {
+                display_id: record.info.id.0,
+                adapter_luid: Some(record.adapter_luid),
+                refresh_hz: record.refresh_hz,
+            })
+            .collect(),
+        Err(error) => {
+            log::debug!("host fingerprint could not enumerate displays: {error}");
+            Vec::new()
+        }
+    }
 }
 
 fn display_config_error(operation: &'static str, result: i32) -> CaptureError {
@@ -2894,7 +2939,7 @@ fn rotation_degrees(rotation: DXGI_MODE_ROTATION) -> u16 {
     }
 }
 
-fn wide_array_to_string(value: &[u16]) -> String {
+pub(crate) fn wide_array_to_string(value: &[u16]) -> String {
     let end = value
         .iter()
         .position(|character| *character == 0)
