@@ -1018,7 +1018,7 @@ pub(crate) fn window_geometry(hwnd: HWND, window: Rect) -> WindowGeometry {
             border_thickness: 0,
         };
     };
-    let frame = intersect_rect(window, dwm_bounds).unwrap_or(window);
+    let frame = window.intersection(dwm_bounds).unwrap_or(window);
     let border_thickness = visible_frame_border_thickness(hwnd)
         .min(frame.width / 4)
         .min(frame.height / 4);
@@ -1133,21 +1133,6 @@ fn inset_rect(rect: Rect, inset: u32) -> Option<Rect> {
         y: rect.y.checked_add(i32::try_from(inset).ok()?)?,
         width,
         height,
-    })
-}
-
-fn intersect_rect(first: Rect, second: Rect) -> Option<Rect> {
-    let left = i64::from(first.x).max(i64::from(second.x));
-    let top = i64::from(first.y).max(i64::from(second.y));
-    let right = (i64::from(first.x) + i64::from(first.width))
-        .min(i64::from(second.x) + i64::from(second.width));
-    let bottom = (i64::from(first.y) + i64::from(first.height))
-        .min(i64::from(second.y) + i64::from(second.height));
-    (right > left && bottom > top).then_some(Rect {
-        x: left as i32,
-        y: top as i32,
-        width: (right - left) as u32,
-        height: (bottom - top) as u32,
     })
 }
 
@@ -1700,6 +1685,45 @@ fn capture_error(
 
 #[cfg(test)]
 mod tests {
+    /// The DWM frame is clipped to the window rect through `Rect::intersection`, which is the
+    /// single half-open implementation in the workspace and is property-tested against
+    /// `Rect::contains` in `captastic-core`. This pins the clipping this module depends on: a
+    /// frame that overhangs the window rect comes back trimmed on exactly the overhanging side,
+    /// and one that misses it entirely comes back as nothing rather than as an empty rectangle.
+    #[test]
+    fn the_visible_frame_is_the_dwm_bounds_clipped_to_the_window_rect() {
+        let window = Rect {
+            x: 100,
+            y: 100,
+            width: 400,
+            height: 300,
+        };
+        let overhanging = Rect {
+            x: 108,
+            y: 100,
+            width: 400,
+            height: 300,
+        };
+        assert_eq!(
+            window.intersection(overhanging),
+            Some(Rect {
+                x: 108,
+                y: 100,
+                width: 392,
+                height: 300,
+            })
+        );
+        assert_eq!(
+            window.intersection(Rect {
+                x: 600,
+                y: 100,
+                width: 100,
+                height: 100,
+            }),
+            None
+        );
+    }
+
     use std::sync::Arc;
     use std::time::Instant;
 
