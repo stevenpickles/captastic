@@ -42,7 +42,9 @@ power_source = "ac"
 # The run must have gone through a real GPU. This is the field that keeps these ceilings from being
 # judged on a hosted CI runner, where every acquisition figure describes a CPU emulating a GPU.
 # Matched against the adapter driving the run's displays, not against every adapter enumerated:
-# this desktop also enumerates the Microsoft Basic Render Driver, as every desktop does.
+# this desktop also enumerates the Microsoft Basic Render Driver, as every desktop does. It needs
+# `synthetic = false` above to mean anything: a synthetic run went through no adapter at all, and
+# is reported as unjudgeable on this field rather than matched against the hardware it ran beside.
 software_adapter = false
 # Also available and deliberately unset, because these ceilings are not calibrated to them yet:
 #   driver_version = "32.0.15.9186"   # exact, for pinning a calibration while chasing a regression

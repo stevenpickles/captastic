@@ -79,6 +79,10 @@ pub struct HostMatch {
     /// judged on a hosted CI runner, where the figures describe a CPU emulating a GPU. Matched
     /// against the adapter driving the run's displays rather than against every adapter
     /// enumerated, because every real desktop also enumerates the Microsoft Basic Render Driver.
+    ///
+    /// Pair it with `synthetic = false`. A synthetic run went through no adapter at all, so there
+    /// is nothing for this to describe; it is reported as unjudgeable rather than matched against
+    /// whatever hardware happens to be in the machine the fake backend ran on.
     pub software_adapter: Option<bool>,
 }
 
@@ -308,18 +312,30 @@ fn host_mismatches(host: &HostMatch, report: &BenchmarkReport) -> Vec<String> {
             .unwrap_or_else(unknown),
     ));
     if let Some(expected) = host.software_adapter {
-        match report.environment.primary_adapter() {
-            Some(adapter) if adapter.software != expected => {
-                mismatches.push(format!(
-                    "the adapter this run used ({}) {} a software rasterizer, budget describes software_adapter = {expected}",
-                    adapter.description,
-                    if adapter.software { "is" } else { "is not" }
-                ));
+        // A synthetic run's frames came from `FakeBackend`, not from any adapter. The fingerprint
+        // still describes the machine it ran on — a real desktop with a real GPU — so without this
+        // the check would answer "not a software adapter" about hardware the run never touched,
+        // and a budget could be judged as applying to a measurement of nothing. Reported rather
+        // than skipped silently, because a budget file that asked for this deserves to be told its
+        // question could not be answered.
+        if report.synthetic {
+            mismatches.push(format!(
+                "this run was synthetic, so it went through no graphics adapter and software_adapter = {expected} cannot be checked"
+            ));
+        } else {
+            match report.environment.primary_adapter() {
+                Some(adapter) if adapter.software != expected => {
+                    mismatches.push(format!(
+                        "the adapter this run used ({}) {} a software rasterizer, budget describes software_adapter = {expected}",
+                        adapter.description,
+                        if adapter.software { "is" } else { "is not" }
+                    ));
+                }
+                Some(_) => {}
+                None => mismatches.push(format!(
+                    "this run named no graphics adapter, so software_adapter = {expected} cannot be checked"
+                )),
             }
-            Some(_) => {}
-            None => mismatches.push(format!(
-                "this run named no graphics adapter, so software_adapter = {expected} cannot be checked"
-            )),
         }
     }
     mismatches
@@ -589,10 +605,16 @@ mod tests {
         assert_eq!(mixed.iter().filter(|outcome| outcome.breached()).count(), 1);
     }
 
-    /// A report describing a real desktop: a GPU, and the Basic Render Driver every desktop has.
+    /// A report describing a real run on a real desktop: a GPU, and the Basic Render Driver every
+    /// desktop has beside it.
+    ///
+    /// `synthetic` is cleared because these tests exercise the adapter checks, and a synthetic run
+    /// is deliberately unjudgeable on its adapter — it went through none.
     fn report_on_a_gpu() -> BenchmarkReport {
         use crate::fingerprint::AdapterFingerprint;
         let mut report = report();
+        report.backend = "dxgi".to_owned();
+        report.synthetic = false;
         report.environment.adapters = vec![
             AdapterFingerprint {
                 description: "NVIDIA GeForce RTX 3070".to_owned(),
@@ -845,6 +867,59 @@ mod tests {
                     .to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn a_synthetic_run_is_not_judged_on_hardware_it_never_touched() {
+        // `captastic benchmark --backend fake` on a real desktop produces a fingerprint full of
+        // real hardware — that is the point of the fingerprint — but the frames came from
+        // `FakeBackend`. Judging `software_adapter` on the GPU sitting beside it would have the
+        // budget apply to a measurement of configured delays.
+        //
+        // The committed budget file pins `synthetic = false` and so skips such a run anyway; this
+        // is about the budget that forgets to, which is the one that would quietly mislead.
+        let mut synthetic = report_on_a_gpu();
+        synthetic.backend = "fake".to_owned();
+        synthetic.synthetic = true;
+        let outcome = evaluate(
+            &BudgetFile {
+                host: HostMatch {
+                    software_adapter: Some(false),
+                    ..HostMatch::default()
+                },
+                absolute: AbsoluteBudgets {
+                    native_frame_p50_ns: Some(1),
+                    ..AbsoluteBudgets::default()
+                },
+                relative: RelativeBudgets::default(),
+            },
+            &synthetic,
+        );
+
+        assert!(!outcome.applied());
+        assert!(!outcome.breached());
+        assert_eq!(
+            outcome.skipped_because,
+            vec![
+                "this run was synthetic, so it went through no graphics adapter and \
+                  software_adapter = false cannot be checked"
+                    .to_owned()
+            ]
+        );
+        // The same fingerprint on a real run is judged normally, so this is a statement about the
+        // backend rather than about the machine.
+        assert!(evaluate(
+            &BudgetFile {
+                host: HostMatch {
+                    software_adapter: Some(false),
+                    ..HostMatch::default()
+                },
+                absolute: AbsoluteBudgets::default(),
+                relative: RelativeBudgets::default(),
+            },
+            &report_on_a_gpu()
+        )
+        .applied());
     }
 
     #[test]
