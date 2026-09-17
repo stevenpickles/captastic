@@ -13,6 +13,8 @@ mod dwm_thumbnail;
 #[cfg(windows)]
 mod dxgi;
 #[cfg(windows)]
+mod host;
+#[cfg(windows)]
 mod hotkey;
 #[cfg(windows)]
 mod overlay;
@@ -40,6 +42,11 @@ pub use daemon_control::DaemonControl;
 pub use display_manager::{display_containing_pointer, DxgiDisplayManager};
 #[cfg(windows)]
 pub use dxgi::{enumerate_displays, materialize_native_region, DxgiBackend, GpuMaterialization};
+#[cfg(windows)]
+pub use host::{
+    adapters, display_hardware, os_build, power_status, processor_name, AdapterInfo,
+    DisplayHardware, PowerStatus,
+};
 #[cfg(windows)]
 pub use hotkey::{HotkeyListener, HotkeySpec};
 #[cfg(windows)]

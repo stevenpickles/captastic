@@ -196,9 +196,9 @@ fn host_mismatches(host: &HostMatch, report: &BenchmarkReport) -> Vec<String> {
             }
         }
     };
-    compare("backend", host.backend.as_deref(), report.backend);
+    compare("backend", host.backend.as_deref(), &report.backend);
     compare("mode", host.mode.as_deref(), &report.mode);
-    compare("cursor", host.cursor.as_deref(), report.cursor);
+    compare("cursor", host.cursor.as_deref(), &report.cursor);
     if let Some(expected) = host.synthetic {
         if expected != report.synthetic {
             mismatches.push(format!(
