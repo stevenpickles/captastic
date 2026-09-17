@@ -234,6 +234,34 @@ fn resolve_daemon_args_with_default(
     })
 }
 
+/// Starts the file destination from the resolved configuration.
+///
+/// One function for both the daemon's startup and the notification area's "Save Captures to
+/// Disk", so a worker started an hour into a session is configured exactly like one started with
+/// the daemon. The settings come from the configuration as it was read at startup, which is the
+/// same rule every other behavioural setting follows: hand edits take effect on the next start.
+///
+/// `start` validates the filename template and creates the output directory before it spawns, so
+/// both of those happen on whichever thread calls this — the main thread at startup, the daemon
+/// thread for a tray toggle. Never the capture thread, which is what ADR 0002 is about.
+#[cfg(windows)]
+fn start_file_output(
+    args: &ResolvedDaemonArgs,
+) -> Result<crate::file_output::FileOutputWorker, AppError> {
+    crate::file_output::FileOutputWorker::start(
+        args.output_directory.clone(),
+        args.output_filename_template.clone(),
+        args.output_format,
+        args.output_encode_options,
+        crate::file_output::HistoryRecorder::new(
+            args.history_store.clone(),
+            args.history_retention,
+        ),
+        args.json,
+        args.output_queue_capacity,
+    )
+}
+
 /// Everything the capture thread needs, gathered so the thread body can be a named function.
 ///
 /// It used to be a 560-line closure inside `run`, which is most of why `run` was unreadable: the
@@ -1074,20 +1102,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     }
     let mut file_output_worker = args
         .file_output
-        .then(|| {
-            crate::file_output::FileOutputWorker::start(
-                args.output_directory.clone(),
-                args.output_filename_template.clone(),
-                args.output_format,
-                args.output_encode_options,
-                crate::file_output::HistoryRecorder::new(
-                    args.history_store.clone(),
-                    args.history_retention,
-                ),
-                args.json,
-                args.output_queue_capacity,
-            )
-        })
+        .then(|| start_file_output(&args))
         .transpose()?;
     let mut clipboard_worker = args
         .clipboard
@@ -1243,7 +1258,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             false
         }
     };
-    let tray = match captastic_windows::TrayIcon::start(startup_enabled) {
+    let tray = match captastic_windows::TrayIcon::start(startup_enabled, args.file_output) {
         Ok(tray) => Some(tray),
         Err(error) => {
             crate::logging::warn(format_args!(
@@ -1526,6 +1541,15 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                     tray,
                                 );
                             }
+                            captastic_windows::TrayEvent::ToggleFileOutput => {
+                                toggle_file_output_from_tray(
+                                    &args,
+                                    &mut workers,
+                                    &destinations,
+                                    tray,
+                                    &mut last_persistence_notification,
+                                );
+                            }
                             captastic_windows::TrayEvent::ToggleStartup => {
                                 toggle_startup_from_tray(tray)
                             }
@@ -1797,6 +1821,177 @@ fn open_logs_from_tray() {
     };
     if let Err(error) = captastic_windows::open_path(path) {
         crate::logging::warn(format_args!("failed to open persistent log: {error}"));
+    }
+}
+
+/// How long a runtime stop of the file worker may wait for it, before the daemon carries on
+/// without it.
+///
+/// Shorter than the shutdown budget on purpose: this runs while the daemon is otherwise healthy
+/// and a person is waiting on a menu click, not at teardown where the alternative to waiting is
+/// losing a capture. A worker that overruns is detached exactly as it would be at shutdown, and
+/// it has already been removed from the destination set, so nothing new reaches it.
+#[cfg(windows)]
+const FILE_OUTPUT_TOGGLE_STOP_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Starts or stops writing captures to disk, and remembers which the user chose.
+///
+/// Runs on the daemon thread, never the capture thread: starting the worker validates the
+/// filename template and creates the output directory, and stopping it joins a thread. Both are
+/// fine here and neither may ever sit on the capture path (ADR 0002).
+///
+/// The order matters in both directions. Enabling starts the worker before the sink joins the
+/// destination set, so no capture is ever offered a destination that does not exist yet.
+/// Disabling removes the sink first, so no capture is queued to a worker that is already
+/// stopping.
+#[cfg(windows)]
+fn toggle_file_output_from_tray(
+    args: &ResolvedDaemonArgs,
+    workers: &mut crate::worker_registry::WorkerRegistry,
+    destinations: &crate::output::OutputDestinations,
+    tray: &captastic_windows::TrayIcon,
+    last_persistence_notification: &mut Option<String>,
+) {
+    let enabled = if workers.file_output().is_some() {
+        destinations.remove(crate::file_output::DESTINATION_NAME);
+        if let Some(worker) = workers.take_file_output() {
+            let teardown = worker.stop_before(Instant::now() + FILE_OUTPUT_TOGGLE_STOP_TIMEOUT);
+            for failure in teardown.failures {
+                crate::logging::warn(format_args!(
+                    "file output was switched off holding a failure for capture {}: {}",
+                    failure.capture_id.0, failure.message
+                ));
+            }
+            // Reported on the way out for the same reason teardown reports it: the totals belong
+            // to the run of the worker that just ended, and nothing else will state them.
+            if let Some(summary) = teardown.summary {
+                if args.json {
+                    println!("{}", summary.to_json());
+                } else {
+                    log::info!("{}", summary.to_line());
+                }
+            }
+        }
+        log::info!("captures are no longer saved to disk (notification area)");
+        false
+    } else if workers.is_shutting_down() {
+        // A click that arrived while the daemon is winding down. Starting a worker now would
+        // spawn a thread the teardown has already walked past.
+        log::info!("ignoring a request to save captures to disk during shutdown");
+        return;
+    } else {
+        match start_file_output(args) {
+            Ok(worker) => {
+                destinations.insert(std::sync::Arc::new(worker.sink()));
+                log::info!(
+                    "saving captures to {} (notification area)",
+                    worker.directory().display()
+                );
+                workers.register_file_output(Some(worker));
+                true
+            }
+            Err(error) => {
+                // The item stays unchecked, because it reports where the next capture will go and
+                // the answer is still "not to disk". The reason is the user's to see: an
+                // unwritable directory or a template the validator refuses is something only they
+                // can fix.
+                let message = format!("Captastic could not start saving captures to disk. {error}");
+                crate::logging::warn(format_args!("{message}"));
+                if let Err(error) =
+                    tray.show_error_with_title("Captastic could not save captures to disk", message)
+                {
+                    crate::logging::warn(format_args!(
+                        "failed to surface a file-output start failure in the notification area: {error}"
+                    ));
+                }
+                return;
+            }
+        }
+    };
+    if let Err(error) = tray.set_file_output_enabled(enabled) {
+        crate::logging::warn(format_args!(
+            "file output changed but the tray menu did not update: {error}"
+        ));
+    }
+    if destinations.is_empty() {
+        // Not refused. The user switched off the only destination this daemon had — a legitimate
+        // configuration, since the clipboard can be disabled — and a menu item that quietly
+        // declines is worse than one that does what it says and then says what it cost.
+        let message = "Captures are no longer delivered anywhere: saving to disk is off and the clipboard is disabled in this configuration.".to_owned();
+        crate::logging::warn(format_args!("{message}"));
+        if let Err(error) =
+            tray.show_error_with_title("Captastic has nowhere to put a capture", message)
+        {
+            crate::logging::warn(format_args!(
+                "failed to surface the empty-destination warning in the notification area: {error}"
+            ));
+        }
+    } else {
+        log::info!(
+            "captures are now delivered to [{}]",
+            destinations.names().join(", ")
+        );
+    }
+    persist_file_output_preference(args, enabled, tray, last_persistence_notification);
+}
+
+/// Writes the choice into the configuration file this daemon is running on, so it survives a
+/// restart.
+///
+/// The runtime state has already changed by the time this runs and is not rolled back if the
+/// write fails: the user asked for captures to go to disk, that is now true, and a read-only
+/// configuration file is no reason to undo it. What they lose is the memory of the choice, which
+/// is exactly what the notification says.
+#[cfg(windows)]
+fn persist_file_output_preference(
+    args: &ResolvedDaemonArgs,
+    enabled: bool,
+    tray: &captastic_windows::TrayIcon,
+    last_notification: &mut Option<String>,
+) {
+    // The profile this daemon is actually running on: an explicit `--config` path, or the default
+    // one. The same rule the tray's Open Config and the UI-state writes follow, so a daemon
+    // started on an alternate profile never edits the default one behind it.
+    let Some(path) = args.ui_state_store.config_path() else {
+        notify_preference_not_saved(
+            "Captastic could not find a configuration file to record the choice in.".to_owned(),
+            tray,
+            last_notification,
+        );
+        return;
+    };
+    match captastic_config::set_output_enabled(path, enabled) {
+        Ok(()) => log::info!("recorded output.enabled = {enabled} in {}", path.display()),
+        Err(error) => notify_preference_not_saved(
+            format!(
+                "Captastic could not record the choice in {}. {error}",
+                path.display()
+            ),
+            tray,
+            last_notification,
+        ),
+    }
+}
+
+/// Says once that a preference was not written down, sharing the deduplication the selection
+/// worker's persistence failures already use: a failing configuration write usually keeps
+/// failing, and the same balloon twice teaches nothing the first did not.
+#[cfg(windows)]
+fn notify_preference_not_saved(
+    message: String,
+    tray: &captastic_windows::TrayIcon,
+    last_notification: &mut Option<String>,
+) {
+    crate::logging::warn(format_args!("{message}"));
+    if last_notification.as_deref() == Some(message.as_str()) {
+        return;
+    }
+    *last_notification = Some(message.clone());
+    if let Err(error) = tray.show_error_with_title("Captastic preferences were not saved", message)
+    {
+        crate::logging::warn(format_args!(
+            "failed to surface a preference-persistence error in the notification area: {error}"
+        ));
     }
 }
 

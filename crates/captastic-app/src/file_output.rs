@@ -25,6 +25,13 @@ const WORKER_RECEIVE_POLL: Duration = Duration::from_millis(50);
 /// share a second *and* the same directory, which means something other than naming is wrong.
 const MAX_COLLISION_ATTEMPTS: u32 = 100;
 
+/// How the file destination is named in the destination set, in logs, and in structured output.
+///
+/// One constant rather than a literal at each site: the destination set is addressed by name when
+/// file output is switched off, and a name that matched in three places and not the fourth would
+/// leave a sink behind that nothing can reach.
+pub const DESTINATION_NAME: &str = "file";
+
 pub struct FileOutputWorker {
     sender: Option<mpsc::SyncSender<OutputJob>>,
     failure_receiver: mpsc::Receiver<FileOutputFailure>,
@@ -171,7 +178,7 @@ impl FileOutputWorker {
     /// The file destination, addressable without knowing it writes files.
     pub fn sink(&self) -> crate::output::ChannelSink {
         crate::output::ChannelSink::new(
-            "file",
+            DESTINATION_NAME,
             self.sender
                 .as_ref()
                 .expect("file output worker is running")
@@ -752,6 +759,75 @@ mod tests {
                 .expect_err("a missing directory cannot be written to");
         assert!(error.contains("failed to write"), "{error}");
 
+        std::fs::remove_dir_all(directory).expect("clean up");
+    }
+
+    /// Counts the captures that have reached a directory.
+    fn written_files(directory: &Path) -> usize {
+        std::fs::read_dir(directory)
+            .expect("read the output directory")
+            .count()
+    }
+
+    /// Waits, briefly and boundedly, for the worker thread to finish a write.
+    fn wait_for_files(directory: &Path, expected: usize) -> usize {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while written_files(directory) < expected && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        written_files(directory)
+    }
+
+    #[test]
+    fn a_destination_switched_on_and_off_starts_and_stops_reaching_disk() {
+        // The mechanics of the notification area's "Save Captures to Disk", without a tray: a
+        // worker started while the daemon runs, its sink joining the live destination set, and
+        // both leaving again — with the clipboard delivering throughout, which is the Milestone 4
+        // independence criterion applied to a destination that now comes and goes.
+        let directory = test_directory("runtime-toggle");
+        let (clipboard_sender, clipboard) = mpsc::sync_channel(4);
+        let destinations = crate::output::OutputDestinations::new(vec![std::sync::Arc::new(
+            crate::output::ChannelSink::new("clipboard", clipboard_sender),
+        )]);
+
+        let worker = FileOutputWorker::start(
+            directory.clone(),
+            captastic_config::DEFAULT_FILENAME_TEMPLATE.to_owned(),
+            OutputFormat::Png,
+            EncodeOptions::default(),
+            no_history(),
+            false,
+            4,
+        )
+        .expect("start the file worker");
+        destinations.insert(std::sync::Arc::new(worker.sink()));
+        assert_eq!(destinations.names(), vec!["clipboard", DESTINATION_NAME]);
+
+        for sink in destinations.current().iter() {
+            sink.submit(window_job(Some("editor"), None))
+                .expect("both destinations accept");
+        }
+        assert_eq!(wait_for_files(&directory, 1), 1, "the capture reached disk");
+        assert!(clipboard.try_recv().is_ok());
+
+        // Switching off: the sink leaves the set first, so nothing is queued to a worker that is
+        // already stopping.
+        assert!(destinations.remove(DESTINATION_NAME));
+        let teardown = worker.stop_before(Instant::now() + Duration::from_secs(2));
+        assert!(teardown.failures.is_empty());
+        assert_eq!(destinations.names(), vec!["clipboard"]);
+
+        for sink in destinations.current().iter() {
+            sink.submit(window_job(Some("editor"), None))
+                .expect("the clipboard still accepts");
+        }
+        assert!(
+            clipboard.try_recv().is_ok(),
+            "the clipboard is untouched by file output going away"
+        );
+        // Nothing new on disk, and no second worker to catch it later.
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(written_files(&directory), 1);
         std::fs::remove_dir_all(directory).expect("clean up");
     }
 
