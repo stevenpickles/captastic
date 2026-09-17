@@ -49,6 +49,23 @@ version, full commit, revision count, channel, dirty state, target, profile, and
 Windows builds carry the same version and commit in their executable properties, and daemon startup
 logs and benchmark reports include the embedded identity.
 
+## Benchmark evidence
+
+Every benchmark report carries an environment fingerprint — OS build, CPU, adapters with their
+driver versions, displays with scale and refresh, session, power source, and the full build
+identity including its dirty flag — and two runs are comparable only if all of that matches. A
+driver update or a hundred commits between two runs moves a latency figure without moving anything
+the numbers say, so a mismatch stops the comparison and names every differing field instead of
+producing a percentage that reads like a regression.
+
+`captastic benchmark --repeat 3 --output-dir <dir>` writes the artifacts a claim rests on: a full
+report per run, the raw per-capture event stream per run with `--raw-events`, and a `repeated.json`
+carrying every stage's spread at p50, p95, and p99. `captastic benchmark compare <baseline>
+<candidate>` holds a later run against a committed one and prints the per-stage deltas with a
+`within_noise`/`slower`/`faster` verdict. The operator procedure for turning those into a
+publishable number — console session, AC power, a repainting display, the acceptance criteria, and
+where accepted sets are committed — is [benchmarks/README.md](benchmarks/README.md).
+
 ## Continuous integration
 
 GitHub Actions checks formatting, rejects compiler and Clippy warnings, runs the workspace tests,

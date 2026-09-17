@@ -315,8 +315,8 @@ tone mapping should do. `FakeBackend` honours the freshness contract the recover
 
 The soak criteria are met on both backends, and the detach ledger is what made their results
 readable. What is left to plan around is evidence rather than resilience: the sequence-marker
-workload, and the environment-fingerprint and repeat-run automation that the deferred
-published-claim criterion waits on. The live lifecycle verifications that remain — sleep/wake,
+workload, deferred past v0.2.0, and the operator runs that the deferred published-claim criterion
+now waits on — the fingerprint and repeat-artifact automation behind it shipped in v0.2.0. The live lifecycle verifications that remain — sleep/wake,
 Remote Desktop, and the `DEVICE_REMOVED`/`DEVICE_RESET` limb of GPU reset — are listed under
 [Release readiness](#release-readiness--v010) because they are recommended before the tag.
 
@@ -376,8 +376,29 @@ explicit, tested behavior.
   available without elevation removes the device on this host, and the elevated adapter cycle that
   would has not been run. Sleep/wake and Remote Desktop still need a machine rather than a fake.
 - Build the controlled sequence-marker workload for freshness, orientation, crop, and cursor tests.
-- Collect environment fingerprints and automate warm-up, raw artifacts, repeat runs, and compatible
-  baseline comparison.
+  **Deferred past v0.2.0**, because every payoff test it enables needs a desk, a mouse and a
+  rotatable display, and it gates no release claim; the seed a future codec should build on already
+  exists, since `FakeBackend` stamps `request.id & 0xff` into every pixel it produces
+  (`crates/captastic-core/src/fake.rs`), which is what makes "which frame was materialized"
+  provable at all today.
+- ~~Collect environment fingerprints and automate warm-up, raw artifacts, repeat runs, and compatible
+  baseline comparison.~~ **Done**, across the fingerprint PR (#87) and the raw-artifact and
+  comparison PR that followed it. Warm-up discard and `--repeat N` against a
+  fresh backend per run were already there. Every report now carries an `EnvironmentFingerprint`
+  identifying the host it describes — OS build, CPU, adapters with driver versions, displays with
+  scale and refresh, session, power source, power plan, and the whole build including its dirty
+  flag — and is deserializable, so a report can be a baseline rather than only a printout.
+  `RunCompatibility` keys on that fingerprint, so two development builds a hundred commits apart no
+  longer compare as the same software, and `HostMatch` lets a budget name the same facts.
+
+  `--output-dir` writes the raw artifacts of a whole repeat set: `run-N.json` per run,
+  `run-N.events.jsonl` when `--raw-events` is given (which under `--repeat` used to be accepted and
+  silently do nothing), and a typed `repeated.json` carrying the set, its compatibility, its
+  per-stage agreement at p50/p95/p99 for all five latency stages, and the budget verdict.
+  `captastic benchmark compare <baseline> <candidate>` reads either shape back and reports the
+  per-stage deltas with a `within_noise`/`slower`/`faster` verdict, or refuses with exit status 2
+  naming every host fact that differs. The operator procedure that turns this into a publishable
+  claim is [benchmarks/README.md](benchmarks/README.md).
 - ~~Enforce relative and absolute performance budgets only on a documented physical benchmark host;
   hosted CI should continue enforcing correctness rather than GPU timing.~~ **Mechanism done.**
   `captastic benchmark --budgets benchmarks/budgets.toml` judges a run, and a budget names the host
@@ -439,10 +460,15 @@ explicit, tested behavior.
   three CPU slots, and the file worker holds its lease across a `Compact` encode plus the write —
   far longer than the clipboard holds one. The bound behaves as designed and reports every refusal;
   the figure to quote is per destination set, not per interval.
-- Three compatible repeat runs support every published performance claim. **Deferred past v0.1.0**,
-  which publishes no absolute performance claims and so satisfies this vacuously until the
-  repeat-run and environment-fingerprint automation exists — see
-  [Release readiness — v0.1.0](#release-readiness--v010).
+- Three compatible repeat runs support every published performance claim. **The automation now
+  exists; the runs are an operator step.** `captastic benchmark --repeat 3 --output-dir …` produces
+  the three runs, proves they are compatible by fingerprint rather than by assertion, reports every
+  stage's spread, and writes the artifacts a claim would be committed with; `benchmark compare`
+  holds a later run against them and refuses when the hosts differ. What is left is not code: three
+  accepted sets have to be measured on the documented host from a console session on AC power with
+  the display repainting, per [benchmarks/README.md](benchmarks/README.md), and no absolute
+  performance claim is published until they are. v0.2.0 publishes none, so this stays satisfied
+  vacuously — but now by choice rather than for want of a way to satisfy it properly.
 
 ## Milestone 6 — Annotation and pinning
 
