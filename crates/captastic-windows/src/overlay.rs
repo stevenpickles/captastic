@@ -30,11 +30,11 @@ use raster::{
 pub use shell::flush_desktop_composition;
 use shell::{
     capture_pointer, consume_self_initiated_capture_change, drain_pending_quit, duration_ns,
-    invalid_frame, invalidate, key_is_autorepeat, last_error, message_time_ms, modifiers,
-    overlay_error, query_display_environment, release_pointer_capture, restore_input_context,
-    screen_point, set_arrow_cursor, set_move_cursor, start_loupe_timer, stop_loupe_timer,
-    ClassRegistration, FrozenSurface, PrivateFontResource, RegionCursor, ThreadDpiContext,
-    LOUPE_TIMER_ID, REGION_CURSOR_CENTER,
+    invalid_frame, invalidate, key_is_autorepeat, last_error, loupe_key_after_focus_change,
+    message_time_ms, modifiers, overlay_error, query_display_environment, release_pointer_capture,
+    restore_input_context, screen_point, set_arrow_cursor, set_move_cursor, start_loupe_timer,
+    stop_loupe_timer, ClassRegistration, FrozenSurface, PrivateFontResource, RegionCursor,
+    ThreadDpiContext, LOUPE_TIMER_ID, REGION_CURSOR_CENTER,
 };
 use snap::{SnapAxis, SnapTarget, SnapTargetKind, SnapTargets, NO_SNAPS};
 use window_enumeration::{enumerate_visible_windows, WindowCandidate};
@@ -80,8 +80,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SPI_SETWORKAREA, SW_SHOW, ULW_ALPHA, WDA_EXCLUDEFROMCAPTURE, WM_APP, WM_CAPTURECHANGED,
     WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP,
     WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
-    WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_LAYERED,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WM_SETFOCUS, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW,
+    WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 #[cfg(test)]
 use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, PM_NOREMOVE, WM_QUIT};
@@ -1410,15 +1410,25 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             state_pointer,
             OverlayInput::LoupeKeyChanged { held: false },
         ),
-        WM_KILLFOCUS => {
-            // A key released while another window has focus is delivered to that window, not to
-            // this one. Without this the magnifier would still be up after an Alt+Tab away and
-            // back, with nothing holding it there.
+        WM_SETFOCUS | WM_KILLFOCUS => {
+            // Losing focus disarms the magnifier key, because a key released while another window
+            // has focus is delivered to that window and would otherwise stay held forever.
+            // Gaining it re-reads the keyboard: after an Alt+Tab away and back, Windows sends
+            // only autorepeat WM_KEYDOWNs for a key that was already down and those are discarded
+            // as repeats, so without this Z could never re-arm. The same read is what makes a Z
+            // already held when the overlay opens work at all - SetFocus in run_overlay sends
+            // this message synchronously, after the state pointer is installed.
             run_machine(
                 hwnd,
                 state_pointer,
-                OverlayInput::LoupeKeyChanged { held: false },
-            )
+                OverlayInput::LoupeKeyChanged {
+                    held: loupe_key_after_focus_change(message == WM_SETFOCUS),
+                },
+            );
+            // Focus notifications are the system's, not ours: consuming them would deny the
+            // default procedure its caret and accessibility bookkeeping.
+            // SAFETY: Default focus handling for this live window.
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
         WM_TIMER if wparam.0 == LOUPE_TIMER_ID => run_machine(
             hwnd,

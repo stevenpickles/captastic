@@ -17,7 +17,7 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, MDT_EFFECTIVE_DPI,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_SHIFT,
+    GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_SHIFT, VK_Z,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateIconIndirect, DestroyCursor, GetMessageTime, IsWindow, KillTimer, LoadCursorW,
@@ -490,6 +490,18 @@ pub(super) fn modifiers() -> Modifiers {
     }
 }
 
+/// The key state the magnifier should adopt when the overlay's focus changes.
+///
+/// One rule in one place, used by both the gain and the loss. Losing focus always disarms: a key
+/// released while another window has focus is delivered to that window, so a held Z would
+/// otherwise stay held forever. Gaining focus re-reads the keyboard, which is the half that was
+/// missing — after an Alt+Tab away and back, Windows delivers only autorepeat `WM_KEYDOWN`s for a
+/// key that was already down, and those are discarded as repeats, so Z could never re-arm. The
+/// same read covers a Z that was already held at the moment the overlay opened.
+pub(super) fn loupe_key_after_focus_change(gained_focus: bool) -> bool {
+    gained_focus && key_is_down(VK_Z.0)
+}
+
 /// Whether a virtual key is held as of the message being dispatched.
 ///
 /// `GetKeyState` returns the "currently down" answer in the high-order bit and a toggle state —
@@ -590,6 +602,17 @@ mod tests {
     use super::super::UI_FONT_HEIGHT;
     use super::*;
     use windows::Win32::Graphics::Gdi::GetTextFaceW;
+
+    #[test]
+    fn losing_focus_always_disarms_the_magnifier_key() {
+        // The half that can be asserted without a keyboard. Gaining focus re-reads the key, which
+        // is what makes a return from Alt+Tab recover; losing it is unconditional, because a key
+        // released over another window is never reported to this one.
+        assert!(!loupe_key_after_focus_change(false));
+        // And the read on focus gain is the live key state rather than a latched value, so a Z
+        // that is not held cannot be re-armed by the focus change itself.
+        assert_eq!(loupe_key_after_focus_change(true), key_is_down(VK_Z.0));
+    }
 
     #[test]
     fn a_repeated_key_press_is_distinguishable_from_a_fresh_one() {

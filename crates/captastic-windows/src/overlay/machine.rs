@@ -3739,6 +3739,33 @@ mod tests {
     }
 
     #[test]
+    fn the_magnifier_key_survives_a_focus_round_trip() {
+        // The machine half of the Alt+Tab fix. Focus loss disarms unconditionally; focus gain
+        // re-reads the keyboard and re-arms. Both directions have to be non-sticky, because the
+        // shell now sends a key-changed input on every focus message and would otherwise either
+        // churn repaints or refuse to come back.
+        let mut model = region_model();
+        model.pointer_local = Some(point(400, 400));
+        transition(&mut model, OverlayInput::LoupeKeyChanged { held: true });
+        assert!(loupe_visible(&model));
+
+        // Alt+Tab away: the key is released over the other window and never reported here.
+        let effects = transition(&mut model, OverlayInput::LoupeKeyChanged { held: false });
+        assert!(!loupe_visible(&model));
+        assert!(matches!(effects.as_slice(), [OverlayEffect::Invalidate]));
+
+        // Alt+Tab back with Z still held. Windows sends only autorepeat key-downs for it, which
+        // the shell discards, so this input is the only thing that can re-arm the magnifier.
+        let effects = transition(&mut model, OverlayInput::LoupeKeyChanged { held: true });
+        assert!(loupe_visible(&model), "the key must be able to come back");
+        assert!(matches!(effects.as_slice(), [OverlayEffect::Invalidate]));
+
+        // Coming back without Z held changes nothing and repaints nothing.
+        transition(&mut model, OverlayInput::LoupeKeyChanged { held: false });
+        assert!(transition(&mut model, OverlayInput::LoupeKeyChanged { held: false }).is_empty());
+    }
+
+    #[test]
     fn each_mode_answers_for_itself() {
         for (mode, key, auto_after_slow_drag) in [
             (LoupeMode::Auto, true, true),
