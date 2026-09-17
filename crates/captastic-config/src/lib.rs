@@ -13,6 +13,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod filename_template;
 mod fsio;
 mod history;
 mod ui_state;
@@ -20,6 +21,7 @@ mod ui_state;
 use fsio::{maintain_config_artifacts, quarantine_config};
 
 pub use captastic_core::OutputFormat;
+pub use filename_template::{validate_template, TOKENS as FILENAME_TEMPLATE_TOKENS};
 pub use fsio::{atomic_write, finalize_new, replace_file};
 pub use history::{
     CaptureHistory, HistoryEntry, HistoryStore, RetentionPolicy, HISTORY_FILE_NAME,
@@ -557,6 +559,10 @@ impl AppConfig {
                 self.output.jpeg_quality
             )));
         }
+        // Checked whether or not file output is enabled: a template is either one Captastic can
+        // expand or it is not, and finding out at the moment the setting is switched on - which is
+        // a tray click away - would be finding out too late.
+        validate_template(&self.output.filename_template).map_err(ConfigError::InvalidValue)?;
         if self.metrics.ring_capacity == 0 || self.metrics.ring_capacity > 10_000_000 {
             return Err(ConfigError::InvalidValue(
                 "metrics.ring_capacity must be between 1 and 10000000".to_owned(),
@@ -1803,6 +1809,24 @@ format = \"webp\"
         )
         .expect_err("unknown output formats must be rejected");
         assert!(error.to_string().contains("webp"), "{error}");
+    }
+
+    #[test]
+    fn a_filename_template_the_daemon_would_refuse_is_invalid_configuration() {
+        // `captastic config validate` used to pass a file that the next daemon launch rejected,
+        // because the template check lived in the file worker. A configuration is valid or it is
+        // not, and the answer cannot depend on which process asked.
+        let mut config = AppConfig::default();
+        config.output.filename_template = "captastic-{tilte}".to_owned();
+        let error = config.validate().expect_err("an unknown token is invalid");
+        assert!(error.to_string().contains("unknown token"), "{error}");
+
+        config.output.filename_template = "{date}/{time}".to_owned();
+        let error = config.validate().expect_err("a path separator is invalid");
+        assert!(error.to_string().contains("path separators"), "{error}");
+
+        config.output.filename_template = DEFAULT_FILENAME_TEMPLATE.to_owned();
+        config.validate().expect("the default template is valid");
     }
 
     #[test]
