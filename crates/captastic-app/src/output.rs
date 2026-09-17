@@ -10,7 +10,7 @@
 //! So producers address an [`OutputSink`]. A sink accepts a job or rejects it, and a rejection is
 //! a fact about that destination alone.
 
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, RwLock};
 
 use captastic_config::{HotkeyAction, HotkeyChord};
 use captastic_core::{CaptureId, CpuFrame, EventRecorder};
@@ -105,6 +105,92 @@ impl OutputSink for ChannelSink {
             mpsc::TrySendError::Full(job) => OutputRejection::QueueFull(Box::new(job)),
             mpsc::TrySendError::Disconnected(job) => OutputRejection::Disconnected(Box::new(job)),
         })
+    }
+}
+
+/// One resolved list of destinations, cheap to hand to a producer.
+///
+/// Reference-counted rather than copied per capture: taking the current set costs one atomic
+/// increment, which is what makes reading it on the capture path affordable.
+pub type DestinationSet = Arc<Vec<Arc<dyn OutputSink>>>;
+
+/// Every destination a finished capture is offered to, as the set stands *now*.
+///
+/// Destinations used to be resolved once at startup and handed to each producer as a frozen list,
+/// which was true for as long as the only way to turn file output on was to edit the
+/// configuration and restart. It stops being true the moment the notification area can start and
+/// stop the file worker: a frozen list would keep offering captures to a worker that has stopped,
+/// or keep missing one that has started, and the producer holding it has no way to find out.
+///
+/// So a producer holds this and reads [`OutputDestinations::current`] once per capture. Writes
+/// happen only when a destination is turned on or off and replace the whole set, so a reader
+/// never sees a half-built list and a capture already in flight completes against the set it
+/// started with.
+#[derive(Clone)]
+pub struct OutputDestinations {
+    current: Arc<RwLock<DestinationSet>>,
+}
+
+impl OutputDestinations {
+    pub fn new(sinks: Vec<Arc<dyn OutputSink>>) -> Self {
+        Self {
+            current: Arc::new(RwLock::new(Arc::new(sinks))),
+        }
+    }
+
+    /// The set as it stands, for one capture to be offered to.
+    ///
+    /// A poisoned lock is read through rather than propagated: the only thing under it is a list
+    /// of senders, a panic while swapping it cannot leave it half-written, and refusing to deliver
+    /// a capture the user already took would be a worse answer than delivering it to the set that
+    /// was there.
+    pub fn current(&self) -> DestinationSet {
+        self.current
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn names(&self) -> Vec<&'static str> {
+        self.current().iter().map(|sink| sink.name()).collect()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.current().is_empty()
+    }
+
+    /// Adds a destination, or replaces the one already using that name.
+    ///
+    /// Replacing rather than appending keeps a repeated enable from stacking two file sinks whose
+    /// workers would each be handed every capture.
+    pub fn insert(&self, sink: Arc<dyn OutputSink>) {
+        self.replace_with(|sinks| {
+            sinks.retain(|existing| existing.name() != sink.name());
+            sinks.push(sink);
+        });
+    }
+
+    /// Removes the destination with this name, reporting whether there was one.
+    pub fn remove(&self, name: &str) -> bool {
+        let mut removed = false;
+        self.replace_with(|sinks| {
+            let before = sinks.len();
+            sinks.retain(|existing| existing.name() != name);
+            removed = sinks.len() != before;
+        });
+        removed
+    }
+
+    /// Copy-on-write: the new set is built beside the live one and swapped in, so a producer
+    /// reading concurrently sees either the whole old list or the whole new one.
+    fn replace_with(&self, edit: impl FnOnce(&mut Vec<Arc<dyn OutputSink>>)) {
+        let mut current = self
+            .current
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut sinks = current.as_ref().clone();
+        edit(&mut sinks);
+        *current = Arc::new(sinks);
     }
 }
 
@@ -218,6 +304,86 @@ mod tests {
         }
         assert!(clipboard.try_recv().is_ok());
         assert!(file.try_recv().is_ok());
+    }
+
+    #[test]
+    fn a_destination_can_join_and_leave_without_disturbing_the_others() {
+        // What the notification area's "Save Captures to Disk" does to the set, stated as a test:
+        // the clipboard neither notices nor stops working while file output comes and goes.
+        let (clipboard_sender, clipboard) = mpsc::sync_channel(4);
+        let destinations = OutputDestinations::new(vec![Arc::new(ChannelSink::new(
+            "clipboard",
+            clipboard_sender,
+        ))]);
+        assert_eq!(destinations.names(), vec!["clipboard"]);
+
+        let (file_sender, file) = mpsc::sync_channel(4);
+        destinations.insert(Arc::new(ChannelSink::new("file", file_sender)));
+        // Appended, so the clipboard keeps its place in the logs.
+        assert_eq!(destinations.names(), vec!["clipboard", "file"]);
+        for sink in destinations.current().iter() {
+            assert!(sink.submit(job()).is_ok(), "{} rejected", sink.name());
+        }
+        assert!(clipboard.try_recv().is_ok());
+        assert!(file.try_recv().is_ok());
+
+        assert!(destinations.remove("file"));
+        assert_eq!(destinations.names(), vec!["clipboard"]);
+        for sink in destinations.current().iter() {
+            assert!(sink.submit(job()).is_ok(), "{} rejected", sink.name());
+        }
+        assert!(clipboard.try_recv().is_ok(), "the clipboard is untouched");
+        assert!(
+            file.try_recv().is_err(),
+            "a removed destination is offered nothing"
+        );
+
+        // Removing what is not there says so rather than pretending.
+        assert!(!destinations.remove("file"));
+    }
+
+    #[test]
+    fn a_capture_in_flight_completes_against_the_set_it_started_with() {
+        // The set is read once per capture, not once per destination: a toggle landing between
+        // two submissions of the same capture must not deliver it to half of one set and half of
+        // another.
+        let (clipboard_sender, clipboard) = mpsc::sync_channel(4);
+        let (file_sender, file) = mpsc::sync_channel(4);
+        let destinations = OutputDestinations::new(vec![
+            Arc::new(ChannelSink::new("clipboard", clipboard_sender)) as Arc<dyn OutputSink>,
+            Arc::new(ChannelSink::new("file", file_sender)),
+        ]);
+
+        let in_flight = destinations.current();
+        destinations.remove("file");
+
+        for sink in in_flight.iter() {
+            assert!(sink.submit(job()).is_ok());
+        }
+        assert!(clipboard.try_recv().is_ok());
+        assert!(file.try_recv().is_ok());
+        // The next capture reads the set as it now stands.
+        assert_eq!(destinations.names(), vec!["clipboard"]);
+    }
+
+    #[test]
+    fn enabling_a_destination_twice_does_not_deliver_a_capture_twice() {
+        let (first_sender, first) = mpsc::sync_channel(4);
+        let destinations = OutputDestinations::new(Vec::new());
+        assert!(destinations.is_empty());
+        destinations.insert(Arc::new(ChannelSink::new("file", first_sender)));
+
+        // A second worker replaces the first rather than joining it: two sinks under one name
+        // would write every capture to disk twice.
+        let (second_sender, second) = mpsc::sync_channel(4);
+        destinations.insert(Arc::new(ChannelSink::new("file", second_sender)));
+        assert_eq!(destinations.names(), vec!["file"]);
+
+        for sink in destinations.current().iter() {
+            assert!(sink.submit(job()).is_ok());
+        }
+        assert!(first.try_recv().is_err());
+        assert!(second.try_recv().is_ok());
     }
 
     #[test]

@@ -49,6 +49,23 @@ version, full commit, revision count, channel, dirty state, target, profile, and
 Windows builds carry the same version and commit in their executable properties, and daemon startup
 logs and benchmark reports include the embedded identity.
 
+## Benchmark evidence
+
+Every benchmark report carries an environment fingerprint — OS build, CPU, adapters with their
+driver versions, displays with scale and refresh, session, power source, and the full build
+identity including its dirty flag — and two runs are comparable only if all of that matches. A
+driver update or a hundred commits between two runs moves a latency figure without moving anything
+the numbers say, so a mismatch stops the comparison and names every differing field instead of
+producing a percentage that reads like a regression.
+
+`captastic benchmark --repeat 3 --output-dir <dir>` writes the artifacts a claim rests on: a full
+report per run, the raw per-capture event stream per run with `--raw-events`, and a `repeated.json`
+carrying every stage's spread at p50, p95, and p99. `captastic benchmark compare <baseline>
+<candidate>` holds a later run against a committed one and prints the per-stage deltas with a
+`within_noise`/`slower`/`faster` verdict. The operator procedure for turning those into a
+publishable number — console session, AC power, a repainting display, the acceptance criteria, and
+where accepted sets are committed — is [benchmarks/README.md](benchmarks/README.md).
+
 ## Continuous integration
 
 GitHub Actions checks formatting, rejects compiler and Clippy warnings, runs the workspace tests,
@@ -90,9 +107,10 @@ Running Captastic without a subcommand starts the resident desktop capture daemo
 configuration. The explicit `daemon` form remains available for scripts, diagnostics, and CLI
 overrides. A named per-session control event prevents more than one daemon instance from running.
 While the daemon is active, Captastic places an icon in the Windows notification area. Double-click
-the icon to capture, or right-click it to capture, open the most recent capture or show it in its
-folder (**Open Last Capture** and **Show in Folder**), pause/resume the global hotkey, open
-`captastic.toml`, open the persistent log, toggle **Start with Windows**, or exit cleanly. If Windows
+the icon to capture, or right-click it to capture, turn **Save Captures to Disk** on or off,
+open the most recent capture or show it in its folder (**Open Last Capture** and **Show in
+Folder**), pause/resume the global hotkey, open `captastic.toml`, open the persistent log, toggle
+**Start with Windows**, or exit cleanly. If Windows
 Explorer restarts, Captastic restores its notification icon automatically. Tray initialization
 failures are logged and do not disable the capture daemon.
 
@@ -174,7 +192,8 @@ Captastic retains the five newest corrupt backups and removes abandoned atomic-w
 siblings after seven days, preventing recovery artifacts from growing without bound.
 
 When the daemon is started with `--config <path>`, that path is also the sole destination for tray
-Open Config and managed UI-state updates; the default profile is not read or written. The daemon
+Open Config, the **Save Captures to Disk** setting, and managed UI-state updates; the default
+profile is not read or written. The daemon
 loads behavioral and remembered UI settings at startup, so hand edits take effect after a restart.
 Background UI saves re-read the current document and preserve unrelated edits and comments. The
 one-shot `captastic capture --selection true` command uses the default profile and flushes its UI
@@ -219,7 +238,8 @@ events, and the persistence worker coalesces equivalent updates before writing.
 ## File output
 
 Captastic can write every capture to disk as well as, or instead of, the clipboard. It is off by
-default:
+default, and the notification area's **Save Captures to Disk** turns it on and off without a
+restart:
 
 ```toml
 [output]
@@ -266,6 +286,18 @@ A capture never overwrites a file it did not create: a name already taken is ret
 `name-3`, and so on, and the write itself refuses rather than replaces. Each written capture is
 reported with its format, path, byte count, and encode/write timings — as a log line, or as a
 `file_output_written` JSON event under `--json`.
+
+**Save Captures to Disk** in the notification-area menu is checked while captures are being
+written, and takes effect on the next capture rather than on the next start: turning it on starts
+the file worker — creating the output directory and rejecting a bad `filename_template` there and
+then — and turning it off stops it, leaving the clipboard untouched either way. The choice is
+written back to `output.enabled` in the configuration this daemon is running on, preserving the
+rest of the document and its comments, so it survives a restart; the file is created if the
+default profile has never been written. If that write fails the notification area says so and the
+setting still applies for this session. A start that fails — an output directory that cannot be
+created, say — leaves the item unchecked and reports why, because the checkmark states where the
+next capture will go. Everything else under `[output]` (format, directory, template) is read at
+startup as before, so changing those still means a restart.
 
 Captastic remembers recent captures under `[history]` (`max_items`, `max_age_days`,
 `max_total_bytes`; `max_items = 0` turns it off). The notification-area menu uses that history for

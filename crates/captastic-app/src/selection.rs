@@ -192,7 +192,7 @@ pub struct SelectionWorker {
 
 impl SelectionWorker {
     pub fn start(
-        output_sinks: Vec<Box<dyn crate::output::OutputSink>>,
+        destinations: crate::output::OutputDestinations,
         capture_sender: mpsc::SyncSender<crate::daemon::CaptureCommand>,
         notices: mpsc::SyncSender<crate::daemon::DaemonNotice>,
         json_output: bool,
@@ -562,6 +562,9 @@ impl SelectionWorker {
                         let cpu_ready_offset_ns = job
                             .cpu_ready_offset_ns
                             .unwrap_or_else(|| duration_ns(job.triggered_at.elapsed()));
+                        // Read per confirmation for the same reason the capture worker reads
+                        // it per capture: the set can have changed while the overlay was open.
+                        let output_sinks = destinations.current();
                         if output_sinks.is_empty() {
                             // A selection with no destination configured. Previously impossible to
                             // express: the worker held a clipboard sender and a `.expect` in the
@@ -587,7 +590,7 @@ impl SelectionWorker {
                             // Every destination, not just the first: a selection is a capture like
                             // any other, and a region chosen in the overlay belongs on disk too if
                             // the user asked for file output.
-                            for sink in &output_sinks {
+                            for sink in output_sinks.iter() {
                                 let destination_job = crate::output::OutputJob {
                                     capture_id: job.capture_id,
                                     triggered_at: job.triggered_at,
@@ -1505,10 +1508,9 @@ mod tests {
         let (capture_sender, _capture_receiver) = mpsc::sync_channel(1);
         let (dropped_sender, _dropped_receiver) = mpsc::sync_channel(1);
         let mut worker = SelectionWorker::start(
-            vec![Box::new(crate::output::ChannelSink::new(
-                "clipboard",
-                clipboard_sender,
-            ))],
+            crate::output::OutputDestinations::new(vec![Arc::new(
+                crate::output::ChannelSink::new("clipboard", clipboard_sender),
+            )]),
             capture_sender,
             dropped_sender,
             false,

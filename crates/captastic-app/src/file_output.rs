@@ -5,13 +5,14 @@
 //! defend. The capture path hands over an owned frame and does not wait.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use captastic_core::{
-    encode_capture, validate_event_order, CaptureId, EncodeOptions, OutputFormat, PerfEventKind,
+    encode_capture, process_detach_ledger, validate_event_order, CaptureId, DetachKind,
+    EncodeOptions, OutputFormat, PerfEventKind,
 };
 use serde_json::json;
 
@@ -25,6 +26,49 @@ const WORKER_RECEIVE_POLL: Duration = Duration::from_millis(50);
 /// share a second *and* the same directory, which means something other than naming is wrong.
 const MAX_COLLISION_ATTEMPTS: u32 = 100;
 
+/// How the file destination is named in the destination set, in logs, and in structured output.
+///
+/// One constant rather than a literal at each site: the destination set is addressed by name when
+/// file output is switched off, and a name that matched in three places and not the fourth would
+/// leave a sink behind that nothing can reach.
+pub const DESTINATION_NAME: &str = "file";
+
+/// Where the worker thread stands relative to the deadline for stopping it.
+///
+/// A flag would not do. Deciding to detach races the thread's own exit: it can finish between the
+/// last `is_finished` poll and the decision, and a detach recorded for a thread that had already
+/// gone would hold the only file-output slot there is for the rest of the run. So the decision and
+/// the exit claim the same cell, and exactly one of them wins.
+struct WorkerLifetime(AtomicU8);
+
+const WORKER_RUNNING: u8 = 0;
+const WORKER_DETACHED: u8 = 1;
+const WORKER_FINISHED: u8 = 2;
+
+impl WorkerLifetime {
+    const fn new() -> Self {
+        Self(AtomicU8::new(WORKER_RUNNING))
+    }
+
+    /// Claims the detach. `false` means the thread finished first and nothing was abandoned.
+    fn detach(&self) -> bool {
+        self.0
+            .compare_exchange(
+                WORKER_RUNNING,
+                WORKER_DETACHED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// The worker thread's last act. `true` means it had already been written off, which is the
+    /// caller's cue to give back the ledger slot that detach took.
+    fn finished(&self) -> bool {
+        self.0.swap(WORKER_FINISHED, Ordering::AcqRel) == WORKER_DETACHED
+    }
+}
+
 pub struct FileOutputWorker {
     sender: Option<mpsc::SyncSender<OutputJob>>,
     failure_receiver: mpsc::Receiver<FileOutputFailure>,
@@ -34,6 +78,7 @@ pub struct FileOutputWorker {
     /// Carries the run's totals back from the worker thread when it exits.
     summary_receiver: mpsc::Receiver<crate::output_metrics::OutputMetrics>,
     stop_requested: Arc<AtomicBool>,
+    lifetime: Arc<WorkerLifetime>,
     join: Option<JoinHandle<()>>,
     directory: PathBuf,
 }
@@ -42,6 +87,9 @@ pub struct FileOutputWorker {
 pub struct FileOutputTeardown {
     pub failures: Vec<FileOutputFailure>,
     pub summary: Option<crate::output_metrics::OutputSummary>,
+    /// Captures that were still queued when the stop arrived and never reached disk. Zero when
+    /// the worker was detached rather than stopped, because nothing finished counting them.
+    pub abandoned: u64,
 }
 
 /// A capture that did not reach disk.
@@ -87,6 +135,8 @@ impl FileOutputWorker {
         let (summary_sender, summary_receiver) = mpsc::sync_channel(1);
         let stop_requested = Arc::new(AtomicBool::new(false));
         let worker_stop_requested = stop_requested.clone();
+        let lifetime = Arc::new(WorkerLifetime::new());
+        let worker_lifetime = lifetime.clone();
         let worker_directory = directory.clone();
         let worker_template = filename_template;
         let worker_history = history;
@@ -152,9 +202,38 @@ impl FileOutputWorker {
                     }
                     finish_attempt(&mut job);
                 }
+                // Whatever was still queued when the stop arrived. The receive loop above
+                // abandons it either way — this is the difference between abandoning it silently
+                // and saying which captures were lost. `try_iter` yields the buffered jobs after
+                // a disconnect too, so it covers both ways out of the loop.
+                for mut job in receiver.try_iter() {
+                    metrics.record_abandoned();
+                    crate::logging::warn(format_args!(
+                        "capture {} was still queued when file output stopped; it was not written",
+                        job.capture_id.0
+                    ));
+                    // The attempt still owes its ending: a capture that vanished without one
+                    // leaves a trace that validates as an unfinished capture forever.
+                    finish_attempt(&mut job);
+                }
+                if metrics.abandoned() > 0 {
+                    crate::logging::warn(format_args!(
+                        "file output stopped with {} capture(s) still queued; they were not written",
+                        metrics.abandoned()
+                    ));
+                }
                 // Reported once, on the way out: a per-capture line already says what each
                 // capture cost, and this is the shape of the whole run.
                 let _ = summary_sender.try_send(metrics);
+                if worker_lifetime.finished() {
+                    // Written off at a deadline and back anyway. The slot it was holding is free,
+                    // so file output can be switched on again. `live` falls; the history of the
+                    // detach stays, which is the number that says whether this is habitual.
+                    process_detach_ledger().rejoined(DetachKind::FileOutputWorker);
+                    log::info!(
+                        "the detached file output worker has exited; saving captures to disk can be switched on again"
+                    );
+                }
             })
             .map_err(|error| AppError::BackendUnavailable(error.to_string()))?;
         Ok(Self {
@@ -163,6 +242,7 @@ impl FileOutputWorker {
             written_receiver,
             summary_receiver,
             stop_requested,
+            lifetime,
             join: Some(join),
             directory,
         })
@@ -171,7 +251,7 @@ impl FileOutputWorker {
     /// The file destination, addressable without knowing it writes files.
     pub fn sink(&self) -> crate::output::ChannelSink {
         crate::output::ChannelSink::new(
-            "file",
+            DESTINATION_NAME,
             self.sender
                 .as_ref()
                 .expect("file output worker is running")
@@ -195,16 +275,18 @@ impl FileOutputWorker {
     pub fn stop_before(mut self, deadline: Instant) -> FileOutputTeardown {
         self.request_stop();
         self.stop_inner(deadline);
+        // Absent when the worker was detached at its deadline rather than exiting, in which case
+        // there are no totals to report because nothing finished counting them.
+        let summary = self
+            .summary_receiver
+            .try_recv()
+            .ok()
+            .filter(|metrics| !metrics.is_empty())
+            .map(|metrics| metrics.summary());
         FileOutputTeardown {
             failures: self.failure_receiver.try_iter().collect(),
-            // Absent when the worker was detached at its deadline rather than exiting, in which
-            // case there are no totals to report because nothing finished counting them.
-            summary: self
-                .summary_receiver
-                .try_recv()
-                .ok()
-                .filter(|metrics| !metrics.is_empty())
-                .map(|metrics| metrics.summary()),
+            abandoned: summary.as_ref().map_or(0, |summary| summary.abandoned),
+            summary,
         }
     }
 
@@ -215,18 +297,34 @@ impl FileOutputWorker {
 
     fn stop_inner(&mut self, deadline: Instant) {
         self.request_stop();
-        if let Some(join) = self.join.take() {
-            while !join.is_finished() && Instant::now() < deadline {
-                thread::sleep(WORKER_STOP_POLL);
-            }
-            if join.is_finished() {
-                let _ = join.join();
-            } else {
-                crate::logging::error(format_args!(
-                    "file output worker did not stop before its shutdown deadline; detaching it so shutdown can continue"
-                ));
-            }
+        let Some(join) = self.join.take() else {
+            return;
+        };
+        while !join.is_finished() && Instant::now() < deadline {
+            thread::sleep(WORKER_STOP_POLL);
         }
+        // `detach` is what decides, not `is_finished`: the thread can exit between the poll above
+        // and this line, and a detach recorded for a thread that had already gone would hold the
+        // only file-output slot there is for the rest of the run.
+        if join.is_finished() || !self.lifetime.detach() {
+            let _ = join.join();
+            return;
+        }
+        // Left running on purpose, exactly as the capture worker is: a write into a disk or a
+        // network share that has stopped answering cannot be cancelled, and blocking here would
+        // hand a menu click — or the process's exit — to whatever is wedged.
+        //
+        // Recorded rather than merely logged because, unlike the capture worker's, this detach is
+        // reachable more than once per run: the notification area can switch file output off and
+        // on again. Until this thread exits it may still write into the output directory, so the
+        // ledger's ceiling is what stops a second worker joining it there.
+        let detached = process_detach_ledger().detached(DetachKind::FileOutputWorker);
+        crate::logging::error(format_args!(
+            "file output worker did not stop before its deadline; detaching it with {} still running of {} allowed ({} detached in total). Saving captures to disk cannot be switched on again until it exits",
+            detached.live,
+            DetachKind::FileOutputWorker.ceiling(),
+            detached.total
+        ));
     }
 }
 
@@ -525,6 +623,8 @@ fn ns_to_ms(ns: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Submitting through the seam a producer uses, rather than through the channel behind it.
+    use crate::output::OutputSink as _;
 
     /// A recorder that remembers nothing, for tests about writing rather than remembering.
     fn no_history() -> HistoryRecorder {
@@ -752,6 +852,210 @@ mod tests {
                 .expect_err("a missing directory cannot be written to");
         assert!(error.contains("failed to write"), "{error}");
 
+        std::fs::remove_dir_all(directory).expect("clean up");
+    }
+
+    /// Counts the captures that have reached a directory.
+    fn written_files(directory: &Path) -> usize {
+        std::fs::read_dir(directory)
+            .expect("read the output directory")
+            .count()
+    }
+
+    /// Waits, briefly and boundedly, for the worker thread to finish a write.
+    fn wait_for_files(directory: &Path, expected: usize) -> usize {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while written_files(directory) < expected && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        written_files(directory)
+    }
+
+    #[test]
+    fn a_destination_switched_on_and_off_starts_and_stops_reaching_disk() {
+        // The mechanics of the notification area's "Save Captures to Disk", without a tray: a
+        // worker started while the daemon runs, its sink joining the live destination set, and
+        // both leaving again — with the clipboard delivering throughout, which is the Milestone 4
+        // independence criterion applied to a destination that now comes and goes.
+        let directory = test_directory("runtime-toggle");
+        let (clipboard_sender, clipboard) = mpsc::sync_channel(4);
+        let destinations = crate::output::OutputDestinations::new(vec![std::sync::Arc::new(
+            crate::output::ChannelSink::new("clipboard", clipboard_sender),
+        )]);
+
+        let worker = FileOutputWorker::start(
+            directory.clone(),
+            captastic_config::DEFAULT_FILENAME_TEMPLATE.to_owned(),
+            OutputFormat::Png,
+            EncodeOptions::default(),
+            no_history(),
+            false,
+            4,
+        )
+        .expect("start the file worker");
+        destinations.insert(std::sync::Arc::new(worker.sink()));
+        assert_eq!(destinations.names(), vec!["clipboard", DESTINATION_NAME]);
+
+        for sink in destinations.current().iter() {
+            sink.submit(window_job(Some("editor"), None))
+                .expect("both destinations accept");
+        }
+        assert_eq!(wait_for_files(&directory, 1), 1, "the capture reached disk");
+        assert!(clipboard.try_recv().is_ok());
+
+        // Switching off: the sink leaves the set first, so nothing is queued to a worker that is
+        // already stopping.
+        assert!(destinations.remove(DESTINATION_NAME));
+        let teardown = worker.stop_before(Instant::now() + Duration::from_secs(2));
+        assert!(teardown.failures.is_empty());
+        assert_eq!(destinations.names(), vec!["clipboard"]);
+
+        for sink in destinations.current().iter() {
+            sink.submit(window_job(Some("editor"), None))
+                .expect("the clipboard still accepts");
+        }
+        assert!(
+            clipboard.try_recv().is_ok(),
+            "the clipboard is untouched by file output going away"
+        );
+        // Nothing new on disk, and no second worker to catch it later.
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(written_files(&directory), 1);
+        std::fs::remove_dir_all(directory).expect("clean up");
+    }
+
+    /// A job whose frame is big enough that encoding it takes long enough to queue another
+    /// behind it. Used only where the test needs the worker to be busy at a known moment.
+    fn slow_job(side: u32) -> OutputJob {
+        let stride = side * 4;
+        let mut job = window_job(Some("editor"), None);
+        let frame = captastic_core::CpuFrame::new(
+            std::sync::Arc::from(vec![0_u8; (stride * side) as usize]),
+            side,
+            side,
+            stride,
+            captastic_core::PixelFormat::Bgra8Unorm,
+            captastic_core::FrameOrigin::TopLeft,
+            captastic_core::ColorSpace::Srgb,
+            captastic_core::FrameMetadata {
+                source_rect: captastic_core::Rect {
+                    x: 0,
+                    y: 0,
+                    width: side,
+                    height: side,
+                },
+                ..job.frame.metadata.clone()
+            },
+        )
+        .expect("test frame");
+        job.frame = frame;
+        job
+    }
+
+    #[test]
+    fn a_capture_still_queued_when_the_destination_stops_is_named_and_counted() {
+        // Switching file output off drops whatever the worker had not reached yet. That is the
+        // same thing shutdown has always done, and it was silent: nothing logged the capture,
+        // nothing counted it, and the run's totals said only that fewer had been written than the
+        // user took. A capture the user asked for and did not get is exactly what a log is for.
+        let directory = test_directory("abandoned");
+        let worker = FileOutputWorker::start(
+            directory.clone(),
+            captastic_config::DEFAULT_FILENAME_TEMPLATE.to_owned(),
+            OutputFormat::Png,
+            EncodeOptions::default(),
+            no_history(),
+            false,
+            4,
+        )
+        .expect("start the file worker");
+        let sink = worker.sink();
+
+        // Three captures arrive together and the stop follows immediately. The worker checks the
+        // stop flag between jobs, so it finishes at most the one it had already taken and the
+        // rest are still in the queue when it breaks — which is the state the stop has to
+        // account for. No timing assumption beyond "encoding a megapixel takes longer than
+        // queueing three messages".
+        for _ in 0..3 {
+            sink.submit(slow_job(512)).expect("the queue accepts");
+        }
+        drop(sink);
+
+        let teardown = worker.stop_before(Instant::now() + Duration::from_secs(10));
+        let summary = teardown.summary.expect("the worker reported its totals");
+        assert!(
+            teardown.abandoned >= 1,
+            "a queued capture is reported as abandoned, not merely missing"
+        );
+        assert_eq!(summary.abandoned, teardown.abandoned);
+        assert_eq!(
+            summary.written + summary.abandoned,
+            3,
+            "every capture is either written or accounted for as abandoned"
+        );
+        assert_eq!(summary.failed, 0, "an abandoned capture is not a failure");
+        assert!(summary
+            .to_line()
+            .contains(&format!("{} abandoned", summary.abandoned)));
+        assert_eq!(summary.to_json()["abandoned"], summary.abandoned);
+        std::fs::remove_dir_all(directory).expect("clean up");
+    }
+
+    #[test]
+    fn a_worker_that_outlives_its_deadline_is_detached_counted_and_released() {
+        // The toggle path makes this reachable more than once per run, which is what makes the
+        // accounting worth having: without it, two file-output threads could be writing into the
+        // same directory with nothing saying so.
+        let directory = test_directory("detached");
+        let worker = FileOutputWorker::start(
+            directory.clone(),
+            captastic_config::DEFAULT_FILENAME_TEMPLATE.to_owned(),
+            OutputFormat::Png,
+            EncodeOptions::default(),
+            no_history(),
+            false,
+            1,
+        )
+        .expect("start the file worker");
+        // A live sink keeps the job channel connected, so the idle worker stays inside its
+        // `WORKER_RECEIVE_POLL` receive instead of waking on a disconnect: it cannot observe the
+        // stop until that poll expires, which is what makes an already-expired deadline find it
+        // running. (In the daemon the same is true for a different reason — the destination set
+        // still held the sink a moment ago, and a capture can be in flight.)
+        let sink = worker.sink();
+        thread::sleep(Duration::from_millis(1));
+
+        let before = process_detach_ledger().count(DetachKind::FileOutputWorker);
+        let teardown = worker.stop_before(Instant::now());
+        let after = process_detach_ledger().count(DetachKind::FileOutputWorker);
+
+        assert_eq!(after.live, before.live + 1, "the detach is counted live");
+        assert_eq!(after.total, before.total + 1, "and kept in the history");
+        assert!(
+            after.at_ceiling(DetachKind::FileOutputWorker),
+            "one detached worker is the whole ceiling, which is what refuses the next one"
+        );
+        assert!(
+            teardown.summary.is_none(),
+            "a worker that never finished counting has no totals to report"
+        );
+
+        // It notices the stop on its next poll and exits. The slot comes back, so the daemon can
+        // start file output again rather than refusing for the rest of the run, and the history
+        // still records that the detach happened.
+        drop(sink);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_detach_ledger()
+            .count(DetachKind::FileOutputWorker)
+            .live
+            > before.live
+            && Instant::now() < deadline
+        {
+            thread::sleep(WORKER_STOP_POLL);
+        }
+        let released = process_detach_ledger().count(DetachKind::FileOutputWorker);
+        assert_eq!(released.live, before.live, "the slot is given back");
+        assert_eq!(released.total, before.total + 1);
         std::fs::remove_dir_all(directory).expect("clean up");
     }
 

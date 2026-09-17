@@ -233,6 +233,34 @@ fn resolve_daemon_args_with_default(
     })
 }
 
+/// Starts the file destination from the resolved configuration.
+///
+/// One function for both the daemon's startup and the notification area's "Save Captures to
+/// Disk", so a worker started an hour into a session is configured exactly like one started with
+/// the daemon. The settings come from the configuration as it was read at startup, which is the
+/// same rule every other behavioural setting follows: hand edits take effect on the next start.
+///
+/// `start` validates the filename template and creates the output directory before it spawns, so
+/// both of those happen on whichever thread calls this — the main thread at startup, the daemon
+/// thread for a tray toggle. Never the capture thread, which is what ADR 0002 is about.
+#[cfg(windows)]
+fn start_file_output(
+    args: &ResolvedDaemonArgs,
+) -> Result<crate::file_output::FileOutputWorker, AppError> {
+    crate::file_output::FileOutputWorker::start(
+        args.output_directory.clone(),
+        args.output_filename_template.clone(),
+        args.output_format,
+        args.output_encode_options,
+        crate::file_output::HistoryRecorder::new(
+            args.history_store.clone(),
+            args.history_retention,
+        ),
+        args.json,
+        args.output_queue_capacity,
+    )
+}
+
 /// Everything the capture thread needs, gathered so the thread body can be a named function.
 ///
 /// It used to be a 560-line closure inside `run`, which is most of why `run` was unreadable: the
@@ -257,8 +285,9 @@ struct CaptureWorkerContext {
     done: mpsc::SyncSender<Result<(), AppError>>,
     commands: mpsc::Receiver<CaptureCommand>,
     selection_sender: Option<mpsc::SyncSender<crate::selection::SelectionJob>>,
-    /// Every destination a finished capture is offered to, in the order they were configured.
-    destinations: Vec<crate::output::ChannelSink>,
+    /// Every destination a finished capture is offered to, read per capture because the set can
+    /// change while the daemon runs.
+    destinations: crate::output::OutputDestinations,
 }
 
 #[cfg(windows)]
@@ -283,12 +312,6 @@ fn run_capture_worker(context: CaptureWorkerContext) {
         selection_sender,
         destinations,
     } = context;
-    // Resolved once: the loop offers every capture to the same set, and building the trait-object
-    // view per capture would allocate on the path this worker exists to keep clear.
-    let destination_refs: Vec<&dyn crate::output::OutputSink> = destinations
-        .iter()
-        .map(|sink| sink as &dyn crate::output::OutputSink)
-        .collect();
     let mut recovery: Option<BackendRecovery> = None;
     let mut backend = match super::create_backend(&backend_name, &display_policy) {
         Ok(backend) => Some(backend),
@@ -605,11 +628,15 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                             .as_ref()
                             .map(captastic_core::CpuFrame::required_bytes);
                         let native_frame_retained = outcome.native_frame.is_some();
+                        // Read here rather than once outside the loop: the notification area
+                        // can start or stop the file worker between two captures, and this
+                        // capture is offered to the set that exists now. One atomic increment.
+                        let destinations = destinations.current();
                         let output_status = match output_status_or_fatal(
                             capture_id,
                             dispatch_output(
                                 selection_sender.as_ref(),
-                                &destination_refs,
+                                &destinations,
                                 capture_id,
                                 trigger.received_at,
                                 trigger.source,
@@ -904,20 +931,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     }
     let mut file_output_worker = args
         .file_output
-        .then(|| {
-            crate::file_output::FileOutputWorker::start(
-                args.output_directory.clone(),
-                args.output_filename_template.clone(),
-                args.output_format,
-                args.output_encode_options,
-                crate::file_output::HistoryRecorder::new(
-                    args.history_store.clone(),
-                    args.history_retention,
-                ),
-                args.json,
-                args.output_queue_capacity,
-            )
-        })
+        .then(|| start_file_output(&args))
         .transpose()?;
     let mut clipboard_worker = args
         .clipboard
@@ -930,16 +944,20 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         })
         .transpose()?;
     // Clipboard first so it keeps its place in the logs when file output joins it.
-    let destinations: Vec<crate::output::ChannelSink> = clipboard_worker
-        .as_ref()
-        .map(crate::clipboard::ClipboardWorker::sink)
-        .into_iter()
-        .chain(
-            file_output_worker
-                .as_ref()
-                .map(crate::file_output::FileOutputWorker::sink),
-        )
-        .collect();
+    let destinations = crate::output::OutputDestinations::new(
+        clipboard_worker
+            .as_ref()
+            .map(crate::clipboard::ClipboardWorker::sink)
+            .map(|sink| Arc::new(sink) as Arc<dyn crate::output::OutputSink>)
+            .into_iter()
+            .chain(
+                file_output_worker
+                    .as_ref()
+                    .map(crate::file_output::FileOutputWorker::sink)
+                    .map(|sink| Arc::new(sink) as Arc<dyn crate::output::OutputSink>),
+            )
+            .collect(),
+    );
     let (command_sender, command_receiver) = mpsc::sync_channel(args.trigger_queue_capacity);
     // Both workers can be forced to abandon work the user asked for; the main thread owns the
     // notification area, so notices travel to it on their own bounded channel rather than through
@@ -952,13 +970,12 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         .then(|| {
             crate::selection::SelectionWorker::start(
                 // Every destination, so a capture confirmed in the overlay reaches the same
-                // places a direct one does. No `.expect` here any more either: an empty list is a
-                // thing the type can say, and the configuration validator already rejects a
-                // selection with nowhere to send its result.
-                destinations
-                    .iter()
-                    .map(|sink| Box::new(sink.clone()) as Box<dyn crate::output::OutputSink>)
-                    .collect(),
+                // places a direct one does — and the same live set, so a selection confirmed
+                // after the user turned file output on lands on disk like a direct capture
+                // would. No `.expect` here either: an empty set is a thing the type can say, and
+                // the configuration validator already rejects a selection with nowhere to send
+                // its result.
+                destinations.clone(),
                 command_sender.clone(),
                 notice_sender.clone(),
                 args.json,
@@ -993,7 +1010,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         done: done_sender,
         commands: command_receiver,
         selection_sender,
-        destinations,
+        destinations: destinations.clone(),
     };
     let capture_join = thread::Builder::new()
         .name("captastic-capture".to_owned())
@@ -1070,7 +1087,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             false
         }
     };
-    let tray = match captastic_windows::TrayIcon::start(startup_enabled) {
+    let tray = match captastic_windows::TrayIcon::start(startup_enabled, args.file_output) {
         Ok(tray) => Some(tray),
         Err(error) => {
             crate::logging::warn(format_args!(
@@ -1353,6 +1370,15 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                     tray,
                                 );
                             }
+                            captastic_windows::TrayEvent::ToggleFileOutput => {
+                                toggle_file_output_from_tray(
+                                    &args,
+                                    &mut workers,
+                                    &destinations,
+                                    tray,
+                                    &mut last_persistence_notification,
+                                );
+                            }
                             captastic_windows::TrayEvent::ToggleStartup => {
                                 toggle_startup_from_tray(tray)
                             }
@@ -1624,6 +1650,223 @@ fn open_logs_from_tray() {
     };
     if let Err(error) = captastic_windows::open_path(path) {
         crate::logging::warn(format_args!("failed to open persistent log: {error}"));
+    }
+}
+
+/// How long a runtime stop of the file worker may wait for it, before the daemon carries on
+/// without it.
+///
+/// Shorter than the shutdown budget on purpose: this runs while the daemon is otherwise healthy
+/// and a person is waiting on a menu click, not at teardown where the alternative to waiting is
+/// losing a capture. A worker that overruns is detached exactly as it would be at shutdown, and
+/// it has already been removed from the destination set, so nothing new reaches it.
+#[cfg(windows)]
+const FILE_OUTPUT_TOGGLE_STOP_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// The detach standing in the way of starting a file destination, if one is.
+///
+/// Takes the ledger rather than reading the process-wide one, so this can be exercised against a
+/// ledger a test owns instead of against a number every other test in the binary shares.
+#[cfg(windows)]
+fn detached_file_output_blocking_start(
+    ledger: &captastic_core::DetachLedger,
+) -> Option<captastic_core::DetachCount> {
+    let count = ledger.count(captastic_core::DetachKind::FileOutputWorker);
+    count
+        .at_ceiling(captastic_core::DetachKind::FileOutputWorker)
+        .then_some(count)
+}
+
+/// Starts or stops writing captures to disk, and remembers which the user chose.
+///
+/// Runs on the daemon thread, never the capture thread: starting the worker validates the
+/// filename template and creates the output directory, and stopping it joins a thread. Both are
+/// fine here and neither may ever sit on the capture path (ADR 0002).
+///
+/// The order matters in both directions. Enabling starts the worker before the sink joins the
+/// destination set, so no capture is ever offered a destination that does not exist yet.
+/// Disabling removes the sink first, so no capture is queued to a worker that is already
+/// stopping.
+#[cfg(windows)]
+fn toggle_file_output_from_tray(
+    args: &ResolvedDaemonArgs,
+    workers: &mut crate::worker_registry::WorkerRegistry,
+    destinations: &crate::output::OutputDestinations,
+    tray: &captastic_windows::TrayIcon,
+    last_persistence_notification: &mut Option<String>,
+) {
+    let enabled = if workers.file_output().is_some() {
+        destinations.remove(crate::file_output::DESTINATION_NAME);
+        let mut abandoned = 0_u64;
+        if let Some(worker) = workers.take_file_output() {
+            let teardown = worker.stop_before(Instant::now() + FILE_OUTPUT_TOGGLE_STOP_TIMEOUT);
+            abandoned = teardown.abandoned;
+            for failure in teardown.failures {
+                crate::logging::warn(format_args!(
+                    "file output was switched off holding a failure for capture {}: {}",
+                    failure.capture_id.0, failure.message
+                ));
+            }
+            // Reported on the way out for the same reason teardown reports it: the totals belong
+            // to the run of the worker that just ended, and nothing else will state them.
+            if let Some(summary) = teardown.summary {
+                if args.json {
+                    println!("{}", summary.to_json());
+                } else {
+                    log::info!("{}", summary.to_line());
+                }
+            }
+        }
+        // The count is stated here as well as in the summary: a user who has just switched
+        // file output off is the one person who needs to know a capture was still in the queue.
+        if abandoned > 0 {
+            log::warn!(
+                "captures are no longer saved to disk (notification area); {abandoned} capture(s) were still queued and were not written"
+            );
+        } else {
+            log::info!("captures are no longer saved to disk (notification area)");
+        }
+        false
+    } else if workers.is_shutting_down() {
+        // A click that arrived while the daemon is winding down. Starting a worker now would
+        // spawn a thread the teardown has already walked past.
+        log::info!("ignoring a request to save captures to disk during shutdown");
+        return;
+    } else if let Some(detached) =
+        detached_file_output_blocking_start(captastic_core::process_detach_ledger())
+    {
+        // A previous worker missed its deadline and was left running. It may still be writing
+        // into the output directory, and a second worker there would race it for names. Refused
+        // rather than queued: it is the user's click, it is not happening, and the item stays
+        // unchecked because the checkmark states where the next capture will go.
+        let message = format!(
+            "A previous file-output worker is still running after it was left behind at its deadline ({} of {} allowed, {} in this session). Captures can be saved again once it exits.",
+            detached.live,
+            captastic_core::DetachKind::FileOutputWorker.ceiling(),
+            detached.total
+        );
+        crate::logging::error(format_args!("refusing to start file output: {message}"));
+        if let Err(error) =
+            tray.show_error_with_title("Captastic could not save captures to disk", message)
+        {
+            crate::logging::warn(format_args!(
+                "failed to surface a refused file-output start in the notification area: {error}"
+            ));
+        }
+        return;
+    } else {
+        match start_file_output(args) {
+            Ok(worker) => {
+                destinations.insert(std::sync::Arc::new(worker.sink()));
+                log::info!(
+                    "saving captures to {} (notification area)",
+                    worker.directory().display()
+                );
+                workers.register_file_output(Some(worker));
+                true
+            }
+            Err(error) => {
+                // The item stays unchecked, because it reports where the next capture will go and
+                // the answer is still "not to disk". The reason is the user's to see: an
+                // unwritable directory or a template the validator refuses is something only they
+                // can fix.
+                let message = format!("Captastic could not start saving captures to disk. {error}");
+                crate::logging::warn(format_args!("{message}"));
+                if let Err(error) =
+                    tray.show_error_with_title("Captastic could not save captures to disk", message)
+                {
+                    crate::logging::warn(format_args!(
+                        "failed to surface a file-output start failure in the notification area: {error}"
+                    ));
+                }
+                return;
+            }
+        }
+    };
+    if let Err(error) = tray.set_file_output_enabled(enabled) {
+        crate::logging::warn(format_args!(
+            "file output changed but the tray menu did not update: {error}"
+        ));
+    }
+    if destinations.is_empty() {
+        // Not refused. The user switched off the only destination this daemon had — a legitimate
+        // configuration, since the clipboard can be disabled — and a menu item that quietly
+        // declines is worse than one that does what it says and then says what it cost.
+        let message = "Captures are no longer delivered anywhere: saving to disk is off and the clipboard is disabled in this configuration.".to_owned();
+        crate::logging::warn(format_args!("{message}"));
+        if let Err(error) =
+            tray.show_error_with_title("Captastic has nowhere to put a capture", message)
+        {
+            crate::logging::warn(format_args!(
+                "failed to surface the empty-destination warning in the notification area: {error}"
+            ));
+        }
+    } else {
+        log::info!(
+            "captures are now delivered to [{}]",
+            destinations.names().join(", ")
+        );
+    }
+    persist_file_output_preference(args, enabled, tray, last_persistence_notification);
+}
+
+/// Writes the choice into the configuration file this daemon is running on, so it survives a
+/// restart.
+///
+/// The runtime state has already changed by the time this runs and is not rolled back if the
+/// write fails: the user asked for captures to go to disk, that is now true, and a read-only
+/// configuration file is no reason to undo it. What they lose is the memory of the choice, which
+/// is exactly what the notification says.
+#[cfg(windows)]
+fn persist_file_output_preference(
+    args: &ResolvedDaemonArgs,
+    enabled: bool,
+    tray: &captastic_windows::TrayIcon,
+    last_notification: &mut Option<String>,
+) {
+    // The profile this daemon is actually running on: an explicit `--config` path, or the default
+    // one. The same rule the tray's Open Config and the UI-state writes follow, so a daemon
+    // started on an alternate profile never edits the default one behind it.
+    let Some(path) = args.ui_state_store.config_path() else {
+        notify_preference_not_saved(
+            "Captastic could not find a configuration file to record the choice in.".to_owned(),
+            tray,
+            last_notification,
+        );
+        return;
+    };
+    match captastic_config::set_output_enabled(path, enabled) {
+        Ok(()) => log::info!("recorded output.enabled = {enabled} in {}", path.display()),
+        Err(error) => notify_preference_not_saved(
+            format!(
+                "Captastic could not record the choice in {}. {error}",
+                path.display()
+            ),
+            tray,
+            last_notification,
+        ),
+    }
+}
+
+/// Says once that a preference was not written down, sharing the deduplication the selection
+/// worker's persistence failures already use: a failing configuration write usually keeps
+/// failing, and the same balloon twice teaches nothing the first did not.
+#[cfg(windows)]
+fn notify_preference_not_saved(
+    message: String,
+    tray: &captastic_windows::TrayIcon,
+    last_notification: &mut Option<String>,
+) {
+    crate::logging::warn(format_args!("{message}"));
+    if last_notification.as_deref() == Some(message.as_str()) {
+        return;
+    }
+    *last_notification = Some(message.clone());
+    if let Err(error) = tray.show_error_with_title("Captastic preferences were not saved", message)
+    {
+        crate::logging::warn(format_args!(
+            "failed to surface a preference-persistence error in the notification area: {error}"
+        ));
     }
 }
 
@@ -2191,7 +2434,7 @@ fn output_status_or_fatal(
 #[allow(clippy::too_many_arguments)]
 fn dispatch_output(
     selection_sender: Option<&mpsc::SyncSender<crate::selection::SelectionJob>>,
-    destinations: &[&dyn crate::output::OutputSink],
+    destinations: &[Arc<dyn crate::output::OutputSink>],
     capture_id: CaptureId,
     triggered_at: Instant,
     source: &'static str,
@@ -2391,7 +2634,7 @@ fn dispatch_selection(
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 fn dispatch_repeat_region(
-    destinations: &[&dyn crate::output::OutputSink],
+    destinations: &[Arc<dyn crate::output::OutputSink>],
     capture_id: CaptureId,
     triggered_at: Instant,
     source: &'static str,
@@ -2524,7 +2767,7 @@ fn repeat_region_rect(
 /// one gave — a capture nobody accepted is still a valid capture, just an undelivered one.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_destinations(
-    sinks: &[&dyn crate::output::OutputSink],
+    sinks: &[Arc<dyn crate::output::OutputSink>],
     capture_id: CaptureId,
     triggered_at: Instant,
     source: &'static str,
@@ -2731,6 +2974,32 @@ fn ns_to_ms(ns: u64) -> f64 {
 
 #[cfg(all(test, windows))]
 mod tests {
+    #[test]
+    fn a_detached_file_worker_blocks_the_next_one_until_it_returns() {
+        // The ceiling exists because a detached worker may still be writing into the output
+        // directory. Two workers there would race each other for names, which is exactly what
+        // the no-clobber write cannot protect against — it refuses to replace a file, so the
+        // loser of the race abandons a capture the user asked for.
+        use captastic_core::{DetachKind, DetachLedger};
+
+        let ledger = DetachLedger::new();
+        assert!(
+            super::detached_file_output_blocking_start(&ledger).is_none(),
+            "nothing is detached on a healthy daemon"
+        );
+
+        let detached = ledger.detached(DetachKind::FileOutputWorker);
+        let blocking = super::detached_file_output_blocking_start(&ledger)
+            .expect("a detached worker blocks the next one");
+        assert_eq!(blocking, detached);
+        assert_eq!(blocking.live, 1);
+
+        // The wedged write finishes and the thread exits: the slot is free and the next click
+        // starts a worker again, rather than the daemon refusing for the rest of the run.
+        ledger.rejoined(DetachKind::FileOutputWorker);
+        assert!(super::detached_file_output_blocking_start(&ledger).is_none());
+    }
+
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -3900,9 +4169,10 @@ mod tests {
         .expect("valid frame");
         let (sender, receiver) = mpsc::sync_channel::<crate::clipboard::ClipboardJob>(1);
         drop(receiver);
-        let sink = crate::output::ChannelSink::new("clipboard", sender);
+        let sink: Arc<dyn crate::output::OutputSink> =
+            Arc::new(crate::output::ChannelSink::new("clipboard", sender));
         let status = dispatch_destinations(
-            &[&sink],
+            &[sink],
             capture_id,
             triggered_at,
             "test",

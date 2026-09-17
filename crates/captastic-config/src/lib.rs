@@ -13,6 +13,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod config_edit;
 mod filename_template;
 mod fsio;
 mod history;
@@ -21,6 +22,7 @@ mod ui_state;
 use fsio::{maintain_config_artifacts, quarantine_config};
 
 pub use captastic_core::OutputFormat;
+pub use config_edit::set_output_enabled;
 pub use filename_template::{validate_template, TOKENS as FILENAME_TEMPLATE_TOKENS};
 pub use fsio::{atomic_write, finalize_new, replace_file};
 pub use history::{
