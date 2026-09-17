@@ -516,7 +516,12 @@ fn format_console_entry(format: LineFormat, entry: &LogEntry) -> String {
     )
 }
 
-fn format_utc_timestamp(unix_micros: u128) -> String {
+/// Formats a Unix timestamp as the ISO-8601 UTC instant every Captastic output uses.
+///
+/// Crate-visible rather than private because the benchmark fingerprint records when a run was
+/// taken, and a baseline whose timestamp reads differently from the log lines beside it makes the
+/// reader do conversion arithmetic to line the two up.
+pub(crate) fn format_utc_timestamp(unix_micros: u128) -> String {
     let (year, month, day, hour, minute, second, _) = crate::clock::utc_parts(unix_micros);
     let micros = (unix_micros % 1_000_000) as u32;
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{micros:06}Z")

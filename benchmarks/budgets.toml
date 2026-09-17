@@ -14,6 +14,10 @@
 # DXGI will not duplicate, so a run started over RDP measures nothing and reports why.
 
 [host]
+# Prose, for the message rather than the comparison: it is what a reader sees when a budget is
+# skipped, and nothing below is derived from it. Every field that is actually matched is named
+# separately, because a description that drifted out of step with the checks would describe a host
+# the budgets no longer apply to and nobody would find out.
 description = "the documented benchmark host: RTX 3070, Dell U2720Q at 3840x2160, release build"
 backend = "dxgi"
 mode = "latest"
@@ -24,6 +28,28 @@ synthetic = false
 # A debug build is slower by a margin no budget should absorb.
 debug_assertions = false
 display_resolution = "3840x2160"
+# A fragment of the adapter's name, matched case-insensitively against every adapter the host
+# enumerates. A fragment rather than the full marketing name, which a driver package is free to
+# reword: a budget that silently stopped applying after a driver update would be worse than none.
+gpu = "RTX 3070"
+# A console session. Remote Desktop composes onto a virtual adapter DXGI will not duplicate, and a
+# locked session measures a desktop nobody is looking at; the hardware being identical does not
+# make either of them this host.
+session = "interactive"
+# Mains power. The same machine clocks down on battery, and the figures below were not measured
+# there.
+power_source = "ac"
+# The run must have gone through a real GPU. This is the field that keeps these ceilings from being
+# judged on a hosted CI runner, where every acquisition figure describes a CPU emulating a GPU.
+# Matched against the adapter driving the run's displays, not against every adapter enumerated:
+# this desktop also enumerates the Microsoft Basic Render Driver, as every desktop does. It needs
+# `synthetic = false` above to mean anything: a synthetic run went through no adapter at all, and
+# is reported as unjudgeable on this field rather than matched against the hardware it ran beside.
+software_adapter = false
+# Also available and deliberately unset, because these ceilings are not calibrated to them yet:
+#   driver_version = "32.0.15.9186"   # exact, for pinning a calibration while chasing a regression
+#   cpu = "Ryzen 9 5900X"             # case-insensitive substring
+#   os_build = "26200"                # prefix, so a monthly revision does not unpin the budget
 
 # Ceilings in nanoseconds.
 #

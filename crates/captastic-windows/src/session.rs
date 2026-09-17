@@ -87,6 +87,25 @@ impl DesktopState {
         matches!(self, Self::Interactive)
     }
 
+    /// A stable lower-case token naming this state, for machine-readable output.
+    ///
+    /// Separate from [`fmt::Display`], deliberately. That prose is written for a person reading a
+    /// log line and is free to be reworded — it has been, twice — whereas a benchmark fingerprint
+    /// compares this value between runs and a budget file matches on it, so rewording it would
+    /// silently make two runs from the same session look like runs from different ones. The
+    /// desktop name a state carries is not part of the token for the same reason: the credential
+    /// prompt and a screensaver are the same answer to "may this run be compared".
+    pub fn token(&self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Locked { .. } => "locked",
+            Self::NotOurs { .. } => "secure_desktop",
+            Self::Detached { .. } => "detached",
+            Self::Remote { .. } => "remote",
+            Self::Unknown { .. } => "unknown",
+        }
+    }
+
     /// Whether this is a condition that clears itself when the user comes back.
     ///
     /// `Unknown` is deliberately not temporary. Waiting forever on a question that was never
@@ -907,10 +926,56 @@ mod tests {
         .is_temporary());
     }
 
+    #[test]
+    fn every_state_has_a_stable_token_that_does_not_carry_the_desktop_name() {
+        // The token is compared between benchmark runs and matched by budget files, so it must be
+        // one value per state — not per desktop that happened to own input at the time.
+        assert_eq!(DesktopState::Interactive.token(), "interactive");
+        assert_eq!(
+            DesktopState::Locked { desktop: None }.token(),
+            DesktopState::Locked {
+                desktop: Some("Winlogon".to_owned())
+            }
+            .token()
+        );
+        assert_eq!(
+            DesktopState::NotOurs {
+                desktop: Some("Screen-saver".to_owned())
+            }
+            .token(),
+            "secure_desktop"
+        );
+        assert_eq!(DesktopState::Remote { protocol: "rdp" }.token(), "remote");
+        // Every token is lower-case with no spaces, so it survives a TOML budget file and a JSON
+        // comparison unquoted and unambiguous.
+        for token in [
+            DesktopState::Interactive.token(),
+            DesktopState::Locked { desktop: None }.token(),
+            DesktopState::NotOurs { desktop: None }.token(),
+            DesktopState::Detached {
+                connect_state: "disconnected",
+            }
+            .token(),
+            DesktopState::Remote { protocol: "rdp" }.token(),
+            DesktopState::Unknown {
+                detail: "probe failed".to_owned(),
+            }
+            .token(),
+        ] {
+            assert!(
+                token
+                    .chars()
+                    .all(|character| character.is_ascii_lowercase() || character == '_'),
+                "{token}"
+            );
+        }
+    }
+
     /// Runs the real probe. Asserts only what is true of any machine able to run it.
     #[test]
     fn the_live_probe_answers_without_panicking() {
         let state = desktop_state();
+        assert!(!state.token().is_empty());
         // A CI agent may have no interactive desktop at all, so the state is not asserted — but
         // whatever it is, it must be describable, and it must not be two things at once.
         assert!(!state.to_string().is_empty());

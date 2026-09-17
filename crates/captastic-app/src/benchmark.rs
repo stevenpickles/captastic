@@ -9,10 +9,10 @@ use captastic_core::{
     CaptureSource, CursorMode, EventRecorder, FakeBackend, FakeBackendConfig, LatencySummary,
     PerfEvent, PerfEventKind,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use crate::build_info::{BuildInfo, BUILD_INFO};
 use crate::error::AppError;
+use crate::fingerprint::EnvironmentFingerprint;
 
 #[derive(Clone, Debug)]
 pub struct BenchmarkOptions {
@@ -33,40 +33,28 @@ pub struct BenchmarkOptions {
     pub fake: FakeBackendConfig,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct EnvironmentFingerprint {
-    pub os: &'static str,
-    pub architecture: &'static str,
-    pub build: BuildInfo,
-    pub debug_assertions: bool,
-    pub displays: Vec<DisplayFingerprint>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct DisplayFingerprint {
-    pub id: String,
-    pub name: String,
-    pub width: u32,
-    pub height: u32,
-    pub rotation_degrees: u16,
-    pub primary: bool,
-}
-
-#[derive(Clone, Debug, Serialize)]
+/// A benchmark run, as it is written out and as it is read back.
+///
+/// Owned strings rather than `&'static str` throughout, including the map keys: a report nothing
+/// can deserialize is a report nothing can compare against, and comparing a run to a baseline is
+/// the whole point of recording one. Nothing can turn a JSON string back into a `&'static str`
+/// without leaking it, so the borrow had to go. The field names and their order are unchanged, so
+/// the JSON a run emits is what it always was plus the new fingerprint fields.
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BenchmarkReport {
     pub schema_version: u32,
-    pub backend: &'static str,
+    pub backend: String,
     pub mode: String,
     /// `include` or `exclude`. Recorded because two runs that differ only in this are the pair the
     /// cursor criterion asks for, and a result file that does not say which it is cannot be paired.
-    pub cursor: &'static str,
+    pub cursor: String,
     pub synthetic: bool,
     pub warmup_iterations: usize,
     pub timed_iterations: usize,
     pub successes: usize,
     pub failures: usize,
     pub timeouts: usize,
-    pub failures_by_kind: BTreeMap<&'static str, usize>,
+    pub failures_by_kind: BTreeMap<String, usize>,
     /// What became of the pointer in each successful capture, counted by outcome.
     ///
     /// Without this a cursor-on run is indistinguishable from a cursor-off one: every capture
@@ -74,7 +62,7 @@ pub struct BenchmarkReport {
     /// not reported the pointer, or reported it hidden - looks exactly like one that drew it. Two
     /// separate measurements of the same thing is the failure this exists to make visible, and it
     /// is the failure that actually happened here twice before it was noticed.
-    pub cursor_outcomes: BTreeMap<&'static str, usize>,
+    pub cursor_outcomes: BTreeMap<String, usize>,
     pub trigger_to_dequeue_latency: LatencySummary,
     pub native_frame_latency: LatencySummary,
     pub cpu_frame_latency: Option<LatencySummary>,
@@ -100,27 +88,50 @@ pub struct BenchmarkRun {
 ///
 /// Deliberately not part of it: iteration counts, timings, and anything the run measured. Those
 /// are the outputs. This is only about whether the runs were asking the same question.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RunCompatibility {
     pub backend: String,
     pub mode: String,
     pub cursor: String,
     pub cpu_frame: bool,
     pub synthetic: bool,
+    /// The whole build, not just its version.
+    ///
+    /// Two development builds of the same `0.2.0-dev` version can be a hundred commits and an
+    /// optimization level apart, and they compared as compatible. Version, short commit, profile,
+    /// target and the dirty flag together are what "the same software" actually means; a dirty
+    /// tree is in it because uncommitted changes are exactly the ones nobody can reconstruct
+    /// afterwards from a commit id.
     pub build: String,
     pub debug_assertions: bool,
+    /// Each attached display as `id:WxH@rotation:scale:refresh`.
+    ///
+    /// Scale and refresh are here because both change the measurement without changing the
+    /// geometry: composition works in physical pixels, and a 60 Hz panel and a 144 Hz one present
+    /// on different cadences.
     pub displays: Vec<String>,
+    /// Each adapter as `description (driver version)`.
+    ///
+    /// The driver is the part that moves. A driver update is the single likeliest cause of a
+    /// capture latency change between two runs a week apart on the same machine, and without it
+    /// the two compare as identical hosts.
+    pub adapters: Vec<String>,
+    pub os_build: Option<String>,
+    /// The session's state. A run over RDP or against a locked desktop measures something else.
+    pub session: Option<String>,
+    /// `ac` or `battery`: the same laptop measures differently on each, silently.
+    pub power_source: Option<String>,
 }
 
 impl RunCompatibility {
     fn of(report: &BenchmarkReport) -> Self {
         Self {
-            backend: report.backend.to_owned(),
+            backend: report.backend.clone(),
             mode: report.mode.clone(),
-            cursor: report.cursor.to_owned(),
+            cursor: report.cursor.clone(),
             cpu_frame: report.cpu_frame_latency.is_some(),
             synthetic: report.synthetic,
-            build: report.environment.build.version.to_owned(),
+            build: build_identity(&report.environment.build),
             debug_assertions: report.environment.debug_assertions,
             displays: report
                 .environment
@@ -128,11 +139,34 @@ impl RunCompatibility {
                 .iter()
                 .map(|display| {
                     format!(
-                        "{}:{}x{}@{}",
-                        display.id, display.width, display.height, display.rotation_degrees
+                        "{}:{}x{}@{}:{:.2}x:{}",
+                        display.id,
+                        display.width,
+                        display.height,
+                        display.rotation_degrees,
+                        display.scale_factor,
+                        display
+                            .refresh_hz
+                            .map(|hz| format!("{hz:.3}Hz"))
+                            .unwrap_or_else(|| UNKNOWN.to_owned())
                     )
                 })
                 .collect(),
+            adapters: report
+                .environment
+                .adapters
+                .iter()
+                .map(|adapter| {
+                    format!(
+                        "{} ({})",
+                        adapter.description,
+                        adapter.driver_version.as_deref().unwrap_or(UNKNOWN)
+                    )
+                })
+                .collect(),
+            os_build: report.environment.os_build.clone(),
+            session: report.environment.session.clone(),
+            power_source: report.environment.power_source.clone(),
         }
     }
 
@@ -168,12 +202,54 @@ impl RunCompatibility {
             self.displays.join(","),
             other.displays.join(","),
         );
+        note(
+            "adapters",
+            self.adapters.join(","),
+            other.adapters.join(","),
+        );
+        note(
+            "os_build",
+            unknown_if_absent(&self.os_build),
+            unknown_if_absent(&other.os_build),
+        );
+        note(
+            "session",
+            unknown_if_absent(&self.session),
+            unknown_if_absent(&other.session),
+        );
+        note(
+            "power_source",
+            unknown_if_absent(&self.power_source),
+            unknown_if_absent(&other.power_source),
+        );
         differences
     }
 }
 
+/// What a fact the host would not answer is called, everywhere a comparison has to print one.
+const UNKNOWN: &str = "unknown";
+
+fn unknown_if_absent(value: &Option<String>) -> String {
+    value.clone().unwrap_or_else(|| UNKNOWN.to_owned())
+}
+
+/// The whole build as one comparable line: version, commit, profile, target, and dirtiness.
+///
+/// A version alone let two development builds a hundred commits apart compare as the same
+/// software, which is the silent version of the failure this module exists to make loud.
+fn build_identity(build: &crate::fingerprint::BuildIdentity) -> String {
+    format!(
+        "{} ({}, {}, {}, {})",
+        build.version,
+        build.git_short_commit.as_deref().unwrap_or(UNKNOWN),
+        build.profile,
+        build.target,
+        if build.dirty { "dirty" } else { "clean" }
+    )
+}
+
 /// Several timed runs of the same question, and what they agree on.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RepeatedBenchmark {
     pub schema_version: u32,
     pub runs: Vec<BenchmarkReport>,
@@ -188,7 +264,7 @@ pub struct RepeatedBenchmark {
 ///
 /// The spread matters more than the average. Three runs whose medians differ by 40% do not
 /// support a claim however good the mean looks, and reporting only a mean would hide exactly that.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RepeatAgreement {
     pub runs: usize,
     pub native_p50_ns: Vec<u64>,
@@ -310,8 +386,8 @@ pub fn run_with_backend(
     let mut frame_age_samples = Vec::with_capacity(options.iterations);
     let mut failures = 0_usize;
     let mut timeouts = 0_usize;
-    let mut failures_by_kind = BTreeMap::new();
-    let mut cursor_outcomes: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut failures_by_kind: BTreeMap<String, usize> = BTreeMap::new();
+    let mut cursor_outcomes: BTreeMap<String, usize> = BTreeMap::new();
     let mut successful_ids = Vec::with_capacity(options.iterations);
 
     for index in 0..options.iterations {
@@ -340,7 +416,7 @@ pub fn run_with_backend(
             Ok(outcome) => {
                 successful_ids.push(capture_id);
                 *cursor_outcomes
-                    .entry(cursor_outcome_label(outcome.metadata.cursor.as_ref()))
+                    .entry(cursor_outcome_label(outcome.metadata.cursor.as_ref()).to_owned())
                     .or_insert(0) += 1;
                 native_samples.push(outcome.metadata.native_ready_offset_ns);
                 if let Some(value) = outcome.metadata.cpu_ready_offset_ns {
@@ -358,7 +434,7 @@ pub fn run_with_backend(
                     timeouts = timeouts.saturating_add(1);
                 }
                 let label = capture_error_kind_label(error.kind);
-                *failures_by_kind.entry(label).or_insert(0) += 1;
+                *failures_by_kind.entry(label.to_owned()).or_insert(0) += 1;
             }
         }
         recorder.record(capture_id, PerfEventKind::AttemptFinished, 0);
@@ -373,12 +449,16 @@ pub fn run_with_backend(
     let events = recorder.into_events();
     let successes = options.iterations.saturating_sub(failures);
     let report = BenchmarkReport {
-        schema_version: 2,
+        // 3: the environment fingerprint grew from "OS, architecture, build version, display
+        // geometry" to the host identity a comparison can actually be keyed on, and the report
+        // became deserializable. Nothing that was in a v2 report has moved or changed meaning.
+        schema_version: 3,
         cursor: match options.cursor {
             CursorMode::Include => "include",
             CursorMode::Exclude => "exclude",
-        },
-        backend: backend.name(),
+        }
+        .to_owned(),
+        backend: backend.name().to_owned(),
         mode: options.mode.name().to_owned(),
         synthetic: backend.name() == "fake",
         warmup_iterations: options.warmup,
@@ -399,24 +479,7 @@ pub fn run_with_backend(
         frame_age: LatencySummary::from_samples(&frame_age_samples),
         lost_metric_events,
         critical_path_order_verified,
-        environment: EnvironmentFingerprint {
-            os: std::env::consts::OS,
-            architecture: std::env::consts::ARCH,
-            build: BUILD_INFO,
-            debug_assertions: cfg!(debug_assertions),
-            displays: backend
-                .displays()
-                .iter()
-                .map(|display| DisplayFingerprint {
-                    id: display.id.0.clone(),
-                    name: display.name.clone(),
-                    width: display.bounds.width,
-                    height: display.bounds.height,
-                    rotation_degrees: display.rotation_degrees,
-                    primary: display.is_primary,
-                })
-                .collect(),
-        },
+        environment: EnvironmentFingerprint::collect(backend.displays()),
     };
     Ok(BenchmarkRun { report, events })
 }
@@ -579,9 +642,13 @@ mod tests {
             cursor: "include".to_owned(),
             cpu_frame: true,
             synthetic: true,
-            build: "0.1.0".to_owned(),
+            build: "0.1.0 (abc1234, release, x86_64-pc-windows-msvc, clean)".to_owned(),
             debug_assertions: false,
-            displays: vec!["primary:1920x1080@0".to_owned()],
+            displays: vec!["primary:1920x1080@0:1.00x:60.000Hz".to_owned()],
+            adapters: vec!["NVIDIA GeForce RTX 3070 (32.0.15.9186)".to_owned()],
+            os_build: Some("26200.9457 (25H2)".to_owned()),
+            session: Some("interactive".to_owned()),
+            power_source: Some("ac".to_owned()),
         };
         let without_cursor = RunCompatibility {
             cursor: "exclude".to_owned(),
@@ -593,11 +660,104 @@ mod tests {
 
         // Every field that changes the question is covered, not just the one the test author
         // happened to think of.
-        with_cursor.displays = vec!["primary:3840x2160@0".to_owned()];
+        with_cursor.displays = vec!["primary:3840x2160@0:1.50x:59.997Hz".to_owned()];
         with_cursor.debug_assertions = true;
-        with_cursor.build = "0.2.0".to_owned();
+        with_cursor.build = "0.2.0 (def5678, debug, x86_64-pc-windows-msvc, dirty)".to_owned();
         let differences = with_cursor.differences(&without_cursor);
         assert_eq!(differences.len(), 4, "{differences:?}");
+    }
+
+    #[test]
+    fn the_host_facts_that_move_a_measurement_are_each_named_on_their_own() {
+        // Each of these used to compare as "the same host": two builds a hundred commits apart at
+        // the same version, a driver update, and a run started over Remote Desktop. A refusal that
+        // did not name which one changed would send the reader back to comparing files by eye.
+        let baseline = RunCompatibility {
+            backend: "dxgi".to_owned(),
+            mode: "latest".to_owned(),
+            cursor: "exclude".to_owned(),
+            cpu_frame: true,
+            synthetic: false,
+            build: "0.2.0-dev.408 (0ca78881, release, x86_64-pc-windows-msvc, clean)".to_owned(),
+            debug_assertions: false,
+            displays: vec!["dell:3840x2160@0:1.50x:59.997Hz".to_owned()],
+            adapters: vec!["NVIDIA GeForce RTX 3070 (32.0.15.9186)".to_owned()],
+            os_build: Some("26200.9457 (25H2)".to_owned()),
+            session: Some("interactive".to_owned()),
+            power_source: Some("ac".to_owned()),
+        };
+
+        let named = |candidate: &RunCompatibility, field: &str| {
+            let differences = baseline.differences(candidate);
+            assert_eq!(differences.len(), 1, "{differences:?}");
+            assert!(differences[0].starts_with(field), "{differences:?}");
+        };
+
+        named(
+            &RunCompatibility {
+                adapters: vec!["NVIDIA GeForce RTX 3070 (32.0.15.7270)".to_owned()],
+                ..baseline.clone()
+            },
+            "adapters",
+        );
+        named(
+            &RunCompatibility {
+                // Same version, same profile, different commit: previously identical.
+                build: "0.2.0-dev.408 (deadbeef, release, x86_64-pc-windows-msvc, clean)"
+                    .to_owned(),
+                ..baseline.clone()
+            },
+            "build",
+        );
+        named(
+            &RunCompatibility {
+                session: Some("remote".to_owned()),
+                ..baseline.clone()
+            },
+            "session",
+        );
+        named(
+            &RunCompatibility {
+                power_source: Some("battery".to_owned()),
+                ..baseline.clone()
+            },
+            "power_source",
+        );
+        named(
+            &RunCompatibility {
+                os_build: Some("26200.9999 (25H2)".to_owned()),
+                ..baseline.clone()
+            },
+            "os_build",
+        );
+        // A host that would not answer at all differs from one that did, rather than matching it.
+        named(
+            &RunCompatibility {
+                session: None,
+                ..baseline.clone()
+            },
+            "session",
+        );
+        // And the refresh rate, which changes the cadence without changing the geometry.
+        named(
+            &RunCompatibility {
+                displays: vec!["dell:3840x2160@0:1.50x:143.998Hz".to_owned()],
+                ..baseline.clone()
+            },
+            "displays",
+        );
+    }
+
+    #[test]
+    fn a_spread_percentage_reads_back_as_the_number_it_was() {
+        // Found by CI, which produced a repeat set whose CPU spread was 15.384615384615385 % and
+        // read it back as ...383 %. serde_json's default parser is allowed to land one ULP off
+        // what it wrote, so without the `float_roundtrip` feature a run compared against its own
+        // artifact differs from itself — in a tool whose entire job is comparing artifacts.
+        let value: f64 = (2.0_f64 / 13.0) * 100.0;
+        let text = serde_json::to_string(&value).expect("the spread serializes");
+        let parsed: f64 = serde_json::from_str(&text).expect("the spread reads back");
+        assert_eq!(value, parsed, "{text}");
     }
 
     #[test]
@@ -608,6 +768,53 @@ mod tests {
         // A zero floor would make the percentage infinite, which reports worse than nothing; the
         // raw samples travel alongside so the reader can see what happened.
         assert_eq!(spread_percent(&[0, 500]), 0.0);
+    }
+
+    #[test]
+    fn a_report_survives_the_round_trip_it_will_have_to_make() {
+        // A baseline is a file on disk that a later run is compared against, so a report that
+        // cannot be read back is a report that can never be a baseline. Equality rather than
+        // "it parses": a field silently dropped by a serde attribute parses perfectly and loses
+        // the evidence.
+        let options = instant_options(CursorMode::Include);
+        let run = run(&options).expect("a run with no configured delays");
+        let json = serde_json::to_string(&run.report).expect("the report serializes");
+        let parsed: BenchmarkReport = serde_json::from_str(&json).expect("the report reads back");
+        assert_eq!(
+            serde_json::to_string(&parsed).expect("the round trip re-serializes"),
+            json
+        );
+        assert_eq!(parsed.schema_version, 3);
+        assert_eq!(parsed.backend, run.report.backend);
+        assert_eq!(parsed.cursor_outcomes, run.report.cursor_outcomes);
+        assert_eq!(parsed.environment, run.report.environment);
+        // The fingerprint is not an empty shell that happens to round-trip.
+        assert_eq!(parsed.environment.os, std::env::consts::OS);
+        assert!(!parsed.environment.recorded_at_utc.is_empty());
+        assert_eq!(
+            parsed.environment.build.version,
+            crate::build_info::BUILD_VERSION
+        );
+    }
+
+    #[test]
+    fn a_repeat_set_survives_the_round_trip_too() {
+        // `--repeat` is what an operator actually runs, and B2 compares whole repeat sets: the
+        // envelope has to read back as well as the reports inside it.
+        let options = instant_options(CursorMode::Exclude);
+        let repeated = run_repeated(&options, 2, || {
+            Ok(Box::new(FakeBackend::new(options.fake.clone())) as Box<dyn CaptureBackend>)
+        })
+        .expect("two runs");
+        let json = serde_json::to_string(&repeated).expect("the repeat set serializes");
+        let parsed: RepeatedBenchmark =
+            serde_json::from_str(&json).expect("the repeat set reads back");
+        assert_eq!(parsed.runs.len(), 2);
+        assert_eq!(parsed.compatibility, repeated.compatibility);
+        assert_eq!(
+            serde_json::to_string(&parsed).expect("the round trip re-serializes"),
+            json
+        );
     }
 
     #[test]

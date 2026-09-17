@@ -13,6 +13,7 @@ mod error;
 mod file_output;
 #[cfg(windows)]
 mod filename_template;
+mod fingerprint;
 mod logging;
 #[cfg(windows)]
 mod output;
@@ -1318,10 +1319,17 @@ fn doctor(json_output: bool) -> Result<(), AppError> {
     } else {
         "unavailable_on_this_platform"
     };
+    // The same fingerprint a benchmark report carries, so the operator procedure has one command
+    // to check the host with before a measuring run: session, power source, software adapter and
+    // dirty build are all visible here, and a run started under the wrong one of those measures
+    // something that cannot be published.
+    let environment =
+        fingerprint::EnvironmentFingerprint::collect(displays.as_deref().unwrap_or_default());
     print_value(
         json_output,
         &json!({
-            "schema_version": 1,
+            // 2: gained "environment".
+            "schema_version": 2,
             "build": build_info::BUILD_INFO,
             "phase": 1,
             "platform": std::env::consts::OS,
@@ -1334,6 +1342,7 @@ fn doctor(json_output: bool) -> Result<(), AppError> {
             "windows_selection_overlay": windows_selection_overlay,
             "latest_warm_frame": "available",
             "critical_path_policy": "configured",
+            "environment": environment,
         }),
     )
 }

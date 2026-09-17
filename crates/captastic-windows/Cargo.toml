@@ -37,6 +37,10 @@ windows = { workspace = true, features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Performance",
+    # The host fingerprint asks where the machine's power comes from and which plan governs it:
+    # the same binary on the same desk produces different latencies on battery under a balanced
+    # plan, and a number published without that stated describes nothing repeatable.
+    "Win32_System_Power",
     "Win32_System_Registry",
     "Win32_System_RemoteDesktop",
     "Win32_System_Shutdown",
