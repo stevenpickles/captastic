@@ -17,7 +17,7 @@ use std::path::Path;
 
 use toml_edit::{value, Document, Item, Table};
 
-use crate::fsio::{atomic_write, replace_file, FileLock};
+use crate::fsio::{atomic_write, finalize_new, replace_file, FileLock};
 use crate::{ConfigError, CONFIG_SCHEMA_VERSION};
 
 /// What a configuration file created for a single setting starts as.
@@ -43,6 +43,11 @@ fn new_document(enabled: bool) -> String {
 /// profile is only written when something needs it, and a preference the user just expressed is
 /// exactly that. Every other setting is left absent rather than materialized at its current
 /// default, so a later Captastic changing a default still reaches this installation.
+///
+/// A file that appears between the read and the write is edited rather than overwritten. Not every
+/// writer of this file takes the lock this one holds — `ensure_default_config` does not, and
+/// neither does the user's text editor — so "it was not there a moment ago" is not a licence to
+/// replace whatever is there now.
 pub fn set_output_enabled(path: &Path, enabled: bool) -> Result<(), ConfigError> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -56,27 +61,53 @@ pub fn set_output_enabled(path: &Path, enabled: bool) -> Result<(), ConfigError>
     // one another's edit — and, more to the point, so a read-modify-write never bases itself on a
     // document another writer is halfway through replacing.
     let _lock = FileLock::acquire(path)?;
-    let text = match fs::read_to_string(path) {
-        Ok(text) => Some(text),
-        Err(source) if source.kind() == ErrorKind::NotFound => None,
-        Err(source) => {
-            return Err(ConfigError::Read {
+    // Twice at most. The first pass can find no file and be beaten to creating one by a writer
+    // that does not take this lock — `ensure_default_config`, or the user's editor — in which case
+    // the second pass reads what they wrote and edits it. A creation that loses that race twice
+    // would mean the file is being created and deleted underneath us, which is not a race worth
+    // looping on.
+    for attempt in 0..2 {
+        let existing = match fs::read_to_string(path) {
+            Ok(text) => Some(text),
+            Err(source) if source.kind() == ErrorKind::NotFound => None,
+            Err(source) => {
+                return Err(ConfigError::Read {
+                    path: path.display().to_string(),
+                    source,
+                })
+            }
+        };
+        let Some(text) = existing else {
+            // Created, not replaced: between the read above and this write, anything may have put
+            // a configuration there, and replacing it would destroy a file this call never read.
+            match atomic_write(path, new_document(enabled).as_bytes(), finalize_new) {
+                Ok(()) => return Ok(()),
+                Err(source) if source.kind() == ErrorKind::AlreadyExists && attempt == 0 => {
+                    continue
+                }
+                Err(source) => {
+                    return Err(ConfigError::Write {
+                        path: path.display().to_string(),
+                        source,
+                    })
+                }
+            }
+        };
+        let mut document = text.parse::<Document>()?;
+        set_enabled(&mut document, enabled)?;
+        return atomic_write(path, document.to_string().as_bytes(), replace_file).map_err(
+            |source| ConfigError::Write {
                 path: path.display().to_string(),
                 source,
-            })
-        }
-    };
-    let text = match text {
-        Some(text) => {
-            let mut document = text.parse::<Document>()?;
-            set_enabled(&mut document, enabled)?;
-            document.to_string()
-        }
-        None => new_document(enabled),
-    };
-    atomic_write(path, text.as_bytes(), replace_file).map_err(|source| ConfigError::Write {
+            },
+        );
+    }
+    Err(ConfigError::Write {
         path: path.display().to_string(),
-        source,
+        source: std::io::Error::new(
+            ErrorKind::AlreadyExists,
+            "the configuration file appeared and disappeared while it was being written",
+        ),
     })
 }
 
