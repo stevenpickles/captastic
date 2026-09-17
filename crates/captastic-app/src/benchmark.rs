@@ -95,9 +95,32 @@ pub struct RunCompatibility {
     pub cursor: String,
     pub cpu_frame: bool,
     pub synthetic: bool,
+    /// The whole build, not just its version.
+    ///
+    /// Two development builds of the same `0.2.0-dev` version can be a hundred commits and an
+    /// optimization level apart, and they compared as compatible. Version, short commit, profile,
+    /// target and the dirty flag together are what "the same software" actually means; a dirty
+    /// tree is in it because uncommitted changes are exactly the ones nobody can reconstruct
+    /// afterwards from a commit id.
     pub build: String,
     pub debug_assertions: bool,
+    /// Each attached display as `id:WxH@rotation:scale:refresh`.
+    ///
+    /// Scale and refresh are here because both change the measurement without changing the
+    /// geometry: composition works in physical pixels, and a 60 Hz panel and a 144 Hz one present
+    /// on different cadences.
     pub displays: Vec<String>,
+    /// Each adapter as `description (driver version)`.
+    ///
+    /// The driver is the part that moves. A driver update is the single likeliest cause of a
+    /// capture latency change between two runs a week apart on the same machine, and without it
+    /// the two compare as identical hosts.
+    pub adapters: Vec<String>,
+    pub os_build: Option<String>,
+    /// The session's state. A run over RDP or against a locked desktop measures something else.
+    pub session: Option<String>,
+    /// `ac` or `battery`: the same laptop measures differently on each, silently.
+    pub power_source: Option<String>,
 }
 
 impl RunCompatibility {
@@ -108,7 +131,7 @@ impl RunCompatibility {
             cursor: report.cursor.clone(),
             cpu_frame: report.cpu_frame_latency.is_some(),
             synthetic: report.synthetic,
-            build: report.environment.build.version.to_owned(),
+            build: build_identity(&report.environment.build),
             debug_assertions: report.environment.debug_assertions,
             displays: report
                 .environment
@@ -116,11 +139,34 @@ impl RunCompatibility {
                 .iter()
                 .map(|display| {
                     format!(
-                        "{}:{}x{}@{}",
-                        display.id, display.width, display.height, display.rotation_degrees
+                        "{}:{}x{}@{}:{:.2}x:{}",
+                        display.id,
+                        display.width,
+                        display.height,
+                        display.rotation_degrees,
+                        display.scale_factor,
+                        display
+                            .refresh_hz
+                            .map(|hz| format!("{hz:.3}Hz"))
+                            .unwrap_or_else(|| UNKNOWN.to_owned())
                     )
                 })
                 .collect(),
+            adapters: report
+                .environment
+                .adapters
+                .iter()
+                .map(|adapter| {
+                    format!(
+                        "{} ({})",
+                        adapter.description,
+                        adapter.driver_version.as_deref().unwrap_or(UNKNOWN)
+                    )
+                })
+                .collect(),
+            os_build: report.environment.os_build.clone(),
+            session: report.environment.session.clone(),
+            power_source: report.environment.power_source.clone(),
         }
     }
 
@@ -156,8 +202,50 @@ impl RunCompatibility {
             self.displays.join(","),
             other.displays.join(","),
         );
+        note(
+            "adapters",
+            self.adapters.join(","),
+            other.adapters.join(","),
+        );
+        note(
+            "os_build",
+            unknown_if_absent(&self.os_build),
+            unknown_if_absent(&other.os_build),
+        );
+        note(
+            "session",
+            unknown_if_absent(&self.session),
+            unknown_if_absent(&other.session),
+        );
+        note(
+            "power_source",
+            unknown_if_absent(&self.power_source),
+            unknown_if_absent(&other.power_source),
+        );
         differences
     }
+}
+
+/// What a fact the host would not answer is called, everywhere a comparison has to print one.
+const UNKNOWN: &str = "unknown";
+
+fn unknown_if_absent(value: &Option<String>) -> String {
+    value.clone().unwrap_or_else(|| UNKNOWN.to_owned())
+}
+
+/// The whole build as one comparable line: version, commit, profile, target, and dirtiness.
+///
+/// A version alone let two development builds a hundred commits apart compare as the same
+/// software, which is the silent version of the failure this module exists to make loud.
+fn build_identity(build: &crate::fingerprint::BuildIdentity) -> String {
+    format!(
+        "{} ({}, {}, {}, {})",
+        build.version,
+        build.git_short_commit.as_deref().unwrap_or(UNKNOWN),
+        build.profile,
+        build.target,
+        if build.dirty { "dirty" } else { "clean" }
+    )
 }
 
 /// Several timed runs of the same question, and what they agree on.
@@ -554,9 +642,13 @@ mod tests {
             cursor: "include".to_owned(),
             cpu_frame: true,
             synthetic: true,
-            build: "0.1.0".to_owned(),
+            build: "0.1.0 (abc1234, release, x86_64-pc-windows-msvc, clean)".to_owned(),
             debug_assertions: false,
-            displays: vec!["primary:1920x1080@0".to_owned()],
+            displays: vec!["primary:1920x1080@0:1.00x:60.000Hz".to_owned()],
+            adapters: vec!["NVIDIA GeForce RTX 3070 (32.0.15.9186)".to_owned()],
+            os_build: Some("26200.9457 (25H2)".to_owned()),
+            session: Some("interactive".to_owned()),
+            power_source: Some("ac".to_owned()),
         };
         let without_cursor = RunCompatibility {
             cursor: "exclude".to_owned(),
@@ -568,11 +660,92 @@ mod tests {
 
         // Every field that changes the question is covered, not just the one the test author
         // happened to think of.
-        with_cursor.displays = vec!["primary:3840x2160@0".to_owned()];
+        with_cursor.displays = vec!["primary:3840x2160@0:1.50x:59.997Hz".to_owned()];
         with_cursor.debug_assertions = true;
-        with_cursor.build = "0.2.0".to_owned();
+        with_cursor.build = "0.2.0 (def5678, debug, x86_64-pc-windows-msvc, dirty)".to_owned();
         let differences = with_cursor.differences(&without_cursor);
         assert_eq!(differences.len(), 4, "{differences:?}");
+    }
+
+    #[test]
+    fn the_host_facts_that_move_a_measurement_are_each_named_on_their_own() {
+        // Each of these used to compare as "the same host": two builds a hundred commits apart at
+        // the same version, a driver update, and a run started over Remote Desktop. A refusal that
+        // did not name which one changed would send the reader back to comparing files by eye.
+        let baseline = RunCompatibility {
+            backend: "dxgi".to_owned(),
+            mode: "latest".to_owned(),
+            cursor: "exclude".to_owned(),
+            cpu_frame: true,
+            synthetic: false,
+            build: "0.2.0-dev.408 (0ca78881, release, x86_64-pc-windows-msvc, clean)".to_owned(),
+            debug_assertions: false,
+            displays: vec!["dell:3840x2160@0:1.50x:59.997Hz".to_owned()],
+            adapters: vec!["NVIDIA GeForce RTX 3070 (32.0.15.9186)".to_owned()],
+            os_build: Some("26200.9457 (25H2)".to_owned()),
+            session: Some("interactive".to_owned()),
+            power_source: Some("ac".to_owned()),
+        };
+
+        let named = |candidate: &RunCompatibility, field: &str| {
+            let differences = baseline.differences(candidate);
+            assert_eq!(differences.len(), 1, "{differences:?}");
+            assert!(differences[0].starts_with(field), "{differences:?}");
+        };
+
+        named(
+            &RunCompatibility {
+                adapters: vec!["NVIDIA GeForce RTX 3070 (32.0.15.7270)".to_owned()],
+                ..baseline.clone()
+            },
+            "adapters",
+        );
+        named(
+            &RunCompatibility {
+                // Same version, same profile, different commit: previously identical.
+                build: "0.2.0-dev.408 (deadbeef, release, x86_64-pc-windows-msvc, clean)"
+                    .to_owned(),
+                ..baseline.clone()
+            },
+            "build",
+        );
+        named(
+            &RunCompatibility {
+                session: Some("remote".to_owned()),
+                ..baseline.clone()
+            },
+            "session",
+        );
+        named(
+            &RunCompatibility {
+                power_source: Some("battery".to_owned()),
+                ..baseline.clone()
+            },
+            "power_source",
+        );
+        named(
+            &RunCompatibility {
+                os_build: Some("26200.9999 (25H2)".to_owned()),
+                ..baseline.clone()
+            },
+            "os_build",
+        );
+        // A host that would not answer at all differs from one that did, rather than matching it.
+        named(
+            &RunCompatibility {
+                session: None,
+                ..baseline.clone()
+            },
+            "session",
+        );
+        // And the refresh rate, which changes the cadence without changing the geometry.
+        named(
+            &RunCompatibility {
+                displays: vec!["dell:3840x2160@0:1.50x:143.998Hz".to_owned()],
+                ..baseline.clone()
+            },
+            "displays",
+        );
     }
 
     #[test]

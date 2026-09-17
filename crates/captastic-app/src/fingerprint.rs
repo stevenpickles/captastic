@@ -178,6 +178,23 @@ impl EnvironmentFingerprint {
             recorded_at_utc: recorded_now(),
         }
     }
+
+    /// The adapter this run actually went through, as far as the fingerprint can tell.
+    ///
+    /// Not "is any adapter a software one": every real desktop enumerates the Microsoft Basic
+    /// Render Driver alongside its GPU, so that question answers `true` on Steven's RTX 3070 box
+    /// and would disqualify the one host the budgets describe. The one that matters is the adapter
+    /// driving the run's displays; where no display named one — a synthetic run, or a host with no
+    /// attached display at all — the first enumerated adapter is the answer, which on a hosted CI
+    /// runner is the software rasterizer and on a desktop is the GPU.
+    pub fn primary_adapter(&self) -> Option<&AdapterFingerprint> {
+        let driving = self
+            .displays
+            .iter()
+            .find_map(|display| display.adapter_luid)
+            .and_then(|luid| self.adapters.iter().find(|adapter| adapter.luid == luid));
+        driving.or_else(|| self.adapters.first())
+    }
 }
 
 fn recorded_now() -> String {
