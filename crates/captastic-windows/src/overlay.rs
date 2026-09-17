@@ -108,6 +108,12 @@ const LIVE_UNDRAWN_ALPHA: u8 = u8::MAX;
 const _: () = assert!(LIVE_UNDRAWN_ALPHA != 0);
 const WINDOW_THUMBNAIL_MAX_PIXELS: u64 = 1_200_000;
 const UI_FONT_HEIGHT: i32 = 21;
+/// The Options row for edge snapping. Named once so the glyph-fit test measures the same string
+/// the menu paints — an Options row whose label overruns its row is the failure this guards.
+///
+/// "Snap to Window Edges" would be plainer but measures 200 px against the 192 px a menu row has
+/// for text at 96 DPI, and widening the menu for one row is a worse trade than the shorter name.
+const SNAP_TO_WINDOWS_LABEL: &str = "Snap to Edges";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SelectionKind {
@@ -235,6 +241,9 @@ pub enum OverlayUiUpdate {
         region: captastic_config::CaptureRegion,
         source: captastic_config::CaptureRegionSource,
     },
+    /// Whether the region tool snaps to window edges. Carries no display id: it is one answer for
+    /// the whole installation, and a toggle made on one monitor applies on the next.
+    SnapToWindows { enabled: bool },
 }
 
 #[derive(Clone, Default)]
@@ -252,7 +261,19 @@ struct OverlayControllerInner {
 #[derive(Clone)]
 struct OverlayUiSink {
     sender: Sender<OverlayUiUpdate>,
-    live_ui: Arc<Mutex<BTreeMap<String, captastic_config::DisplayUiState>>>,
+    live_ui: Arc<Mutex<LiveUiState>>,
+}
+
+/// What this process has learned about remembered UI state since it started, so a second overlay
+/// opened before the persistence worker has written anything still sees the first one's choices.
+///
+/// Split into per-display entries and the handful of preferences that are not about a display at
+/// all: a global kept in the map would only be visible on monitors this process had already drawn
+/// on, which is exactly the bug it exists to prevent.
+#[derive(Default)]
+struct LiveUiState {
+    displays: BTreeMap<String, captastic_config::DisplayUiState>,
+    snap_to_windows: Option<bool>,
 }
 
 impl OverlayController {
@@ -265,7 +286,7 @@ impl OverlayController {
             inner: Arc::new(OverlayControllerInner {
                 ui_updates: Some(OverlayUiSink {
                     sender: ui_updates,
-                    live_ui: Arc::new(Mutex::new(BTreeMap::new())),
+                    live_ui: Arc::new(Mutex::new(LiveUiState::default())),
                 }),
                 ..OverlayControllerInner::default()
             }),
@@ -284,7 +305,15 @@ impl OverlayController {
             .live_ui
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *live_ui.entry(display_id.to_owned()).or_insert(fallback)
+        let snap_to_windows = live_ui.snap_to_windows;
+        let mut remembered = *live_ui
+            .displays
+            .entry(display_id.to_owned())
+            .or_insert(fallback);
+        if let Some(enabled) = snap_to_windows {
+            remembered.snap_to_windows = Some(enabled);
+        }
+        remembered
     }
 
     pub fn submit_ui_update(&self, update: OverlayUiUpdate) {
@@ -543,7 +572,7 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
             hovered_control: None,
             pointer_local: None,
             hovered: None,
-            snap_to_windows: true,
+            snap_to_windows: remembered_ui.snap_to_windows.unwrap_or(true),
             snap_targets: None,
             active_snaps: NO_SNAPS,
         },
@@ -931,18 +960,16 @@ impl OverlayUiSink {
     }
 }
 
-fn apply_overlay_ui_update(
-    state: &mut BTreeMap<String, captastic_config::DisplayUiState>,
-    update: &OverlayUiUpdate,
-) {
+fn apply_overlay_ui_update(state: &mut LiveUiState, update: &OverlayUiUpdate) {
     match update {
+        OverlayUiUpdate::SnapToWindows { enabled } => state.snap_to_windows = Some(*enabled),
         OverlayUiUpdate::Interaction {
             display_id,
             tool,
             region,
             source,
         } => {
-            let display = state.entry(display_id.clone()).or_default();
+            let display = state.displays.entry(display_id.clone()).or_default();
             display.tool = Some(*tool);
             if let Some(region) = region {
                 display.region = Some(*region);
@@ -955,8 +982,11 @@ fn apply_overlay_ui_update(
             center_x,
             center_y,
         } => {
-            state.entry(display_id.clone()).or_default().overlay_center =
-                Some((*center_x, *center_y));
+            state
+                .displays
+                .entry(display_id.clone())
+                .or_default()
+                .overlay_center = Some((*center_x, *center_y));
         }
         OverlayUiUpdate::ConfirmedRegion {
             display_id,
@@ -964,6 +994,7 @@ fn apply_overlay_ui_update(
             source,
         } => {
             state
+                .displays
                 .entry(display_id.clone())
                 .or_default()
                 .confirmed_region = Some(captastic_config::ConfirmedRegion {
@@ -1576,6 +1607,13 @@ fn apply_overlay_effects(
                     position,
                     state.model.display_environment,
                 );
+            }
+            OverlayEffect::PersistSnapPreference { enabled } => {
+                // SAFETY: Shared borrow released at the block's end.
+                let state = unsafe { &*state_pointer };
+                if let Some(sink) = state.ui_updates.as_ref() {
+                    sink.submit(OverlayUiUpdate::SnapToWindows { enabled });
+                }
             }
             OverlayEffect::PersistInteraction { region } => {
                 // SAFETY: Shared borrow released at the block's end.
@@ -3302,6 +3340,7 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
     );
     let rows = [
         (ToolbarControl::DimBackground, layout.dim_background),
+        (ToolbarControl::SnapToWindows, layout.snap_to_windows),
         (
             ToolbarControl::ClipboardDestination,
             layout.clipboard_destination,
@@ -3337,6 +3376,28 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
             bottom: layout.dim_background.bottom,
         },
         "Dim Background",
+        rgb(245, 245, 247),
+        TextAlignment::Left,
+        tokens.font_height,
+    );
+    if state.model.snap_to_windows {
+        draw_checkmark(
+            device,
+            layout.snap_to_windows.left + tokens.menu_check_offset,
+            (layout.snap_to_windows.top + layout.snap_to_windows.bottom) / 2,
+            rgb(86, 156, 255),
+            metrics,
+        );
+    }
+    draw_text(
+        device,
+        UiRect {
+            left: layout.snap_to_windows.left + tokens.menu_text_offset,
+            top: layout.snap_to_windows.top,
+            right: layout.snap_to_windows.right - tokens.text_padding,
+            bottom: layout.snap_to_windows.bottom,
+        },
+        SNAP_TO_WINDOWS_LABEL,
         rgb(245, 245, 247),
         TextAlignment::Left,
         tokens.font_height,
@@ -3617,6 +3678,46 @@ mod tests {
         assert!(matches!(
             receiver.try_recv(),
             Ok(OverlayUiUpdate::ToolbarCenter { .. })
+        ));
+    }
+
+    #[test]
+    fn the_snap_preference_is_live_on_a_display_this_process_has_never_drawn_on() {
+        // The reason the global is not kept in the per-display map: a toggle made on the laptop
+        // screen has to apply on the external monitor too, before the persistence worker has
+        // written anything and without that monitor ever having had an entry.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let controller = OverlayController::with_ui_updates(sender);
+        assert_eq!(
+            controller
+                .remembered_ui("display-1", Default::default())
+                .snap_to_windows,
+            None
+        );
+
+        controller.submit_ui_update(OverlayUiUpdate::SnapToWindows { enabled: false });
+
+        for display in ["display-1", "a-monitor-never-seen-before"] {
+            assert_eq!(
+                controller
+                    .remembered_ui(display, Default::default())
+                    .snap_to_windows,
+                Some(false),
+                "{display}"
+            );
+        }
+        // The live answer overrides a stale fallback read off disk before the toggle happened.
+        let stale = captastic_config::DisplayUiState {
+            snap_to_windows: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            controller.remembered_ui("display-2", stale).snap_to_windows,
+            Some(false)
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(OverlayUiUpdate::SnapToWindows { enabled: false })
         ));
     }
 
@@ -4616,6 +4717,11 @@ mod tests {
                     "Dim Background",
                     layout.dim_background.width() - tokens.menu_text_offset - tokens.text_padding,
                     layout.dim_background.height(),
+                ),
+                (
+                    SNAP_TO_WINDOWS_LABEL,
+                    layout.snap_to_windows.width() - tokens.menu_text_offset - tokens.text_padding,
+                    layout.snap_to_windows.height(),
                 ),
                 (
                     "Copy to Clipboard",

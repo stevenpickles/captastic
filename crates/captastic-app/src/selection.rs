@@ -1005,6 +1005,9 @@ fn persist_ui_state(
                 captastic_windows::OverlayUiUpdate::ConfirmedRegion { display_id, .. } => {
                     (display_id.clone(), 2)
                 }
+                // Global rather than per display, so it coalesces against one key of its own:
+                // the last toggle in a burst is the one the user left the menu on.
+                captastic_windows::OverlayUiUpdate::SnapToWindows { .. } => (String::new(), 3),
             };
             coalesce_ui_update(&mut latest, key, update);
         }
@@ -1026,6 +1029,9 @@ fn persist_ui_state(
                     region,
                     source,
                 } => store.save_display_confirmed_region(&display_id, region, source),
+                captastic_windows::OverlayUiUpdate::SnapToWindows { enabled } => {
+                    store.save_snap_to_windows(enabled)
+                }
             };
             if let Err(error) = result {
                 let message = format!("failed to persist UI state: {error}");

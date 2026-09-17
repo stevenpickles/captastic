@@ -359,6 +359,10 @@ pub struct DisplayUiState {
     /// Per-display regions are monitor-local. A legacy global fallback remains desktop-absolute.
     pub confirmed_region: Option<ConfirmedRegion>,
     pub region_is_display_local: bool,
+    /// Whether the region tool snaps its edges to nearby window edges. Global rather than
+    /// per-display: it is a statement about how the user wants to work, not about one monitor.
+    /// `None` means the user has never said, and the overlay's default stands.
+    pub snap_to_windows: Option<bool>,
 }
 
 pub(crate) fn prepare_config_path_for_open(

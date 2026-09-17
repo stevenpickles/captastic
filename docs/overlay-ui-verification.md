@@ -53,7 +53,7 @@ resize-handle geometry.
 | Tool control hit target | 44 x 44 |
 | Options control | 100 x 44 |
 | Capture control | 120 x 44 |
-| Options menu | 248 x 132 |
+| Options menu | 248 x 172 |
 | Menu row | 236 x 40 |
 | Toolbar/menu type | 16 |
 | Primary icon | 22 |
@@ -63,10 +63,10 @@ Expected physical sizes are:
 
 | Scaling | DPI | Toolbar (px) | Options menu (px) |
 | --- | ---: | ---: | ---: |
-| 100% | 96 | 418 x 56 | 248 x 132 |
-| 125% | 120 | 523 x 70 | 310 x 165 |
-| 150% | 144 | 627 x 84 | 372 x 198 |
-| 200% | 192 | 836 x 112 | 496 x 264 |
+| 100% | 96 | 418 x 56 | 248 x 172 |
+| 125% | 120 | 523 x 70 | 310 x 215 |
+| 150% | 144 | 627 x 84 | 372 x 258 |
+| 200% | 192 | 836 x 112 | 496 x 344 |
 
 This is not a uniform shrink. Tool buttons retain 44-DIP pointer targets, while
 the grip, separators, icons, corners, padding, and gaps use purpose-specific
@@ -96,7 +96,20 @@ The test suite proves that:
 - cancellation persists the selected tool and latest region for the next overlay;
 - resize-handle hit targets scale with monitor DPI;
 - actual Ioskeley Mono glyph measurements fit Options, Capture, and every
-  dropdown row at all four target DPI levels.
+  dropdown row at all four target DPI levels;
+- the Options menu's rows tile it exactly, with no gap or overlap, at all four
+  target DPI levels;
+- snapping moves an edge at most the threshold and always onto a target edge,
+  is idempotent, keeps a moved region's exact dimensions, and never overrules
+  the display clamp or the minimum region size;
+- a snapped right or bottom edge is the target's exclusive edge, and a guide is
+  emitted only for a coordinate the surviving rectangle sits on;
+- a distance tie resolves to the earlier (topmost) target, and the display
+  never wins one;
+- Ctrl and the disabled option both produce the unsnapped rectangle and no
+  guides;
+- arrow nudges stay inside the display and above the minimum size for any run
+  of presses, never snap, and stop emitting repaints at a display edge.
 
 Changes to these invariants belong in the pure layout helpers or their tests
 before Win32 painting changes.
@@ -111,6 +124,19 @@ pointer around every side, touch all display edges, and use all eight handles.
 Move or resize the region, switch to Window and Full Display and back, and verify
 the exact live rectangle returns. Select Region, cancel without capturing, then
 reopen the overlay and verify both Region and that rectangle are restored.
+
+For region precision, on every display configuration below:
+
+| Check | What to do | What must happen |
+| --- | --- | --- |
+| Snap to a window edge | Draw a region and bring its right edge to within a few pixels of a window's right border | The edge jumps onto the border, a hairline accent guide runs the full height of that window, and the badge's width is the one that puts the region's last column on the window's last column |
+| Snap while resizing | Grab the east handle and approach the same border | Only the right edge moves; the left edge stays put even when it is also near a border |
+| Snap while moving | Drag the whole region near a window's left border | The region lands on the border and the badge's dimensions do not change |
+| Ctrl releases it | Hold Ctrl and repeat any of the above | Nothing is pulled anywhere, the guide disappears while Ctrl is down, and releasing the button keeps the pixel under the pointer |
+| Guide lifetime | Release the button on a snapped edge | The guide disappears; the rectangle does not move |
+| Turn it off | Options -> Snap to Edges, then repeat | No snapping and no guides; reopen the overlay and the row is still unchecked; `state.toml` contains `snap_to_windows = false` |
+| Nudge | With a region selected, press the arrow keys, then with Shift, then with Ctrl | One pixel, ten pixels, and a resize of the right/bottom edges; the badge tracks each press; holding a key repeats; a key held at the display edge changes nothing |
+| Nudge does not snap | Nudge an edge to one pixel off a window border | It stays exactly where it was put |
 
 | Display configuration | Scaling | Required checks |
 | --- | --- | --- |

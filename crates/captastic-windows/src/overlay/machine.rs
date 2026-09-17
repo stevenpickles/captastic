@@ -282,6 +282,10 @@ pub(super) enum OverlayEffect {
     PersistInteraction {
         region: Option<Rect>,
     },
+    /// Persist the snap-to-window-edges preference. Global, not per display.
+    PersistSnapPreference {
+        enabled: bool,
+    },
     /// Destroy the overlay window with the given outcome. Always the final effect.
     Close(CloseOutcome),
 }
@@ -567,6 +571,16 @@ fn toolbar_control_pressed(
         ToolbarControl::Capture => return confirm(model),
         ToolbarControl::DimBackground => {
             model.dim_background = !model.dim_background;
+        }
+        ToolbarControl::SnapToWindows => {
+            model.snap_to_windows = !model.snap_to_windows;
+            // Switching it off mid-run leaves a guide on screen describing a rule that no longer
+            // applies; switching it on does not retro-snap the current selection.
+            model.active_snaps = NO_SNAPS;
+            effects.extend(request_snap_targets(model));
+            effects.push(OverlayEffect::PersistSnapPreference {
+                enabled: model.snap_to_windows,
+            });
         }
         ToolbarControl::ClipboardDestination => {}
         ToolbarControl::Cancel => return cancel(model),
@@ -1820,12 +1834,33 @@ mod tests {
             (center(layout.region), ToolbarControl::Region, false),
             (center(layout.options), ToolbarControl::Options, false),
             (center(layout.capture), ToolbarControl::Capture, false),
+            (
+                center(layout.dim_background),
+                ToolbarControl::DimBackground,
+                false,
+            ),
+            (
+                center(layout.snap_to_windows),
+                ToolbarControl::SnapToWindows,
+                false,
+            ),
+            (
+                center(layout.clipboard_destination),
+                ToolbarControl::ClipboardDestination,
+                false,
+            ),
             (center(layout.cancel), ToolbarControl::Cancel, true),
         ];
         for (local, expected, closes) in cases {
             let mut model = region_model();
-            // The cancel row only hits while the options menu is open.
-            model.options_open = expected == ToolbarControl::Cancel;
+            // The menu rows only hit while the options menu is open.
+            model.options_open = matches!(
+                expected,
+                ToolbarControl::DimBackground
+                    | ToolbarControl::SnapToWindows
+                    | ToolbarControl::ClipboardDestination
+                    | ToolbarControl::Cancel
+            );
             // Give the machine an active drag to prove every dispatch clears it.
             model.anchor = Some(point(1, 1));
             model.dragging = true;
@@ -2056,6 +2091,69 @@ mod tests {
         );
         assert_eq!(model.hovered_control, Some(ToolbarControl::DimBackground));
         assert!(close_outcome(&effects).is_none());
+    }
+
+    #[test]
+    fn the_snap_row_toggles_persists_and_keeps_the_menu_open() {
+        let mut model = region_model();
+        model.options_open = true;
+        model.snap_targets = None;
+        model.active_snaps = [
+            Some(SnapGuide {
+                axis: SnapAxis::X,
+                position: 400,
+                span: (300, 500),
+                trailing: false,
+            }),
+            None,
+        ];
+        let layout = layout_for(&model);
+
+        // On by default, so the first press turns it off.
+        let effects = transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point: center(layout.snap_to_windows),
+                window_slot: None,
+            },
+        );
+        assert!(!model.snap_to_windows);
+        assert!(
+            model.options_open,
+            "the menu stays open for further toggles"
+        );
+        assert_eq!(model.hovered_control, Some(ToolbarControl::SnapToWindows));
+        assert_eq!(
+            model.active_snaps, NO_SNAPS,
+            "a guide describing a rule that no longer applies must go"
+        );
+        assert!(has_effect(&effects, |e| matches!(
+            e,
+            OverlayEffect::PersistSnapPreference { enabled: false }
+        )));
+        assert!(
+            !has_effect(&effects, |e| matches!(e, OverlayEffect::BuildSnapTargets)),
+            "switching it off must not pay for an enumeration"
+        );
+        assert!(close_outcome(&effects).is_none());
+
+        // Switching it back on asks for the inventory it will now need.
+        let effects = transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point: center(layout.snap_to_windows),
+                window_slot: None,
+            },
+        );
+        assert!(model.snap_to_windows);
+        assert!(has_effect(&effects, |e| matches!(
+            e,
+            OverlayEffect::PersistSnapPreference { enabled: true }
+        )));
+        assert!(has_effect(&effects, |e| matches!(
+            e,
+            OverlayEffect::BuildSnapTargets
+        )));
     }
 
     #[test]

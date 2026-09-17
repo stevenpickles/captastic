@@ -4,7 +4,7 @@ const TOOLBAR_WIDTH: i32 = 418;
 const TOOLBAR_HEIGHT: i32 = 56;
 const TOOLBAR_BOTTOM_MARGIN: i32 = 24;
 const MENU_WIDTH: i32 = 248;
-const MENU_HEIGHT: i32 = 132;
+const MENU_HEIGHT: i32 = 172;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ToolbarControl {
@@ -15,6 +15,7 @@ pub(super) enum ToolbarControl {
     Options,
     Capture,
     DimBackground,
+    SnapToWindows,
     ClipboardDestination,
     Cancel,
 }
@@ -236,6 +237,7 @@ pub(super) struct ToolbarLayout {
     pub(super) capture: UiRect,
     pub(super) menu: UiRect,
     pub(super) dim_background: UiRect,
+    pub(super) snap_to_windows: UiRect,
     pub(super) clipboard_destination: UiRect,
     pub(super) cancel: UiRect,
 }
@@ -368,17 +370,23 @@ impl ToolbarLayout {
                 right: row_right,
                 bottom: menu.top + metrics.px(46),
             },
-            clipboard_destination: UiRect {
+            snap_to_windows: UiRect {
                 left: row_left,
                 top: menu.top + metrics.px(46),
                 right: row_right,
                 bottom: menu.top + metrics.px(86),
             },
-            cancel: UiRect {
+            clipboard_destination: UiRect {
                 left: row_left,
                 top: menu.top + metrics.px(86),
                 right: row_right,
                 bottom: menu.top + metrics.px(126),
+            },
+            cancel: UiRect {
+                left: row_left,
+                top: menu.top + metrics.px(126),
+                right: row_right,
+                bottom: menu.top + metrics.px(166),
             },
             menu,
         }
@@ -388,6 +396,9 @@ impl ToolbarLayout {
         if options_open && self.menu.contains(point) {
             if self.dim_background.contains(point) {
                 return Some(ToolbarControl::DimBackground);
+            }
+            if self.snap_to_windows.contains(point) {
+                return Some(ToolbarControl::SnapToWindows);
             }
             if self.clipboard_destination.contains(point) {
                 return Some(ToolbarControl::ClipboardDestination);
@@ -787,11 +798,11 @@ mod tests {
     }
     #[test]
     fn compact_toolbar_scales_at_supported_dpi_levels() {
-        for (dpi, expected_width, expected_height) in [
-            (96, 418, 56),
-            (120, 523, 70),
-            (144, 627, 84),
-            (192, 836, 112),
+        for (dpi, expected_width, expected_height, expected_menu) in [
+            (96, 418, 56, (248, 172)),
+            (120, 523, 70, (310, 215)),
+            (144, 627, 84, (372, 258)),
+            (192, 836, 112, (496, 344)),
         ] {
             let environment = DisplayEnvironment {
                 work_area: UiRect {
@@ -808,6 +819,24 @@ mod tests {
             assert_eq!(layout.bounds.height(), expected_height);
             assert_eq!(layout.full_display.width(), environment.metrics.px(44));
             assert_eq!(layout.full_display.height(), environment.metrics.px(44));
+            assert_eq!(
+                (layout.menu.width(), layout.menu.height()),
+                expected_menu,
+                "{dpi} DPI"
+            );
+            // Every row sits inside the menu and none overlaps its neighbour.
+            let rows = [
+                layout.dim_background,
+                layout.snap_to_windows,
+                layout.clipboard_destination,
+                layout.cancel,
+            ];
+            for row in rows {
+                assert!(row.top >= layout.menu.top && row.bottom <= layout.menu.bottom);
+            }
+            for pair in rows.windows(2) {
+                assert_eq!(pair[0].bottom, pair[1].top, "{dpi} DPI");
+            }
             assert!(layout.menu.left >= environment.work_area.left);
             assert!(layout.menu.top >= environment.work_area.top);
             assert!(layout.menu.right <= environment.work_area.right);
