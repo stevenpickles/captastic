@@ -258,8 +258,9 @@ struct CaptureWorkerContext {
     done: mpsc::SyncSender<Result<(), AppError>>,
     commands: mpsc::Receiver<CaptureCommand>,
     selection_sender: Option<mpsc::SyncSender<crate::selection::SelectionJob>>,
-    /// Every destination a finished capture is offered to, in the order they were configured.
-    destinations: Vec<crate::output::ChannelSink>,
+    /// Every destination a finished capture is offered to, read per capture because the set can
+    /// change while the daemon runs.
+    destinations: crate::output::OutputDestinations,
 }
 
 #[cfg(windows)]
@@ -284,12 +285,6 @@ fn run_capture_worker(context: CaptureWorkerContext) {
         selection_sender,
         destinations,
     } = context;
-    // Resolved once: the loop offers every capture to the same set, and building the trait-object
-    // view per capture would allocate on the path this worker exists to keep clear.
-    let destination_refs: Vec<&dyn crate::output::OutputSink> = destinations
-        .iter()
-        .map(|sink| sink as &dyn crate::output::OutputSink)
-        .collect();
     let mut recovery: Option<BackendRecovery> = None;
     let mut backend = match super::create_backend(&backend_name, &display_policy) {
         Ok(backend) => Some(backend),
@@ -670,11 +665,15 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                             .as_ref()
                             .map(captastic_core::CpuFrame::required_bytes);
                         let native_frame_retained = outcome.native_frame.is_some();
+                        // Read here rather than once outside the loop: the notification area
+                        // can start or stop the file worker between two captures, and this
+                        // capture is offered to the set that exists now. One atomic increment.
+                        let destinations = destinations.current();
                         let output_status = match output_status_or_fatal(
                             capture_id,
                             dispatch_output(
                                 selection_sender.as_ref(),
-                                &destination_refs,
+                                &destinations,
                                 capture_id,
                                 trigger.received_at,
                                 trigger.source,
@@ -1101,16 +1100,20 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         })
         .transpose()?;
     // Clipboard first so it keeps its place in the logs when file output joins it.
-    let destinations: Vec<crate::output::ChannelSink> = clipboard_worker
-        .as_ref()
-        .map(crate::clipboard::ClipboardWorker::sink)
-        .into_iter()
-        .chain(
-            file_output_worker
-                .as_ref()
-                .map(crate::file_output::FileOutputWorker::sink),
-        )
-        .collect();
+    let destinations = crate::output::OutputDestinations::new(
+        clipboard_worker
+            .as_ref()
+            .map(crate::clipboard::ClipboardWorker::sink)
+            .map(|sink| Arc::new(sink) as Arc<dyn crate::output::OutputSink>)
+            .into_iter()
+            .chain(
+                file_output_worker
+                    .as_ref()
+                    .map(crate::file_output::FileOutputWorker::sink)
+                    .map(|sink| Arc::new(sink) as Arc<dyn crate::output::OutputSink>),
+            )
+            .collect(),
+    );
     let (command_sender, command_receiver) = mpsc::sync_channel(args.trigger_queue_capacity);
     // Both workers can be forced to abandon work the user asked for; the main thread owns the
     // notification area, so notices travel to it on their own bounded channel rather than through
@@ -1123,13 +1126,12 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         .then(|| {
             crate::selection::SelectionWorker::start(
                 // Every destination, so a capture confirmed in the overlay reaches the same
-                // places a direct one does. No `.expect` here any more either: an empty list is a
-                // thing the type can say, and the configuration validator already rejects a
-                // selection with nowhere to send its result.
-                destinations
-                    .iter()
-                    .map(|sink| Box::new(sink.clone()) as Box<dyn crate::output::OutputSink>)
-                    .collect(),
+                // places a direct one does — and the same live set, so a selection confirmed
+                // after the user turned file output on lands on disk like a direct capture
+                // would. No `.expect` here either: an empty set is a thing the type can say, and
+                // the configuration validator already rejects a selection with nowhere to send
+                // its result.
+                destinations.clone(),
                 command_sender.clone(),
                 notice_sender.clone(),
                 args.json,
@@ -1164,7 +1166,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         done: done_sender,
         commands: command_receiver,
         selection_sender,
-        destinations,
+        destinations: destinations.clone(),
     };
     let capture_join = thread::Builder::new()
         .name("captastic-capture".to_owned())
@@ -2503,7 +2505,7 @@ fn dispatch_live_selection(
 #[allow(clippy::too_many_arguments)]
 fn dispatch_output(
     selection_sender: Option<&mpsc::SyncSender<crate::selection::SelectionJob>>,
-    destinations: &[&dyn crate::output::OutputSink],
+    destinations: &[Arc<dyn crate::output::OutputSink>],
     capture_id: CaptureId,
     triggered_at: Instant,
     source: &'static str,
@@ -2704,7 +2706,7 @@ fn dispatch_selection(
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 fn dispatch_repeat_region(
-    destinations: &[&dyn crate::output::OutputSink],
+    destinations: &[Arc<dyn crate::output::OutputSink>],
     capture_id: CaptureId,
     triggered_at: Instant,
     source: &'static str,
@@ -2837,7 +2839,7 @@ fn repeat_region_rect(
 /// one gave — a capture nobody accepted is still a valid capture, just an undelivered one.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_destinations(
-    sinks: &[&dyn crate::output::OutputSink],
+    sinks: &[Arc<dyn crate::output::OutputSink>],
     capture_id: CaptureId,
     triggered_at: Instant,
     source: &'static str,
@@ -4279,9 +4281,10 @@ mod tests {
         .expect("valid frame");
         let (sender, receiver) = mpsc::sync_channel::<crate::clipboard::ClipboardJob>(1);
         drop(receiver);
-        let sink = crate::output::ChannelSink::new("clipboard", sender);
+        let sink: Arc<dyn crate::output::OutputSink> =
+            Arc::new(crate::output::ChannelSink::new("clipboard", sender));
         let status = dispatch_destinations(
-            &[&sink],
+            &[sink],
             capture_id,
             triggered_at,
             "test",

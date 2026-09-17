@@ -10,7 +10,7 @@
 //! So producers address an [`OutputSink`]. A sink accepts a job or rejects it, and a rejection is
 //! a fact about that destination alone.
 
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, RwLock};
 
 use captastic_config::{HotkeyAction, HotkeyChord};
 use captastic_core::{CaptureId, CpuFrame, EventRecorder};
@@ -105,6 +105,50 @@ impl OutputSink for ChannelSink {
             mpsc::TrySendError::Full(job) => OutputRejection::QueueFull(Box::new(job)),
             mpsc::TrySendError::Disconnected(job) => OutputRejection::Disconnected(Box::new(job)),
         })
+    }
+}
+
+/// One resolved list of destinations, cheap to hand to a producer.
+///
+/// Reference-counted rather than copied per capture: taking the current set costs one atomic
+/// increment, which is what makes reading it on the capture path affordable.
+pub type DestinationSet = Arc<Vec<Arc<dyn OutputSink>>>;
+
+/// Every destination a finished capture is offered to, as the set stands *now*.
+///
+/// Destinations used to be resolved once at startup and handed to each producer as a frozen list,
+/// which was true for as long as the only way to turn file output on was to edit the
+/// configuration and restart. It stops being true the moment the notification area can start and
+/// stop the file worker: a frozen list would keep offering captures to a worker that has stopped,
+/// or keep missing one that has started, and the producer holding it has no way to find out.
+///
+/// So a producer holds this and reads [`OutputDestinations::current`] once per capture. Writes
+/// happen only when a destination is turned on or off and replace the whole set, so a reader
+/// never sees a half-built list and a capture already in flight completes against the set it
+/// started with.
+#[derive(Clone)]
+pub struct OutputDestinations {
+    current: Arc<RwLock<DestinationSet>>,
+}
+
+impl OutputDestinations {
+    pub fn new(sinks: Vec<Arc<dyn OutputSink>>) -> Self {
+        Self {
+            current: Arc::new(RwLock::new(Arc::new(sinks))),
+        }
+    }
+
+    /// The set as it stands, for one capture to be offered to.
+    ///
+    /// A poisoned lock is read through rather than propagated: the only thing under it is a list
+    /// of senders, a panic while swapping it cannot leave it half-written, and refusing to deliver
+    /// a capture the user already took would be a worse answer than delivering it to the set that
+    /// was there.
+    pub fn current(&self) -> DestinationSet {
+        self.current
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 }
 
