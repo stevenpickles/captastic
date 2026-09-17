@@ -1041,7 +1041,8 @@ pub struct OutputConfig {
     /// than in a `[output.jpeg]` table because one setting is not a section.
     pub jpeg_quality: u8,
     pub queue_capacity: usize,
-    /// Where captures are written. `None` selects [`default_output_directory`].
+    /// Where captures are written. `None` lets the application choose: on Windows, `Captastic`
+    /// inside the Pictures folder the shell reports, and otherwise [`default_output_directory`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub directory: Option<PathBuf>,
     /// Names a capture, without its extension. See `DEFAULT_FILENAME_TEMPLATE`.
@@ -1108,10 +1109,18 @@ impl Default for OutputConfig {
     }
 }
 
-/// Where captures land when the user has not said otherwise.
+/// Where captures land when the user has not said otherwise and nothing better is known.
 ///
 /// Beside the pictures a person already has, rather than in `.captastic` beside Captastic's own
 /// files: a screenshot is the user's document, not application state.
+///
+/// This is the home-relative guess, and it is a guess. On Windows the shell's Pictures folder is
+/// a known folder whose location OneDrive's Known Folder Move, a roaming profile, or a policy can
+/// redirect — commonly to `%USERPROFILE%\OneDrive\Pictures` — while `%USERPROFILE%\Pictures` is
+/// left behind as an empty directory that still exists and is still writable. So the Windows app
+/// asks the shell first (`captastic_windows::known_pictures_folder`) and falls back to this; this
+/// crate stays platform-neutral and does not make that call itself. Off Windows, and when the
+/// shell declines to answer, this is the answer.
 pub fn default_output_directory() -> Option<PathBuf> {
     home_directory().map(|home| home.join("Pictures").join("Captastic"))
 }

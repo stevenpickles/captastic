@@ -69,7 +69,11 @@ quoted with the fingerprint and the spread that came with them.
   narrowing it silently. **JPEG cannot carry an alpha channel**, so the transparent corners and
   shadow of a window capture are composited over opaque white, and the configuration comment, the
   README, and a debug log line each say so. JPEG encoding uses the `jpeg-encoder` crate; this
-  software is based in part on the work of the Independent JPEG Group.
+  software is based in part on the work of the Independent JPEG Group. With no `output.directory`
+  set, captures go to `Captastic` inside the Pictures folder Windows shows you — Captastic asks the
+  shell for it rather than assuming `%USERPROFILE%\Pictures`, so a Pictures folder moved by
+  OneDrive's Known Folder Move, a roaming profile, or a group policy is where captures land, and the
+  path settled on is logged at info when saving starts.
 - **The notification area can turn file output on and off.** **Save Captures to Disk** sits directly
   above the history entries, is checked while captures are being written, and takes effect on the
   next capture: turning it on starts the file worker — creating the output directory and rejecting a
@@ -161,6 +165,17 @@ proved by tests against the same code paths, but the menu item has not been used
 capture has landed on disk because of it, and neither of its rarer paths — a file worker held past
 its stop deadline, and captures abandoned because they were queued faster than they could be encoded
 — has been seen outside a test.
+
+**The default output directory was wrong, and only running it found that.** On 2026-09-17 Steven
+turned file output on and went looking for the captures. There was no `Pictures\Captastic` folder —
+OneDrive's Known Folder Move had moved his Pictures folder to `C:\Users\Steven\OneDrive\Pictures`,
+and Captastic, which built its default from `%USERPROFILE%`, had been writing into the empty
+`C:\Users\Steven\Pictures` left behind. Every test passed throughout: the directory was created and
+the file was written, exactly as asked, somewhere Explorer no longer calls Pictures. Captastic now
+asks the shell for the Pictures folder and logs the directory it settled on when saving starts. The
+fix was verified on that machine — a one-shot capture landed in
+`C:\Users\Steven\OneDrive\Pictures\Captastic` — and the test file was removed afterwards. Redirected
+known folders are now covered by tests; no other known folder has been looked at.
 
 **A window capture's alpha has not been through the two new encoders.** Both were checked once on a
 real capture: on 2026-09-17 a 3840 × 2160 full-display DXGI capture was written as JPEG at quality

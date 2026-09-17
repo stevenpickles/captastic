@@ -272,9 +272,18 @@ filename_template = "{timestamp}-{application}-{title}"
 ```
 
 `directory` must be absolute — a daemon's working directory is whatever launched it, so a relative
-path would put captures somewhere unpredictable — and defaults to `<home>\Pictures\Captastic`. It
-is created when the daemon starts rather than at the first capture, so a directory that cannot be
-created is a startup error instead of a surprise at the hotkey.
+path would put captures somewhere unpredictable. It is created when the daemon starts rather than
+at the first capture, so a directory that cannot be created is a startup error instead of a
+surprise at the hotkey.
+
+Omit it and captures go to `Captastic` inside **the Pictures folder Windows shows you** — including
+when OneDrive's Known Folder Move, a roaming profile, or a group policy has moved it somewhere like
+`C:\Users\you\OneDrive\Pictures`. Captastic asks the shell where Pictures is rather than assuming
+`%USERPROFILE%\Pictures`, which on a redirected machine is usually an empty directory that still
+exists — captures written there land somewhere Explorer no longer calls Pictures. The exact path is
+logged at info when the daemon starts with file output on, and again when **Save Captures to Disk**
+turns it on, so a log line and the Pictures folder in Explorer are always comparable. If Windows
+will not name a Pictures folder at all, the fallback is `<home>\Pictures\Captastic`.
 
 `format` chooses the encoder:
 

@@ -177,6 +177,10 @@ fn resolve_daemon_args_with_default(
             max_age_ms: (maximum_age != 0).then_some(maximum_age),
         },
     };
+    // The same resolution a one-shot capture uses, so `captastic capture` and the daemon cannot
+    // disagree about where a capture went. Resolved before the struct below starts consuming
+    // `config`.
+    let output_directory = super::configured_output_directory(&config)?;
     Ok(ResolvedDaemonArgs {
         backend: args.backend.unwrap_or(config.daemon.backend),
         display_policy: super::resolve_display_policy(
@@ -191,15 +195,7 @@ fn resolve_daemon_args_with_default(
         cpu_frame: args.cpu_frame.unwrap_or(config.capture.cpu_frame),
         clipboard: args.clipboard.unwrap_or(config.clipboard.enabled),
         file_output: config.output.enabled,
-        output_directory: config
-            .output
-            .directory
-            .clone()
-            .or_else(captastic_config::default_output_directory)
-            .ok_or(AppError::BackendUnavailable(
-                "unable to determine a default output directory from USERPROFILE or HOME"
-                    .to_owned(),
-            ))?,
+        output_directory,
         output_queue_capacity: config.output.queue_capacity,
         output_filename_template: config.output.filename_template.clone(),
         output_format: config.output.format,
@@ -968,6 +964,13 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         .file_output
         .then(|| start_file_output(&args))
         .transpose()?;
+    if let Some(worker) = file_output_worker.as_ref() {
+        // The tray toggle already says this when it starts a worker an hour into a session. A
+        // daemon that started with file output on said nothing, which is precisely the case where
+        // the directory is a default nobody chose — and, when the shell's Pictures folder has been
+        // redirected, not the one a user would guess. One line, once, naming the resolved path.
+        log::info!("saving captures to {}", worker.directory().display());
+    }
     let mut clipboard_worker = args
         .clipboard
         .then(|| {

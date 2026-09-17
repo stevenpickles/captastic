@@ -626,17 +626,10 @@ fn write_one_shot_file_output(
             "file output was requested but no CPU frame was returned".to_owned(),
         ));
     };
-    let directory = config
-        .output
-        .directory
-        .clone()
-        .or_else(captastic_config::default_output_directory)
-        .ok_or_else(|| {
-            AppError::BackendUnavailable(
-                "unable to determine a default output directory from USERPROFILE or HOME"
-                    .to_owned(),
-            )
-        })?;
+    let directory = configured_output_directory(config)?;
+    // Said before the write rather than after it, so a capture that fails on an unwritable
+    // directory still names the directory it was refused by.
+    log::info!("saving this capture to {}", directory.display());
     recorder.record(capture_id, PerfEventKind::EncodeStarted, 0);
     let (path, bytes, encode_ns, write_ns) = file_output::write_capture_now(
         &directory,
@@ -1056,6 +1049,67 @@ fn config(command: ConfigCommand) -> Result<(), AppError> {
     }
 }
 
+/// Where the Windows shell says the user's Pictures folder is, or `None` off Windows.
+///
+/// The probe lives in `captastic-windows` because it is a Win32 call; `captastic-config` stays
+/// platform-neutral and knows nothing about it. This is the one place the two meet.
+///
+/// Off Windows nothing reaches this: every caller sits behind the same `cfg(windows)` the file
+/// destination itself does. The `not(windows)` arm is what makes the question answerable in a
+/// build that could one day have one.
+#[cfg(windows)]
+fn known_pictures_folder() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        captastic_windows::known_pictures_folder()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// Decides where captures go, for the daemon and for a one-shot alike.
+///
+/// Three answers in order, and only the first two are anybody's preference:
+///
+/// 1. `output.directory`, because a user who named a directory meant it.
+/// 2. `Captastic` inside the Pictures folder *the shell reports*. Not `%USERPROFILE%\Pictures`:
+///    OneDrive's Known Folder Move, a roaming profile, and group policy all redirect it, and on a
+///    redirected machine the old path commonly still exists as an empty leftover — so writing
+///    there succeeds and the user, looking at the Pictures folder Explorer shows them, sees no
+///    captures at all. That was the 2026-09-17 report.
+/// 3. [`captastic_config::default_output_directory`], which is the home-relative guess. Off
+///    Windows there is no known folder to ask, and on Windows this is what is left when the shell
+///    declines to answer.
+///
+/// `known_pictures` is a parameter rather than a call so the order above is testable on a host
+/// that has no known folders at all — which is every non-Windows host the test suite runs on, and
+/// why this one function is compiled there while its two callers are not.
+#[cfg(any(windows, test))]
+fn resolve_output_directory(
+    configured: Option<&Path>,
+    known_pictures: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    configured
+        .map(Path::to_path_buf)
+        .or_else(|| known_pictures.map(|pictures| pictures.join("Captastic")))
+        .or_else(captastic_config::default_output_directory)
+}
+
+/// [`resolve_output_directory`] against the live machine, or the error the caller reports.
+#[cfg(windows)]
+fn configured_output_directory(config: &AppConfig) -> Result<std::path::PathBuf, AppError> {
+    resolve_output_directory(config.output.directory.as_deref(), known_pictures_folder())
+        .ok_or_else(|| {
+            AppError::BackendUnavailable(
+                "unable to determine a default output directory from the shell's Pictures folder, \
+                 USERPROFILE, or HOME"
+                    .to_owned(),
+            )
+        })
+}
+
 /// The cursor policy from configuration.
 ///
 /// One-shot captures have no `--cursor` flag: the policy is a standing preference rather than a
@@ -1396,6 +1450,67 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    /// An explicit `output.directory` wins, and it wins unchanged.
+    ///
+    /// A user who named a directory named the directory, not its parent: nothing is appended to
+    /// it, including `Captastic`.
+    #[test]
+    fn a_configured_output_directory_is_used_exactly_as_written() {
+        let configured = std::path::PathBuf::from(if cfg!(windows) {
+            r"D:\shots"
+        } else {
+            "/srv/shots"
+        });
+        let pictures = std::path::PathBuf::from(if cfg!(windows) {
+            r"C:\Users\someone\OneDrive\Pictures"
+        } else {
+            "/home/someone/Pictures"
+        });
+        assert_eq!(
+            resolve_output_directory(Some(&configured), Some(pictures)),
+            Some(configured.clone())
+        );
+        // And it still wins when the shell has nothing to say.
+        assert_eq!(
+            resolve_output_directory(Some(&configured), None),
+            Some(configured)
+        );
+    }
+
+    /// With no configured directory, the shell's Pictures folder decides — redirected or not.
+    ///
+    /// The redirected path here is the real one from the 2026-09-17 report: captures were landing
+    /// in `C:\Users\Steven\Pictures\Captastic`, a leftover directory Explorer no longer shows as
+    /// Pictures, while OneDrive's Known Folder Move had moved the real one.
+    #[test]
+    fn without_a_configured_directory_the_shells_pictures_folder_decides() {
+        let redirected = std::path::PathBuf::from(if cfg!(windows) {
+            r"C:\Users\Steven\OneDrive\Pictures"
+        } else {
+            "/home/steven/OneDrive/Pictures"
+        });
+        let resolved = resolve_output_directory(None, Some(redirected.clone()))
+            .expect("a known folder is enough on its own");
+        assert_eq!(resolved, redirected.join("Captastic"));
+        // `Path::ends_with` compares components, so one form covers both separators.
+        assert!(
+            resolved.ends_with("OneDrive/Pictures/Captastic"),
+            "{resolved:?}"
+        );
+    }
+
+    /// No configured directory and no known folder falls back to the home-relative guess.
+    ///
+    /// Which is the only answer available off Windows, and the last one on a Windows machine
+    /// whose shell declines to name a Pictures folder.
+    #[test]
+    fn with_neither_the_home_relative_default_is_the_fallback() {
+        assert_eq!(
+            resolve_output_directory(None, None),
+            captastic_config::default_output_directory()
+        );
+    }
 
     #[test]
     fn the_readback_pool_covers_every_frame_a_selection_can_pin() {
