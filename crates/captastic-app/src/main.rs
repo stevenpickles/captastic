@@ -7,6 +7,7 @@ mod cli;
 #[cfg(windows)]
 mod clipboard;
 mod clock;
+mod compare;
 mod daemon;
 mod error;
 #[cfg(windows)]
@@ -36,7 +37,7 @@ use captastic_core::{
 use clap::Parser;
 #[cfg(windows)]
 use cli::PreviewArg;
-use cli::{BenchmarkArgs, Cli, Command, ConfigCommand, ModeArg, StartupCommand};
+use cli::{BenchmarkArgs, BenchmarkCommand, Cli, Command, ConfigCommand, ModeArg, StartupCommand};
 use error::AppError;
 use serde_json::json;
 
@@ -935,6 +936,40 @@ fn load_optional_one_shot_ui_state(
 }
 
 fn benchmark(args: BenchmarkArgs) -> Result<(), AppError> {
+    match args.command {
+        Some(BenchmarkCommand::Compare {
+            baseline,
+            candidate,
+            json,
+            noise_percent,
+        }) => benchmark_compare(&baseline, &candidate, json, noise_percent),
+        None => benchmark_run(args.run),
+    }
+}
+
+/// Holds a recorded run against an accepted baseline, or refuses to.
+///
+/// Only the refusal is an error. A `slower` verdict exits zero: a comparison is a measurement the
+/// operator is still interpreting, and a command that fails on one is a command that gets run with
+/// `|| true` until the day it would have mattered.
+fn benchmark_compare(
+    baseline: &Path,
+    candidate: &Path,
+    json_output: bool,
+    noise_percent: f64,
+) -> Result<(), AppError> {
+    let baseline_set = compare::load(baseline)?;
+    let candidate_set = compare::load(candidate)?;
+    let comparison = compare::compare(&baseline_set, &candidate_set, noise_percent)?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&comparison)?);
+    } else {
+        compare::report(&comparison, &baseline_set.label, &candidate_set.label);
+    }
+    Ok(())
+}
+
+fn benchmark_run(args: cli::BenchmarkRunArgs) -> Result<(), AppError> {
     args.validate()?;
     let display_policy = resolve_display_policy(&args.display)?;
     let mut native_backend = if args.backend == "fake" {

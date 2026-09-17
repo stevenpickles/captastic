@@ -146,8 +146,44 @@ pub struct CaptureArgs {
     pub json: bool,
 }
 
+/// `benchmark`, which is either a run or one of the commands that works on runs already recorded.
+///
+/// `args_conflicts_with_subcommands` keeps every existing invocation parsing exactly as it did:
+/// the run flags are still `benchmark`'s own, not a `benchmark run` subcommand's, so no script,
+/// no README line and no operator's muscle memory had to change to make room for `compare`.
 #[derive(Debug, Args)]
+#[command(args_conflicts_with_subcommands = true)]
 pub struct BenchmarkArgs {
+    #[command(subcommand)]
+    pub command: Option<BenchmarkCommand>,
+    #[command(flatten)]
+    pub run: BenchmarkRunArgs,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BenchmarkCommand {
+    /// Compare a candidate run against a baseline measured on the same host.
+    ///
+    /// Either side may be a single `run-N.json` report or a whole `repeated.json` set.
+    Compare {
+        /// The accepted baseline: a `run-N.json` report or a `repeated.json` set.
+        baseline: PathBuf,
+        /// The run being judged, in the same two shapes.
+        candidate: PathBuf,
+        #[arg(long)]
+        json: bool,
+        /// How far a stage may move before it is called a change rather than noise.
+        ///
+        /// The default is just above the 1.7-6.6 % run-to-run spread this host has measured. The
+        /// larger of the two sets' own measured spreads wins when it is wider than this, because a
+        /// set that disagreed with itself by 12 % cannot detect an 8 % regression.
+        #[arg(long, default_value_t = 7.0)]
+        noise_percent: f64,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct BenchmarkRunArgs {
     #[arg(long, default_value = "fake")]
     pub backend: String,
     /// Display policy: pointer, primary, virtual_desktop, or display:<persistent-id>.
@@ -199,7 +235,7 @@ pub struct BenchmarkArgs {
     pub json: bool,
 }
 
-impl BenchmarkArgs {
+impl BenchmarkRunArgs {
     /// Rejects the flag combinations clap cannot express, before any capture is taken.
     ///
     /// Checked up front rather than at the point of use, so a run that would produce no artifacts
@@ -345,6 +381,7 @@ mod tests {
         let Some(Command::Benchmark(args)) = cli.command else {
             panic!("expected a benchmark command");
         };
+        let args = args.run;
         let error = args.validate().expect_err("the combination is refused");
         assert!(
             error.to_string().contains("--output-dir"),
@@ -367,8 +404,11 @@ mod tests {
         let Some(Command::Benchmark(args)) = cli.command else {
             panic!("expected a benchmark command");
         };
-        assert_eq!(args.output_dir.as_deref(), Some(Path::new("C:/tmp/run")));
-        args.validate().expect("the combination is accepted");
+        assert_eq!(
+            args.run.output_dir.as_deref(),
+            Some(Path::new("C:/tmp/run"))
+        );
+        args.run.validate().expect("the combination is accepted");
 
         // A single run still writes its one event stream to the one path it was given.
         let cli = Cli::try_parse_from(["captastic", "benchmark", "--raw-events", "events.jsonl"])
@@ -376,7 +416,76 @@ mod tests {
         let Some(Command::Benchmark(args)) = cli.command else {
             panic!("expected a benchmark command");
         };
-        args.validate().expect("a single run needs no directory");
+        args.run
+            .validate()
+            .expect("a single run needs no directory");
+    }
+
+    #[test]
+    fn benchmark_gained_a_subcommand_without_moving_its_own_flags() {
+        // `args_conflicts_with_subcommands` is what makes this safe: the run flags stayed on
+        // `benchmark` itself rather than moving to a `benchmark run` subcommand, so every script,
+        // README line and budget-file comment that predates `compare` still parses.
+        let cli = Cli::try_parse_from(["captastic", "benchmark", "--iterations", "5"])
+            .expect("the pre-existing form still parses");
+        let Some(Command::Benchmark(args)) = cli.command else {
+            panic!("expected a benchmark command");
+        };
+        assert!(args.command.is_none(), "no subcommand was asked for");
+        assert_eq!(args.run.iterations, 5);
+
+        let cli = Cli::try_parse_from([
+            "captastic",
+            "benchmark",
+            "compare",
+            "a.json",
+            "b.json",
+            "--noise-percent",
+            "3",
+        ])
+        .expect("the compare form parses");
+        let Some(Command::Benchmark(args)) = cli.command else {
+            panic!("expected a benchmark command");
+        };
+        let Some(BenchmarkCommand::Compare {
+            baseline,
+            candidate,
+            json,
+            noise_percent,
+        }) = args.command
+        else {
+            panic!("expected a compare subcommand");
+        };
+        assert_eq!(baseline, Path::new("a.json"));
+        assert_eq!(candidate, Path::new("b.json"));
+        assert!(!json);
+        assert!((noise_percent - 3.0).abs() < f64::EPSILON);
+
+        // The default noise floor sits just above the run-to-run spread this host has measured.
+        let cli = Cli::try_parse_from(["captastic", "benchmark", "compare", "a.json", "b.json"])
+            .expect("compare without a noise floor");
+        let Some(Command::Benchmark(args)) = cli.command else {
+            panic!("expected a benchmark command");
+        };
+        let Some(BenchmarkCommand::Compare { noise_percent, .. }) = args.command else {
+            panic!("expected a compare subcommand");
+        };
+        assert!((noise_percent - 7.0).abs() < f64::EPSILON);
+
+        // Run flags and the subcommand are mutually exclusive rather than silently ignored.
+        assert!(
+            Cli::try_parse_from([
+                "captastic",
+                "benchmark",
+                "--iterations",
+                "5",
+                "compare",
+                "a.json",
+                "b.json",
+            ])
+            .is_err(),
+            "a run flag beside `compare` would do nothing and must not be accepted"
+        );
     }
 
     #[test]

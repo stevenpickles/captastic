@@ -124,7 +124,7 @@ pub struct RunCompatibility {
 }
 
 impl RunCompatibility {
-    fn of(report: &BenchmarkReport) -> Self {
+    pub(crate) fn of(report: &BenchmarkReport) -> Self {
         Self {
             backend: report.backend.clone(),
             mode: report.mode.clone(),
@@ -171,7 +171,7 @@ impl RunCompatibility {
     }
 
     /// Names every field that differs, so a refusal to compare says what to fix.
-    fn differences(&self, other: &Self) -> Vec<String> {
+    pub(crate) fn differences(&self, other: &Self) -> Vec<String> {
         let mut differences = Vec::new();
         let mut note = |field: &str, first: String, second: String| {
             if first != second {
