@@ -143,8 +143,13 @@ close request — and by nothing else:
   appearance does;
 - the two new Options rows and the **View** row rendering, greyed or otherwise, and the menu's new
   height on screen;
-- pressing **F**, a video stopping and resuming, and the **FROZEN · pixels from hotkey press** tag —
-  including whether the bundled font renders its middle dot;
+- a video stopping and resuming across the **F** toggle. Pressing **F** itself was watched on
+  2026-09-17 against build `0.2.0-dev.479`, and it is what found the one defect this release's
+  overlay work has had on a screen: the frozen view came up with see-through chrome and skewed
+  colours, because the compositor did not treat the layered window as opaque; the frozen view now
+  forces every pixel opaque before it is presented, and after that change the frozen view, its dim,
+  outline, handles, badge, toolbar, and the **FROZEN · pixels from hotkey press** tag all rendered
+  as intended;
 - a confirmation of any kind through a running daemon, and therefore the new `preview_mode`,
   `capture_anchor`, and `view_switched` JSON from a real capture;
 - either new preference surviving a daemon restart end to end;
