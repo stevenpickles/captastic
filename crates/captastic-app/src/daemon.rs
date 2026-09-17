@@ -1834,6 +1834,20 @@ fn open_logs_from_tray() {
 #[cfg(windows)]
 const FILE_OUTPUT_TOGGLE_STOP_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// The detach standing in the way of starting a file destination, if one is.
+///
+/// Takes the ledger rather than reading the process-wide one, so this can be exercised against a
+/// ledger a test owns instead of against a number every other test in the binary shares.
+#[cfg(windows)]
+fn detached_file_output_blocking_start(
+    ledger: &captastic_core::DetachLedger,
+) -> Option<captastic_core::DetachCount> {
+    let count = ledger.count(captastic_core::DetachKind::FileOutputWorker);
+    count
+        .at_ceiling(captastic_core::DetachKind::FileOutputWorker)
+        .then_some(count)
+}
+
 /// Starts or stops writing captures to disk, and remembers which the user chose.
 ///
 /// Runs on the daemon thread, never the capture thread: starting the worker validates the
@@ -1878,6 +1892,28 @@ fn toggle_file_output_from_tray(
         // A click that arrived while the daemon is winding down. Starting a worker now would
         // spawn a thread the teardown has already walked past.
         log::info!("ignoring a request to save captures to disk during shutdown");
+        return;
+    } else if let Some(detached) =
+        detached_file_output_blocking_start(captastic_core::process_detach_ledger())
+    {
+        // A previous worker missed its deadline and was left running. It may still be writing
+        // into the output directory, and a second worker there would race it for names. Refused
+        // rather than queued: it is the user's click, it is not happening, and the item stays
+        // unchecked because the checkmark states where the next capture will go.
+        let message = format!(
+            "A previous file-output worker is still running after it was left behind at its deadline ({} of {} allowed, {} in this session). Captures can be saved again once it exits.",
+            detached.live,
+            captastic_core::DetachKind::FileOutputWorker.ceiling(),
+            detached.total
+        );
+        crate::logging::error(format_args!("refusing to start file output: {message}"));
+        if let Err(error) =
+            tray.show_error_with_title("Captastic could not save captures to disk", message)
+        {
+            crate::logging::warn(format_args!(
+                "failed to surface a refused file-output start in the notification area: {error}"
+            ));
+        }
         return;
     } else {
         match start_file_output(args) {
@@ -3242,6 +3278,32 @@ fn ns_to_ms(ns: u64) -> f64 {
 
 #[cfg(all(test, windows))]
 mod tests {
+    #[test]
+    fn a_detached_file_worker_blocks_the_next_one_until_it_returns() {
+        // The ceiling exists because a detached worker may still be writing into the output
+        // directory. Two workers there would race each other for names, which is exactly what
+        // the no-clobber write cannot protect against — it refuses to replace a file, so the
+        // loser of the race abandons a capture the user asked for.
+        use captastic_core::{DetachKind, DetachLedger};
+
+        let ledger = DetachLedger::new();
+        assert!(
+            super::detached_file_output_blocking_start(&ledger).is_none(),
+            "nothing is detached on a healthy daemon"
+        );
+
+        let detached = ledger.detached(DetachKind::FileOutputWorker);
+        let blocking = super::detached_file_output_blocking_start(&ledger)
+            .expect("a detached worker blocks the next one");
+        assert_eq!(blocking, detached);
+        assert_eq!(blocking.live, 1);
+
+        // The wedged write finishes and the thread exits: the slot is free and the next click
+        // starts a worker again, rather than the daemon refusing for the rest of the run.
+        ledger.rejoined(DetachKind::FileOutputWorker);
+        assert!(super::detached_file_output_blocking_start(&ledger).is_none());
+    }
+
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
