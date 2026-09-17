@@ -970,11 +970,11 @@ impl Drop for WindowRenderPermit<'_> {
 /// Both backends must crop the same `content` rectangle and rebuild the same border ring around
 /// it, or the same window comes out with different margins depending on which one ran, and the
 /// overlay preview lands a border width away from the frame that is finally published.
-struct WindowGeometry {
+pub(crate) struct WindowGeometry {
     /// `GetWindowRect`: the whole window, including the invisible resize frame around it.
     window: Rect,
     /// The DWM extended frame bounds clipped to `window`: the window as the user sees it.
-    frame: Rect,
+    pub(crate) frame: Rect,
     /// `frame` inset by `border_thickness`: the pixels copied out of a render.
     content: Rect,
     /// The width of the visible DWM border, rebuilt synthetically around `content`.
@@ -995,7 +995,11 @@ impl WindowGeometry {
     }
 }
 
-fn window_geometry(hwnd: HWND, window: Rect) -> WindowGeometry {
+/// The rectangles a window capture — and the region tool's edge snapping — are derived from.
+///
+/// Read-only Win32/DWM queries against a foreign window: `DwmGetWindowAttribute` reads compositor
+/// state rather than sending a message, so this is safe to call from inside window enumeration.
+pub(crate) fn window_geometry(hwnd: HWND, window: Rect) -> WindowGeometry {
     let mut native = RECT::default();
     // SAFETY: hwnd is a live top-level window and native is writable for the exact RECT size.
     let result = unsafe {

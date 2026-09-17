@@ -12,6 +12,7 @@ use windows::Win32::Foundation::POINT;
 use captastic_core::Rect;
 
 use super::layout::{DisplayEnvironment, ToolbarControl, ToolbarLayout, UiMetrics};
+use super::snap::SnapTargets;
 use super::{NativeWindowHandle, SelectionKind, WindowCandidate};
 
 pub(super) const DRAG_THRESHOLD: i32 = 4;
@@ -106,11 +107,24 @@ pub(super) struct OverlayModel {
     /// The window-chooser candidate under the pointer. The shell owns the thumbnail
     /// inventory and supplies hit results through inputs; the machine owns the decision.
     pub(super) hovered: Option<WindowCandidate>,
+    /// Whether the region tool pulls edges onto nearby window, work-area and display edges.
+    pub(super) snap_to_windows: bool,
+    /// The edge inventory to snap against, once the shell has built it.
+    ///
+    /// Built at most once per run and deliberately never refreshed: enumerating windows is the
+    /// expensive part of opening the chooser, and doing it again on every pointer move to catch a
+    /// window that moved while the overlay was up would cost far more than the staleness is worth.
+    /// `None` means "not asked for yet", which is why it is not simply an empty inventory.
+    pub(super) snap_targets: Option<SnapTargets>,
 }
 
 /// A translated window message. The shell decodes `LPARAM`/`WPARAM`/message identity; the
 /// machine never sees Win32 encodings.
-#[derive(Clone, Copy, Debug)]
+///
+/// `Clone` but not `Copy`: [`OverlayInput::SnapTargetsReady`] carries an owned inventory, which is
+/// the point — the shell enumerates windows inside an effect handler and hands the result back as
+/// a value, so the machine still never performs a query of its own.
+#[derive(Clone, Debug)]
 pub(super) enum OverlayInput {
     /// Pointer moved to a screen-space point. Under the Window tool the shell resolves the
     /// thumbnail under the pointer (it owns the inventory) and passes the candidate along.
@@ -134,6 +148,8 @@ pub(super) enum OverlayInput {
     /// The shell finished a requested window-preview update: `rect` is the captured frame's
     /// source rectangle when a ready preview now backs the selected window, `None` otherwise.
     WindowPreviewResolved { rect: Option<Rect> },
+    /// The shell finished the enumeration requested by [`OverlayEffect::BuildSnapTargets`].
+    SnapTargetsReady { targets: SnapTargets },
     /// Enter pressed.
     ConfirmRequested,
     /// Escape, right-click, or an external close request.
@@ -195,6 +211,10 @@ pub(super) enum OverlayEffect {
     /// renders batch by batch through posted messages so the pump stays live; the machine only
     /// decides when a build is wanted.
     BuildWindowOverview,
+    /// Enumerate windows and feed their visible frames back as
+    /// [`OverlayInput::SnapTargetsReady`]. Emitted once per run, the first time the region tool
+    /// could need an edge to snap to, so a run that never draws a region never pays for it.
+    BuildSnapTargets,
     /// Capture (or retry) the preview for the given window and feed the outcome back as
     /// [`OverlayInput::WindowPreviewResolved`]. Synchronous and blocking in the shell today
     /// (M21); the non-sticky retry semantics live in the shell's preview cache.
@@ -222,6 +242,12 @@ pub(super) fn transition(model: &mut OverlayModel, input: OverlayInput) -> Vec<O
         } => pointer_moved(model, point, window_hover),
         OverlayInput::PointerDown { point, window_slot } => pointer_down(model, point, window_slot),
         OverlayInput::WindowPreviewResolved { rect } => window_preview_resolved(model, rect),
+        OverlayInput::SnapTargetsReady { targets } => {
+            model.snap_targets = Some(targets);
+            // Nothing visible changed: the inventory is requested before the first pointer move
+            // that could use it, and that move repaints on its own.
+            Vec::new()
+        }
         OverlayInput::PointerUp { point } => pointer_up(model, point),
         OverlayInput::DoubleClicked { point } => double_clicked(model, point),
         OverlayInput::PointerCaptureLost => pointer_capture_lost(model),
@@ -366,6 +392,9 @@ fn pointer_down(
         CaptureTool::FullDisplay => return vec![OverlayEffect::Invalidate],
         CaptureTool::Region => {}
     }
+    // The press that starts any region adjustment is the last moment the inventory can be built
+    // without the user waiting on it mid-drag, and the first moment it is certainly wanted.
+    let mut effects: Vec<OverlayEffect> = request_snap_targets(model).into_iter().collect();
     let existing_region = (model.selection_kind == Some(SelectionKind::Region))
         .then_some(model.selection)
         .flatten();
@@ -378,11 +407,11 @@ fn pointer_down(
         model.hovered_handle = Some(handle);
         model.anchor = None;
         model.dragging = false;
-        vec![
+        effects.extend([
             OverlayEffect::SetCursor(CursorIntent::Resize(handle)),
             OverlayEffect::CapturePointer,
             OverlayEffect::Invalidate,
-        ]
+        ]);
     } else if existing_region.is_some_and(|selection| contains(selection, point)) {
         model.moving_region = existing_region.map(|original| MoveDrag {
             original,
@@ -391,11 +420,11 @@ fn pointer_down(
         model.anchor = None;
         model.dragging = false;
         model.hovered_handle = None;
-        vec![
+        effects.extend([
             OverlayEffect::SetCursor(CursorIntent::Move),
             OverlayEffect::CapturePointer,
             OverlayEffect::Invalidate,
-        ]
+        ]);
     } else {
         model.anchor = Some(point);
         model.dragging = false;
@@ -406,13 +435,25 @@ fn pointer_down(
         model.selected_window = None;
         model.hovered_handle = None;
         model.hovered = None;
-        vec![
+        effects.extend([
             OverlayEffect::ClearDimensionLabel,
             OverlayEffect::SetCursor(CursorIntent::Crosshair),
             OverlayEffect::CapturePointer,
             OverlayEffect::Invalidate,
-        ]
+        ]);
     }
+    effects
+}
+
+/// Asks the shell for the snap inventory the first time the region tool could use one.
+///
+/// Guarded on all three conditions rather than only on the tool: enumeration is the expensive part
+/// of opening the chooser, and a run with snapping switched off, or one that never leaves the
+/// full-display tool, must not pay for it. Once built it is never rebuilt — see
+/// [`OverlayModel::snap_targets`].
+fn request_snap_targets(model: &OverlayModel) -> Option<OverlayEffect> {
+    (model.snap_to_windows && model.tool == CaptureTool::Region && model.snap_targets.is_none())
+        .then_some(OverlayEffect::BuildSnapTargets)
 }
 
 fn toolbar_control_pressed(
@@ -536,6 +577,7 @@ pub(super) fn activate_tool(model: &mut OverlayModel, tool: CaptureTool) -> Vec<
         }
         CaptureTool::Region => {}
     }
+    effects.extend(request_snap_targets(model));
     if tool != CaptureTool::Window {
         effects.push(OverlayEffect::HideLiveThumbnails);
     }
@@ -928,6 +970,8 @@ mod tests {
             hovered_control: None,
             pointer_local: None,
             hovered: None,
+            snap_to_windows: true,
+            snap_targets: Some(SnapTargets::default()),
         }
     }
 
@@ -1556,9 +1600,7 @@ mod tests {
                 model.selection_kind = kind;
                 model.last_region = Some(region);
                 model.options_open = true;
-                model.hovered = Some(WindowCandidate {
-                    handle: NativeWindowHandle::from_raw(0x42),
-                });
+                model.hovered = Some(candidate(0x42));
 
                 let effects = activate_tool(&mut model, to);
                 let changed = from != to;
@@ -1817,6 +1859,12 @@ mod tests {
     fn candidate(raw: isize) -> WindowCandidate {
         WindowCandidate {
             handle: NativeWindowHandle::from_raw(raw),
+            frame: Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
         }
     }
 
@@ -2046,6 +2094,66 @@ mod tests {
     }
 
     #[test]
+    fn the_snap_inventory_is_requested_once_and_only_where_it_could_be_used() {
+        // A region press with no inventory yet asks for one.
+        let mut model = region_model();
+        model.snap_targets = None;
+        let effects = transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point: point(100, 100),
+                window_slot: None,
+            },
+        );
+        assert!(has_effect(&effects, |e| matches!(
+            e,
+            OverlayEffect::BuildSnapTargets
+        )));
+
+        // The shell answers, and no later press asks again: enumeration is the expensive part of
+        // opening the chooser and a drag must not repeat it.
+        let effects = transition(
+            &mut model,
+            OverlayInput::SnapTargetsReady {
+                targets: SnapTargets::default(),
+            },
+        );
+        assert!(effects.is_empty(), "nothing visible changed");
+        assert!(model.snap_targets.is_some());
+        let effects = transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point: point(400, 400),
+                window_slot: None,
+            },
+        );
+        assert!(!has_effect(&effects, |e| matches!(
+            e,
+            OverlayEffect::BuildSnapTargets
+        )));
+
+        // Switching to Region asks for it; the other tools never do, and neither does a run with
+        // snapping switched off.
+        for (tool, snap, expected) in [
+            (CaptureTool::Region, true, true),
+            (CaptureTool::Region, false, false),
+            (CaptureTool::FullDisplay, true, false),
+            (CaptureTool::Window, true, false),
+        ] {
+            let mut model = region_model();
+            model.tool = CaptureTool::FullDisplay;
+            model.snap_targets = None;
+            model.snap_to_windows = snap;
+            let effects = activate_tool(&mut model, tool);
+            assert_eq!(
+                has_effect(&effects, |e| matches!(e, OverlayEffect::BuildSnapTargets)),
+                expected,
+                "{tool:?} snap={snap}"
+            );
+        }
+    }
+
+    #[test]
     fn close_is_always_the_final_effect() {
         let inputs = [
             OverlayInput::ConfirmRequested,
@@ -2064,7 +2172,7 @@ mod tests {
                 height: 50,
             });
             model.selection_kind = Some(SelectionKind::Region);
-            let effects = transition(&mut model, input);
+            let effects = transition(&mut model, input.clone());
             if let Some(position) = effects
                 .iter()
                 .position(|effect| matches!(effect, OverlayEffect::Close(_)))

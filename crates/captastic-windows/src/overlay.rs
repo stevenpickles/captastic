@@ -12,6 +12,7 @@ mod layout;
 mod machine;
 mod raster;
 mod shell;
+mod snap;
 mod window_enumeration;
 
 use layout::{
@@ -33,6 +34,7 @@ use shell::{
     set_move_cursor, ClassRegistration, FrozenSurface, PrivateFontResource, RegionCursor,
     ThreadDpiContext, REGION_CURSOR_CENTER,
 };
+use snap::{SnapTarget, SnapTargetKind, SnapTargets};
 use window_enumeration::{enumerate_visible_windows, WindowCandidate};
 
 #[cfg(test)]
@@ -539,6 +541,8 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
             hovered_control: None,
             pointer_local: None,
             hovered: None,
+            snap_to_windows: true,
+            snap_targets: None,
         },
         overlay_hwnd: HWND(0),
         live_preview: preview_source.is_live(),
@@ -1470,6 +1474,23 @@ fn apply_overlay_effects(
                 let state = unsafe { &mut *state_pointer };
                 start_window_overview_build(hwnd, state);
             }
+            OverlayEffect::BuildSnapTargets => {
+                // Enumeration happens here, in an effect handler, and never inside the machine:
+                // the model borrow taken for the transition has already ended, so the Win32 calls
+                // below cannot observe a live `&mut` of the state. The same shape as
+                // UpdateWindowPreview -> WindowPreviewResolved.
+                let targets = {
+                    // SAFETY: The borrow ends before the feedback transition derives its own.
+                    let state = unsafe { &mut *state_pointer };
+                    build_snap_targets(state)
+                };
+                // SAFETY: The Box remains alive; this borrow ends at the semicolon.
+                let effects = transition(
+                    unsafe { &mut (*state_pointer).model },
+                    OverlayInput::SnapTargetsReady { targets },
+                );
+                apply_overlay_effects(hwnd, state_pointer, effects);
+            }
             OverlayEffect::UpdateWindowPreview { window } => {
                 let rect = {
                     // The 700 ms blocking capture attempt stays synchronous here (M21); the
@@ -1923,7 +1944,23 @@ fn ensure_window_mode_assets(state: &mut OverlayState) {
     if state.window_assets_ready {
         return;
     }
-    if state.windows.is_none() {
+    ensure_window_inventory(state);
+    let reusable = state.cached_blurred_background.take();
+    state.blurred_background = build_blurred_background(&state.surface, 24, reusable).ok();
+    state.window_assets_ready = true;
+}
+
+/// Enumerates the capturable windows on this display, once per run.
+///
+/// Split out of [`ensure_window_mode_assets`] because the region tool needs the same inventory
+/// for edge snapping and emphatically does not need the blurred chooser backdrop that used to
+/// come with it — building that costs a full-display downscale the region tool would never look
+/// at. Whichever tool asks first pays; the other then finds the list already there.
+fn ensure_window_inventory(state: &mut OverlayState) {
+    if state.windows.is_some() {
+        return;
+    }
+    {
         let displays = match crate::dxgi::enumerate_displays() {
             Ok(displays)
                 if displays
@@ -1963,9 +2000,89 @@ fn ensure_window_mode_assets(state: &mut OverlayState) {
             },
         );
     }
-    let reusable = state.cached_blurred_background.take();
-    state.blurred_background = build_blurred_background(&state.surface, 24, reusable).ok();
-    state.window_assets_ready = true;
+}
+
+/// The ordered edge inventory the region tool snaps against, built once per run.
+///
+/// Windows come first, in the front-to-back order `EnumWindows` reports, so the topmost window
+/// wins a distance tie; then the work area (the taskbar's inner edge, which is where a region
+/// meant to exclude the taskbar belongs); then the display itself, last, so it can only ever win
+/// when nothing else is in reach. Every frame is clipped to the captured display, because an edge
+/// off the side of it is not an edge the user can put a region on.
+fn build_snap_targets(state: &mut OverlayState) -> SnapTargets {
+    let started = Instant::now();
+    ensure_window_inventory(state);
+    let source = state.model.source;
+    // The work area arrives overlay-local (it is measured against the captured display's origin);
+    // every other target here is in desktop coordinates.
+    let work_area = state.model.display_environment.work_area;
+    let work_area = Rect::from_edges(
+        i64::from(work_area.left) + i64::from(source.x),
+        i64::from(work_area.top) + i64::from(source.y),
+        i64::from(work_area.right) + i64::from(source.x),
+        i64::from(work_area.bottom) + i64::from(source.y),
+    );
+    let targets = snap_targets_from(
+        state
+            .windows
+            .iter()
+            .flatten()
+            .map(|candidate| candidate.frame),
+        work_area,
+        source,
+    );
+    log::debug!(
+        "region snap inventory for display {}: {} targets in {} ns",
+        state.reference_metadata.display_id.0,
+        targets.len(),
+        duration_ns(started.elapsed()),
+    );
+    if log::log_enabled!(log::Level::Trace) {
+        for target in targets.iter() {
+            log::trace!(
+                "snap target kind={:?} rect={}x{}{:+}{:+}",
+                target.kind,
+                target.rect.width,
+                target.rect.height,
+                target.rect.x,
+                target.rect.y,
+            );
+        }
+    }
+    targets
+}
+
+/// Assembles the inventory from geometry alone, so the ordering rule that the whole tie-break
+/// rests on is testable without a desktop.
+fn snap_targets_from(
+    frames: impl IntoIterator<Item = Rect>,
+    work_area: Option<Rect>,
+    source: Rect,
+) -> SnapTargets {
+    let mut targets: Vec<SnapTarget> = frames
+        .into_iter()
+        .filter_map(|frame| frame.intersection(source))
+        .map(|rect| SnapTarget {
+            rect,
+            kind: SnapTargetKind::Window,
+        })
+        .collect();
+    // A work area equal to the display carries no edge the display does not already carry, and
+    // listing it twice would only make a duplicate line appear under the guide.
+    if let Some(rect) = work_area
+        .and_then(|rect| rect.intersection(source))
+        .filter(|rect| *rect != source)
+    {
+        targets.push(SnapTarget {
+            rect,
+            kind: SnapTargetKind::WorkArea,
+        });
+    }
+    targets.push(SnapTarget {
+        rect: source,
+        kind: SnapTargetKind::Display,
+    });
+    SnapTargets::new(targets)
 }
 
 fn fallback_display_info(state: &OverlayState) -> DisplayInfo {
@@ -3472,6 +3589,76 @@ mod tests {
                 height: 30,
             })
         );
+    }
+
+    #[test]
+    fn the_snap_inventory_is_clipped_and_ordered_windows_work_area_display() {
+        let source = Rect {
+            x: -1920,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let on_display = Rect {
+            x: -1800,
+            y: 100,
+            width: 400,
+            height: 300,
+        };
+        let straddling = Rect {
+            x: -200,
+            y: 100,
+            width: 400,
+            height: 300,
+        };
+        let elsewhere = Rect {
+            x: 200,
+            y: 100,
+            width: 400,
+            height: 300,
+        };
+        let work_area = Rect {
+            x: -1920,
+            y: 0,
+            width: 1920,
+            height: 1040,
+        };
+        let targets =
+            snap_targets_from([on_display, straddling, elsewhere], Some(work_area), source);
+        let listed: Vec<_> = targets
+            .iter()
+            .map(|target| (target.kind, target.rect))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                // Enumeration order is z-order, and the inventory preserves it.
+                (SnapTargetKind::Window, on_display),
+                // Only the part on this display: an edge off the side of it is not an edge a
+                // region can be put on.
+                (
+                    SnapTargetKind::Window,
+                    Rect {
+                        x: -200,
+                        y: 100,
+                        width: 200,
+                        height: 300,
+                    }
+                ),
+                // `elsewhere` is on the other monitor entirely and is dropped.
+                (SnapTargetKind::WorkArea, work_area),
+                (SnapTargetKind::Display, source),
+            ]
+        );
+
+        // A work area identical to the display adds nothing but a duplicate guide.
+        let without = snap_targets_from([], Some(source), source);
+        assert_eq!(
+            without.iter().map(|target| target.kind).collect::<Vec<_>>(),
+            vec![SnapTargetKind::Display]
+        );
+        // The display is always present, so a run with no windows still snaps to the screen edge.
+        assert_eq!(snap_targets_from([], None, source).len(), 1);
     }
 
     #[test]
