@@ -120,6 +120,33 @@ pub(super) enum LoupeMode {
 }
 
 impl LoupeMode {
+    /// The mode a click on the Options row selects next. Three states cycle rather than toggle,
+    /// which keeps one row where two would otherwise be needed.
+    pub(super) const fn next(self) -> Self {
+        match self {
+            Self::Auto => Self::Key,
+            Self::Key => Self::Off,
+            Self::Off => Self::Auto,
+        }
+    }
+
+    /// The Options row's label, which states the current mode rather than the action.
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Zoom: Auto",
+            Self::Key => "Zoom: Hold Z",
+            Self::Off => "Zoom: Off",
+        }
+    }
+
+    pub(super) const fn to_config(self) -> captastic_config::RegionZoom {
+        match self {
+            Self::Auto => captastic_config::RegionZoom::Auto,
+            Self::Key => captastic_config::RegionZoom::Key,
+            Self::Off => captastic_config::RegionZoom::Off,
+        }
+    }
+
     pub(super) const fn from_config(mode: captastic_config::RegionZoom) -> Self {
         match mode {
             captastic_config::RegionZoom::Auto => Self::Auto,
@@ -380,6 +407,10 @@ pub(super) enum OverlayEffect {
     /// Persist the snap-to-window-edges preference. Global, not per display.
     PersistSnapPreference {
         enabled: bool,
+    },
+    /// Persist when the magnifier appears. Global, not per display.
+    PersistRegionZoom {
+        mode: LoupeMode,
     },
     /// Destroy the overlay window with the given outcome. Always the final effect.
     Close(CloseOutcome),
@@ -688,6 +719,16 @@ fn toolbar_control_pressed(
             effects.extend(request_snap_targets(model));
             effects.push(OverlayEffect::PersistSnapPreference {
                 enabled: model.snap_to_windows,
+            });
+        }
+        ToolbarControl::RegionZoom => {
+            model.loupe.mode = model.loupe.mode.next();
+            // The speed history belongs to the mode that was in force when it was gathered, and
+            // a magnifier that appeared the instant Off became Auto would be reacting to a
+            // pointer that has been parked over the menu.
+            model.loupe.forget_motion();
+            effects.push(OverlayEffect::PersistRegionZoom {
+                mode: model.loupe.mode,
             });
         }
         ToolbarControl::ClipboardDestination => {}
@@ -2088,6 +2129,11 @@ mod tests {
                 false,
             ),
             (
+                center(layout.region_zoom),
+                ToolbarControl::RegionZoom,
+                false,
+            ),
+            (
                 center(layout.clipboard_destination),
                 ToolbarControl::ClipboardDestination,
                 false,
@@ -2101,6 +2147,7 @@ mod tests {
                 expected,
                 ToolbarControl::DimBackground
                     | ToolbarControl::SnapToWindows
+                    | ToolbarControl::RegionZoom
                     | ToolbarControl::ClipboardDestination
                     | ToolbarControl::Cancel
             );
@@ -2407,6 +2454,47 @@ mod tests {
             e,
             OverlayEffect::BuildSnapTargets
         )));
+    }
+
+    #[test]
+    fn the_zoom_row_cycles_three_ways_persists_and_keeps_the_menu_open() {
+        let mut model = region_model();
+        model.options_open = true;
+        model.loupe.auto_visible = true;
+        let layout = layout_for(&model);
+        assert_eq!(model.loupe.mode, LoupeMode::Auto);
+
+        for expected in [LoupeMode::Key, LoupeMode::Off, LoupeMode::Auto] {
+            let effects = transition(
+                &mut model,
+                OverlayInput::PointerDown {
+                    point: center(layout.region_zoom),
+                    window_slot: None,
+                    time_ms: 0,
+                },
+            );
+            assert_eq!(model.loupe.mode, expected);
+            assert!(model.options_open, "the menu stays open for another press");
+            assert_eq!(model.hovered_control, Some(ToolbarControl::RegionZoom));
+            assert!(has_effect(&effects, |e| matches!(
+                e,
+                OverlayEffect::PersistRegionZoom { mode } if *mode == expected
+            )));
+            assert!(close_outcome(&effects).is_none());
+            // The pointer has been parked over the menu, and that history belongs to the mode
+            // that was in force when it was gathered.
+            assert!(!model.loupe.auto_visible, "{expected:?}");
+        }
+    }
+
+    #[test]
+    fn every_zoom_mode_survives_a_round_trip_through_the_stored_value() {
+        for mode in [LoupeMode::Auto, LoupeMode::Key, LoupeMode::Off] {
+            assert_eq!(LoupeMode::from_config(mode.to_config()), mode);
+            assert!(mode.label().starts_with("Zoom: "));
+        }
+        // Three presses return to where it started, so the row is never a dead end.
+        assert_eq!(LoupeMode::Auto.next().next().next(), LoupeMode::Auto);
     }
 
     #[test]

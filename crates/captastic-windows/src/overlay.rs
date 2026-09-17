@@ -246,6 +246,8 @@ pub enum OverlayUiUpdate {
     /// Whether the region tool snaps to window edges. Carries no display id: it is one answer for
     /// the whole installation, and a toggle made on one monitor applies on the next.
     SnapToWindows { enabled: bool },
+    /// When the region tool's magnifier appears. Global, for the same reason.
+    RegionZoom { mode: captastic_config::RegionZoom },
 }
 
 #[derive(Clone, Default)]
@@ -276,6 +278,7 @@ struct OverlayUiSink {
 struct LiveUiState {
     displays: BTreeMap<String, captastic_config::DisplayUiState>,
     snap_to_windows: Option<bool>,
+    region_zoom: Option<captastic_config::RegionZoom>,
 }
 
 impl OverlayController {
@@ -308,12 +311,17 @@ impl OverlayController {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let snap_to_windows = live_ui.snap_to_windows;
+        let region_zoom = live_ui.region_zoom;
         let mut remembered = *live_ui
             .displays
             .entry(display_id.to_owned())
             .or_insert(fallback);
+        // A global answers for every display, including one whose stored entry predates it.
         if let Some(enabled) = snap_to_windows {
             remembered.snap_to_windows = Some(enabled);
+        }
+        if let Some(mode) = region_zoom {
+            remembered.region_zoom = Some(mode);
         }
         remembered
     }
@@ -992,6 +1000,7 @@ impl OverlayUiSink {
 fn apply_overlay_ui_update(state: &mut LiveUiState, update: &OverlayUiUpdate) {
     match update {
         OverlayUiUpdate::SnapToWindows { enabled } => state.snap_to_windows = Some(*enabled),
+        OverlayUiUpdate::RegionZoom { mode } => state.region_zoom = Some(*mode),
         OverlayUiUpdate::Interaction {
             display_id,
             tool,
@@ -1694,6 +1703,15 @@ fn apply_overlay_effects(
                 let state = unsafe { &*state_pointer };
                 if let Some(sink) = state.ui_updates.as_ref() {
                     sink.submit(OverlayUiUpdate::SnapToWindows { enabled });
+                }
+            }
+            OverlayEffect::PersistRegionZoom { mode } => {
+                // SAFETY: Shared borrow released at the block's end.
+                let state = unsafe { &*state_pointer };
+                if let Some(sink) = state.ui_updates.as_ref() {
+                    sink.submit(OverlayUiUpdate::RegionZoom {
+                        mode: mode.to_config(),
+                    });
                 }
             }
             OverlayEffect::PersistInteraction { region } => {
@@ -3661,6 +3679,7 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
     let rows = [
         (ToolbarControl::DimBackground, layout.dim_background),
         (ToolbarControl::SnapToWindows, layout.snap_to_windows),
+        (ToolbarControl::RegionZoom, layout.region_zoom),
         (
             ToolbarControl::ClipboardDestination,
             layout.clipboard_destination,
@@ -3718,6 +3737,21 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
             bottom: layout.snap_to_windows.bottom,
         },
         SNAP_TO_WINDOWS_LABEL,
+        rgb(245, 245, 247),
+        TextAlignment::Left,
+        tokens.font_height,
+    );
+    // No checkmark: this row cycles through three states rather than being on or off, so its
+    // label states the current one and a tick beside it would only be ambiguous.
+    draw_text(
+        device,
+        UiRect {
+            left: layout.region_zoom.left + tokens.menu_text_offset,
+            top: layout.region_zoom.top,
+            right: layout.region_zoom.right - tokens.text_padding,
+            bottom: layout.region_zoom.bottom,
+        },
+        state.model.loupe.mode.label(),
         rgb(245, 245, 247),
         TextAlignment::Left,
         tokens.font_height,
@@ -4038,6 +4072,23 @@ mod tests {
         assert!(matches!(
             receiver.try_recv(),
             Ok(OverlayUiUpdate::SnapToWindows { enabled: false })
+        ));
+
+        // The zoom mode is the same kind of answer and takes the same route.
+        controller.submit_ui_update(OverlayUiUpdate::RegionZoom {
+            mode: captastic_config::RegionZoom::Key,
+        });
+        assert_eq!(
+            controller
+                .remembered_ui("another-monitor-never-seen-before", Default::default())
+                .region_zoom,
+            Some(captastic_config::RegionZoom::Key)
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(OverlayUiUpdate::RegionZoom {
+                mode: captastic_config::RegionZoom::Key
+            })
         ));
     }
 
@@ -5057,6 +5108,21 @@ mod tests {
                     SNAP_TO_WINDOWS_LABEL,
                     layout.snap_to_windows.width() - tokens.menu_text_offset - tokens.text_padding,
                     layout.snap_to_windows.height(),
+                ),
+                (
+                    machine::LoupeMode::Auto.label(),
+                    layout.region_zoom.width() - tokens.menu_text_offset - tokens.text_padding,
+                    layout.region_zoom.height(),
+                ),
+                (
+                    machine::LoupeMode::Key.label(),
+                    layout.region_zoom.width() - tokens.menu_text_offset - tokens.text_padding,
+                    layout.region_zoom.height(),
+                ),
+                (
+                    machine::LoupeMode::Off.label(),
+                    layout.region_zoom.width() - tokens.menu_text_offset - tokens.text_padding,
+                    layout.region_zoom.height(),
                 ),
                 (
                     "Copy to Clipboard",

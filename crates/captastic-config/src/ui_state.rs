@@ -322,6 +322,11 @@ impl UiStateStore {
         self.update(|state| state.snap_to_windows = Some(enabled))
     }
 
+    /// Records when the region tool's magnifier appears, for every display.
+    pub fn save_region_zoom(&self, mode: RegionZoom) -> Result<(), ConfigError> {
+        self.update(|state| state.region_zoom = Some(mode))
+    }
+
     pub fn save_display_confirmed_region(
         &self,
         display_id: &str,
@@ -804,15 +809,13 @@ last_capture_tool = \"window\"
         );
 
         store.save_snap_to_windows(false).expect("save the toggle");
+        store
+            .save_region_zoom(RegionZoom::Off)
+            .expect("save the zoom mode");
         for display in ["display-1", "a display this machine has never drawn on"] {
-            assert_eq!(
-                store
-                    .load_display_ui_state(display)
-                    .expect("load")
-                    .snap_to_windows,
-                Some(false),
-                "{display}"
-            );
+            let resolved = store.load_display_ui_state(display).expect("load");
+            assert_eq!(resolved.snap_to_windows, Some(false), "{display}");
+            assert_eq!(resolved.region_zoom, Some(RegionZoom::Off), "{display}");
         }
         // It survives beside per-display state rather than replacing it.
         store
@@ -828,6 +831,7 @@ last_capture_tool = \"window\"
         // Written as a plain global key, with the schema version untouched.
         let text = fs::read_to_string(&state_path).expect("read state");
         assert!(text.contains("snap_to_windows = false"), "{text}");
+        assert!(text.contains("region_zoom = \"off\""), "{text}");
         assert!(
             text.contains(&format!("schema_version = {STATE_SCHEMA_VERSION}")),
             "{text}"
