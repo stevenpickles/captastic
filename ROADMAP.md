@@ -541,12 +541,13 @@ Settled with Steven on 2026-10-15 and recorded in
 
 Each lands as its own pull request with a manual desktop checklist.
 
-1. **Pin a capture.** The `captastic-desktop-ui` thread, the frame copy, the widened toolbar and the
+1. **Pin a capture** (#105, checked on the desktop 2026-10-15). The `captastic-desktop-ui` thread, the frame copy, the widened toolbar and the
    shortcuts, and an always-on-top window showing a confirmed capture at its physical size, with
    move, close, opacity and click-through, plus **Close All Pins** and **Make Pins Clickable** in the
    notification area. First because it is the smallest end-to-end path through the new thread, frame
    ownership and window shell, with no editing model yet.
-2. **Editor shell, crop and redaction.** The editor window and model, crop adjustment, and
+2. **Editor shell, crop and redaction** (`feature/69/edit-crop-and-redact`, built on #105). The
+   editor window and model, crop adjustment, and
    destructive redaction (an opaque fill over the exported pixels, never a blur or a reversible
    layer), with the capture withheld until **Done** and then published through the destination set.
 3. **Shapes and highlights.** Arrows, rectangles and highlights on the editor model.
@@ -755,27 +756,25 @@ disposition are recorded in
 [docs/investigations.md](docs/investigations.md#the-2026-08-code-architecture-and-roadmap-review).
 The order below reflects what remains.
 
-1. Run #103's desktop check: two Chocolatey upgrades between builds that carry the relaunch, the
-   second with Captastic running, which should leave it running and unelevated.
-2. Build Milestone 6 slices 1 and 2 as [ADR 0010](docs/adr/0010-pinning-and-annotation.md) settles
-   them — pinning, then the editor with crop and redaction — each with its manual checklist. They
-   gate the 0.3.0 tag.
-3. Ship 0.3.0: the disposable-VM checklist (portable installer and upgrade relaunch included),
+1. Merge Milestone 6 slices 1 and 2 as [ADR 0010](docs/adr/0010-pinning-and-annotation.md) settles
+   them — pinning (checked on the desktop) and the editor with crop and redaction, once its manual
+   checklist passes. They gate the 0.3.0 tag. #103's upgrade relaunch was checked on 2026-10-15.
+2. Ship 0.3.0: the disposable-VM checklist (portable installer and upgrade relaunch included),
    release notes, the branch model, and the first Chocolatey community push. Milestone 6's
    remaining slices can follow as 0.3.x.
-4. Finish Milestone 5's evidence work, which is now measurement rather than code: the operator
+3. Finish Milestone 5's evidence work, which is now measurement rather than code: the operator
    claim runs from [benchmarks/README.md](benchmarks/README.md), after which the absolute budget
    ceilings can be set and a figure can be published. The sequence-marker workload and Milestone 3's
    window-capture backend trait stay deferred — the first needs a desk, a mouse and a rotatable
    display and gates no release claim; the second changes no user-visible contract.
-5. Complete Milestone 1 (multi-adapter composition and the hardware validation matrix) when the
+4. Complete Milestone 1 (multi-adapter composition and the hardware validation matrix) when the
    hardware is available; it needs a second adapter, not design.
-6. Settle the outstanding design decisions — latest-mode currency on an idle desktop,
+5. Settle the outstanding design decisions — latest-mode currency on an idle desktop,
    `fresh` + `virtual_desktop`, and control-event hardening. Milestone 4's two product questions are
    answered (ADR 0008), and the mouse-capture/software-KVM contract is settled in ADR 0009: each use
    takes the pointer source that answers its own question, and Captastic promises nothing about
    where a foreign owner has put the mouse.
-7. Cross-platform work (Milestone 7), the decision gate's other candidate, after Milestone 6.
+6. Cross-platform work (Milestone 7), the decision gate's other candidate, after Milestone 6.
 
 ### Lifecycle recovery: what the investigation settled
 
@@ -791,17 +790,13 @@ not reproduced on demand, is in
 
 ## Recommended next branch
 
-`feature/68/pin-a-capture`: Milestone 6 slice 1 as
-[ADR 0010](docs/adr/0010-pinning-and-annotation.md) describes it. In order: the
-`captastic-desktop-ui` thread and its registration with the worker registry; the deep copy of the
-confirmed frame; the pinned window itself; the widened toolbar with **Pin** and **Edit** (Edit
-greyed until slice 2) and **Shift+Enter**; the notification-area **Close All Pins** and **Make Pins
-Clickable**; and a test that pins the process-ID exclusion from the chooser and snapping. Its
-manual checklist covers 100 % and 200 % scaling, a pin surviving several further overlay runs, and a
-pin appearing in a display capture.
-
-Alongside it, #103's desktop check needs two upgrades between relaunch-carrying builds; the packages
-are in `dist`.
+The 0.3.0 release preparation, once slices 1 and 2 are merged: release notes covering the single
+executable, Save to Disk in the overlay, the upgrade relaunch, pinning and the editor (including the
+plain statement that only **Edit** withholds a capture), the disposable-VM checklist, and the
+release branch model. Slice 2's manual checklist comes first: the editor at 100 % and 150 %
+scaling, a crop and a redaction each published through **Done** to the clipboard and to disk, a
+cancelled edit leaving the clipboard as it was, an editor moved between displays of different
+scaling, and an editor left open when Captastic exits.
 
 FakeBackend fidelity keeps its leverage and is worth extending as gaps appear: much of Milestone 4
 shipped with daemon-side behaviour verified only by unit tests, because a second daemon cannot start

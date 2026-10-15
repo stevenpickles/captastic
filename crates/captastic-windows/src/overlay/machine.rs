@@ -2659,7 +2659,7 @@ mod tests {
 
     #[test]
     fn the_keyboard_cannot_reach_an_action_the_toolbar_greys() {
-        // Edit is greyed until the editor exists, and Pin in a run with no daemon behind it.
+        // Pin and Edit are both greyed in a run with no daemon behind it.
         let mut model = region_model_with_selection();
         let effects = transition(
             &mut model,
