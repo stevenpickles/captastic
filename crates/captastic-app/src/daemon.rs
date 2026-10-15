@@ -1321,6 +1321,25 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                         }
                     }
                 }
+                // The Options menu's Save to Disk row, acted on here because the worker registry
+                // and the destination set live on this thread. The request normally lands within
+                // a tick of the click, while the overlay is still open, so the confirmation that
+                // follows goes to the set as the user just left it; one confirmed inside that
+                // tick still goes to the set as it was.
+                if let Some(requested) = workers
+                    .selection()
+                    .and_then(crate::selection::SelectionWorker::take_file_output_request)
+                {
+                    set_file_output_enabled(
+                        &args,
+                        &mut workers,
+                        &destinations,
+                        tray.as_ref(),
+                        &mut last_persistence_notification,
+                        requested,
+                        "overlay",
+                    );
+                }
                 if let Some(worker) = workers.selection() {
                     while let Some(failure) = worker.try_recv_persistence_failure() {
                         if let Some(tray) = tray.as_ref() {
@@ -1410,12 +1429,15 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                 );
                             }
                             captastic_windows::TrayEvent::ToggleFileOutput => {
-                                toggle_file_output_from_tray(
+                                let requested = workers.file_output().is_none();
+                                set_file_output_enabled(
                                     &args,
                                     &mut workers,
                                     &destinations,
-                                    tray,
+                                    Some(tray),
                                     &mut last_persistence_notification,
+                                    requested,
+                                    "notification area",
                                 );
                             }
                             captastic_windows::TrayEvent::ToggleStartup => {
@@ -1718,6 +1740,12 @@ fn detached_file_output_blocking_start(
 
 /// Starts or stops writing captures to disk, and remembers which the user chose.
 ///
+/// One function behind two places the user can ask from - the notification area's item and the
+/// overlay's Options row - so the two cannot drift in what the setting means. Takes the state
+/// asked for rather than a toggle: the overlay reports where the user left the row, and that can
+/// already be the case if the notification area was used while the overlay was open, or if two
+/// clicks cancelled out. Such a request is satisfied by doing nothing.
+///
 /// Runs on the daemon thread, never the capture thread: starting the worker validates the
 /// filename template and creates the output directory, and stopping it joins a thread. Both are
 /// fine here and neither may ever sit on the capture path (ADR 0002).
@@ -1727,13 +1755,22 @@ fn detached_file_output_blocking_start(
 /// Disabling removes the sink first, so no capture is queued to a worker that is already
 /// stopping.
 #[cfg(windows)]
-fn toggle_file_output_from_tray(
+fn set_file_output_enabled(
     args: &ResolvedDaemonArgs,
     workers: &mut crate::worker_registry::WorkerRegistry,
     destinations: &crate::output::OutputDestinations,
-    tray: &captastic_windows::TrayIcon,
+    tray: Option<&captastic_windows::TrayIcon>,
     last_persistence_notification: &mut Option<String>,
+    requested: bool,
+    source: &'static str,
 ) {
+    if requested == workers.file_output().is_some() {
+        log::info!(
+            "captures are already {} saved to disk ({source})",
+            if requested { "being" } else { "not being" }
+        );
+        return;
+    }
     let enabled = if workers.file_output().is_some() {
         destinations.remove(crate::file_output::DESTINATION_NAME);
         let mut abandoned = 0_u64;
@@ -1760,10 +1797,10 @@ fn toggle_file_output_from_tray(
         // file output off is the one person who needs to know a capture was still in the queue.
         if abandoned > 0 {
             log::warn!(
-                "captures are no longer saved to disk (notification area); {abandoned} capture(s) were still queued and were not written"
+                "captures are no longer saved to disk ({source}); {abandoned} capture(s) were still queued and were not written"
             );
         } else {
-            log::info!("captures are no longer saved to disk (notification area)");
+            log::info!("captures are no longer saved to disk ({source})");
         }
         false
     } else if workers.is_shutting_down() {
@@ -1785,20 +1822,19 @@ fn toggle_file_output_from_tray(
             detached.total
         );
         crate::logging::error(format_args!("refusing to start file output: {message}"));
-        if let Err(error) =
-            tray.show_error_with_title("Captastic could not save captures to disk", message)
-        {
-            crate::logging::warn(format_args!(
-                "failed to surface a refused file-output start in the notification area: {error}"
-            ));
-        }
+        surface_in_tray(
+            tray,
+            "Captastic could not save captures to disk",
+            message,
+            "a refused file-output start",
+        );
         return;
     } else {
         match start_file_output(args) {
             Ok(worker) => {
                 destinations.insert(std::sync::Arc::new(worker.sink()));
                 log::info!(
-                    "saving captures to {} (notification area)",
+                    "saving captures to {} ({source})",
                     worker.directory().display()
                 );
                 workers.register_file_output(Some(worker));
@@ -1811,21 +1847,22 @@ fn toggle_file_output_from_tray(
                 // can fix.
                 let message = format!("Captastic could not start saving captures to disk. {error}");
                 crate::logging::warn(format_args!("{message}"));
-                if let Err(error) =
-                    tray.show_error_with_title("Captastic could not save captures to disk", message)
-                {
-                    crate::logging::warn(format_args!(
-                        "failed to surface a file-output start failure in the notification area: {error}"
-                    ));
-                }
+                surface_in_tray(
+                    tray,
+                    "Captastic could not save captures to disk",
+                    message,
+                    "a file-output start failure",
+                );
                 return;
             }
         }
     };
-    if let Err(error) = tray.set_file_output_enabled(enabled) {
-        crate::logging::warn(format_args!(
-            "file output changed but the tray menu did not update: {error}"
-        ));
+    if let Some(tray) = tray {
+        if let Err(error) = tray.set_file_output_enabled(enabled) {
+            crate::logging::warn(format_args!(
+                "file output changed but the tray menu did not update: {error}"
+            ));
+        }
     }
     if destinations.is_empty() {
         // Not refused. The user switched off the only destination this daemon had — a legitimate
@@ -1833,13 +1870,12 @@ fn toggle_file_output_from_tray(
         // declines is worse than one that does what it says and then says what it cost.
         let message = "Captures are no longer delivered anywhere: saving to disk is off and the clipboard is disabled in this configuration.".to_owned();
         crate::logging::warn(format_args!("{message}"));
-        if let Err(error) =
-            tray.show_error_with_title("Captastic has nowhere to put a capture", message)
-        {
-            crate::logging::warn(format_args!(
-                "failed to surface the empty-destination warning in the notification area: {error}"
-            ));
-        }
+        surface_in_tray(
+            tray,
+            "Captastic has nowhere to put a capture",
+            message,
+            "the empty-destination warning",
+        );
     } else {
         log::info!(
             "captures are now delivered to [{}]",
@@ -1860,7 +1896,7 @@ fn toggle_file_output_from_tray(
 fn persist_file_output_preference(
     args: &ResolvedDaemonArgs,
     enabled: bool,
-    tray: &captastic_windows::TrayIcon,
+    tray: Option<&captastic_windows::TrayIcon>,
     last_notification: &mut Option<String>,
 ) {
     // The profile this daemon is actually running on: an explicit `--config` path, or the default
@@ -1893,7 +1929,7 @@ fn persist_file_output_preference(
 #[cfg(windows)]
 fn notify_preference_not_saved(
     message: String,
-    tray: &captastic_windows::TrayIcon,
+    tray: Option<&captastic_windows::TrayIcon>,
     last_notification: &mut Option<String>,
 ) {
     crate::logging::warn(format_args!("{message}"));
@@ -1901,10 +1937,32 @@ fn notify_preference_not_saved(
         return;
     }
     *last_notification = Some(message.clone());
-    if let Err(error) = tray.show_error_with_title("Captastic preferences were not saved", message)
-    {
+    surface_in_tray(
+        tray,
+        "Captastic preferences were not saved",
+        message,
+        "a preference-persistence error",
+    );
+}
+
+/// Raises a balloon when there is a notification area to raise it in.
+///
+/// Every caller has already written the message to the log, so a daemon whose tray never started
+/// loses the balloon and nothing else. `what` names the balloon in the warning that says it could
+/// not be shown.
+#[cfg(windows)]
+fn surface_in_tray(
+    tray: Option<&captastic_windows::TrayIcon>,
+    title: &str,
+    message: String,
+    what: &str,
+) {
+    let Some(tray) = tray else {
+        return;
+    };
+    if let Err(error) = tray.show_error_with_title(title, message) {
         crate::logging::warn(format_args!(
-            "failed to surface a preference-persistence error in the notification area: {error}"
+            "failed to surface {what} in the notification area: {error}"
         ));
     }
 }

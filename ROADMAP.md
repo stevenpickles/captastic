@@ -356,7 +356,11 @@ capture critical path.
   writing into the output directory, starting file output again is refused — with the reason in the
   notification area — until its thread returns and gives the slot back. Captures queued when the
   destination stops are abandoned, but now named at warn level and counted rather than dropped
-  silently.
+  silently. Since v0.2.0 the overlay's **Options -> Save to Disk** row is the same switch reached
+  from inside a run: the request goes to the daemon thread, which applies it through the one
+  function the notification-area item uses, and the confirmation that follows is offered to the
+  destination set as the user just left it. The **Copy to Clipboard** row beside it now reports the
+  clipboard setting instead of an unconditional tick.
 
 ### Exit criteria
 

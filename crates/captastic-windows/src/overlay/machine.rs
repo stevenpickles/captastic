@@ -242,6 +242,17 @@ pub(super) struct OverlayModel {
     pub(super) toolbar_drag: Option<ToolbarDrag>,
     pub(super) options_open: bool,
     pub(super) dim_background: bool,
+    /// Whether the clipboard receives the capture. Stated by the Options menu, never switched
+    /// there: it is the destination a run is assumed to have, and turning it off is a
+    /// configuration-file decision the notification area does not offer either.
+    pub(super) clipboard_enabled: bool,
+    /// Whether captures are written to disk: as the daemon reported it when the run opened, then
+    /// as the user has asked for it since. The same setting as the notification area's
+    /// `Save Captures to Disk`, reachable from a second place.
+    pub(super) file_output_enabled: bool,
+    /// Whether this run has a daemon behind it that can act on a request to switch file output.
+    /// A one-shot capture has none, so its row states the destination rather than offering it.
+    pub(super) file_output_switchable: bool,
     pub(super) hovered_control: Option<ToolbarControl>,
     pub(super) pointer_local: Option<POINT>,
     /// The window-chooser candidate under the pointer. The shell owns the thumbnail
@@ -435,6 +446,12 @@ pub(super) enum OverlayEffect {
     /// Persist when the magnifier appears. Global, not per display.
     PersistRegionZoom {
         mode: LoupeMode,
+    },
+    /// Ask the daemon to turn file output on or off. Not a persistence effect: the daemon starts
+    /// or stops the file worker and records `output.enabled` itself, exactly as it does for the
+    /// notification-area item, so the two places cannot disagree about what the setting means.
+    RequestFileOutput {
+        enabled: bool,
     },
     /// Destroy the overlay window with the given outcome. Always the final effect.
     Close(CloseOutcome),
@@ -771,6 +788,18 @@ fn toolbar_control_pressed(
             effects.extend(toggle_view(model));
         }
         ToolbarControl::ClipboardDestination => {}
+        ToolbarControl::FileOutputDestination => {
+            // Optimistic: the checkmark flips at the click and the daemon acts afterwards. A start
+            // the daemon refuses (a written-off worker still holding the directory, an unwritable
+            // directory) is reported in the notification area, where the tray's own item is
+            // corrected; this run's row is not, and the next run opens on the truth.
+            if model.file_output_switchable {
+                model.file_output_enabled = !model.file_output_enabled;
+                effects.push(OverlayEffect::RequestFileOutput {
+                    enabled: model.file_output_enabled,
+                });
+            }
+        }
         ToolbarControl::Cancel => return cancel(model),
     }
     effects.push(OverlayEffect::SetCursor(CursorIntent::Arrow));
@@ -1634,6 +1663,9 @@ mod tests {
             toolbar_drag: None,
             options_open: false,
             dim_background: true,
+            clipboard_enabled: true,
+            file_output_enabled: false,
+            file_output_switchable: true,
             hovered_control: None,
             pointer_local: None,
             hovered: None,
@@ -2271,6 +2303,11 @@ mod tests {
                 ToolbarControl::ClipboardDestination,
                 false,
             ),
+            (
+                center(layout.file_output_destination),
+                ToolbarControl::FileOutputDestination,
+                false,
+            ),
             (center(layout.cancel), ToolbarControl::Cancel, true),
         ];
         for (local, expected, closes) in cases {
@@ -2282,6 +2319,7 @@ mod tests {
                     | ToolbarControl::SnapToWindows
                     | ToolbarControl::RegionZoom
                     | ToolbarControl::ClipboardDestination
+                    | ToolbarControl::FileOutputDestination
                     | ToolbarControl::Cancel
             );
             // Give the machine an active drag to prove every dispatch clears it.
@@ -2521,6 +2559,91 @@ mod tests {
             "the menu stays open for further toggles"
         );
         assert_eq!(model.hovered_control, Some(ToolbarControl::DimBackground));
+        assert!(close_outcome(&effects).is_none());
+    }
+
+    #[test]
+    fn the_save_to_disk_row_toggles_asks_the_daemon_and_keeps_the_menu_open() {
+        let mut model = region_model();
+        model.options_open = true;
+        let layout = layout_for(&model);
+        let press = || OverlayInput::PointerDown {
+            point: center(layout.file_output_destination),
+            window_slot: None,
+            time_ms: 0,
+        };
+
+        // Off when the run opened, so the first press asks for it on.
+        let effects = transition(&mut model, press());
+        assert!(model.file_output_enabled);
+        assert!(
+            model.options_open,
+            "the menu stays open for further toggles"
+        );
+        assert_eq!(
+            model.hovered_control,
+            Some(ToolbarControl::FileOutputDestination)
+        );
+        assert!(has_effect(&effects, |e| matches!(
+            e,
+            OverlayEffect::RequestFileOutput { enabled: true }
+        )));
+        assert!(close_outcome(&effects).is_none());
+
+        let effects = transition(&mut model, press());
+        assert!(!model.file_output_enabled);
+        assert!(has_effect(&effects, |e| matches!(
+            e,
+            OverlayEffect::RequestFileOutput { enabled: false }
+        )));
+    }
+
+    #[test]
+    fn the_save_to_disk_row_is_inert_without_a_daemon_to_act_on_it() {
+        let mut model = region_model();
+        model.options_open = true;
+        model.file_output_switchable = false;
+        let layout = layout_for(&model);
+
+        let effects = transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point: center(layout.file_output_destination),
+                window_slot: None,
+                time_ms: 0,
+            },
+        );
+        assert!(
+            !model.file_output_enabled,
+            "a stated destination does not flip"
+        );
+        assert!(!has_effect(&effects, |e| matches!(
+            e,
+            OverlayEffect::RequestFileOutput { .. }
+        )));
+        assert!(model.options_open);
+    }
+
+    #[test]
+    fn the_clipboard_row_is_stated_rather_than_switched() {
+        let mut model = region_model();
+        model.options_open = true;
+        let layout = layout_for(&model);
+
+        let effects = transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point: center(layout.clipboard_destination),
+                window_slot: None,
+                time_ms: 0,
+            },
+        );
+        assert!(model.clipboard_enabled);
+        assert!(model.options_open);
+        assert!(!has_effect(&effects, |e| matches!(
+            e,
+            OverlayEffect::RequestFileOutput { .. }
+        )));
         assert!(close_outcome(&effects).is_none());
     }
 

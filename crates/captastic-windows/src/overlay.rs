@@ -116,6 +116,10 @@ const UI_FONT_HEIGHT: i32 = 21;
 /// "Snap to Window Edges" would be plainer but measures 200 px against the 192 px a menu row has
 /// for text at 96 DPI, and widening the menu for one row is a worse trade than the shorter name.
 const SNAP_TO_WINDOWS_LABEL: &str = "Snap to Edges";
+/// The Options row for file output. Shorter than the notification area's "Save Captures to Disk"
+/// for the same reason as the snap row: the menu is 192 px wide for text at 96 DPI, and the menu
+/// already says these rows are about captures.
+const FILE_OUTPUT_LABEL: &str = "Save to Disk";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SelectionKind {
@@ -316,6 +320,32 @@ impl SelectionOutcome {
     }
 }
 
+/// Where a confirmed capture will be delivered, as the Options menu states it when a run opens.
+///
+/// The overlay does not deliver captures and does not decide where they go; it shows the answer
+/// the caller gives it and, for file output, relays a request to change it. The clipboard is
+/// stated only: there is no place in the product that switches it at runtime, and a row that
+/// offered to would be lying about what a click could do.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OverlayDestinations {
+    /// Whether the clipboard receives captures.
+    pub clipboard: bool,
+    /// Whether captures are written to disk, as it stands when the run opens.
+    pub file_output: bool,
+    /// Whether a daemon is behind this run to act on [`OverlayUiUpdate::FileOutput`]. False for a
+    /// one-shot capture, whose row states the destination and does not offer to change it.
+    pub file_output_switchable: bool,
+}
+
+impl OverlayDestinations {
+    /// The destinations a run without a daemon has: the clipboard, and nothing to switch.
+    pub const CLIPBOARD_ONLY: Self = Self {
+        clipboard: true,
+        file_output: false,
+        file_output_switchable: false,
+    };
+}
+
 #[derive(Clone, Debug)]
 pub enum OverlayUiUpdate {
     Interaction {
@@ -339,6 +369,10 @@ pub enum OverlayUiUpdate {
     SnapToWindows { enabled: bool },
     /// When the region tool's magnifier appears. Global, for the same reason.
     RegionZoom { mode: captastic_config::RegionZoom },
+    /// The user asked, from the Options menu, for captures to be saved to disk or not. Not a
+    /// UI preference: the receiver hands it to the daemon, which starts or stops the file worker
+    /// and records `output.enabled` exactly as it does for the notification-area item.
+    FileOutput { enabled: bool },
 }
 
 #[derive(Clone, Default)]
@@ -507,6 +541,7 @@ pub fn select_from_frozen_frame_with_initial_tool_and_ui(
         controller,
         initial_tool,
         remembered_ui,
+        OverlayDestinations::CLIPBOARD_ONLY,
         resources,
     )
 }
@@ -575,6 +610,7 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
     controller: &OverlayController,
     initial_tool: InitialSelectionTool,
     remembered_ui: Option<captastic_config::DisplayUiState>,
+    destinations: OverlayDestinations,
     resources: &mut OverlayResources,
 ) -> Result<SelectionOutcome, CaptureError> {
     let preparation_started = Instant::now();
@@ -709,6 +745,9 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
             toolbar_drag: None,
             options_open: false,
             dim_background: true,
+            clipboard_enabled: destinations.clipboard,
+            file_output_enabled: destinations.file_output,
+            file_output_switchable: destinations.file_output_switchable,
             hovered_control: None,
             pointer_local: None,
             hovered: None,
@@ -1152,6 +1191,9 @@ fn apply_overlay_ui_update(state: &mut LiveUiState, update: &OverlayUiUpdate) {
     match update {
         OverlayUiUpdate::SnapToWindows { enabled } => state.snap_to_windows = Some(*enabled),
         OverlayUiUpdate::RegionZoom { mode } => state.region_zoom = Some(*mode),
+        // Not UI state: the daemon owns the answer, and every run is told it afresh from the
+        // destination set rather than from what an earlier run asked for.
+        OverlayUiUpdate::FileOutput { .. } => {}
         OverlayUiUpdate::Interaction {
             display_id,
             tool,
@@ -1980,6 +2022,13 @@ fn apply_overlay_effects(
                     sink.submit(OverlayUiUpdate::RegionZoom {
                         mode: mode.to_config(),
                     });
+                }
+            }
+            OverlayEffect::RequestFileOutput { enabled } => {
+                // SAFETY: Shared borrow released at the block's end.
+                let state = unsafe { &*state_pointer };
+                if let Some(sink) = state.ui_updates.as_ref() {
+                    sink.submit(OverlayUiUpdate::FileOutput { enabled });
                 }
             }
             OverlayEffect::PersistInteraction { region } => {
@@ -4108,6 +4157,10 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
             ToolbarControl::ClipboardDestination,
             layout.clipboard_destination,
         ),
+        (
+            ToolbarControl::FileOutputDestination,
+            layout.file_output_destination,
+        ),
         (ToolbarControl::Cancel, layout.cancel),
     ];
     for (control, row) in rows {
@@ -4201,13 +4254,19 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
         TextAlignment::Left,
         tokens.font_height,
     );
-    draw_checkmark(
-        device,
-        layout.clipboard_destination.left + tokens.menu_check_offset,
-        (layout.clipboard_destination.top + layout.clipboard_destination.bottom) / 2,
-        rgb(86, 156, 255),
-        metrics,
-    );
+    // Both destination rows state where the confirmation will go. The clipboard row is greyed
+    // because nothing here can change it; the disk row is greyed only when the run has no daemon
+    // to hand the request to, and otherwise reads as the toggle it is - the same setting as the
+    // notification area's `Save Captures to Disk`.
+    if state.model.clipboard_enabled {
+        draw_checkmark(
+            device,
+            layout.clipboard_destination.left + tokens.menu_check_offset,
+            (layout.clipboard_destination.top + layout.clipboard_destination.bottom) / 2,
+            rgb(86, 156, 255),
+            metrics,
+        );
+    }
     draw_text(
         device,
         UiRect {
@@ -4218,6 +4277,32 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
         },
         "Copy to Clipboard",
         rgb(210, 210, 214),
+        TextAlignment::Left,
+        tokens.font_height,
+    );
+    if state.model.file_output_enabled {
+        draw_checkmark(
+            device,
+            layout.file_output_destination.left + tokens.menu_check_offset,
+            (layout.file_output_destination.top + layout.file_output_destination.bottom) / 2,
+            rgb(86, 156, 255),
+            metrics,
+        );
+    }
+    draw_text(
+        device,
+        UiRect {
+            left: layout.file_output_destination.left + tokens.menu_text_offset,
+            top: layout.file_output_destination.top,
+            right: layout.file_output_destination.right - tokens.text_padding,
+            bottom: layout.file_output_destination.bottom,
+        },
+        FILE_OUTPUT_LABEL,
+        if state.model.file_output_switchable {
+            rgb(245, 245, 247)
+        } else {
+            rgb(210, 210, 214)
+        },
         TextAlignment::Left,
         tokens.font_height,
     );
@@ -5717,6 +5802,13 @@ mod tests {
                         - tokens.menu_text_offset
                         - tokens.text_padding,
                     layout.clipboard_destination.height(),
+                ),
+                (
+                    FILE_OUTPUT_LABEL,
+                    layout.file_output_destination.width()
+                        - tokens.menu_text_offset
+                        - tokens.text_padding,
+                    layout.file_output_destination.height(),
                 ),
                 (
                     "Cancel Capture",
