@@ -39,7 +39,7 @@ impl OneShotUiStateWorker {
         let controller = captastic_windows::OverlayController::with_ui_updates(sender);
         let join = thread::Builder::new()
             .name("captastic-ui-state-once".to_owned())
-            .spawn(move || persist_ui_state(receiver, store, Some(failure_sender)))
+            .spawn(move || persist_ui_state(receiver, store, Some(failure_sender), None))
             .map_err(|error| AppError::BackendUnavailable(error.to_string()))?;
         Ok(Self {
             controller: Some(controller),
@@ -185,6 +185,8 @@ pub struct SelectionWorker {
     controller: Option<captastic_windows::OverlayController>,
     ui_sender: Option<mpsc::Sender<captastic_windows::OverlayUiUpdate>>,
     failure_receiver: mpsc::Receiver<String>,
+    /// Requests from the Options menu to save captures to disk or not, for the daemon to act on.
+    file_output_receiver: mpsc::Receiver<bool>,
     stop_requested: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
     ui_join: Option<JoinHandle<()>>,
@@ -203,11 +205,19 @@ impl SelectionWorker {
         let (sender, receiver) = mpsc::sync_channel::<SelectionJob>(queue_capacity);
         let (ui_sender, ui_receiver) = mpsc::channel();
         let (failure_sender, failure_receiver) = mpsc::channel();
+        let (file_output_sender, file_output_receiver) = mpsc::channel();
         let stop_requested = Arc::new(AtomicBool::new(false));
         let worker_stop_requested = stop_requested.clone();
         let ui_join = thread::Builder::new()
             .name("captastic-ui-state".to_owned())
-            .spawn(move || persist_ui_state(ui_receiver, ui_state_store, Some(failure_sender)))
+            .spawn(move || {
+                persist_ui_state(
+                    ui_receiver,
+                    ui_state_store,
+                    Some(failure_sender),
+                    Some(file_output_sender),
+                )
+            })
             .map_err(|error| AppError::BackendUnavailable(error.to_string()))?;
         let controller = captastic_windows::OverlayController::with_ui_updates(ui_sender.clone());
         let worker_controller = controller.clone();
@@ -276,11 +286,17 @@ impl SelectionWorker {
                         initial_view(job.preview_mode),
                         job.preview_mode == PreviewMode::Live,
                     );
+                    // Read at the moment the overlay opens rather than carried on the job: the
+                    // set can have changed between the press and the run, and the row states
+                    // where the confirmation will go, which is decided by the set at the
+                    // confirmation.
+                    let destinations = overlay_destinations(&destinations.names());
                     captastic_windows::select_from_preview_source_with_initial_tool_and_ui(
                         preview_source,
                         &worker_controller,
                         job.initial_tool,
                         Some(remembered_ui),
+                        destinations,
                         &mut overlay_resources,
                     )
                 };
@@ -707,6 +723,7 @@ impl SelectionWorker {
             controller: Some(controller),
             ui_sender: Some(ui_sender),
             failure_receiver,
+            file_output_receiver,
             stop_requested,
             join: Some(join),
             ui_join: Some(ui_join),
@@ -722,6 +739,13 @@ impl SelectionWorker {
 
     pub fn try_recv_persistence_failure(&self) -> Option<String> {
         self.failure_receiver.try_recv().ok()
+    }
+
+    /// Where an overlay run last asked file output to be, if a request arrived since the previous
+    /// poll. Later requests supersede earlier ones: the daemon acts on where the user left the
+    /// row, not on every click along the way.
+    pub fn take_file_output_request(&self) -> Option<bool> {
+        self.file_output_receiver.try_iter().last()
     }
 
     #[cfg(test)]
@@ -1072,10 +1096,23 @@ fn remember_confirmed_region(
     });
 }
 
+/// Where the overlay says a capture goes, from the destination set's names.
+///
+/// A daemon run is always switchable: the daemon is the thing that starts and stops the file
+/// worker, and it is listening for the request.
+fn overlay_destinations(names: &[&'static str]) -> captastic_windows::OverlayDestinations {
+    captastic_windows::OverlayDestinations {
+        clipboard: names.contains(&crate::clipboard::DESTINATION_NAME),
+        file_output: names.contains(&crate::file_output::DESTINATION_NAME),
+        file_output_switchable: true,
+    }
+}
+
 fn persist_ui_state(
     receiver: mpsc::Receiver<captastic_windows::OverlayUiUpdate>,
     store: captastic_config::UiStateStore,
     failure_sender: Option<mpsc::Sender<String>>,
+    file_output_requests: Option<mpsc::Sender<bool>>,
 ) {
     while let Ok(first) = receiver.recv() {
         let mut latest = BTreeMap::<(String, u8), captastic_windows::OverlayUiUpdate>::new();
@@ -1094,6 +1131,10 @@ fn persist_ui_state(
                 // the last toggle in a burst is the one the user left the menu on.
                 captastic_windows::OverlayUiUpdate::SnapToWindows { .. } => (String::new(), 3),
                 captastic_windows::OverlayUiUpdate::RegionZoom { .. } => (String::new(), 4),
+                // Not persisted here at all, but coalesced for the same reason: the daemon is
+                // asked for where the row ended up, and two clicks that put it back where it
+                // started become a request it can see is already satisfied.
+                captastic_windows::OverlayUiUpdate::FileOutput { .. } => (String::new(), 5),
             };
             coalesce_ui_update(&mut latest, key, update);
         }
@@ -1120,6 +1161,15 @@ fn persist_ui_state(
                 }
                 captastic_windows::OverlayUiUpdate::RegionZoom { mode } => {
                     store.save_region_zoom(mode)
+                }
+                captastic_windows::OverlayUiUpdate::FileOutput { enabled } => {
+                    // Handed to the daemon thread, which owns the file worker and the
+                    // destination set. A one-shot run has no daemon and no sender, and the
+                    // overlay was told not to offer the row in that case.
+                    if let Some(sender) = file_output_requests.as_ref() {
+                        let _ = sender.send(enabled);
+                    }
+                    Ok(())
                 }
             };
             if let Err(error) = result {
@@ -1479,7 +1529,7 @@ mod tests {
             .expect("queue update");
         drop(update_sender);
 
-        persist_ui_state(update_receiver, store, Some(failure_sender));
+        persist_ui_state(update_receiver, store, Some(failure_sender), None);
 
         let failure = failure_receiver
             .try_recv()
@@ -1499,12 +1549,59 @@ mod tests {
             controller: None,
             ui_sender: None,
             failure_receiver,
+            file_output_receiver: mpsc::channel().1,
             stop_requested: Arc::new(AtomicBool::new(false)),
             join: None,
             ui_join: None,
         };
 
         assert_eq!(worker.stop(), vec!["scripted shutdown failure".to_owned()]);
+    }
+
+    #[test]
+    fn file_output_requests_reach_the_daemon_as_the_last_word_in_a_burst() {
+        let (update_sender, update_receiver) = mpsc::channel();
+        let (request_sender, request_receiver) = mpsc::channel();
+        for enabled in [true, false, true] {
+            update_sender
+                .send(captastic_windows::OverlayUiUpdate::FileOutput { enabled })
+                .expect("queue update");
+        }
+        drop(update_sender);
+
+        // The store is never written: a file-output request is not UI state.
+        persist_ui_state(
+            update_receiver,
+            captastic_config::UiStateStore::at(
+                std::env::temp_dir().join("captastic-never-written-state.toml"),
+            ),
+            None,
+            Some(request_sender),
+        );
+
+        assert_eq!(request_receiver.try_iter().collect::<Vec<_>>(), vec![true]);
+    }
+
+    #[test]
+    fn the_overlay_is_told_the_destinations_by_name() {
+        let both = overlay_destinations(&[
+            crate::clipboard::DESTINATION_NAME,
+            crate::file_output::DESTINATION_NAME,
+        ]);
+        assert!(both.clipboard);
+        assert!(both.file_output);
+        let clipboard_only = overlay_destinations(&[crate::clipboard::DESTINATION_NAME]);
+        assert!(clipboard_only.clipboard);
+        assert!(!clipboard_only.file_output);
+        let nothing = overlay_destinations(&[]);
+        assert!(!nothing.clipboard);
+        assert!(!nothing.file_output);
+        for destinations in [both, clipboard_only, nothing] {
+            assert!(
+                destinations.file_output_switchable,
+                "a daemon run can always ask"
+            );
+        }
     }
 
     #[test]

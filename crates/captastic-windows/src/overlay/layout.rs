@@ -4,7 +4,7 @@ const TOOLBAR_WIDTH: i32 = 418;
 const TOOLBAR_HEIGHT: i32 = 56;
 const TOOLBAR_BOTTOM_MARGIN: i32 = 24;
 const MENU_WIDTH: i32 = 248;
-const MENU_HEIGHT: i32 = 252;
+const MENU_HEIGHT: i32 = 292;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ToolbarControl {
@@ -19,6 +19,7 @@ pub(super) enum ToolbarControl {
     RegionZoom,
     PreviewView,
     ClipboardDestination,
+    FileOutputDestination,
     Cancel,
 }
 
@@ -463,6 +464,7 @@ pub(super) struct ToolbarLayout {
     pub(super) region_zoom: UiRect,
     pub(super) preview_view: UiRect,
     pub(super) clipboard_destination: UiRect,
+    pub(super) file_output_destination: UiRect,
     pub(super) cancel: UiRect,
 }
 
@@ -618,11 +620,17 @@ impl ToolbarLayout {
                 right: row_right,
                 bottom: menu.top + metrics.px(206),
             },
-            cancel: UiRect {
+            file_output_destination: UiRect {
                 left: row_left,
                 top: menu.top + metrics.px(206),
                 right: row_right,
                 bottom: menu.top + metrics.px(246),
+            },
+            cancel: UiRect {
+                left: row_left,
+                top: menu.top + metrics.px(246),
+                right: row_right,
+                bottom: menu.top + metrics.px(286),
             },
             menu,
         }
@@ -644,6 +652,9 @@ impl ToolbarLayout {
             }
             if self.clipboard_destination.contains(point) {
                 return Some(ToolbarControl::ClipboardDestination);
+            }
+            if self.file_output_destination.contains(point) {
+                return Some(ToolbarControl::FileOutputDestination);
             }
             if self.cancel.contains(point) {
                 return Some(ToolbarControl::Cancel);
@@ -1041,10 +1052,10 @@ mod tests {
     #[test]
     fn compact_toolbar_scales_at_supported_dpi_levels() {
         for (dpi, expected_width, expected_height, expected_menu) in [
-            (96, 418, 56, (248, 252)),
-            (120, 523, 70, (310, 315)),
-            (144, 627, 84, (372, 378)),
-            (192, 836, 112, (496, 504)),
+            (96, 418, 56, (248, 292)),
+            (120, 523, 70, (310, 365)),
+            (144, 627, 84, (372, 438)),
+            (192, 836, 112, (496, 584)),
         ] {
             let environment = DisplayEnvironment {
                 work_area: UiRect {
@@ -1073,6 +1084,7 @@ mod tests {
                 layout.region_zoom,
                 layout.preview_view,
                 layout.clipboard_destination,
+                layout.file_output_destination,
                 layout.cancel,
             ];
             for row in rows {
