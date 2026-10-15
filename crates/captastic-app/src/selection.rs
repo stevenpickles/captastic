@@ -39,7 +39,7 @@ impl OneShotUiStateWorker {
         let controller = captastic_windows::OverlayController::with_ui_updates(sender);
         let join = thread::Builder::new()
             .name("captastic-ui-state-once".to_owned())
-            .spawn(move || persist_ui_state(receiver, store, Some(failure_sender), None))
+            .spawn(move || persist_ui_state(receiver, store, Some(failure_sender), None, None))
             .map_err(|error| AppError::BackendUnavailable(error.to_string()))?;
         Ok(Self {
             controller: Some(controller),
@@ -190,12 +190,15 @@ pub struct SelectionWorker {
     /// The desktop UI thread, started by the first Pin or Edit and stopped with this worker
     /// (ADR 0010).
     desktop_ui: Arc<Mutex<Option<captastic_windows::DesktopUi>>>,
+    /// The daemon's recordings, which the overlay's Record starts (ADR 0011).
+    recordings: Option<crate::recording::RecordingHost>,
     stop_requested: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
     ui_join: Option<JoinHandle<()>>,
 }
 
 impl SelectionWorker {
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         destinations: crate::output::OutputDestinations,
         capture_sender: mpsc::SyncSender<crate::daemon::CaptureCommand>,
@@ -204,8 +207,11 @@ impl SelectionWorker {
         queue_capacity: usize,
         confirmed_regions: ConfirmedRegionCache,
         ui_state_store: captastic_config::UiStateStore,
+        recordings: Option<crate::recording::RecordingHost>,
     ) -> Result<Self, AppError> {
         let (sender, receiver) = mpsc::sync_channel::<SelectionJob>(queue_capacity);
+        let worker_recordings = recordings.clone();
+        let persistence_recordings = recordings.clone();
         let (ui_sender, ui_receiver) = mpsc::channel();
         let (failure_sender, failure_receiver) = mpsc::channel();
         let (file_output_sender, file_output_receiver) = mpsc::channel();
@@ -221,6 +227,7 @@ impl SelectionWorker {
                     ui_state_store,
                     Some(failure_sender),
                     Some(file_output_sender),
+                    persistence_recordings,
                 )
             })
             .map_err(|error| AppError::BackendUnavailable(error.to_string()))?;
@@ -295,7 +302,12 @@ impl SelectionWorker {
                     // set can have changed between the press and the run, and the row states
                     // where the confirmation will go, which is decided by the set at the
                     // confirmation.
-                    let destinations = overlay_destinations(&destinations.names());
+                    let destinations = overlay_destinations(
+                        &destinations.names(),
+                        worker_recordings
+                            .as_ref()
+                            .map(crate::recording::RecordingHost::format),
+                    );
                     captastic_windows::select_from_preview_source_with_initial_tool_and_ui(
                         preview_source,
                         &worker_controller,
@@ -607,6 +619,28 @@ impl SelectionWorker {
                             window_application: selection.window_application.clone(),
                         };
                         match selection.intent {
+                            captastic_windows::ConfirmIntent::Record => {
+                                // Recorded over time instead of captured now (ADR 0011): the area
+                                // the overlay confirmed, on the display it was confirmed on. The
+                                // snapshot is not published; the recording's frames come fresh.
+                                let request = crate::recording::RecordingRequest {
+                                    capture_id: publication.capture_id,
+                                    display_id: selected_frame.metadata.display_id.clone(),
+                                    area: selection.rect,
+                                    window_title: publication.window_title.clone(),
+                                    window_application: publication.window_application.clone(),
+                                };
+                                drop(selected_frame);
+                                match worker_recordings.as_ref() {
+                                    Some(recordings) => {
+                                        recordings.start(request, &worker_desktop_ui);
+                                    }
+                                    None => log::warn!(
+                                        "capture {} asked to record with no recording host; nothing was recorded",
+                                        publication.capture_id.0
+                                    ),
+                                }
+                            }
                             captastic_windows::ConfirmIntent::Edit => {
                                 // Edit withholds the capture until the editor's Done, and then
                                 // publishes only what it made (ADR 0010): a secret that has
@@ -725,6 +759,7 @@ impl SelectionWorker {
             failure_receiver,
             file_output_receiver,
             desktop_ui,
+            recordings,
             stop_requested,
             join: Some(join),
             ui_join: Some(ui_join),
@@ -794,6 +829,11 @@ impl SelectionWorker {
 
     fn stop_inner(&mut self, deadline: Instant) {
         self.request_stop();
+        // A recording running when Captastic exits is finished, not discarded: stopped first, so
+        // it needs no more frames, and given the deadline to write its file.
+        if let Some(recordings) = self.recordings.as_ref() {
+            recordings.stop_before(deadline);
+        }
         // `request_stop` already dropped this side's update sender, so the UI-state thread is
         // winding down in parallel and only needs a moment to write once the selection thread
         // releases its own sender. Joining the selection thread against the full deadline could
@@ -1129,8 +1169,12 @@ fn remember_confirmed_region(
 ///
 /// A daemon run is always switchable: the daemon is the thing that starts and stops the file
 /// worker, and it is listening for the request.
-fn overlay_destinations(names: &[&'static str]) -> captastic_windows::OverlayDestinations {
+fn overlay_destinations(
+    names: &[&'static str],
+    record_format: Option<captastic_config::RecordingFormat>,
+) -> captastic_windows::OverlayDestinations {
     captastic_windows::OverlayDestinations {
+        record_format,
         clipboard: names.contains(&crate::clipboard::DESTINATION_NAME),
         file_output: names.contains(&crate::file_output::DESTINATION_NAME),
         file_output_switchable: true,
@@ -1373,6 +1417,7 @@ const fn confirm_intent(intent: captastic_windows::ConfirmIntent) -> &'static st
         captastic_windows::ConfirmIntent::Capture => "capture",
         captastic_windows::ConfirmIntent::Pin => "pin",
         captastic_windows::ConfirmIntent::Edit => "edit",
+        captastic_windows::ConfirmIntent::Record => "record",
     }
 }
 
@@ -1381,6 +1426,7 @@ fn persist_ui_state(
     store: captastic_config::UiStateStore,
     failure_sender: Option<mpsc::Sender<String>>,
     file_output_requests: Option<mpsc::Sender<bool>>,
+    recordings: Option<crate::recording::RecordingHost>,
 ) {
     while let Ok(first) = receiver.recv() {
         let mut latest = BTreeMap::<(String, u8), captastic_windows::OverlayUiUpdate>::new();
@@ -1403,6 +1449,7 @@ fn persist_ui_state(
                 // asked for where the row ended up, and two clicks that put it back where it
                 // started become a request it can see is already satisfied.
                 captastic_windows::OverlayUiUpdate::FileOutput { .. } => (String::new(), 5),
+                captastic_windows::OverlayUiUpdate::RecordingFormat { .. } => (String::new(), 6),
             };
             coalesce_ui_update(&mut latest, key, update);
         }
@@ -1436,6 +1483,14 @@ fn persist_ui_state(
                     // overlay was told not to offer the row in that case.
                     if let Some(sender) = file_output_requests.as_ref() {
                         let _ = sender.send(enabled);
+                    }
+                    Ok(())
+                }
+                captastic_windows::OverlayUiUpdate::RecordingFormat { format } => {
+                    // Not UI state either: the recording host applies it to the next recording
+                    // and writes it back as `recording.format`.
+                    if let Some(recordings) = recordings.as_ref() {
+                        recordings.set_format(format);
                     }
                     Ok(())
                 }
@@ -1797,7 +1852,7 @@ mod tests {
             .expect("queue update");
         drop(update_sender);
 
-        persist_ui_state(update_receiver, store, Some(failure_sender), None);
+        persist_ui_state(update_receiver, store, Some(failure_sender), None, None);
 
         let failure = failure_receiver
             .try_recv()
@@ -1819,6 +1874,7 @@ mod tests {
             failure_receiver,
             file_output_receiver: mpsc::channel().1,
             desktop_ui: Arc::new(Mutex::new(None)),
+            recordings: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
             join: None,
             ui_join: None,
@@ -1846,6 +1902,7 @@ mod tests {
             ),
             None,
             Some(request_sender),
+            None,
         );
 
         assert_eq!(request_receiver.try_iter().collect::<Vec<_>>(), vec![true]);
@@ -1853,16 +1910,19 @@ mod tests {
 
     #[test]
     fn the_overlay_is_told_the_destinations_by_name() {
-        let both = overlay_destinations(&[
-            crate::clipboard::DESTINATION_NAME,
-            crate::file_output::DESTINATION_NAME,
-        ]);
+        let both = overlay_destinations(
+            &[
+                crate::clipboard::DESTINATION_NAME,
+                crate::file_output::DESTINATION_NAME,
+            ],
+            Some(captastic_config::RecordingFormat::Gif),
+        );
         assert!(both.clipboard);
         assert!(both.file_output);
-        let clipboard_only = overlay_destinations(&[crate::clipboard::DESTINATION_NAME]);
+        let clipboard_only = overlay_destinations(&[crate::clipboard::DESTINATION_NAME], None);
         assert!(clipboard_only.clipboard);
         assert!(!clipboard_only.file_output);
-        let nothing = overlay_destinations(&[]);
+        let nothing = overlay_destinations(&[], Some(captastic_config::RecordingFormat::Mp4));
         assert!(!nothing.clipboard);
         assert!(!nothing.file_output);
         for destinations in [both, clipboard_only, nothing] {
@@ -1902,6 +1962,7 @@ mod tests {
             1,
             Arc::new(Mutex::new(BTreeMap::new())),
             captastic_config::UiStateStore::for_config(directory.join("captastic.toml")),
+            None,
         )
         .expect("start idle selection worker");
 

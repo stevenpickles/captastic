@@ -96,6 +96,25 @@ still-image tool.
   and the time limit are the ways out. If the overlay's area becomes unreachable — a display
   disappearing — the recording ends with it.
 
+## As built (0.4.0)
+
+What implementing this settled, for the next reader:
+
+- **A window is recorded as its area on the screen.** Recording a window through Windows Graphics
+  Capture would follow the window and see it when covered, but a session per frame is far too slow
+  and a persistent one is a second capture engine. A window recording therefore records the
+  rectangle the window occupied when **Record** was pressed, from the same desktop duplication as
+  regions, and records whatever is in that rectangle - including another window moved over it.
+- **Frames come from the daemon's capture thread**, one `RecordFrame` request at a time, so a
+  recording shares the engine's display list and recovery. Each is a full CPU readback cropped to
+  the area; reading back only the area on the GPU is a later optimization.
+- **The queue is sized in bytes**, 128 MiB, between 2 and 90 frames, rather than a fixed four: the
+  first H.264 frame can stall while the hardware encoder starts, and a small recording should ride
+  that out without dropping frames. The clock starts once the encoder is ready.
+- **The bar** shows the elapsed time against the limit and **Stop**, then "Saving..." until the
+  file is finished; the border is 3 DIP, outside the area, and the bar goes below the area, above
+  it, or inside its bottom edge, whichever keeps it on the screen.
+
 ## Slices
 
 As listed under Milestone 9 in `ROADMAP.md`: the recording engine; GIF output; the Record button, the

@@ -510,6 +510,362 @@ impl FrameQueue {
     }
 }
 
+/// Asks the daemon's capture thread for each frame, so a recording shares the capture engine the
+/// still captures use - its display list, its recovery - rather than duplicating the desktop a
+/// second time. Still captures are refused while a recording runs, so the two never compete for
+/// the engine's readback buffers.
+struct CaptureThreadFrames {
+    sender: std::sync::mpsc::SyncSender<crate::daemon::CaptureCommand>,
+    source: captastic_core::CaptureSource,
+}
+
+/// How long a recording waits for one frame before counting it as failed.
+const FRAME_TIMEOUT: Duration = Duration::from_secs(2);
+
+impl FrameSource for CaptureThreadFrames {
+    fn next_frame(&mut self) -> Result<CpuFrame, CaptureError> {
+        let (reply, answer) = std::sync::mpsc::sync_channel(1);
+        let request = crate::daemon::CaptureCommand::RecordFrame(Box::new(
+            crate::daemon::RecordFrameRequest {
+                source: self.source.clone(),
+                reply,
+            },
+        ));
+        self.sender.try_send(request).map_err(|error| {
+            CaptureError::synthetic(match error {
+                std::sync::mpsc::TrySendError::Full(_) => "the capture thread is busy",
+                std::sync::mpsc::TrySendError::Disconnected(_) => "the capture thread has stopped",
+            })
+        })?;
+        answer
+            .recv_timeout(FRAME_TIMEOUT)
+            .map_err(|_| CaptureError::synthetic("the capture thread did not answer in time"))?
+    }
+}
+
+/// What the overlay confirmed with **Record**.
+pub struct RecordingRequest {
+    pub capture_id: captastic_core::CaptureId,
+    pub display_id: captastic_core::DisplayId,
+    /// The recorded area, in desktop coordinates.
+    pub area: Rect,
+    pub window_title: Option<String>,
+    pub window_application: Option<String>,
+}
+
+/// The daemon's recordings: at most one at a time, its indicator, and where it is saved.
+///
+/// Cheap to clone; every clone is the same host.
+#[derive(Clone)]
+pub struct RecordingHost {
+    inner: Arc<HostInner>,
+}
+
+struct HostInner {
+    /// Set from the moment a recording is asked for until its file is finished or removed, and
+    /// read by the capture thread to refuse still captures meanwhile.
+    active: Arc<AtomicBool>,
+    stop: Mutex<Option<Arc<AtomicBool>>>,
+    join: Mutex<Option<thread::JoinHandle<()>>>,
+    config: Mutex<captastic_config::RecordingConfig>,
+    output_directory: PathBuf,
+    filename_template: String,
+    history: crate::file_output::HistoryRecorder,
+    notices: std::sync::mpsc::SyncSender<crate::daemon::DaemonNotice>,
+    capture_sender: std::sync::mpsc::SyncSender<crate::daemon::CaptureCommand>,
+    /// Where `recording.format` is written back when **Record As** changes it.
+    config_path: Option<PathBuf>,
+    json_output: bool,
+}
+
+impl RecordingHost {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        config: captastic_config::RecordingConfig,
+        output_directory: PathBuf,
+        filename_template: String,
+        history: crate::file_output::HistoryRecorder,
+        notices: std::sync::mpsc::SyncSender<crate::daemon::DaemonNotice>,
+        capture_sender: std::sync::mpsc::SyncSender<crate::daemon::CaptureCommand>,
+        config_path: Option<PathBuf>,
+        json_output: bool,
+    ) -> Self {
+        Self {
+            inner: Arc::new(HostInner {
+                active: Arc::new(AtomicBool::new(false)),
+                stop: Mutex::new(None),
+                join: Mutex::new(None),
+                config: Mutex::new(config),
+                output_directory,
+                filename_template,
+                history,
+                notices,
+                capture_sender,
+                config_path,
+                json_output,
+            }),
+        }
+    }
+
+    /// Whether a recording is running, for the capture thread to refuse still captures by.
+    pub fn active_flag(&self) -> Arc<AtomicBool> {
+        self.inner.active.clone()
+    }
+
+    /// What **Record** records into now.
+    pub fn format(&self) -> RecordingFormat {
+        lock(&self.inner.config).format
+    }
+
+    /// Applies **Record As**: this and later recordings use `format`, and it is written back to
+    /// the configuration as `recording.format` so it survives a restart.
+    pub fn set_format(&self, format: RecordingFormat) {
+        lock(&self.inner.config).format = format;
+        log::info!("recordings will be saved as {format}");
+        if let Some(path) = self.inner.config_path.as_deref() {
+            if let Err(error) = captastic_config::set_recording_format(path, format) {
+                crate::logging::warn(format_args!(
+                    "the recording format could not be saved to {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    /// Starts recording `request`'s area: shows the indicator through `desktop_ui` and records on
+    /// a thread of its own until **Stop** or the time limit. Refused, with a notice, while another
+    /// recording runs.
+    pub fn start(
+        &self,
+        request: RecordingRequest,
+        desktop_ui: &Arc<Mutex<Option<captastic_windows::DesktopUi>>>,
+    ) {
+        let inner = &self.inner;
+        if inner.active.swap(true, Ordering::AcqRel) {
+            let _ = inner
+                .notices
+                .try_send(crate::daemon::DaemonNotice::RecordingInProgress);
+            return;
+        }
+        let config = lock(&inner.config).clone();
+        let settings = RecordingSettings::from_config(&config);
+        let stem = crate::filename_template::expand(
+            &inner.filename_template,
+            &crate::filename_template::TemplateContext {
+                timestamp_micros: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |elapsed| elapsed.as_micros()),
+                display: &request.display_id.0,
+                mode: "recording",
+                width: request.area.width,
+                height: request.area.height,
+                application: request.window_application.as_deref(),
+                title: request.window_title.as_deref(),
+            },
+        );
+        let path = match reserve_path(&inner.output_directory, &stem, settings.format.extension()) {
+            Ok(path) => path,
+            Err(error) => {
+                inner.active.store(false, Ordering::Release);
+                self.report_failure(request.capture_id, &error);
+                return;
+            }
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        *lock(&inner.stop) = Some(stop.clone());
+        show_indicator(desktop_ui, request.area, &stop, settings.max_duration);
+        log::info!(
+            "recording {} started: {}x{} at {},{} as {} for at most {} s",
+            request.capture_id.0,
+            request.area.width,
+            request.area.height,
+            request.area.x,
+            request.area.y,
+            settings.format,
+            settings.max_duration.as_secs()
+        );
+        if inner.json_output {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "schema_version": 1,
+                    "event": "recording_started",
+                    "capture_id": request.capture_id,
+                    "format": settings.format,
+                    "area": request.area,
+                })
+            );
+        }
+        let host = self.clone();
+        let thread_desktop_ui = desktop_ui.clone();
+        let spawned = thread::Builder::new()
+            .name("captastic-recording".to_owned())
+            .spawn(move || host.run(request, settings, path, stop, thread_desktop_ui));
+        match spawned {
+            Ok(join) => *lock(&inner.join) = Some(join),
+            Err(error) => {
+                inner.active.store(false, Ordering::Release);
+                hide_indicator(Some(desktop_ui));
+                crate::logging::warn(format_args!(
+                    "the recording thread could not start: {error}"
+                ));
+            }
+        }
+    }
+
+    /// The recording thread: records, takes the indicator down, and says how it went.
+    fn run(
+        &self,
+        request: RecordingRequest,
+        settings: RecordingSettings,
+        path: PathBuf,
+        stop: Arc<AtomicBool>,
+        desktop_ui: Arc<Mutex<Option<captastic_windows::DesktopUi>>>,
+    ) {
+        let inner = &self.inner;
+        let mut frames = CaptureThreadFrames {
+            sender: inner.capture_sender.clone(),
+            source: if request.display_id == captastic_core::DisplayId::virtual_desktop() {
+                captastic_core::CaptureSource::VirtualDesktop
+            } else {
+                captastic_core::CaptureSource::Display(request.display_id.clone())
+            },
+        };
+        let result = record(&mut frames, request.area, settings, &path, &stop);
+        hide_indicator(Some(&desktop_ui));
+        *lock(&inner.stop) = None;
+        inner.active.store(false, Ordering::Release);
+        match result {
+            Ok(report) => {
+                log::info!(
+                    "recording {} saved: {} s, {}x{}, {} bytes, {} frames captured, {} written, {} dropped, ended by {:?}",
+                    request.capture_id.0,
+                    report.duration.as_secs_f64(),
+                    report.width,
+                    report.height,
+                    report.bytes,
+                    report.frames_captured,
+                    report.frames_written,
+                    report.frames_dropped,
+                    report.ended
+                );
+                inner
+                    .history
+                    .record_recording(&report, &request.display_id.0);
+                if inner.json_output {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "schema_version": 1,
+                            "event": "recording_complete",
+                            "capture_id": request.capture_id,
+                            "report": report,
+                        })
+                    );
+                }
+                let _ = inner
+                    .notices
+                    .try_send(crate::daemon::DaemonNotice::RecordingSaved {
+                        file_name: report
+                            .path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        ended: report.ended,
+                    });
+            }
+            Err(error) => self.report_failure(request.capture_id, &error),
+        }
+    }
+
+    fn report_failure(&self, capture_id: captastic_core::CaptureId, error: &RecordingError) {
+        crate::logging::warn(format_args!(
+            "recording {} failed and nothing was saved: {error}",
+            capture_id.0
+        ));
+        if self.inner.json_output {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "schema_version": 1,
+                    "event": "recording_failed",
+                    "capture_id": capture_id,
+                    "message": error.to_string(),
+                })
+            );
+        }
+        let _ = self
+            .inner
+            .notices
+            .try_send(crate::daemon::DaemonNotice::RecordingFailed {
+                message: error.to_string(),
+            });
+    }
+
+    /// Stops a running recording and waits until `deadline` for its file to be finished.
+    /// Captastic exiting finishes a recording rather than discarding it.
+    pub fn stop_before(&self, deadline: Instant) {
+        if let Some(stop) = lock(&self.inner.stop).as_ref() {
+            stop.store(true, Ordering::Release);
+        }
+        let Some(join) = lock(&self.inner.join).take() else {
+            return;
+        };
+        while !join.is_finished() {
+            if Instant::now() >= deadline {
+                log::warn!("the recording did not finish before the shutdown deadline");
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _ = join.join();
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn show_indicator(
+    desktop_ui: &Arc<Mutex<Option<captastic_windows::DesktopUi>>>,
+    area: Rect,
+    stop: &Arc<AtomicBool>,
+    limit: Duration,
+) {
+    let mut host = lock(desktop_ui);
+    if host.is_none() {
+        match captastic_windows::DesktopUi::start() {
+            Ok(started) => *host = Some(started),
+            Err(error) => {
+                // Without the indicator a recording would run unseen, which ADR 0011 rules out;
+                // it is stopped at once, and finishes as the shortest recording there is.
+                crate::logging::warn(format_args!(
+                    "the recording border could not be shown, so the recording is stopped: {error}"
+                ));
+                stop.store(true, Ordering::Release);
+                return;
+            }
+        }
+    }
+    if let Some(host) = host.as_ref() {
+        if let Err(error) = host.show_recording(area, stop.clone(), limit) {
+            crate::logging::warn(format_args!(
+                "the recording border could not be shown, so the recording is stopped: {error}"
+            ));
+            stop.store(true, Ordering::Release);
+        }
+    }
+}
+
+fn hide_indicator(desktop_ui: Option<&Arc<Mutex<Option<captastic_windows::DesktopUi>>>>) {
+    let Some(desktop_ui) = desktop_ui else { return };
+    if let Some(host) = lock(desktop_ui).as_ref() {
+        let _ = host.hide_recording();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -726,6 +1082,100 @@ mod tests {
             Next::Frame(pixels, _) => assert_eq!(pixels, vec![6]),
             Next::Closed(_) => panic!("expected a frame"),
         }
+    }
+
+    #[test]
+    #[ignore = "shows the recording border on the interactive desktop"]
+    fn the_host_records_through_the_capture_thread_saves_remembers_and_says_so() {
+        use crate::daemon::{CaptureCommand, DaemonNotice};
+
+        let directory = directory("host");
+        let (capture_sender, capture_receiver) = std::sync::mpsc::sync_channel(4);
+        let (notice_sender, notices) = std::sync::mpsc::sync_channel(8);
+        let display = rect(0, 0, 160, 120);
+        // A stand-in capture thread that answers each frame request with a changing frame.
+        let capture_thread = thread::spawn(move || {
+            let mut value = 0_u8;
+            while let Ok(command) = capture_receiver.recv() {
+                if let CaptureCommand::RecordFrame(request) = command {
+                    value = value.wrapping_add(9);
+                    let _ = request.reply.send(Ok(frame(display, value)));
+                }
+            }
+        });
+        let history = captastic_config::HistoryStore::at(directory.join("history.toml"));
+        let host = RecordingHost::new(
+            captastic_config::RecordingConfig {
+                format: RecordingFormat::Gif,
+                max_seconds: 30,
+                gif_max_dimension: 1280,
+            },
+            directory.join("captures"),
+            "{timestamp}".to_owned(),
+            crate::file_output::HistoryRecorder::new(
+                history.clone(),
+                captastic_config::HistoryConfig::default().retention(),
+            ),
+            notice_sender,
+            capture_sender,
+            None,
+            false,
+        );
+        let desktop_ui = Arc::new(Mutex::new(None));
+        host.start(
+            RecordingRequest {
+                capture_id: captastic_core::CaptureId(5),
+                display_id: DisplayId::primary(),
+                area: rect(20, 10, 100, 80),
+                window_title: None,
+                window_application: None,
+            },
+            &desktop_ui,
+        );
+        assert!(host.active_flag().load(Ordering::Acquire));
+        // A second recording is refused while the first runs.
+        host.start(
+            RecordingRequest {
+                capture_id: captastic_core::CaptureId(6),
+                display_id: DisplayId::primary(),
+                area: rect(0, 0, 10, 10),
+                window_title: None,
+                window_application: None,
+            },
+            &desktop_ui,
+        );
+        thread::sleep(Duration::from_millis(700));
+        host.stop_before(Instant::now() + Duration::from_secs(5));
+        assert!(!host.active_flag().load(Ordering::Acquire));
+        let received: Vec<DaemonNotice> = notices.try_iter().collect();
+        assert!(received
+            .iter()
+            .any(|notice| matches!(notice, DaemonNotice::RecordingInProgress)));
+        assert!(
+            received
+                .iter()
+                .any(|notice| matches!(notice, DaemonNotice::RecordingSaved { .. })),
+            "no saved notice"
+        );
+        let saved: Vec<PathBuf> = std::fs::read_dir(directory.join("captures"))
+            .expect("captures")
+            .map(|entry| entry.expect("entry").path())
+            .collect();
+        assert_eq!(saved.len(), 1, "{saved:?}");
+        assert_eq!(saved[0].extension().and_then(|e| e.to_str()), Some("gif"));
+        let remembered = history.load().expect("history");
+        assert_eq!(remembered.entries.len(), 1);
+        assert_eq!(remembered.entries[0].mode, "recording");
+        assert_eq!(
+            (remembered.entries[0].width, remembered.entries[0].height),
+            (100, 80)
+        );
+        if let Some(ui) = desktop_ui.lock().expect("ui").take() {
+            ui.stop(Instant::now() + Duration::from_secs(2));
+        }
+        drop(host);
+        let _ = capture_thread.join();
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
