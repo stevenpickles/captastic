@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
+mod desktop_ui;
 mod layout;
 mod machine;
 mod pin;
@@ -117,7 +118,7 @@ const UI_FONT_HEIGHT: i32 = 21;
 ///
 /// "Snap to Window Edges" would be plainer but measures 200 px against the 192 px a menu row has
 /// for text at 96 DPI, and widening the menu for one row is a worse trade than the shorter name.
-pub use pin::PinHost;
+pub use desktop_ui::DesktopUi;
 
 const SNAP_TO_WINDOWS_LABEL: &str = "Snap to Edges";
 /// The Options row for file output. Shorter than the notification area's "Save Captures to Disk"
@@ -4619,7 +4620,7 @@ mod tests {
             metadata,
         )
         .expect("a valid four-pixel frame");
-        let host = PinHost::start().expect("the pinned-capture thread starts");
+        let host = DesktopUi::start().expect("the desktop UI thread starts");
         host.pin(frame.detached(), frame.metadata.source_rect)
             .expect("the pin request is accepted");
 

@@ -187,8 +187,9 @@ pub struct SelectionWorker {
     failure_receiver: mpsc::Receiver<String>,
     /// Requests from the Options menu to save captures to disk or not, for the daemon to act on.
     file_output_receiver: mpsc::Receiver<bool>,
-    /// The pinned-capture thread, started by the first Pin and stopped with this worker (ADR 0010).
-    pins: Arc<Mutex<Option<captastic_windows::PinHost>>>,
+    /// The desktop UI thread, started by the first Pin or Edit and stopped with this worker
+    /// (ADR 0010).
+    desktop_ui: Arc<Mutex<Option<captastic_windows::DesktopUi>>>,
     stop_requested: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
     ui_join: Option<JoinHandle<()>>,
@@ -208,8 +209,8 @@ impl SelectionWorker {
         let (ui_sender, ui_receiver) = mpsc::channel();
         let (failure_sender, failure_receiver) = mpsc::channel();
         let (file_output_sender, file_output_receiver) = mpsc::channel();
-        let pins = Arc::new(Mutex::new(None));
-        let worker_pins = pins.clone();
+        let desktop_ui = Arc::new(Mutex::new(None));
+        let worker_desktop_ui = desktop_ui.clone();
         let stop_requested = Arc::new(AtomicBool::new(false));
         let worker_stop_requested = stop_requested.clone();
         let ui_join = thread::Builder::new()
@@ -665,7 +666,7 @@ impl SelectionWorker {
                             }
                         }
                         if let Some(frame) = pin_frame {
-                            pin_capture(&worker_pins, job.capture_id, &frame, selection.rect);
+                            pin_capture(&worker_desktop_ui, job.capture_id, &frame, selection.rect);
                         }
                     }
                     Ok(captastic_windows::SelectionOutcome::Cancelled) => {
@@ -749,7 +750,7 @@ impl SelectionWorker {
             ui_sender: Some(ui_sender),
             failure_receiver,
             file_output_receiver,
-            pins,
+            desktop_ui,
             stop_requested,
             join: Some(join),
             ui_join: Some(ui_join),
@@ -773,8 +774,8 @@ impl SelectionWorker {
     /// Closes every pinned capture, from the notification area. Nothing to do if none was ever
     /// pinned: the thread that would hold them has not been started.
     pub fn close_all_pins(&self) {
-        if let Some(host) = lock_pins(&self.pins).as_ref() {
-            if let Err(error) = host.close_all() {
+        if let Some(host) = lock_desktop_ui(&self.desktop_ui).as_ref() {
+            if let Err(error) = host.close_all_pins() {
                 crate::logging::warn(format_args!("could not close the pinned captures: {error}"));
             }
         }
@@ -783,8 +784,8 @@ impl SelectionWorker {
     /// Makes every pinned capture clickable again. A click-through pin cannot be clicked to undo
     /// that, so the notification area is the way back (ADR 0010).
     pub fn make_pins_clickable(&self) {
-        if let Some(host) = lock_pins(&self.pins).as_ref() {
-            if let Err(error) = host.make_all_clickable() {
+        if let Some(host) = lock_desktop_ui(&self.desktop_ui).as_ref() {
+            if let Err(error) = host.make_all_pins_clickable() {
                 crate::logging::warn(format_args!(
                     "could not make the pinned captures clickable: {error}"
                 ));
@@ -837,7 +838,7 @@ impl SelectionWorker {
         // Pins close with the daemon. Taken after the selection thread has stopped, so no Pin can
         // start a new host behind this one; a thread that overruns holds only windows and ends
         // with the process.
-        if let Some(host) = lock_pins(&self.pins).take() {
+        if let Some(host) = lock_desktop_ui(&self.desktop_ui).take() {
             host.stop(selection_deadline);
         }
         if let Some(join) = self.ui_join.take() {
@@ -1159,35 +1160,36 @@ fn overlay_destinations(names: &[&'static str]) -> captastic_windows::OverlayDes
         clipboard: names.contains(&crate::clipboard::DESTINATION_NAME),
         file_output: names.contains(&crate::file_output::DESTINATION_NAME),
         file_output_switchable: true,
-        // The worker starts the pinned-capture thread on the first Pin, so a daemon run can
+        // The worker starts the desktop UI thread on the first Pin, so a daemon run can
         // always offer it.
         pin_available: true,
         edit_available: false,
     }
 }
 
-fn lock_pins(
-    pins: &Mutex<Option<captastic_windows::PinHost>>,
-) -> std::sync::MutexGuard<'_, Option<captastic_windows::PinHost>> {
+fn lock_desktop_ui(
+    desktop_ui: &Mutex<Option<captastic_windows::DesktopUi>>,
+) -> std::sync::MutexGuard<'_, Option<captastic_windows::DesktopUi>> {
     // A panic while holding this lock cannot leave a host half-made: the Option is either set or
     // not. Recovering the guard keeps pins usable rather than failing every later Pin.
-    pins.lock()
+    desktop_ui
+        .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Pins a confirmed capture, starting the pinned-capture thread if this is the first.
+/// Pins a confirmed capture, starting the desktop UI thread if this is the first.
 ///
 /// A failure is logged and the capture is otherwise unaffected: it has already gone to its
 /// destinations exactly as Capture would have sent it.
 fn pin_capture(
-    pins: &Mutex<Option<captastic_windows::PinHost>>,
+    desktop_ui: &Mutex<Option<captastic_windows::DesktopUi>>,
     capture_id: captastic_core::CaptureId,
     frame: &captastic_core::CpuFrame,
     at: captastic_core::Rect,
 ) {
-    let mut host = lock_pins(pins);
+    let mut host = lock_desktop_ui(desktop_ui);
     if host.is_none() {
-        match captastic_windows::PinHost::start() {
+        match captastic_windows::DesktopUi::start() {
             Ok(started) => *host = Some(started),
             Err(error) => {
                 crate::logging::warn(format_args!(
@@ -1667,7 +1669,7 @@ mod tests {
             ui_sender: None,
             failure_receiver,
             file_output_receiver: mpsc::channel().1,
-            pins: Arc::new(Mutex::new(None)),
+            desktop_ui: Arc::new(Mutex::new(None)),
             stop_requested: Arc::new(AtomicBool::new(false)),
             join: None,
             ui_join: None,
