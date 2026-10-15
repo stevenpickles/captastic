@@ -57,6 +57,34 @@ Install-ChocolateyShortcut `
     -IconLocation $executable `
     -Description 'Start Captastic screenshot capture'
 
+# An upgrade that stopped a running Captastic starts it again; a first install never does. The
+# before-modify hook of the version being replaced leaves the marker, so upgrades from 0.2, whose
+# hook predates it, do not relaunch.
+$relaunchMarker = Join-Path $env:TEMP 'captastic-relaunch-after-upgrade'
+if (Test-Path -LiteralPath $relaunchMarker -PathType Leaf) {
+    $stoppedAt = [DateTime]::MinValue
+    $recent = [DateTime]::TryParse(
+        (Get-Content -LiteralPath $relaunchMarker -Raw).Trim(),
+        [System.Globalization.CultureInfo]::InvariantCulture,
+        [System.Globalization.DateTimeStyles]::RoundtripKind,
+        [ref]$stoppedAt
+    ) -and ([DateTime]::UtcNow - $stoppedAt.ToUniversalTime()) -lt [TimeSpan]::FromMinutes(10)
+    Remove-Item -LiteralPath $relaunchMarker -Force
+    # This script is elevated, and a tray application started from it would be too. explorer.exe
+    # hands the start to the desktop shell already running in this session, which starts Captastic
+    # as the signed-in user at their normal integrity level. Without that shell there is nobody to
+    # hand it to, and starting explorer.exe here would only start an elevated one.
+    $sessionId = (Get-Process -Id $PID).SessionId
+    $shell = Get-Process -Name explorer -ErrorAction SilentlyContinue |
+        Where-Object { $_.SessionId -eq $sessionId }
+    if ($recent -and $shell) {
+        Start-Process -FilePath (Join-Path $env:WINDIR 'explorer.exe') -ArgumentList ('"{0}"' -f $executable)
+        Write-Host 'Captastic was running before the upgrade and has been started again.'
+    } elseif ($recent) {
+        Write-Host 'Captastic was running before the upgrade. Start it again from the Start Menu.'
+    }
+}
 
-Write-Host 'Captastic is installed. Start it from the Start Menu.'
+
+Write-Host 'Captastic is installed. Start it from the Start Menu if it is not already running.'
 Write-Host 'Configuration and logs are stored under ~/.captastic.'

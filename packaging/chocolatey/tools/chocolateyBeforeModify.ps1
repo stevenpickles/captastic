@@ -40,3 +40,11 @@ do {
 if ($running) {
     throw 'The running Captastic daemon did not stop within five seconds.'
 }
+
+# Left for chocolateyInstall.ps1, which runs next in an upgrade, so it can start Captastic again for
+# the user it was just taken away from. An uninstall removes it instead. The time lets the install
+# ignore one left by an upgrade that failed before it got that far.
+[System.IO.File]::WriteAllText(
+    (Join-Path $env:TEMP 'captastic-relaunch-after-upgrade'),
+    [DateTime]::UtcNow.ToString('o')
+)

@@ -102,6 +102,13 @@ try {
         '--source', $upgrade.Directory,
         '--yes', '--pre', '--no-progress', '--limit-output'
     )
+    # Nothing was running when the upgrade began, so it has nothing to start again. An upgrade of a
+    # running Captastic does relaunch it, but needs a desktop shell this runner does not have.
+    $controlEvent = $null
+    if ([System.Threading.EventWaitHandle]::TryOpenExisting('Local\CaptasticDaemonControl-v1', [ref]$controlEvent)) {
+        $controlEvent.Dispose()
+        throw 'Chocolatey upgrade launched a Captastic that was not running before it.'
+    }
     Invoke-Choco @('uninstall', 'captastic', '--yes', '--no-progress', '--limit-output')
     $installed = $false
 
