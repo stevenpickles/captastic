@@ -110,6 +110,18 @@ max_age_days = 30
 # Forget the oldest once remembered captures exceed this many bytes. Zero disables the limit.
 max_total_bytes = 0
 
+[recording]
+# Screen recordings, started from the overlay's Record button. "gif" (15 frames a second) is what
+# chats and issues embed directly; "mp4" (H.264, 30 frames a second) is far smaller for anything
+# long or large. The overlay's Options -> Record As row changes it for later recordings too.
+format = "gif"
+# A recording stops by itself after this many seconds, 1 to 600. Its Stop button ends it sooner.
+max_seconds = 60
+# A GIF is scaled down so its longer side is at most this many pixels, 64 to 4096. MP4 keeps the
+# recorded size. Recordings are always saved to the [output] directory, whether or not still
+# captures are, and never to the clipboard.
+gif_max_dimension = 1280
+
 [metrics]
 enabled = true
 ring_capacity = 10000

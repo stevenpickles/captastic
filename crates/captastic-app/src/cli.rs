@@ -44,6 +44,8 @@ pub enum Command {
         json: bool,
     },
     Capture(CaptureArgs),
+    /// Record the display, or part of it, to an animated GIF or an MP4.
+    Record(RecordArgs),
     Benchmark(BenchmarkArgs),
     /// Report the exact source and build identity.
     Version {
@@ -142,6 +144,42 @@ pub struct CaptureArgs {
     pub selection_preview: PreviewArg,
     #[arg(long, action = clap::ArgAction::Set, default_value_t = false)]
     pub clipboard: bool,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum RecordFormatArg {
+    Gif,
+    Mp4,
+}
+
+#[derive(Debug, Args)]
+pub struct RecordArgs {
+    /// Configuration file (defaults to %USERPROFILE%\.captastic\captastic.toml when present).
+    ///
+    /// Reads `[recording]`, `[capture] cursor`, and `[output]` for where an unnamed recording goes.
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+    #[arg(long, default_value = "fake")]
+    pub backend: String,
+    /// Display policy: pointer, primary, virtual_desktop, or display:<persistent-id>.
+    #[arg(long, default_value = "primary")]
+    pub display: String,
+    /// How long to record.
+    #[arg(long, default_value_t = 3)]
+    pub seconds: u32,
+    /// The format, overriding `[recording] format`.
+    #[arg(long, value_enum)]
+    pub format: Option<RecordFormatArg>,
+    /// Part of the display to record, as x,y,width,height in desktop pixels. The whole display
+    /// when omitted.
+    #[arg(long)]
+    pub region: Option<String>,
+    /// Where to write the recording; it must not exist. Defaults to a new file in the output
+    /// directory, named by the filename template.
+    #[arg(long)]
+    pub output: Option<PathBuf>,
     #[arg(long)]
     pub json: bool,
 }

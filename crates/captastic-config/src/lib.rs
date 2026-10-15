@@ -410,6 +410,7 @@ pub struct AppConfig {
     pub metrics: MetricsConfig,
     pub logging: LoggingConfig,
     pub history: HistoryConfig,
+    pub recording: RecordingConfig,
     pub ui: UiConfig,
 }
 
@@ -426,6 +427,7 @@ impl Default for AppConfig {
             metrics: MetricsConfig::default(),
             logging: LoggingConfig::default(),
             history: HistoryConfig::default(),
+            recording: RecordingConfig::default(),
             ui: UiConfig::default(),
         }
     }
@@ -584,6 +586,7 @@ impl AppConfig {
         // expand or it is not, and finding out at the moment the setting is switched on - which is
         // a tray click away - would be finding out too late.
         validate_template(&self.output.filename_template).map_err(ConfigError::InvalidValue)?;
+        self.recording.validate()?;
         if self.metrics.ring_capacity == 0 || self.metrics.ring_capacity > 10_000_000 {
             return Err(ConfigError::InvalidValue(
                 "metrics.ring_capacity must be between 1 and 10000000".to_owned(),
@@ -1092,6 +1095,89 @@ impl HistoryConfig {
             max_age: (self.max_age_days > 0)
                 .then(|| Duration::from_secs(u64::from(self.max_age_days) * 24 * 60 * 60)),
             max_total_bytes: (self.max_total_bytes > 0).then_some(self.max_total_bytes),
+        }
+    }
+}
+
+/// What a screen recording is saved as (ADR 0011).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingFormat {
+    /// An animated GIF: what chats, issues and documents embed directly. Small and short.
+    #[default]
+    Gif,
+    /// H.264 video in an MP4: far smaller and smoother for anything long or large.
+    Mp4,
+}
+
+impl RecordingFormat {
+    pub const fn extension(self) -> &'static str {
+        match self {
+            Self::Gif => "gif",
+            Self::Mp4 => "mp4",
+        }
+    }
+
+    /// Frames captured each second. GIF viewers handle little more than this well, and the file
+    /// grows with every frame; video is smooth at its usual rate.
+    pub const fn frame_rate(self) -> u32 {
+        match self {
+            Self::Gif => 15,
+            Self::Mp4 => 30,
+        }
+    }
+}
+
+impl fmt::Display for RecordingFormat {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.extension())
+    }
+}
+
+/// `[recording]`: screen recordings to GIF or MP4 (ADR 0011).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RecordingConfig {
+    /// The format a recording starts in, until the overlay's **Record As** row is changed.
+    pub format: RecordingFormat,
+    /// A recording stops by itself after this many seconds. Between 1 and 600.
+    pub max_seconds: u32,
+    /// A GIF is scaled down so its longer side is at most this many pixels. Between 64 and 4096.
+    /// MP4 is not: it keeps the recorded size, up to its encoder's own limit.
+    pub gif_max_dimension: u32,
+}
+
+impl RecordingConfig {
+    pub const MAX_SECONDS: u32 = 600;
+
+    pub fn max_duration(&self) -> Duration {
+        Duration::from_secs(u64::from(self.max_seconds))
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !(1..=Self::MAX_SECONDS).contains(&self.max_seconds) {
+            return Err(ConfigError::InvalidValue(format!(
+                "recording.max_seconds must be between 1 and {}, got {}",
+                Self::MAX_SECONDS,
+                self.max_seconds
+            )));
+        }
+        if !(64..=4096).contains(&self.gif_max_dimension) {
+            return Err(ConfigError::InvalidValue(format!(
+                "recording.gif_max_dimension must be between 64 and 4096, got {}",
+                self.gif_max_dimension
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Default for RecordingConfig {
+    fn default() -> Self {
+        Self {
+            format: RecordingFormat::Gif,
+            max_seconds: 60,
+            gif_max_dimension: 1280,
         }
     }
 }
@@ -1848,6 +1934,37 @@ mod tests {
 
         config.output.filename_template = DEFAULT_FILENAME_TEMPLATE.to_owned();
         config.validate().expect("the default template is valid");
+    }
+
+    #[test]
+    fn recording_defaults_are_a_minute_of_gif_and_both_limits_are_checked() {
+        let config = AppConfig::default();
+        assert_eq!(config.recording.format, RecordingFormat::Gif);
+        assert_eq!(config.recording.max_duration(), Duration::from_secs(60));
+        assert_eq!(config.recording.gif_max_dimension, 1280);
+        for seconds in [0, 601] {
+            let mut config = AppConfig::default();
+            config.recording.max_seconds = seconds;
+            let error = config.validate().expect_err("out of range");
+            assert!(
+                error.to_string().contains("recording.max_seconds"),
+                "{error}"
+            );
+        }
+        for dimension in [63, 4097] {
+            let mut config = AppConfig::default();
+            config.recording.gif_max_dimension = dimension;
+            let error = config.validate().expect_err("out of range");
+            assert!(
+                error.to_string().contains("recording.gif_max_dimension"),
+                "{error}"
+            );
+        }
+        let parsed: AppConfig =
+            toml::from_str("[recording]\nformat = \"mp4\"\nmax_seconds = 120\n").expect("parse");
+        assert_eq!(parsed.recording.format, RecordingFormat::Mp4);
+        assert_eq!(parsed.recording.max_seconds, 120);
+        assert!(toml::from_str::<AppConfig>("[recording]\nformat = \"avi\"\n").is_err());
     }
 
     #[test]
