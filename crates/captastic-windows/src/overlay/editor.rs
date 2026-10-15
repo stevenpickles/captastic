@@ -41,13 +41,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use super::desktop_ui::{desktop_error, forget_window, release_window_state, window_state};
 use super::layout::{UiMetrics, UiRect};
 use super::raster::{
-    draw_edit_icon, draw_ellipse, draw_filled_ellipse, draw_lines, draw_outline_rect,
-    draw_round_box, draw_surface_to_rect, draw_text, fill_device_rect, measure_ui_text, rgb,
-    TextAlignment,
+    draw_lines, draw_outline_rect, draw_round_box, draw_surface_to_rect, draw_text,
+    fill_device_rect, measure_ui_text, rgb, TextAlignment,
 };
 use super::shell::{
     capture_pointer, modifiers, query_display_environment, release_pointer_capture, FrozenSurface,
 };
+use super::vector::{bgr, Bgr, Diagonal, Painter};
 
 pub(super) const EDITOR_CLASS_NAME: PCWSTR = w!("CaptasticEditor-v1");
 const EDITOR_WINDOW_NAME: PCWSTR = w!("Edit capture - Captastic");
@@ -1406,6 +1406,7 @@ fn compose(state: &EditorState, surface: &FrozenSurface) {
         draw_crop_handles(device, crop_on_screen, metrics, accent);
     }
     draw_toolbar(device, state, crop);
+    paint_icons(state, surface);
     draw_tooltip(device, state);
 }
 
@@ -1454,24 +1455,12 @@ fn draw_toolbar(device: HDC, state: &EditorState, crop: Rect) {
         }),
         rgb(60, 60, 65),
     );
-    let colour_tool = state.colour_tool();
-    let current_colour = colour_tool
-        .colour_slot()
-        .map(|slot| state.colours[slot])
-        .unwrap_or(RED);
     for (button, bounds) in &layout.buttons {
         let (button, bounds) = (*button, *bounds);
         let enabled = state.button_enabled(button);
         let hovered = enabled && state.hovered == Some(button);
-        if let EditorButton::Swatch(index) = button {
-            draw_swatch(
-                device,
-                bounds,
-                index,
-                index == current_colour,
-                hovered,
-                metrics,
-            );
+        if let EditorButton::Swatch(_) = button {
+            // Painted antialiased after GDI is done: see paint_icons.
             continue;
         }
         let selected = button == EditorButton::Tool(state.tool);
@@ -1521,53 +1510,202 @@ fn draw_toolbar(device: HDC, state: &EditorState, crop: Rect) {
     }
 }
 
-fn draw_swatch(
-    device: HDC,
+/// The toolbar's antialiased icons: the marker and highlighter, each showing the colour it draws
+/// in, and the colour swatches. Painted into the back buffer's pixels once GDI has finished with
+/// it, and before the tooltip, which may sit over them.
+fn paint_icons(state: &EditorState, surface: &FrozenSurface) {
+    // SAFETY: Completes every queued GDI draw before the pixels are touched directly.
+    let _ = unsafe { GdiFlush() };
+    // SAFETY: The surface's DIB holds exactly byte_length writable bytes, owned by this thread.
+    let pixels = unsafe { std::slice::from_raw_parts_mut(surface.bits, surface.byte_length) };
+    let mut painter = Painter::new(pixels, surface.width as usize);
+    let metrics = state.metrics;
+    let chosen_colour = state
+        .colour_tool()
+        .colour_slot()
+        .map(|slot| state.colours[slot]);
+    let ink = bgr(245, 245, 247);
+    for (button, bounds) in &state.layout.buttons {
+        let hovered = state.hovered == Some(*button);
+        match *button {
+            EditorButton::Swatch(index) => paint_swatch(
+                &mut painter,
+                *bounds,
+                index,
+                chosen_colour == Some(index),
+                hovered,
+                metrics,
+            ),
+            EditorButton::Tool(EditorTool::Pen) => paint_pen(
+                &mut painter,
+                *bounds,
+                ink,
+                colour_bgr(state.colour(EditorTool::Pen)),
+                metrics,
+            ),
+            EditorButton::Tool(EditorTool::Marker) => paint_marker(
+                &mut painter,
+                *bounds,
+                ink,
+                colour_bgr(state.colour(EditorTool::Marker)),
+                metrics,
+            ),
+            EditorButton::Tool(EditorTool::Highlighter) => paint_highlighter(
+                &mut painter,
+                *bounds,
+                ink,
+                colour_bgr(state.colour(EditorTool::Highlighter)),
+                metrics,
+            ),
+            _ => {}
+        }
+    }
+}
+
+const fn colour_bgr(colour: Color) -> Bgr {
+    bgr(colour.red, colour.green, colour.blue)
+}
+
+fn icon_frame(bounds: UiRect, metrics: UiMetrics) -> (f32, f32, f32) {
+    let (left, top, size) = icon_box(bounds, metrics);
+    (left as f32, top as f32, size as f32)
+}
+
+/// A slim pen on the diagonal with a conical nib, its point in the colour it draws.
+fn paint_pen(painter: &mut Painter, bounds: UiRect, ink: Bgr, point: Bgr, metrics: UiMetrics) {
+    let (left, top, size) = icon_frame(bounds, metrics);
+    let pen = Diagonal::new(left, top, size, 0.06);
+    let half = 0.11;
+    // The nib: a cone in the body colour, its point in the ink.
+    painter.polygon(
+        &[pen.at(0.0, 0.0), pen.at(0.30, -half), pen.at(0.30, half)],
+        ink,
+        1.0,
+    );
+    painter.polygon(
+        &[pen.at(0.0, 0.0), pen.at(0.13, -0.05), pen.at(0.13, 0.05)],
+        point,
+        1.0,
+    );
+    painter.polygon(
+        &pen.quad([(0.30, -half), (0.38, -half), (0.38, half), (0.30, half)]),
+        bgr(160, 160, 166),
+        1.0,
+    );
+    painter.polygon(
+        &pen.quad([(0.38, -half), (0.86, -half), (0.86, half), (0.38, half)]),
+        ink,
+        1.0,
+    );
+    painter.capsule(pen.at(0.86, 0.0), pen.at(0.90, 0.0), half * size, ink, 1.0);
+}
+
+/// A chisel-tipped marker on the diagonal, its tip in the colour it draws.
+fn paint_marker(painter: &mut Painter, bounds: UiRect, ink: Bgr, tip: Bgr, metrics: UiMetrics) {
+    let (left, top, size) = icon_frame(bounds, metrics);
+    let pen = Diagonal::new(left, top, size, 0.06);
+    let half = 0.17;
+    // A rim of the body colour around the tip, so a black or dark tip still reads on the toolbar.
+    painter.polygon(
+        &pen.quad([(-0.03, -0.12), (0.30, -0.15), (0.30, 0.15), (0.12, 0.15)]),
+        ink,
+        1.0,
+    );
+    painter.polygon(
+        &pen.quad([(0.02, -0.08), (0.28, -0.11), (0.28, 0.11), (0.14, 0.11)]),
+        tip,
+        1.0,
+    );
+    // The collar, then the barrel with a rounded end.
+    painter.polygon(
+        &pen.quad([(0.28, -half), (0.38, -half), (0.38, half), (0.28, half)]),
+        bgr(160, 160, 166),
+        1.0,
+    );
+    painter.polygon(
+        &pen.quad([(0.38, -half), (0.80, -half), (0.80, half), (0.38, half)]),
+        ink,
+        1.0,
+    );
+    painter.capsule(pen.at(0.80, 0.0), pen.at(0.86, 0.0), half * size, ink, 1.0);
+    // A cap line across the barrel.
+    painter.polygon(
+        &pen.quad([(0.66, -half), (0.69, -half), (0.69, half), (0.66, half)]),
+        bgr(160, 160, 166),
+        1.0,
+    );
+}
+
+/// A broad highlighter laying down a translucent stroke of its colour.
+fn paint_highlighter(
+    painter: &mut Painter,
+    bounds: UiRect,
+    ink: Bgr,
+    colour: Bgr,
+    metrics: UiMetrics,
+) {
+    let (left, top, size) = icon_frame(bounds, metrics);
+    // The stroke it has drawn, across the bottom.
+    let stroke_y = top + size * 0.86;
+    painter.capsule(
+        (left + size * 0.08, stroke_y),
+        (left + size * 0.92, stroke_y),
+        size * 0.12,
+        colour,
+        0.7,
+    );
+    // The highlighter, its broad flat tip resting on the end of the stroke.
+    let pen = Diagonal::new(left + size * 0.12, top - size * 0.10, size, 0.10);
+    let half = 0.2;
+    painter.polygon(
+        &pen.quad([(0.0, -0.16), (0.22, -half), (0.22, half), (0.0, 0.16)]),
+        ink,
+        1.0,
+    );
+    painter.polygon(
+        &pen.quad([(0.03, -0.12), (0.20, -0.15), (0.20, 0.15), (0.03, 0.12)]),
+        colour,
+        1.0,
+    );
+    painter.polygon(
+        &pen.quad([(0.22, -half), (0.32, -half), (0.32, half), (0.22, half)]),
+        bgr(160, 160, 166),
+        1.0,
+    );
+    painter.polygon(
+        &pen.quad([(0.32, -half), (0.76, -half), (0.76, half), (0.32, half)]),
+        ink,
+        1.0,
+    );
+    painter.capsule(pen.at(0.76, 0.0), pen.at(0.80, 0.0), half * size, ink, 1.0);
+}
+
+/// A colour swatch: a disc with a quiet rim, so black and white both read on the toolbar, and a
+/// ring when it is the colour in use or under the pointer.
+fn paint_swatch(
+    painter: &mut Painter,
     bounds: UiRect,
     index: usize,
     chosen: bool,
     hovered: bool,
     metrics: UiMetrics,
 ) {
-    let colour = PALETTE[index].1;
-    let radius = metrics.px(SWATCH_DIAMETER_DIP) / 2;
-    let (x, y) = (
-        (bounds.left + bounds.right) / 2,
-        (bounds.top + bounds.bottom) / 2,
+    let colour = colour_bgr(PALETTE[index].1);
+    let centre = (
+        (bounds.left + bounds.right) as f32 / 2.0,
+        (bounds.top + bounds.bottom) as f32 / 2.0,
     );
-    draw_filled_ellipse(
-        device,
-        x - radius,
-        y - radius,
-        x + radius,
-        y + radius,
-        rgb(colour.red, colour.green, colour.blue),
-    );
-    // A thin rim so black reads against the toolbar and white against nothing at all.
-    draw_ellipse(
-        device,
-        x - radius,
-        y - radius,
-        x + radius,
-        y + radius,
-        rgb(120, 120, 126),
-        1,
-    );
+    let radius = metrics.px(SWATCH_DIAMETER_DIP) as f32 / 2.0;
+    let line = (metrics.dpi as f32 / UiMetrics::BASE_DPI as f32).max(1.0);
+    painter.circle(centre, radius, colour, 1.0);
+    painter.ring(centre, radius, line, bgr(130, 130, 136), 0.9);
     if chosen || hovered {
-        let ring = radius + metrics.px(3);
-        draw_ellipse(
-            device,
-            x - ring,
-            y - ring,
-            x + ring,
-            y + ring,
-            if chosen {
-                rgb(245, 245, 247)
-            } else {
-                rgb(140, 140, 146)
-            },
-            metrics.px(2).max(1),
-        );
+        let ring = if chosen {
+            bgr(245, 245, 247)
+        } else {
+            bgr(140, 140, 146)
+        };
+        painter.ring(centre, radius + line * 3.5, line * 2.0, ring, 1.0);
     }
 }
 
@@ -1646,38 +1784,8 @@ fn draw_tool_icon(
                 stroke,
             );
         }
-        EditorTool::Pen => draw_edit_icon(device, bounds, ink, metrics),
-        EditorTool::Marker => {
-            draw_lines(
-                device,
-                &[
-                    (left + quarter / 2, bottom - quarter / 2),
-                    (right - quarter / 2, top + quarter / 2),
-                ],
-                ink,
-                (stroke * 3).max(3),
-            );
-        }
-        EditorTool::Highlighter => {
-            let colour = PALETTE[YELLOW].1;
-            fill_device_rect(
-                device,
-                RECT {
-                    left,
-                    top: top + size / 2 - quarter / 2,
-                    right,
-                    bottom: top + size / 2 + quarter,
-                },
-                rgb(colour.red, colour.green, colour.blue),
-            );
-            draw_lines(
-                device,
-                &[(left, top + quarter), (right, top + quarter)],
-                ink,
-                stroke,
-            );
-            draw_lines(device, &[(left, bottom), (right, bottom)], ink, stroke);
-        }
+        // Painted antialiased after GDI is done, in the colour each draws in: see paint_icons.
+        EditorTool::Pen | EditorTool::Marker | EditorTool::Highlighter => {}
     }
 }
 

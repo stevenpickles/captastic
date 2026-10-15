@@ -16,6 +16,7 @@ mod pin;
 mod raster;
 mod shell;
 mod snap;
+mod vector;
 mod window_enumeration;
 
 use layout::{
