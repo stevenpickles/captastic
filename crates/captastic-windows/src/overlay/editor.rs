@@ -75,7 +75,9 @@ const DRAG_THRESHOLD_DIP: i32 = 3;
 /// How far, in capture pixels, the pointer must move before a stroke takes another point.
 const STROKE_STEP: f32 = 0.75;
 /// Wide enough for every button and swatch at every scaling.
-const MINIMUM_CLIENT_DIP: (i32, i32) = (740, 320);
+const MINIMUM_CLIENT_DIP: (i32, i32) = (760, 320);
+/// How far a box's corners are rounded: enough to soften them, not enough to read as a pill.
+const BOX_RADIUS_DIP: f32 = 6.0;
 /// The share of the display's work area a new editor may take.
 const MAXIMUM_WORK_AREA_SHARE: f64 = 0.9;
 
@@ -85,11 +87,12 @@ const CANVAS_RGB: (u8, u8, u8) = (24, 24, 27);
 const ACCENT_RGB: (u8, u8, u8) = (45, 125, 246);
 
 /// The colours a mark can be drawn in, with the name each swatch's tooltip gives.
-const PALETTE: [(&str, Color); 6] = [
+const PALETTE: [(&str, Color); 7] = [
     ("Red", Color::rgb(229, 57, 53)),
     ("Yellow", Color::rgb(253, 216, 53)),
     ("Green", Color::rgb(67, 160, 71)),
     ("Blue", Color::rgb(30, 136, 229)),
+    ("Magenta", Color::rgb(216, 27, 186)),
     ("Black", Color::rgb(0, 0, 0)),
     ("White", Color::rgb(255, 255, 255)),
 ];
@@ -604,6 +607,7 @@ impl EditorState {
                         rect,
                         color: self.colour(*tool),
                         width: self.width(*tool).round().max(1.0) as u32,
+                        radius: BOX_RADIUS_DIP * self.stroke_unit,
                     }),
                     _ => None,
                 }
@@ -1174,9 +1178,9 @@ fn key_button(key: u16, ctrl: bool, shift: bool) -> Option<EditorButton> {
         (0x50, false) => tool(EditorTool::Pen),
         (0x4D, false) => tool(EditorTool::Marker),
         (0x48, false) => tool(EditorTool::Highlighter),
-        // 1 to 6 on the main row or the number pad.
-        (0x31..=0x36, false) => Some(EditorButton::Swatch(usize::from(key - 0x31))),
-        (0x61..=0x66, false) => Some(EditorButton::Swatch(usize::from(key - 0x61))),
+        // 1 to 7 on the main row or the number pad, one for each colour.
+        (0x31..=0x37, false) => Some(EditorButton::Swatch(usize::from(key - 0x31))),
+        (0x61..=0x67, false) => Some(EditorButton::Swatch(usize::from(key - 0x61))),
         _ => None,
     }
 }
@@ -2104,7 +2108,11 @@ mod tests {
             key_button(0x61, false, false),
             Some(EditorButton::Swatch(0))
         );
-        assert_eq!(key_button(u16::from(b'7'), false, false), None);
+        assert_eq!(
+            key_button(u16::from(b'7'), false, false),
+            Some(EditorButton::Swatch(6))
+        );
+        assert_eq!(key_button(u16::from(b'8'), false, false), None);
         assert_eq!(
             key_button(u16::from(b'Z'), true, false),
             Some(EditorButton::Undo)
