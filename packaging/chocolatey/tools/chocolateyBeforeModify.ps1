@@ -1,77 +1,42 @@
 $ErrorActionPreference = 'Stop'
 
-$toolsDirectory = Split-Path -Parent $MyInvocation.MyCommand.Definition
-$cli = Join-Path $toolsDirectory 'captastic\captastic.exe'
-
-function Invoke-CaptasticCommand([string[]]$Arguments) {
-    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $startInfo.FileName = $cli
-    $startInfo.Arguments = $Arguments -join ' '
-    $startInfo.UseShellExecute = $false
-    $startInfo.CreateNoWindow = $true
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
-    $process = New-Object System.Diagnostics.Process
-    $process.StartInfo = $startInfo
-    try {
-        if (-not $process.Start()) {
-            throw 'Captastic process did not start.'
-        }
-        $stdout = $process.StandardOutput.ReadToEnd()
-        $process.StandardError.ReadToEnd() | Out-Null
-        $process.WaitForExit()
-        return [PSCustomObject]@{
-            ExitCode = $process.ExitCode
-            Stdout = $stdout
-        }
-    } finally {
-        $process.Dispose()
-    }
+# Captastic is stopped through its session control event rather than through an executable. Every
+# version's daemon holds this event while it runs and closes it as it exits, and every version's
+# `stop` command did nothing but signal it. Going to the event directly is what lets this hook stop
+# a 0.2 daemon and a 0.3 one alike, and 0.3 ships no command line to ask.
+#
+# CAPTASTIC_HOOK_TEST_CONTROL_EVENT exists for scripts/test-chocolatey-hooks.ps1 alone, so the hook
+# tests drive a fixture instead of stopping a real daemon in the session they run in.
+$controlEventName = 'Local\CaptasticDaemonControl-v1'
+if ($env:CAPTASTIC_HOOK_TEST_CONTROL_EVENT) {
+    $controlEventName = $env:CAPTASTIC_HOOK_TEST_CONTROL_EVENT
 }
 
-if (-not (Test-Path -LiteralPath $cli -PathType Leaf)) {
+function Test-CaptasticRunning {
+    $controlEvent = $null
+    if (-not [System.Threading.EventWaitHandle]::TryOpenExisting($controlEventName, [ref]$controlEvent)) {
+        return $false
+    }
+    $controlEvent.Dispose()
+    return $true
+}
+
+$controlEvent = $null
+if (-not [System.Threading.EventWaitHandle]::TryOpenExisting($controlEventName, [ref]$controlEvent)) {
     return
 }
-
-$status = $null
 try {
-    # Captastic writes operational logs to stderr even when a command succeeds.
-    # Keep native streams separate because Chocolatey's PowerShell host promotes
-    # native stderr to a terminating error when ErrorActionPreference is Stop.
-    $statusResult = Invoke-CaptasticCommand @('status', '--json')
-    if ($statusResult.ExitCode -ne 0) {
-        throw "Captastic status failed with exit code $($statusResult.ExitCode)."
-    }
-    $status = ($statusResult.Stdout | ConvertFrom-Json).status
-} catch {
-    throw "Captastic status could not be read before package modification: $($_.Exception.Message)"
-}
-
-if ($status -eq 'not_running') {
-    return
-}
-if ($status -ne 'running') {
-    throw "Captastic returned unexpected status '$status'; refusing package modification."
-}
-
-$stopResult = Invoke-CaptasticCommand @('stop')
-if ($stopResult.ExitCode -ne 0) {
-    throw "Captastic stop failed with exit code $($stopResult.ExitCode)."
+    [void]$controlEvent.Set()
+} finally {
+    $controlEvent.Dispose()
 }
 
 $deadline = [DateTime]::UtcNow.AddSeconds(5)
 do {
     Start-Sleep -Milliseconds 100
-    $statusResult = Invoke-CaptasticCommand @('status', '--json')
-    if ($statusResult.ExitCode -ne 0) {
-        throw "Captastic status failed with exit code $($statusResult.ExitCode) while waiting for shutdown."
-    }
-    $status = ($statusResult.Stdout | ConvertFrom-Json).status
-} while ($status -eq 'running' -and [DateTime]::UtcNow -lt $deadline)
+    $running = Test-CaptasticRunning
+} while ($running -and [DateTime]::UtcNow -lt $deadline)
 
-if ($status -eq 'running') {
+if ($running) {
     throw 'The running Captastic daemon did not stop within five seconds.'
-}
-if ($status -ne 'not_running') {
-    throw "Captastic returned unexpected status '$status' after stop; refusing package modification."
 }

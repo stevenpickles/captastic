@@ -47,7 +47,7 @@ function ConvertTo-OptionalUInt64([string]$Value, [string]$Name) {
 }
 
 function Get-BinaryBuildMetadata([string]$Directory) {
-    $items = foreach ($binary in @('captastic.exe', 'captastic-desktop.exe')) {
+    $items = foreach ($binary in @('captastic.exe')) {
         $path = Join-Path $Directory $binary
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
             throw "Distribution binary is missing: $path"

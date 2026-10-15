@@ -63,8 +63,8 @@ jobs:
 
       - name: Report distribution build identity
         run: |
-          cargo run --locked --profile dist -p captastic-app -- --version
-          cargo run --locked --profile dist -p captastic-app -- version --json
+          cargo run --locked --profile dist -p captastic-app --bin captastic-dev -- --version
+          cargo run --locked --profile dist -p captastic-app --bin captastic-dev -- version --json
 
       - name: Run packaging tests
         if: runner.os == 'Windows'

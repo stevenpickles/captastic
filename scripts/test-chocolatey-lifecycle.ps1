@@ -79,16 +79,20 @@ try {
         '--source', $initial.Directory,
         '--yes', '--pre', '--no-progress', '--limit-output'
     )
-    foreach ($shim in @('captastic.exe', 'captastic-desktop.exe')) {
-        if (-not (Test-Path -LiteralPath (Join-Path $chocolateyBin $shim) -PathType Leaf)) {
-            throw "Chocolatey install did not create shim $shim."
-        }
+    if (-not (Test-Path -LiteralPath (Join-Path $chocolateyBin 'captastic.exe') -PathType Leaf)) {
+        throw 'Chocolatey install did not create shim captastic.exe.'
+    }
+    if (Test-Path -LiteralPath (Join-Path $chocolateyBin 'captastic-desktop.exe')) {
+        throw 'Chocolatey install created the retired captastic-desktop.exe shim.'
     }
     if (-not (Test-Path -LiteralPath $shortcutPath -PathType Leaf)) {
         throw "Chocolatey install did not create Start Menu shortcut $shortcutPath."
     }
-    $status = & (Join-Path $chocolateyBin 'captastic.exe') status --json | ConvertFrom-Json
-    if ($LASTEXITCODE -ne 0 -or $status.status -ne 'not_running') {
+    # The shipped executable has no status command; a running daemon is one holding its control
+    # event, which is the question `status` used to answer.
+    $controlEvent = $null
+    if ([System.Threading.EventWaitHandle]::TryOpenExisting('Local\CaptasticDaemonControl-v1', [ref]$controlEvent)) {
+        $controlEvent.Dispose()
         throw 'Chocolatey first install unexpectedly launched Captastic.'
     }
 
