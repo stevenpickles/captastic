@@ -111,10 +111,12 @@ now redrawn when it is committed, however it got there (PR #107).
 
 ## What was not observed
 
-- **The disposable-VM checklist** — a clean machine's portable `install.ps1` and `uninstall.ps1`, and
-  the Chocolatey install, upgrade and uninstall — is the release gate described in
-  [docs/chocolatey.md](https://github.com/stevenpickles/captastic/blob/v0.3.0/docs/chocolatey.md);
-  record its result here before publishing.
+- **The disposable-VM checklist was not run for this release.** Its steps are in
+  [docs/chocolatey.md](https://github.com/stevenpickles/captastic/blob/v0.3.0/docs/chocolatey.md): a
+  clean machine's portable `install.ps1` and `uninstall.ps1`, and the Chocolatey install, upgrade
+  and uninstall. The portable installer has therefore not been watched end to end on 0.3, and the
+  Chocolatey paths were watched only on a machine that already had Captastic; hosted CI covers the
+  silent install, upgrade and uninstall without a desktop.
 - Pins and editors at any scaling other than 150 %, on more than one display, or moved between
   displays of different scaling.
 - Drawing responsiveness on a 4K capture with many marks: a stroke redraws only the pixels it
