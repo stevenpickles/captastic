@@ -529,7 +529,7 @@ Ctrl+C on a foreground daemon, **Exit** in the notification-area menu, or `capta
 
 For a smaller distributable binary without changing the profiled release build, use `cargo build --profile dist -p captastic-app`.
 
-See [ROADMAP.md](ROADMAP.md) for prioritized work after v0.2.0 — the remaining milestones, their
+See [ROADMAP.md](ROADMAP.md) for prioritized work — the remaining milestones, their
 status, and the release signing and distribution backlog — and
 [outputs/Captastic-Specification.md](outputs/Captastic-Specification.md) for the complete original
 implementation plan.
