@@ -456,8 +456,14 @@ mod tests {
         // produce a percentage that reads exactly like a regression. Every differing field is
         // named with both sides, because a refusal listing only the first sends the reader back to
         // diffing fingerprint blocks by eye.
-        let baseline = one_run("baseline.json");
-        let mut candidate = one_run("candidate.json");
+        // Both sides start from the same pinned host rather than the one running the test: a
+        // Remote Desktop session already reports "remote", and then the candidate's change below
+        // is no change at all.
+        let [mut baseline, mut candidate] = ["baseline.json", "candidate.json"].map(one_run);
+        for set in [&mut baseline, &mut candidate] {
+            set.runs[0].environment.os_build = Some("26100.9000 (24H2)".to_owned());
+            set.runs[0].environment.session = Some("interactive".to_owned());
+        }
         candidate.runs[0].environment.os_build = Some("26200.9999 (25H2)".to_owned());
         candidate.runs[0].environment.session = Some("remote".to_owned());
         candidate.runs[0].cursor = "include".to_owned();
