@@ -54,11 +54,13 @@ pub enum StrokeStyle {
 pub enum Mark {
     /// An opaque fill over everything beneath it.
     Redaction(Rect),
-    /// A box outline, `width` pixels thick, drawn inside `rect`.
+    /// A box outline, `width` pixels thick, drawn inside `rect`, its outer corners rounded by
+    /// `radius` pixels. The inner corners follow, so the band is the same width all the way round.
     Rectangle {
         rect: Rect,
         color: Color,
         width: u32,
+        radius: f32,
     },
     /// A freehand line through `points`, `width` pixels across, with round ends and joins.
     Stroke {
@@ -350,33 +352,20 @@ pub fn paint_mark(
     };
     match mark {
         Mark::Redaction(_) => fill(pixels, reach, offset, 4, &REDACTION_EIGHT_BIT),
-        Mark::Rectangle { rect, color, width } => {
-            let pixel = ordered(*color, blue_first);
-            let thickness_x = (*width).min(rect.width);
-            let thickness_y = (*width).min(rect.height);
-            let bands = [
-                Rect {
-                    height: thickness_y,
-                    ..*rect
-                },
-                Rect {
-                    y: (rect.bottom() - i64::from(thickness_y)) as i32,
-                    height: thickness_y,
-                    ..*rect
-                },
-                Rect {
-                    width: thickness_x,
-                    ..*rect
-                },
-                Rect {
-                    x: (rect.right() - i64::from(thickness_x)) as i32,
-                    width: thickness_x,
-                    ..*rect
-                },
-            ];
-            for band in bands {
-                if let Some(band) = band.intersection(area) {
-                    fill(pixels, band, offset, 4, &pixel);
+        Mark::Rectangle {
+            rect,
+            color,
+            width,
+            radius,
+        } => {
+            let ink = ordered(*color, blue_first);
+            for y in reach.y..(reach.bottom() as i32) {
+                for x in reach.x..(reach.right() as i32) {
+                    let cover = box_outline_coverage(*rect, *width as f32, *radius, x, y);
+                    if cover > 0.0 {
+                        let at = offset(x, y);
+                        blend_over(&mut pixels[at..at + 4], &ink, cover, alpha);
+                    }
                 }
             }
         }
@@ -404,6 +393,26 @@ pub fn paint_mark(
             }
         }
     }
+}
+
+/// How much of the pixel at `(x, y)` a box outline covers, from 0 to 1, antialiased along both
+/// its outer and its inner edge.
+fn box_outline_coverage(rect: Rect, width: f32, radius: f32, x: i32, y: i32) -> f32 {
+    let half_width = rect.width as f32 / 2.0;
+    let half_height = rect.height as f32 / 2.0;
+    let radius = radius.clamp(0.0, half_width.min(half_height));
+    let centre = (rect.x as f32 + half_width, rect.y as f32 + half_height);
+    let point = (x as f32 + 0.5 - centre.0, y as f32 + 0.5 - centre.1);
+    // The signed distance to the rounded outer edge: negative inside, positive outside.
+    let q = (
+        point.0.abs() - (half_width - radius),
+        point.1.abs() - (half_height - radius),
+    );
+    let outside = (q.0.max(0.0).powi(2) + q.1.max(0.0).powi(2)).sqrt();
+    let distance = outside + q.0.max(q.1).min(0.0) - radius;
+    let within_outer = (0.5 - distance).clamp(0.0, 1.0);
+    let beyond_inner = (distance + width + 0.5).clamp(0.0, 1.0);
+    within_outer.min(beyond_inner)
 }
 
 fn ordered(color: Color, blue_first: bool) -> [u8; 4] {
@@ -744,6 +753,7 @@ mod tests {
             rect: rect(0, 0, 2, 1),
             color: RED,
             width: 1,
+            radius: 0.0,
         }));
         let rendered = edit.render().expect("render");
         assert_eq!(&rendered.pixels()[..8], &[0x11; 8]);
@@ -757,6 +767,7 @@ mod tests {
             rect: rect(1, 1, 6, 6),
             color: RED,
             width: 2,
+            radius: 0.0,
         }));
         let rendered = edit.render().expect("render");
         let red = [RED.blue, RED.green, RED.red, 255];
@@ -768,6 +779,33 @@ mod tests {
         assert_eq!(pixel(&rendered, 3, 3), [255; 4]);
         assert_eq!(pixel(&rendered, 0, 0), [255; 4]);
         assert_eq!(pixel(&rendered, 7, 7), [255; 4]);
+    }
+
+    #[test]
+    fn a_rounded_box_leaves_its_corners_clear_and_keeps_its_sides() {
+        let mut edit = Edit::new(white(20, 20));
+        assert!(edit.add(Mark::Rectangle {
+            rect: rect(0, 0, 20, 20),
+            color: RED,
+            width: 2,
+            radius: 6.0,
+        }));
+        let rendered = edit.render().expect("render");
+        let red = [RED.blue, RED.green, RED.red, 255];
+        // The very corner is outside the curve.
+        assert_eq!(pixel(&rendered, 0, 0), [255; 4]);
+        // The middle of each side is solid.
+        assert_eq!(pixel(&rendered, 10, 0), red);
+        assert_eq!(pixel(&rendered, 0, 10), red);
+        assert_eq!(pixel(&rendered, 19, 10), red);
+        assert_eq!(pixel(&rendered, 10, 19), red);
+        // The curve is antialiased: somewhere near the corner a pixel is part-covered.
+        assert!((0..6).any(|i| {
+            let value = pixel(&rendered, i, i);
+            value != red && value != [255; 4]
+        }));
+        // And the inside is untouched.
+        assert_eq!(pixel(&rendered, 10, 10), [255; 4]);
     }
 
     #[test]
@@ -896,6 +934,7 @@ mod tests {
             rect: rect(0, 0, 6, 6),
             color: RED,
             width: 6,
+            radius: 0.0,
         });
         edit.redact(rect(1, 1, 2, 2));
         edit.add(Mark::Stroke {
@@ -924,11 +963,13 @@ mod tests {
             rect: rect(10, 10, 2, 2),
             color: RED,
             width: 1,
+            radius: 0.0,
         }));
         assert!(!edit.add(Mark::Rectangle {
             rect: rect(0, 0, 2, 2),
             color: RED,
             width: 0,
+            radius: 0.0,
         }));
         assert!(!edit.add(Mark::Stroke {
             points: Vec::new(),
