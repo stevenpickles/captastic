@@ -43,15 +43,15 @@ use shell::{
 use snap::{SnapAxis, SnapTarget, SnapTargetKind, SnapTargets, NO_SNAPS};
 use window_enumeration::{enumerate_visible_windows, WindowCandidate};
 
+use machine::{
+    confirm_intent, default_region_for_source, fit_region_to_source, initial_selection,
+    local_point, transition, CaptureTool, CloseOutcome, CursorIntent, OverlayEffect, OverlayInput,
+    OverlayModel, ResizeHandle,
+};
 #[cfg(test)]
 use machine::{
     contains, hit_test_resize_handle, latest_interaction_region, move_region, rect_from_points,
     resize_region,
-};
-use machine::{
-    default_region_for_source, fit_region_to_source, initial_selection, local_point, transition,
-    CaptureTool, CloseOutcome, CursorIntent, Modifiers, OverlayEffect, OverlayInput, OverlayModel,
-    ResizeHandle,
 };
 
 use crate::dwm_thumbnail::{fit_source_in_bounds, DwmThumbnail};
@@ -1647,6 +1647,7 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                     point,
                     window_slot,
                     time_ms: message_time_ms(),
+                    modifiers: modifiers(),
                 }
             };
             run_machine(hwnd, state_pointer, input)
@@ -2127,20 +2128,6 @@ fn apply_overlay_effects(
                 return;
             }
         }
-    }
-}
-
-/// The intent a confirming key or click carries: Shift pins and Ctrl edits, as the plain key or
-/// click captures (ADR 0010). Ctrl wins when both are held: it is the one that withholds the
-/// capture, and an edit can still be abandoned, where a capture already delivered cannot be taken
-/// back.
-fn confirm_intent(held: Modifiers) -> ConfirmIntent {
-    if held.ctrl {
-        ConfirmIntent::Edit
-    } else if held.shift {
-        ConfirmIntent::Pin
-    } else {
-        ConfirmIntent::Capture
     }
 }
 
@@ -4127,7 +4114,7 @@ fn draw_hover_tooltip(device: HDC, state: &OverlayState, layout: ToolbarLayout) 
         }
         Some(ToolbarControl::Capture) => {
             let value = if state.model.selection.is_some() {
-                "Copy selection to clipboard"
+                "Copy selection (Shift+click to pin, Ctrl+click to edit)"
             } else {
                 "Select something to capture"
             };
