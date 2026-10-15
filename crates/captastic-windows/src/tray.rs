@@ -16,7 +16,7 @@ use windows::Win32::System::Shutdown::{ShutdownBlockReasonCreate, ShutdownBlockR
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Shell::{
     ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR,
-    NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+    NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
@@ -208,10 +208,30 @@ impl TrayIcon {
         title: impl Into<String>,
         message: impl Into<String>,
     ) -> Result<(), CaptureError> {
+        self.notify(title.into(), message.into(), false)
+    }
+
+    /// A notification that something went as asked, with the information icon rather than the
+    /// error one: a saved recording, for instance.
+    pub fn show_info_with_title(
+        &self,
+        title: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Result<(), CaptureError> {
+        self.notify(title.into(), message.into(), true)
+    }
+
+    fn notify(
+        &self,
+        title: String,
+        message: String,
+        informational: bool,
+    ) -> Result<(), CaptureError> {
         self.notification_sender
             .try_send(TrayNotification {
-                title: title.into(),
-                message: message.into(),
+                title,
+                message,
+                informational,
             })
             .map_err(|error| tray_error("queue_tray_error", error.to_string()))?;
         // SAFETY: hwnd identifies the live hidden tray window owned by the tray thread.
@@ -1177,6 +1197,8 @@ fn modify_tray_tooltip(hwnd: HWND, paused: bool) -> Result<(), CaptureError> {
 struct TrayNotification {
     title: String,
     message: String,
+    /// The information icon rather than the error one.
+    informational: bool,
 }
 
 fn show_error_notification(
@@ -1191,7 +1213,11 @@ fn show_error_notification(
     );
     write_wide(&mut data.szInfoTitle, &notification.title);
     write_wide(&mut data.szInfo, &notification.message);
-    data.dwInfoFlags = NIIF_ERROR;
+    data.dwInfoFlags = if notification.informational {
+        NIIF_INFO
+    } else {
+        NIIF_ERROR
+    };
     // SAFETY: data identifies the existing icon and contains terminated notification buffers.
     if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
         return Err(last_error("show_tray_error_notification"));
