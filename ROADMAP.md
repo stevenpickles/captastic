@@ -1,16 +1,17 @@
 # Captastic roadmap
 
-Captastic now has a fast Windows-native DXGI capture engine, clipboard output, region and window
-selection, persistent UI state, a notification-area desktop experience, current-user installation,
-and release packaging. v0.1.0 and v0.1.1 have shipped and v0.2.0 is merged to `dev` awaiting its
-release branch; the work after it should make Captastic more useful on real workstations while
-preserving the low-latency, native design.
+Captastic now has a fast Windows-native DXGI capture engine, clipboard and file output, region and
+window selection, persistent UI state, a notification-area desktop experience, current-user
+installation, and release packaging. v0.1.0, v0.1.1 and v0.2.0 have shipped. 0.3.0 is in progress on
+`dev`: it ships Captastic as one windowless executable, and its theme is the first post-capture
+features, pinning and annotation (Milestone 6), while keeping the low-latency, native capture path
+untouched when they are not used.
 
 This roadmap is ordered by user impact and architectural dependency, with release readiness placed
 first because it is the only time-bound section. Closed investigations have moved to
 [docs/investigations.md](docs/investigations.md) so this file carries planning signal rather than
 narrative; every fact they recorded survives there. Authenticode signing remains important for a
-public release, but it gates neither v0.1.0 nor the capture milestones below.
+public release, but it gates neither a release nor the milestones below.
 
 ## Product principles
 
@@ -51,122 +52,85 @@ public release, but it gates neither v0.1.0 nor the capture milestones below.
   (PRs #88 and #90).
 - Benchmark evidence tooling: a host fingerprint in every report, run compatibility and budget
   hosts keyed on it, raw per-repeat artifacts, and `benchmark compare` (PRs #87 and #91).
+- One shipped executable: `captastic.exe` is built for the Windows subsystem and runs the
+  notification-area daemon, so login and the Start Menu open no console, and the command line is the
+  unshipped developer tool `captastic-dev` (PR #101). The overlay's **Options** menu states both
+  destinations and switches file output (PR #100).
 
-## Release readiness — v0.1.0
+## Shipped releases
 
-**Status:** v0.1.0 shipped on 2026-09-03: `release/v0.1.0` merged to `main` by PR #81, the tag on
-that merge commit ran the tagged path of the release workflow, and the GitHub release carries the
-archive, checksum, Chocolatey package, and manifest. The manual Chocolatey community push has not
-been made. v0.1.1 shipped on 2026-09-16, a patch release cut from `dev` after PR #83 (the
-dock-switch first-capture fixes) under the same branch model; its notes are
-`docs/release-notes-v0.1.1.md`. The gates below are kept as the record of what v0.1.0 had to
-satisfy.
-v0.1.0 is a deliberately unsigned first tag whose purpose is to exercise the release mechanics end
-to end and to describe honestly what Captastic is and is not. It is not gated on the capture
-milestones below, and it makes no performance claim.
+| Release | Date | What it was | Notes |
+| --- | --- | --- | --- |
+| v0.1.0 | 2026-09-03 | The first tag: unsigned, no performance claim, the release mechanics exercised end to end | [notes](docs/release-notes-v0.1.0.md) |
+| v0.1.1 | 2026-09-16 | Patch: the dock-switch first-capture fixes (PR #83) | [notes](docs/release-notes-v0.1.1.md) |
+| v0.2.0 | 2026-09-17 | Output formats, region precision, the frozen view, the file-output toggle, benchmark evidence | [notes](docs/release-notes-v0.2.0.md) |
+
+The v0.2.0 manual checklists found two defects that nothing else had (#94, the frozen view presented
+with `ULW_OPAQUE` was not opaque; #95, the default output directory ignored a redirected Pictures
+folder), which is the standing argument for running a manual checklist before every release that
+changes overlay or desktop behaviour. No release has yet been pushed to the Chocolatey community
+repository; that is deliberately deferred to 0.3.0 (below).
 
 **Branch model for every formal release.** Cut a `release/v<version>` branch from `dev`, merge it
 to `main` by pull request, tag `v<version>` on `main`, and then merge the release branch back to
 `dev` by pull request. Nothing is pushed to `main` or `dev` directly; both are covered by the
-repository ruleset that requires pull requests. `main` does not exist before v0.1.0. One
-consequence to know about: `build.rs` and `scripts/build-packages.ps1` measure the revision count
-from the newest `v*` tag reachable from `HEAD`, and the tag sits on a merge commit that only
-`main` contains, so `dev` builds keep counting from the previous reachable tag or the repository
-root. That is cosmetic; if it ever matters, open the back-merge pull request from `main` instead
-of from the release branch.
+repository ruleset that requires pull requests. One consequence to know about: `build.rs` and
+`scripts/build-packages.ps1` measure the revision count from the newest `v*` tag reachable from
+`HEAD`, and the tag sits on a merge commit that only `main` contains, so `dev` builds keep counting
+from the previous reachable tag or the repository root. That is cosmetic; if it ever matters, open
+the back-merge pull request from `main` instead of from the release branch.
+
+**The standing rule on performance claims.** Release notes quote no millisecond unless the claim
+procedure in [benchmarks/README.md](benchmarks/README.md) has been run and the sets that support the
+figure are committed. Every release so far has published no absolute number, which satisfies
+Milestone 5's criterion vacuously and on purpose.
+
+## Release readiness — v0.3.0
+
+**Status:** in progress on `dev` (workspace version 0.3.0). Decided on 2026-10-15:
+
+- **Theme: pinning and annotation (Milestone 6).** It was the decision gate's open choice against a
+  first cross-platform proof; it wins because it is user-visible, ungated, and buildable and
+  testable on one machine, where Milestone 1's remainder needs a second adapter.
+- **One shipped executable, the CLI developer-only** (PR #101). Done, and observed on the desktop:
+  the 0.2.0 → 0.3.0 Chocolatey upgrade migrating the login entry and removing the old shim, the
+  Start Menu start with no console, start at login, and the `--version`, argument-error and
+  "Captastic stopped" dialogs.
+- **The Chocolatey community push waits for 0.3.0** rather than catching up v0.1.0 or v0.2.0.
+
+Already on `dev`: PR #99 (a host-independent compare test), #100 (the overlay's Save to Disk row and
+an honest clipboard row) and #101. Next to land: relaunching Captastic after a Chocolatey upgrade
+that stopped it (`feature/67/relaunch-after-upgrade`).
 
 ### Gates — before the tag
 
-- **Unsigned-release documentation and README repositioning.** Landing alongside this refresh as
-  `docs/unsigned-releases.md`, which states what an unsigned release means for the person
-  installing it and how a download is verified against the published SHA-256, and as a README that
-  positions Captastic for a first release rather than for a development audience. Nothing is
-  advertised that signing would be needed to claim.
-- **A release-notes draft (`docs/release-notes-v0.1.0.md`) that publishes no absolute performance
-  numbers.** The decision, recorded here rather than left implicit: Milestone 5's exit criterion
-  *"Three compatible repeat runs support every published performance claim"* is **deferred past
-  v0.1.0**, and is satisfied vacuously at v0.1.0 by publishing no absolute claims at all — with no
-  published number there is nothing for repeat runs to support. The criterion binds again the
-  moment an absolute figure is published, and publishing one waits on the repeat-run and
-  environment-fingerprint automation Milestone 5 still lists as outstanding, and on the absolute
-  budgets deliberately left unset until measured on the documented benchmark host. Release notes
-  may describe the design and its latency boundaries; they may not quote a millisecond.
-- **Release mechanics never yet exercised live.** Four of them, in the order they occur:
-  - The **tag-triggered path of the release workflow**. The one successful workflow run was a
-    `workflow_dispatch`, which takes the CI-prerelease branch (`-PrereleaseLabel ci.…`). The
-    `-ReleaseTag` branch of `scripts/build-packages.ps1` has never run: it additionally proves the
-    matching tag points at `HEAD`, the source is clean, the Cargo version matches, and both
-    executables embed the exact formal version, and only then marks the manifest publishable and
-    records a direct tagged-release URL in `VERIFICATION.txt`. Every one of those proofs is
-    untested against a real tag.
-  - The **disposable-VM checklist** in [docs/chocolatey.md](docs/chocolatey.md): Start Menu entry
-    launches the tray application, the global hotkey captures, an upgrade stops a running daemon
-    cleanly, and `~/.captastic` survives uninstall. Hosted CI covers silent install, shims,
-    shortcut, upgrade and uninstall cleanup, but has no interactive desktop, so this cannot be
-    delegated to it.
-  - The **manual `choco push`**, only after the tagged GitHub release exists, its direct download
-    URLs work, and its manifest hashes match. A first submission also has to pass Chocolatey
-    community validation and moderation before `choco install captastic` works against the default
-    source, so it is not finished when the push returns.
-  - The **immediate post-tag workspace version bump** on `dev`, once the release branch has been
-    merged back, so subsequent `dev` and `ci` identifiers are prereleases of the next release
-    rather than of the one just published.
-
-### Operator-run verification — recommended before the tag, formally deferrable
-
-These need a human at the machine, and they are the recovery paths that shipped with the least live
-verification. Recommended before the tag; deferrable past it only if the release notes disclose
-that they are unverified.
-
-- Live **sleep/wake** recovery.
-- Live **Remote Desktop** recovery.
-- The **`DEVICE_REMOVED`/`DEVICE_RESET` limb** of GPU-reset recovery, via the elevated adapter
-  cycle. Its `AccessLost` limb is already measured against a real driver restart.
-
-### Explicitly not gating
-
-- **Multi-adapter composition** (Milestone 1) — hardware-gated, and the structured unsupported
-  error is an honest answer rather than a silent wrong one.
-- **HDR verification on a real HDR display** — hardware; the sinks already refuse what they cannot
-  describe.
-- **Authenticode signing** — deliberately sequenced after a stable release channel exists, which is
-  what v0.1.0 creates.
-- **Milestone 3's follow-ups** (retained sessions, the backend trait, richer metrics) — internal
-  quality, no user-visible contract.
-- **Milestones 6 and 7** — post-release by the existing decision gate.
-
-## Release readiness — v0.2.0
-
-**Status:** `release/v0.2.0` was cut from `dev` on 2026-09-17 after every slice merged — PRs #87
-and #91 (benchmark evidence), #88 (output formats), #89 (region precision), #90 (the
-notification-area file-output toggle), #92 (the frozen-view toggle), #93 (this section and the
-notes), and the two fixes the manual checklists found, #94 (the frozen view presented opaque) and
-#95 (the default output directory follows the shell's Pictures folder). The notes are
-[docs/release-notes-v0.2.0.md](docs/release-notes-v0.2.0.md).
-
-### Gates — before the tag
-
-- **The manual checklists in PRs #89, #90 and #92: run.** On 2026-09-17, on one 3840 × 2160
-  display at 150 % scaling, every region-precision and frozen-view step in
-  [docs/overlay-ui-verification.md](docs/overlay-ui-verification.md) and the file-output toggle's
-  steps were watched working, including the live-view magnifier sample coming back free of the
-  overlay. The two defects they found are fixed above. Not watched: video stopping and resuming
-  across the `F` toggle, other scalings and a second display, the presenter fallback, the
-  `BufferExhausted` balloon, and the file destination's detach and abandoned-capture paths.
-- **The benchmark claim run: not made, by choice.** The notes quote no figure. Running
-  [benchmarks/README.md](benchmarks/README.md) remains the way to earn one for a later release.
+- **Milestone 6's first slices merged and their exit criteria met** — at minimum pinning and the
+  editor with crop and destructive redaction (see [Milestone 6](#milestone-6--annotation-and-pinning)).
+  Shapes and text may follow in a later 0.3.x if they are not ready; a half-finished editor may not.
+- **A manual desktop checklist for every slice that changes overlay or desktop behaviour,** run
+  before merge, as #100 and #101 were.
+- **The disposable-VM checklist** in [docs/chocolatey.md](docs/chocolatey.md), now also covering the
+  portable `install.ps1`/`uninstall.ps1` end to end and an upgrade of a running 0.3 relaunching it —
+  the two install paths not yet observed live.
+- **Release notes** that say what changed for an existing user: one executable, `captastic` on `PATH`
+  now starts the tray application, the command line is a developer tool, and the 0.2 login entry is
+  migrated.
 
 ### Then the release itself
 
-The v0.1.0 branch model, unchanged: cut `release/v0.2.0` from `dev`, merge it to `main` by pull
-request, tag `v0.2.0` on `main`, run the disposable-VM checklist in
-[docs/chocolatey.md](docs/chocolatey.md), push to Chocolatey manually once the release URLs and
-hashes verify, merge the release branch back to `dev`, and bump the workspace version to 0.3.0.
+The branch model above, then the **first Chocolatey community push**: only after the tagged GitHub
+release exists, its direct download URLs work, and its manifest hashes match. A first submission
+also has to pass Chocolatey community validation and moderation before `choco install captastic`
+resolves against the default source, so it is not finished when the push returns.
 
-**The standing rule, restated because v0.2.0 is the first release with the tooling to break it:**
-release notes quote no millisecond unless the claim procedure has been run and the sets that
-support the figure are committed. As drafted, v0.2.0 publishes no absolute number, which satisfies
-Milestone 5's deferred criterion the same way v0.1.0 did — vacuously, and on purpose.
+### Explicitly not gating
+
+- **The operator-run recovery checks** carried since v0.1.0: live sleep/wake, live Remote Desktop,
+  and the `DEVICE_REMOVED`/`DEVICE_RESET` limb of GPU-reset recovery via the elevated adapter cycle.
+  Still recommended, still deferrable with disclosure.
+- **A benchmark claim run** — optional; without it the notes quote no figure.
+- **Multi-adapter composition and HDR verification** — hardware-gated.
+- **Authenticode signing** — sequenced after a stable release channel, as before.
 
 ## Milestone 1 — Multi-monitor and topology support
 
@@ -386,7 +350,8 @@ workload, deferred past v0.2.0, and the operator runs that the deferred publishe
 now waits on — the fingerprint and repeat-artifact automation behind it shipped in v0.2.0. The live
 lifecycle verifications that remain — sleep/wake, Remote Desktop, and the
 `DEVICE_REMOVED`/`DEVICE_RESET` limb of GPU reset — are listed under
-[Release readiness](#release-readiness--v010) because they are recommended before the tag.
+[Release readiness — v0.3.0](#release-readiness--v030) because they are recommended before every
+tag.
 
 **Outcome:** Captastic handles the remaining pixel formats and Windows lifecycle transitions with
 explicit, tested behavior.
@@ -540,9 +505,10 @@ explicit, tested behavior.
 
 ## Milestone 6 — Annotation and pinning
 
-**Status:** Not started, and no longer gated. The overlay/tray message-state-machine extraction it
-waited on is complete, so the compose/render layer and window-shell utilities annotation needs now
-exist as separable modules. Remains behind Milestones 1 and 5 by priority, not by dependency.
+**Status:** Next — the 0.3.0 theme, chosen on 2026-10-15 at the decision gate in Milestone 7. Not
+started. Nothing gates it: the overlay/tray state-machine extraction it waited on is complete, so the
+compose/render layer (`overlay/raster.rs`) and the window-shell utilities (`overlay/shell.rs`) it
+needs exist as separable modules.
 
 **Outcome:** Optional post-capture tools add communication value without changing Captastic's
 capture-engine identity.
@@ -554,11 +520,50 @@ capture-engine identity.
 - Keep annotation resources lazy and absent from direct clipboard/file hotkeys.
 - Define whether editing is modal or concurrent before adding capture-history integration.
 
+### Decisions to settle first
+
+One ADR, written before the first slice, because each answer shapes every slice after it:
+
+- **Where the tools are reached.** Candidates: actions on the overlay toolbar beside **Capture**
+  (for example **Pin** and **Edit**), a post-capture affordance, and notification-area items for the
+  last capture. The overlay is where the user already is when they decide; the tray is where they
+  are afterwards.
+- **Modal or concurrent.** Whether an editor or a pinned window may stay open while the hotkey
+  starts another overlay run, and what owns the screen when both exist.
+- **Where an edited result goes.** Whether it replaces the clipboard and writes a new file through
+  the destination set, never overwriting the capture it started from.
+- **Whether pinned windows appear in captures.** The exit criterion says a pinned window is never a
+  capture *candidate* (the window chooser, edge snapping) unless asked for; whether one shows in a
+  display or region capture, as anything else on screen does, is a separate choice.
+- **Frame ownership.** A pinned window or an editor must copy its pixels out of the CPU readback
+  pool rather than hold a pooled frame: the pool has three slots, and v0.2.0's soak showed that a
+  destination holding a lease for long is what produces `BufferExhausted` refusals.
+
+### Proposed slices
+
+Each lands as its own pull request with a manual desktop checklist.
+
+1. **Pin a capture.** An always-on-top window showing a confirmed capture at its physical size, with
+   move, close, opacity and click-through, and excluded from the window chooser and edge snapping.
+   First because it is the smallest end-to-end path through the new frame ownership and the window
+   shell, with no editing model yet.
+2. **Editor shell, crop and redaction.** The editor window and model, crop adjustment, and
+   destructive redaction (pixels overwritten in the exported frame, never a reversible layer), with
+   the result published through the destination set.
+3. **Shapes and highlights.** Arrows, rectangles and highlights on the editor model.
+4. **Text.** Text annotations, with DPI-correct font rendering in the exported pixels.
+5. **History integration.** Opening a recent capture in the editor, once modal versus concurrent is
+   settled and proven by the slices above.
+
+Slices 1 and 2 gate the 0.3.0 tag; 3–5 may follow in 0.3.x.
+
 ### Exit criteria
 
 - Unedited capture metrics and memory use are unchanged when annotation is not invoked.
 - Redaction modifies exported pixels rather than storing a reversible overlay.
 - Pinned windows cannot be mistaken for capture candidates unless explicitly requested.
+- A pinned window or an open editor never holds a CPU readback slot, so it cannot cause a
+  `BufferExhausted` refusal however long it stays open.
 
 ## Milestone 7 — Native macOS and Linux implementations
 
@@ -594,12 +599,16 @@ platforms as equivalent when they are not.
 
 After capture quality and history are stable, choose annotation/pinning or the first cross-platform
 proof based on the intended audience. Neither should delay the Windows workstation milestones.
+**Taken on 2026-10-15: annotation and pinning first,** as the 0.3.0 theme. Cross-platform work
+remains the next candidate after it.
 
 ## Milestone 8 — Precision region selection
 
-**Status:** Complete (v0.2.0, PRs #89 and #92). Shipped with its exit criteria met by test and
-unobserved on a desktop; the manual matrices are listed under
-[Release readiness — v0.2.0](#release-readiness--v020).
+**Status:** Complete (v0.2.0, PRs #89 and #92). Every exit criterion is met by test, and the PR #89
+and #92 checklists were watched working on 2026-09-17 on one 3840 × 2160 display at 150 % scaling,
+including the live-view magnifier sample coming back free of the overlay. Not watched: other
+scalings, a second display, video stopping and resuming across the `F` toggle, the presenter
+fallback, and the `BufferExhausted` balloon.
 
 **Outcome:** A region can be placed on the exact pixel the user means, over a picture that holds
 still when the desktop will not.
@@ -638,23 +647,22 @@ still when the desktop will not.
 - A snapped edge lands on the target's exact pixel column or row and the guide describes the edge
   the region really sits on. **Met by test** — unit and property coverage pins the half-open
   relationship, including the case where the minimum-size clamp invalidates a guide and it is
-  dropped. **Not yet observed live** (PR #89 checklist 1–4).
+  dropped. **Observed live** on 2026-09-17 (PR #89 checklist 1–4).
 - The keyboard can place an edge the pointer cannot, and never fights the snap that put it there.
   **Met by test** — nudges of any length and order leave a legal region, never snap, and stop
-  repainting at a display edge. **Not yet observed live** (PR #89 checklist 5–6).
+  repainting at a display edge. **Observed live** on 2026-09-17 (PR #89 checklist 5–6).
 - The magnifier shows the pixels the capture will contain, stays on the monitor, and never covers
   its own source square. **Met by test** at all four scalings, including a real GDI blit proving
-  the nearest-neighbour enlargement invents no colour. **Not yet observed live**, and the live-view
-  sample coming back with no trace of the overlay in it is the one check nothing here substitutes
-  for (PR #89 checklist 7–10).
+  the nearest-neighbour enlargement invents no colour. **Observed live** on 2026-09-17, including
+  the live-view sample coming back with no trace of the overlay in it (PR #89 checklist 7–10).
 - The user can stop the picture without losing the press, and gets the picture they were looking
   at. **Met by test** — the fake backend stamps `request.id & 0xff` into every pixel, so a
   frozen-view confirmation is proved to crop the capture taken at the press and a live-view
-  confirmation the capture taken at the confirmation. **Not yet observed live** (PR #92
+  confirmation the capture taken at the confirmation. **Observed live** on 2026-09-17 (PR #92
   checklist 1–6).
 - Both preferences survive a daemon restart and the view toggle does not. **Met by test** at the
-  store and the live-cache level, including a display this process has never drawn on. **The full
-  round trip through a running daemon is not yet observed** (PR #89 checklist 11, PR #92
+  store and the live-cache level, including a display this process has never drawn on. The full round
+  trip through a running daemon was observed on 2026-09-17 (PR #89 checklist 11, PR #92
   checklist 7).
 
 ## Architecture hardening backlog
@@ -748,24 +756,27 @@ disposition are recorded in
 [docs/investigations.md](docs/investigations.md#the-2026-08-code-architecture-and-roadmap-review).
 The order below reflects what remains.
 
-1. Ship v0.2.0: the manual checklists from PRs #89, #90 and #92, the optional benchmark claim run,
-   then `release/v0.2.0` to `main`, the tag, the disposable-VM check, the manual `choco push`, the
-   back-merge, and the bump to 0.3.0. First because it is time-bound and because everything the
-   release exercises — the checklists especially — is exercised by nothing else.
-2. Complete Milestone 1 (multi-adapter composition and the hardware validation matrix). The only
-   milestone in progress, and the one whose remaining work needs hardware rather than design.
-3. Finish Milestone 5's evidence work, which is now measurement rather than code: the operator
+1. Land the relaunch after a Chocolatey upgrade (`feature/67/relaunch-after-upgrade`), the last
+   packaging change 0.3.0 needs before its theme work.
+2. Write the Milestone 6 ADR (the [decisions to settle first](#decisions-to-settle-first)), then
+   build slices 1 and 2 — pinning, then the editor with crop and redaction — each with its manual
+   checklist. They gate the 0.3.0 tag.
+3. Ship 0.3.0: the disposable-VM checklist (portable installer and upgrade relaunch included),
+   release notes, the branch model, and the first Chocolatey community push. Milestone 6's
+   remaining slices can follow as 0.3.x.
+4. Finish Milestone 5's evidence work, which is now measurement rather than code: the operator
    claim runs from [benchmarks/README.md](benchmarks/README.md), after which the absolute budget
    ceilings can be set and a figure can be published. The sequence-marker workload and Milestone 3's
    window-capture backend trait stay deferred — the first needs a desk, a mouse and a rotatable
    display and gates no release claim; the second changes no user-visible contract.
-4. Settle the outstanding design decisions — latest-mode currency on an idle desktop,
+5. Complete Milestone 1 (multi-adapter composition and the hardware validation matrix) when the
+   hardware is available; it needs a second adapter, not design.
+6. Settle the outstanding design decisions — latest-mode currency on an idle desktop,
    `fresh` + `virtual_desktop`, and control-event hardening. Milestone 4's two product questions are
    answered (ADR 0008), and the mouse-capture/software-KVM contract is settled in ADR 0009: each use
    takes the pointer source that answers its own question, and Captastic promises nothing about
    where a foreign owner has put the mouse.
-5. Add annotation/pinning (Milestone 6, now ungated) or cross-platform work (Milestone 7), based on
-   audience demand (existing decision gate).
+7. Cross-platform work (Milestone 7), the decision gate's other candidate, after Milestone 6.
 
 ### Lifecycle recovery: what the investigation settled
 
@@ -781,28 +792,19 @@ not reproduced on demand, is in
 
 ## Recommended next branch
 
-`release/v0.2.0`, cut from `dev` on 2026-09-17 after the manual checklists were run and the two
-defects they found were merged. Everything v0.2.0 contains is merged; the branch exists only to
-carry the release through `main`, the tag, and the merge back to `dev` as described under
-[Release readiness — v0.2.0](#release-readiness--v020), after which the workspace version moves to
-the 0.3.0 line.
+`feature/67/relaunch-after-upgrade` is open and needs only its desktop check: with Captastic running,
+a Chocolatey upgrade to a newer 0.3 prerelease should leave it running afterwards, unelevated.
 
-The checklists did find something — twice — which is the argument for running them before every
-release about overlay behaviour: a presenter flag the compositor did not honour, and a default
-directory that was right for the profile and wrong for the user. The operator-run live
-verifications from v0.1.0 — sleep/wake, Remote Desktop, and the `DEVICE_REMOVED`/`DEVICE_RESET`
-limb of GPU-reset recovery through the elevated adapter cycle — are still outstanding and still
-deferrable, and the benchmark claim run was not made for v0.2.0, so its notes quote no number.
+After it, the Milestone 6 ADR: a short document, not a branch of code, that settles the entry points,
+modal versus concurrent editing, where an edited result goes, whether pinned windows appear in
+captures, and frame ownership. Then slice 1, pinning, as the first code branch of the theme.
 
-Then the release itself: the release branch to `main` by pull request, the tag on `main`, the
-disposable-VM checklist, the manual `choco push` once the release URLs and hashes verify, the
-pull request merging the release branch back to `dev`, and the version bump.
+FakeBackend fidelity keeps its leverage and is worth extending as gaps appear: much of Milestone 4
+shipped with daemon-side behaviour verified only by unit tests, because a second daemon cannot start
+while one holds the session control event, and a fake backend that honestly reproduces the real
+contract is what would close that gap for everything after it — the pinned window and the editor
+included.
 
-FakeBackend fidelity keeps its leverage beyond this milestone and is worth extending as gaps appear:
-much of Milestone 4 shipped with daemon-side behaviour verified only by unit tests, because a second
-daemon cannot start while one holds the session control event, and a fake backend that honestly
-reproduces the real contract is what would close that gap for everything after it.
-
-Milestone 1's remaining work is the higher priority by roadmap order, but it is gated on hardware
-rather than effort: multi-adapter composition cannot be honestly validated on a single-adapter,
-single-monitor machine. Schedule it when the hardware matrix is available.
+Milestone 1's remaining work is gated on hardware rather than effort: multi-adapter composition
+cannot be honestly validated on a single-adapter, single-monitor machine. Schedule it when the
+hardware matrix is available.
