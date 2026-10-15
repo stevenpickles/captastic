@@ -396,6 +396,10 @@ fn capture(args: cli::CaptureArgs) -> Result<(), AppError> {
                     // A one-shot run has no daemon to start a file worker for it: the row states
                     // what this capture will do and does not offer to change it.
                     file_output_switchable: false,
+                    // Nothing outlives a one-shot run to keep a pin open, and the editor is
+                    // ADR 0010's second slice.
+                    pin_available: false,
+                    edit_available: false,
                 },
                 &mut overlay_resources,
             )?;

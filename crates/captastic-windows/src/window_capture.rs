@@ -2729,6 +2729,7 @@ mod tests {
             &OverlaySelection {
                 rect: desktop.metadata.source_rect,
                 kind: SelectionKind::Display,
+                intent: crate::overlay::ConfirmIntent::Capture,
                 window: None,
                 window_title: None,
                 window_application: None,
@@ -2761,6 +2762,7 @@ mod tests {
             &OverlaySelection {
                 rect: desktop.metadata.source_rect,
                 kind: SelectionKind::Window,
+                intent: crate::overlay::ConfirmIntent::Capture,
                 window: None,
                 window_title: None,
                 window_application: None,
@@ -2791,6 +2793,7 @@ mod tests {
             &OverlaySelection {
                 rect: preview.metadata.source_rect,
                 kind: SelectionKind::Window,
+                intent: crate::overlay::ConfirmIntent::Capture,
                 window: None,
                 window_title: None,
                 window_application: None,
@@ -2817,6 +2820,7 @@ mod tests {
             captured_window_frame(&OverlaySelection {
                 rect: preview.metadata.source_rect,
                 kind: SelectionKind::Window,
+                intent: crate::overlay::ConfirmIntent::Capture,
                 window: None,
                 window_title: None,
                 window_application: None,

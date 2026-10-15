@@ -16,7 +16,7 @@ use super::snap::{
     guides_for, snap_coordinate, snap_point, snap_translation, ActiveSnaps, EdgeMask, RectEdges,
     SnapAxis, SnapHit, SnapTargets, NO_SNAPS, SNAP_THRESHOLD_DIP,
 };
-use super::{NativeWindowHandle, PreviewView, SelectionKind, WindowCandidate};
+use super::{ConfirmIntent, NativeWindowHandle, PreviewView, SelectionKind, WindowCandidate};
 
 pub(super) const DRAG_THRESHOLD: i32 = 4;
 pub(super) const MIN_REGION_SIZE: i64 = 8;
@@ -253,6 +253,10 @@ pub(super) struct OverlayModel {
     /// Whether this run has a daemon behind it that can act on a request to switch file output.
     /// A one-shot capture has none, so its row states the destination rather than offering it.
     pub(super) file_output_switchable: bool,
+    /// Whether **Pin** may end this run; see `OverlayDestinations::pin_available`.
+    pub(super) pin_available: bool,
+    /// Whether **Edit** may end this run; see `OverlayDestinations::edit_available`.
+    pub(super) edit_available: bool,
     pub(super) hovered_control: Option<ToolbarControl>,
     pub(super) pointer_local: Option<POINT>,
     /// The window-chooser candidate under the pointer. The shell owns the thumbnail
@@ -317,7 +321,13 @@ pub(super) enum OverlayInput {
     PointerCaptureLost,
     /// The shell finished a requested window-preview update: `rect` is the captured frame's
     /// source rectangle when a ready preview now backs the selected window, `None` otherwise.
-    WindowPreviewResolved { rect: Option<Rect> },
+    ///
+    /// `intent` is what the click that chose the window asked for: a preview click confirms at
+    /// once, so Shift and Ctrl on that click stand in for the Pin and Edit buttons.
+    WindowPreviewResolved {
+        rect: Option<Rect>,
+        intent: ConfirmIntent,
+    },
     /// The shell finished the enumeration requested by [`OverlayEffect::BuildSnapTargets`].
     SnapTargetsReady { targets: SnapTargets },
     /// The magnifier's hotkey went down or came up. Also delivered with `held: false` when the
@@ -335,8 +345,8 @@ pub(super) enum OverlayInput {
     /// The shell has already folded the modifier state into these numbers, so the machine never
     /// has to know which key was pressed — only what the user asked the region to do.
     Nudge { dx: i32, dy: i32, resize: bool },
-    /// Enter pressed.
-    ConfirmRequested,
+    /// Enter pressed, with the intent its modifiers chose: Shift pins, Ctrl edits.
+    ConfirmRequested { intent: ConfirmIntent },
     /// Escape, right-click, or an external close request.
     CancelRequested,
     /// The display configuration changed under the overlay; its geometry is no longer current.
@@ -385,6 +395,7 @@ pub(super) enum CloseOutcome {
         rect: Rect,
         kind: SelectionKind,
         window: Option<NativeWindowHandle>,
+        intent: ConfirmIntent,
     },
     Cancelled,
     /// Close without persisting geometry from a configuration that is no longer current.
@@ -471,7 +482,9 @@ pub(super) fn transition(model: &mut OverlayModel, input: OverlayInput) -> Vec<O
             window_slot,
             time_ms,
         } => pointer_down(model, point, window_slot, time_ms),
-        OverlayInput::WindowPreviewResolved { rect } => window_preview_resolved(model, rect),
+        OverlayInput::WindowPreviewResolved { rect, intent } => {
+            window_preview_resolved(model, rect, intent)
+        }
         OverlayInput::SnapTargetsReady { targets } => {
             model.snap_targets = Some(targets);
             // Nothing visible changed: the inventory is requested before the first pointer move
@@ -485,7 +498,7 @@ pub(super) fn transition(model: &mut OverlayModel, input: OverlayInput) -> Vec<O
         OverlayInput::Tick { time_ms } => loupe_tick(model, time_ms),
         OverlayInput::ToggleView => toggle_view(model),
         OverlayInput::Nudge { dx, dy, resize } => nudge(model, dx, dy, resize),
-        OverlayInput::ConfirmRequested => confirm(model),
+        OverlayInput::ConfirmRequested { intent } => confirm(model, intent),
         OverlayInput::CancelRequested => cancel(model),
         OverlayInput::DisplayConfigurationInvalidated { reason } => {
             vec![OverlayEffect::Close(
@@ -756,7 +769,9 @@ fn toolbar_control_pressed(
         }
         // Capture and Cancel end the run without touching the cursor or repainting: the window
         // is being destroyed (or, for a selection-less capture press, nothing changed).
-        ToolbarControl::Capture => return confirm(model),
+        ToolbarControl::Capture => return confirm(model, ConfirmIntent::Capture),
+        ToolbarControl::Pin => return confirm(model, ConfirmIntent::Pin),
+        ToolbarControl::Edit => return confirm(model, ConfirmIntent::Edit),
         ToolbarControl::DimBackground => {
             model.dim_background = !model.dim_background;
         }
@@ -1172,12 +1187,23 @@ fn resize_region_by(region: Rect, dx: i32, dy: i32, source: Rect) -> Rect {
     Rect::from_edges(left, top, right, bottom).unwrap_or(region)
 }
 
-fn window_preview_resolved(model: &mut OverlayModel, rect: Option<Rect>) -> Vec<OverlayEffect> {
+fn window_preview_resolved(
+    model: &mut OverlayModel,
+    rect: Option<Rect>,
+    intent: ConfirmIntent,
+) -> Vec<OverlayEffect> {
     model.selection = rect;
     model.selection_kind = rect.map(|_| SelectionKind::Window);
     if model.selection.is_some() {
-        // A ready preview confirms immediately; the shell attaches the captured frame.
-        confirm(model)
+        // A ready preview confirms immediately; the shell attaches the captured frame. An
+        // unavailable Pin or Edit falls back to Capture rather than swallowing the click: the
+        // window is chosen, and a click that did nothing would read as a bug.
+        let effects = confirm(model, intent);
+        if effects.is_empty() {
+            confirm(model, ConfirmIntent::Capture)
+        } else {
+            effects
+        }
     } else {
         // Not ready (or empty space): stay in the chooser. The preview cache deliberately does
         // not latch failures, so the next click retries.
@@ -1194,7 +1220,7 @@ fn double_clicked(model: &mut OverlayModel, point: POINT) -> Vec<OverlayEffect> 
     if layout.hit_test(local, model.options_open).is_some() {
         return Vec::new();
     }
-    confirm(model)
+    confirm(model, ConfirmIntent::Capture)
 }
 
 fn pointer_capture_lost(model: &mut OverlayModel) -> Vec<OverlayEffect> {
@@ -1217,16 +1243,27 @@ fn pointer_capture_lost(model: &mut OverlayModel) -> Vec<OverlayEffect> {
     effects
 }
 
-fn confirm(model: &mut OverlayModel) -> Vec<OverlayEffect> {
+fn confirm(model: &mut OverlayModel, intent: ConfirmIntent) -> Vec<OverlayEffect> {
     let (Some(rect), Some(kind)) = (model.selection, model.selection_kind) else {
         return Vec::new();
     };
+    // A greyed action is refused here, not merely drawn grey, so a keyboard shortcut cannot reach
+    // what the button would not.
+    let available = match intent {
+        ConfirmIntent::Capture => true,
+        ConfirmIntent::Pin => model.pin_available,
+        ConfirmIntent::Edit => model.edit_available,
+    };
+    if !available {
+        return Vec::new();
+    }
     debug_assert_eq!(model.tool, CaptureTool::from_selection_kind(kind));
     let mut effects = persist_interaction(model);
     effects.push(OverlayEffect::Close(CloseOutcome::Confirmed {
         rect,
         kind,
         window: model.selected_window,
+        intent,
     }));
     effects
 }
@@ -1666,6 +1703,8 @@ mod tests {
             clipboard_enabled: true,
             file_output_enabled: false,
             file_output_switchable: true,
+            pin_available: true,
+            edit_available: false,
             hovered_control: None,
             pointer_local: None,
             hovered: None,
@@ -2030,7 +2069,12 @@ mod tests {
             });
             model.selection_kind = Some(kind);
 
-            let effects = transition(&mut model, OverlayInput::ConfirmRequested);
+            let effects = transition(
+                &mut model,
+                OverlayInput::ConfirmRequested {
+                    intent: ConfirmIntent::Capture,
+                },
+            );
             let positions: Vec<_> = effects
                 .iter()
                 .map(|effect| match effect {
@@ -2053,7 +2097,13 @@ mod tests {
     #[test]
     fn confirm_without_a_selection_does_nothing() {
         let mut model = region_model();
-        assert!(transition(&mut model, OverlayInput::ConfirmRequested).is_empty());
+        assert!(transition(
+            &mut model,
+            OverlayInput::ConfirmRequested {
+                intent: ConfirmIntent::Capture,
+            }
+        )
+        .is_empty());
     }
 
     #[test]
@@ -2282,6 +2332,8 @@ mod tests {
             (center(layout.window), ToolbarControl::Window, false),
             (center(layout.region), ToolbarControl::Region, false),
             (center(layout.options), ToolbarControl::Options, false),
+            (center(layout.pin), ToolbarControl::Pin, false),
+            (center(layout.edit), ToolbarControl::Edit, false),
             (center(layout.capture), ToolbarControl::Capture, false),
             (
                 center(layout.dim_background),
@@ -2560,6 +2612,121 @@ mod tests {
         );
         assert_eq!(model.hovered_control, Some(ToolbarControl::DimBackground));
         assert!(close_outcome(&effects).is_none());
+    }
+
+    fn region_model_with_selection() -> OverlayModel {
+        let mut model = region_model();
+        model.tool = CaptureTool::Region;
+        model.selection = Some(Rect {
+            x: 5,
+            y: 6,
+            width: 70,
+            height: 80,
+        });
+        model.selection_kind = Some(SelectionKind::Region);
+        model
+    }
+
+    fn confirmed_intent(effects: &[OverlayEffect]) -> Option<ConfirmIntent> {
+        match close_outcome(effects) {
+            Some(CloseOutcome::Confirmed { intent, .. }) => Some(intent),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn pin_and_edit_buttons_confirm_with_their_intent() {
+        let layout = layout_for(&region_model_with_selection());
+        let press = |at: POINT| OverlayInput::PointerDown {
+            point: at,
+            window_slot: None,
+            time_ms: 0,
+        };
+
+        let mut model = region_model_with_selection();
+        let effects = transition(&mut model, press(center(layout.pin)));
+        assert_eq!(confirmed_intent(&effects), Some(ConfirmIntent::Pin));
+
+        let mut model = region_model_with_selection();
+        model.edit_available = true;
+        let effects = transition(&mut model, press(center(layout.edit)));
+        assert_eq!(confirmed_intent(&effects), Some(ConfirmIntent::Edit));
+
+        let mut model = region_model_with_selection();
+        let effects = transition(&mut model, press(center(layout.capture)));
+        assert_eq!(confirmed_intent(&effects), Some(ConfirmIntent::Capture));
+    }
+
+    #[test]
+    fn the_keyboard_cannot_reach_an_action_the_toolbar_greys() {
+        // Edit is greyed until the editor exists, and Pin in a run with no daemon behind it.
+        let mut model = region_model_with_selection();
+        let effects = transition(
+            &mut model,
+            OverlayInput::ConfirmRequested {
+                intent: ConfirmIntent::Edit,
+            },
+        );
+        assert!(
+            effects.is_empty(),
+            "an unavailable Edit leaves the run open"
+        );
+
+        let mut model = region_model_with_selection();
+        model.pin_available = false;
+        let effects = transition(
+            &mut model,
+            OverlayInput::ConfirmRequested {
+                intent: ConfirmIntent::Pin,
+            },
+        );
+        assert!(effects.is_empty(), "an unavailable Pin leaves the run open");
+
+        let mut model = region_model_with_selection();
+        let effects = transition(
+            &mut model,
+            OverlayInput::ConfirmRequested {
+                intent: ConfirmIntent::Pin,
+            },
+        );
+        assert_eq!(confirmed_intent(&effects), Some(ConfirmIntent::Pin));
+    }
+
+    #[test]
+    fn a_window_chosen_with_an_unavailable_action_is_still_captured() {
+        // A preview click confirms at once. Ctrl on that click asks for Edit, which this run does
+        // not offer; swallowing the click would leave the user wondering why nothing happened.
+        let mut model = region_model();
+        model.tool = CaptureTool::Window;
+        let effects = transition(
+            &mut model,
+            OverlayInput::WindowPreviewResolved {
+                rect: Some(Rect {
+                    x: 20,
+                    y: 30,
+                    width: 200,
+                    height: 100,
+                }),
+                intent: ConfirmIntent::Edit,
+            },
+        );
+        assert_eq!(confirmed_intent(&effects), Some(ConfirmIntent::Capture));
+
+        let mut model = region_model();
+        model.tool = CaptureTool::Window;
+        let effects = transition(
+            &mut model,
+            OverlayInput::WindowPreviewResolved {
+                rect: Some(Rect {
+                    x: 20,
+                    y: 30,
+                    width: 200,
+                    height: 100,
+                }),
+                intent: ConfirmIntent::Pin,
+            },
+        );
+        assert_eq!(confirmed_intent(&effects), Some(ConfirmIntent::Pin));
     }
 
     #[test]
@@ -3086,6 +3253,7 @@ mod tests {
             &mut model,
             OverlayInput::WindowPreviewResolved {
                 rect: Some(frame_rect),
+                intent: ConfirmIntent::Capture,
             },
         );
         assert_eq!(model.selection, Some(frame_rect));
@@ -3096,7 +3264,9 @@ mod tests {
             "window confirms do not persist a region"
         );
         match close_outcome(&effects) {
-            Some(CloseOutcome::Confirmed { kind, window, rect }) => {
+            Some(CloseOutcome::Confirmed {
+                kind, window, rect, ..
+            }) => {
                 assert_eq!(kind, SelectionKind::Window);
                 assert_eq!(window, Some(handle));
                 assert_eq!(rect, frame_rect);
@@ -3129,7 +3299,10 @@ mod tests {
 
             let effects = transition(
                 &mut model,
-                OverlayInput::WindowPreviewResolved { rect: None },
+                OverlayInput::WindowPreviewResolved {
+                    rect: None,
+                    intent: ConfirmIntent::Capture,
+                },
             );
             assert_eq!(model.selection, None);
             assert_eq!(model.selection_kind, None);
@@ -4582,7 +4755,9 @@ mod tests {
     #[test]
     fn close_is_always_the_final_effect() {
         let inputs = [
-            OverlayInput::ConfirmRequested,
+            OverlayInput::ConfirmRequested {
+                intent: ConfirmIntent::Capture,
+            },
             OverlayInput::CancelRequested,
             OverlayInput::DisplayConfigurationInvalidated { reason: "test" },
             OverlayInput::DoubleClicked {

@@ -187,6 +187,8 @@ pub struct SelectionWorker {
     failure_receiver: mpsc::Receiver<String>,
     /// Requests from the Options menu to save captures to disk or not, for the daemon to act on.
     file_output_receiver: mpsc::Receiver<bool>,
+    /// The pinned-capture thread, started by the first Pin and stopped with this worker (ADR 0010).
+    pins: Arc<Mutex<Option<captastic_windows::PinHost>>>,
     stop_requested: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
     ui_join: Option<JoinHandle<()>>,
@@ -206,6 +208,8 @@ impl SelectionWorker {
         let (ui_sender, ui_receiver) = mpsc::channel();
         let (failure_sender, failure_receiver) = mpsc::channel();
         let (file_output_sender, file_output_receiver) = mpsc::channel();
+        let pins = Arc::new(Mutex::new(None));
+        let worker_pins = pins.clone();
         let stop_requested = Arc::new(AtomicBool::new(false));
         let worker_stop_requested = stop_requested.clone();
         let ui_join = thread::Builder::new()
@@ -583,12 +587,30 @@ impl SelectionWorker {
                                     // opened in is otherwise indistinguishable from one that was
                                     // switched and switched back.
                                     "view_switched": selection.view_switched,
+                                    "intent": confirm_intent(selection.intent),
                                 })
                             );
                         }
                         let cpu_ready_offset_ns = job
                             .cpu_ready_offset_ns
                             .unwrap_or_else(|| duration_ns(job.triggered_at.elapsed()));
+                        // Pin publishes exactly as Capture does and also keeps the capture on
+                        // screen (ADR 0010). The share taken here is only held until the pin has
+                        // made its own copy below, after the destinations have their jobs, so
+                        // pinning adds nothing to the time a capture takes to reach the clipboard.
+                        let pin_frame = match selection.intent {
+                            captastic_windows::ConfirmIntent::Pin => Some(selected_frame.clone()),
+                            captastic_windows::ConfirmIntent::Capture => None,
+                            captastic_windows::ConfirmIntent::Edit => {
+                                // The overlay is never offered Edit until the editor exists, so
+                                // this cannot be reached; if it is, capturing is the safe reading.
+                                log::warn!(
+                                    "capture {} asked for an editor that does not exist yet; delivering it as a capture",
+                                    job.capture_id.0
+                                );
+                                None
+                            }
+                        };
                         // Read per confirmation for the same reason the capture worker reads
                         // it per capture: the set can have changed while the overlay was open.
                         let output_sinks = destinations.current();
@@ -641,6 +663,9 @@ impl SelectionWorker {
                                     );
                                 }
                             }
+                        }
+                        if let Some(frame) = pin_frame {
+                            pin_capture(&worker_pins, job.capture_id, &frame, selection.rect);
                         }
                     }
                     Ok(captastic_windows::SelectionOutcome::Cancelled) => {
@@ -724,6 +749,7 @@ impl SelectionWorker {
             ui_sender: Some(ui_sender),
             failure_receiver,
             file_output_receiver,
+            pins,
             stop_requested,
             join: Some(join),
             ui_join: Some(ui_join),
@@ -744,6 +770,28 @@ impl SelectionWorker {
     /// Where an overlay run last asked file output to be, if a request arrived since the previous
     /// poll. Later requests supersede earlier ones: the daemon acts on where the user left the
     /// row, not on every click along the way.
+    /// Closes every pinned capture, from the notification area. Nothing to do if none was ever
+    /// pinned: the thread that would hold them has not been started.
+    pub fn close_all_pins(&self) {
+        if let Some(host) = lock_pins(&self.pins).as_ref() {
+            if let Err(error) = host.close_all() {
+                crate::logging::warn(format_args!("could not close the pinned captures: {error}"));
+            }
+        }
+    }
+
+    /// Makes every pinned capture clickable again. A click-through pin cannot be clicked to undo
+    /// that, so the notification area is the way back (ADR 0010).
+    pub fn make_pins_clickable(&self) {
+        if let Some(host) = lock_pins(&self.pins).as_ref() {
+            if let Err(error) = host.make_all_clickable() {
+                crate::logging::warn(format_args!(
+                    "could not make the pinned captures clickable: {error}"
+                ));
+            }
+        }
+    }
+
     pub fn take_file_output_request(&self) -> Option<bool> {
         self.file_output_receiver.try_iter().last()
     }
@@ -785,6 +833,12 @@ impl SelectionWorker {
             if !join_worker_until(join, "selection", selection_deadline) {
                 selection_stopped = false;
             }
+        }
+        // Pins close with the daemon. Taken after the selection thread has stopped, so no Pin can
+        // start a new host behind this one; a thread that overruns holds only windows and ends
+        // with the process.
+        if let Some(host) = lock_pins(&self.pins).take() {
+            host.stop(selection_deadline);
         }
         if let Some(join) = self.ui_join.take() {
             if selection_stopped {
@@ -1105,6 +1159,69 @@ fn overlay_destinations(names: &[&'static str]) -> captastic_windows::OverlayDes
         clipboard: names.contains(&crate::clipboard::DESTINATION_NAME),
         file_output: names.contains(&crate::file_output::DESTINATION_NAME),
         file_output_switchable: true,
+        // The worker starts the pinned-capture thread on the first Pin, so a daemon run can
+        // always offer it.
+        pin_available: true,
+        edit_available: false,
+    }
+}
+
+fn lock_pins(
+    pins: &Mutex<Option<captastic_windows::PinHost>>,
+) -> std::sync::MutexGuard<'_, Option<captastic_windows::PinHost>> {
+    // A panic while holding this lock cannot leave a host half-made: the Option is either set or
+    // not. Recovering the guard keeps pins usable rather than failing every later Pin.
+    pins.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Pins a confirmed capture, starting the pinned-capture thread if this is the first.
+///
+/// A failure is logged and the capture is otherwise unaffected: it has already gone to its
+/// destinations exactly as Capture would have sent it.
+fn pin_capture(
+    pins: &Mutex<Option<captastic_windows::PinHost>>,
+    capture_id: captastic_core::CaptureId,
+    frame: &captastic_core::CpuFrame,
+    at: captastic_core::Rect,
+) {
+    let mut host = lock_pins(pins);
+    if host.is_none() {
+        match captastic_windows::PinHost::start() {
+            Ok(started) => *host = Some(started),
+            Err(error) => {
+                crate::logging::warn(format_args!(
+                    "capture {} was delivered but could not be pinned: {error}",
+                    capture_id.0
+                ));
+                return;
+            }
+        }
+    }
+    let Some(host) = host.as_ref() else { return };
+    // Detached: a pin stays open as long as the user wants it, and must never hold one of the
+    // readback pool's slots while it does (ADR 0010).
+    match host.pin(frame.detached(), at) {
+        Ok(()) => log::info!(
+            "pinned capture {} ({}x{} at {},{})",
+            capture_id.0,
+            frame.width(),
+            frame.height(),
+            at.x,
+            at.y
+        ),
+        Err(error) => crate::logging::warn(format_args!(
+            "capture {} was delivered but could not be pinned: {error}",
+            capture_id.0
+        )),
+    }
+}
+
+const fn confirm_intent(intent: captastic_windows::ConfirmIntent) -> &'static str {
+    match intent {
+        captastic_windows::ConfirmIntent::Capture => "capture",
+        captastic_windows::ConfirmIntent::Pin => "pin",
+        captastic_windows::ConfirmIntent::Edit => "edit",
     }
 }
 
@@ -1550,6 +1667,7 @@ mod tests {
             ui_sender: None,
             failure_receiver,
             file_output_receiver: mpsc::channel().1,
+            pins: Arc::new(Mutex::new(None)),
             stop_requested: Arc::new(AtomicBool::new(false)),
             join: None,
             ui_join: None,
@@ -1600,6 +1718,14 @@ mod tests {
             assert!(
                 destinations.file_output_switchable,
                 "a daemon run can always ask"
+            );
+            assert!(
+                destinations.pin_available,
+                "a daemon run can always pin, whatever the destinations"
+            );
+            assert!(
+                !destinations.edit_available,
+                "the editor is ADR 0010's second slice"
             );
         }
     }

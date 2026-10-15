@@ -1445,6 +1445,16 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                     "notification area",
                                 );
                             }
+                            captastic_windows::TrayEvent::ClosePins => {
+                                if let Some(worker) = workers.selection() {
+                                    worker.close_all_pins();
+                                }
+                            }
+                            captastic_windows::TrayEvent::MakePinsClickable => {
+                                if let Some(worker) = workers.selection() {
+                                    worker.make_pins_clickable();
+                                }
+                            }
                             captastic_windows::TrayEvent::ToggleStartup => {
                                 toggle_startup_from_tray(tray)
                             }

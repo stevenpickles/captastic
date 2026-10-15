@@ -274,6 +274,20 @@ impl CpuFrame {
         self.stride_bytes as usize * self.height as usize
     }
 
+    /// The same frame in a buffer of its own.
+    ///
+    /// Cloning a frame shares its pixels, and a capture backend's readback pool knows a slot is
+    /// free only when nothing else shares it. Anything that keeps a frame for as long as a person
+    /// wants it - a pinned window, an editor - takes this copy instead, so it can never hold a slot
+    /// the next capture needs (ADR 0010).
+    #[must_use]
+    pub fn detached(&self) -> Self {
+        Self {
+            pixels: Arc::from(&self.pixels[..]),
+            ..self.clone()
+        }
+    }
+
     pub fn crop(&self, selection: Rect) -> Result<Self, FrameError> {
         if selection.width == 0 || selection.height == 0 {
             return Err(FrameError::EmptyCrop);
@@ -386,6 +400,23 @@ mod tests {
                 required: 16,
             })
         );
+    }
+
+    #[test]
+    fn a_detached_frame_shares_nothing_with_its_source() {
+        let source = test_frame();
+        let detached = source.detached();
+        assert!(!Arc::ptr_eq(
+            source.pixels_shared(),
+            detached.pixels_shared()
+        ));
+        assert_eq!(Arc::strong_count(source.pixels_shared()), 1);
+        assert_eq!(source.pixels(), detached.pixels());
+        assert_eq!(
+            (source.width(), source.height(), source.stride_bytes()),
+            (detached.width(), detached.height(), detached.stride_bytes())
+        );
+        assert_eq!(source.metadata.source_rect, detached.metadata.source_rect);
     }
 
     #[test]
