@@ -24,6 +24,10 @@ clap = { version = "=4.4.14", features = ["derive"] }
 # `simd` (which `std` does not imply) is this crate's only source of `unsafe`, so declining both
 # leaves a dependency that compiles under its own `forbid(unsafe_code)`.
 jpeg-encoder = { version = "=0.7.1", default-features = false }
+# Animated GIF for screen recordings (ADR 0011). Pure Rust, MIT or Apache-2.0, like png. The
+# color_quant feature brings NeuQuant (MIT) for each frame's palette; the GPL imagequant is what
+# this deliberately is not.
+gif = { version = "=0.14.2", default-features = false, features = ["std", "color_quant"] }
 log = { version = "=0.4.20", features = ["std"] }
 # Pulls flate2/miniz_oxide as its DEFLATE backend: pure Rust, no C toolchain, exact-pinnable
 # through the committed lockfile like every other dependency here.

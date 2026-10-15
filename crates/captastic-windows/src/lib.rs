@@ -27,6 +27,8 @@ mod startup;
 #[cfg(windows)]
 mod tray;
 #[cfg(windows)]
+mod video;
+#[cfg(windows)]
 mod window_capture;
 #[cfg(windows)]
 mod window_capture_wgc;
@@ -68,5 +70,7 @@ pub use session::{desktop_state, DesktopState};
 pub use startup::{disable_startup, enable_startup, startup_command};
 #[cfg(windows)]
 pub use tray::{open_path, show_error_dialog, show_info_dialog, TrayEvent, TrayIcon};
+#[cfg(windows)]
+pub use video::{mp4_frame_size, Mp4Writer, VideoSummary, MP4_MAXIMUM_SIZE};
 #[cfg(windows)]
 pub use window_capture::{captured_window_frame, materialize_selection};

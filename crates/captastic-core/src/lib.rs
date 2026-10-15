@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 
+mod animation;
 mod bmp;
 mod capture;
 mod detach;
@@ -15,6 +16,7 @@ mod png;
 #[cfg(test)]
 mod test_frames;
 
+pub use animation::{fit_within, shrink_bgra, AnimationError, AnimationSummary, GifWriter};
 pub use capture::{
     BackendCapabilities, CaptureBackend, CaptureId, CaptureMode, CaptureOutcome, CaptureRequest,
     CaptureSource, CursorMode, NativeFrame,
