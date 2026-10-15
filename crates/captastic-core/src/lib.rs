@@ -21,7 +21,7 @@ pub use capture::{
 };
 pub use detach::{process_detach_ledger, DetachCount, DetachKind, DetachLedger, DetachSummary};
 pub use display::{DisplayId, DisplayInfo, DisplayTopology, DisplayTopologyError, Rect};
-pub use edit::Edit;
+pub use edit::{paint_mark, Color, Edit, Mark, StrokeStyle};
 pub use encode::{
     encode_capture, EncodeError, EncodeOptions, EncodedCapture, OutputFormat, DEFAULT_JPEG_QUALITY,
 };

@@ -11,7 +11,9 @@
 //! does not. Redactions are shown as the opaque fill they will be published as, so what is on
 //! screen is what will be sent.
 
-use captastic_core::{CaptureError, CpuFrame, Edit, FrameAlpha, PixelFormat, Rect};
+use captastic_core::{
+    paint_mark, CaptureError, CpuFrame, Edit, FrameAlpha, Mark, PixelFormat, Rect,
+};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{BeginPaint, BitBlt, EndPaint, GdiFlush, PAINTSTRUCT, SRCCOPY};
@@ -360,8 +362,8 @@ fn dim_outside(pixels: &mut [u8], width: usize, area: UiRect, keep: UiRect) {
 }
 
 /// The capture as the editor shows it: tightly packed, opaque, with a capture that carries alpha
-/// laid over the canvas colour, and every redaction filled.
-fn compose_preview(source: &CpuFrame, redactions: &[Rect]) -> Vec<u8> {
+/// laid over the canvas colour, and every mark painted as it will be published.
+fn compose_preview(source: &CpuFrame, marks: &[Mark]) -> Vec<u8> {
     let (width, height) = (source.width() as usize, source.height() as usize);
     let stride = source.stride_bytes() as usize;
     let background = [CANVAS_RGB.2, CANVAS_RGB.1, CANVAS_RGB.0];
@@ -384,15 +386,21 @@ fn compose_preview(source: &CpuFrame, redactions: &[Rect]) -> Vec<u8> {
             to[3] = u8::MAX;
         }
     }
-    for redaction in redactions {
-        let (x, y) = (redaction.x as usize, redaction.y as usize);
-        for row in y..(y + redaction.height as usize).min(height) {
-            let start = (row * width + x) * 4;
-            let end = (row * width + (x + redaction.width as usize).min(width)) * 4;
-            for pixel in pixels[start..end].chunks_exact_mut(4) {
-                pixel.copy_from_slice(&[0, 0, 0, u8::MAX]);
-            }
-        }
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: source.width(),
+        height: source.height(),
+    };
+    for mark in marks {
+        paint_mark(
+            mark,
+            &mut pixels,
+            width * 4,
+            area,
+            PixelFormat::Bgra8Unorm,
+            FrameAlpha::Opaque,
+        );
     }
     pixels
 }
@@ -980,7 +988,7 @@ fn key_pressed(hwnd: HWND, state_pointer: *mut EditorState, key: u16) {
 }
 
 fn refresh_preview(state: &mut EditorState) {
-    let pixels = compose_preview(state.edit.source(), state.edit.redactions());
+    let pixels = compose_preview(state.edit.source(), state.edit.marks());
     if let Err(error) = state.preview.write_pixels(&pixels) {
         log::warn!("could not redraw the editor's preview: {error}");
     }
@@ -1621,7 +1629,7 @@ mod tests {
             metadata,
         )
         .expect("frame");
-        let preview = compose_preview(&frame, &[rect(1, 0, 1, 2)]);
+        let preview = compose_preview(&frame, &[Mark::Redaction(rect(1, 0, 1, 2))]);
         // A desktop capture's alpha byte is meaningless, so the preview is opaque.
         assert_eq!(&preview[0..4], &[50, 60, 70, 255]);
         assert_eq!(&preview[4..8], &[0, 0, 0, 255]);
