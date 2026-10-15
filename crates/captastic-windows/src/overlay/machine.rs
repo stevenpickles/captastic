@@ -16,7 +16,7 @@ use super::snap::{
     guides_for, snap_coordinate, snap_point, snap_translation, ActiveSnaps, EdgeMask, RectEdges,
     SnapAxis, SnapHit, SnapTargets, NO_SNAPS, SNAP_THRESHOLD_DIP,
 };
-use super::{NativeWindowHandle, PreviewView, SelectionKind, WindowCandidate};
+use super::{ConfirmIntent, NativeWindowHandle, PreviewView, SelectionKind, WindowCandidate};
 
 pub(super) const DRAG_THRESHOLD: i32 = 4;
 pub(super) const MIN_REGION_SIZE: i64 = 8;
@@ -242,6 +242,21 @@ pub(super) struct OverlayModel {
     pub(super) toolbar_drag: Option<ToolbarDrag>,
     pub(super) options_open: bool,
     pub(super) dim_background: bool,
+    /// Whether the clipboard receives the capture. Stated by the Options menu, never switched
+    /// there: it is the destination a run is assumed to have, and turning it off is a
+    /// configuration-file decision the notification area does not offer either.
+    pub(super) clipboard_enabled: bool,
+    /// Whether captures are written to disk: as the daemon reported it when the run opened, then
+    /// as the user has asked for it since. The same setting as the notification area's
+    /// `Save Captures to Disk`, reachable from a second place.
+    pub(super) file_output_enabled: bool,
+    /// Whether this run has a daemon behind it that can act on a request to switch file output.
+    /// A one-shot capture has none, so its row states the destination rather than offering it.
+    pub(super) file_output_switchable: bool,
+    /// Whether **Pin** may end this run; see `OverlayDestinations::pin_available`.
+    pub(super) pin_available: bool,
+    /// Whether **Edit** may end this run; see `OverlayDestinations::edit_available`.
+    pub(super) edit_available: bool,
     pub(super) hovered_control: Option<ToolbarControl>,
     pub(super) pointer_local: Option<POINT>,
     /// The window-chooser candidate under the pointer. The shell owns the thumbnail
@@ -285,13 +300,15 @@ pub(super) enum OverlayInput {
     /// Primary button pressed. Under the Window tool the shell resolves which thumbnail slot
     /// (if any) the press landed on.
     ///
-    /// Deliberately carries no modifiers: a press commits no geometry, so there is nothing for
-    /// Ctrl to suppress yet. The anchor it records is snapped later, when the press becomes a
-    /// drag, using that move's modifier state.
+    /// The modifiers are read only by a press on **Capture**, where Shift and Ctrl ask for Pin
+    /// and Edit as they do on Enter. A press commits no geometry, so there is nothing for Ctrl to
+    /// suppress yet: the anchor it records is snapped later, when the press becomes a drag, using
+    /// that move's modifier state.
     PointerDown {
         point: POINT,
         window_slot: Option<NativeWindowHandle>,
         time_ms: u32,
+        modifiers: Modifiers,
     },
     /// Primary button released. Fully modeled for every tool.
     ///
@@ -299,14 +316,21 @@ pub(super) enum OverlayInput {
     /// button-up point: without them a drag made with Ctrl held would snap at the last instant,
     /// and the rectangle the user let go of would not be the one they got.
     PointerUp { point: POINT, modifiers: Modifiers },
-    /// Primary button double-clicked anywhere.
-    DoubleClicked { point: POINT },
+    /// Primary button double-clicked anywhere. Off the toolbar it confirms, and Shift and Ctrl
+    /// ask for Pin and Edit as they do on Enter.
+    DoubleClicked { point: POINT, modifiers: Modifiers },
     /// Pointer capture was taken by another window. Self-initiated releases are consumed by the
     /// shell's protocol flag and never reach the machine.
     PointerCaptureLost,
     /// The shell finished a requested window-preview update: `rect` is the captured frame's
     /// source rectangle when a ready preview now backs the selected window, `None` otherwise.
-    WindowPreviewResolved { rect: Option<Rect> },
+    ///
+    /// `intent` is what the click that chose the window asked for: a preview click confirms at
+    /// once, so Shift and Ctrl on that click stand in for the Pin and Edit buttons.
+    WindowPreviewResolved {
+        rect: Option<Rect>,
+        intent: ConfirmIntent,
+    },
     /// The shell finished the enumeration requested by [`OverlayEffect::BuildSnapTargets`].
     SnapTargetsReady { targets: SnapTargets },
     /// The magnifier's hotkey went down or came up. Also delivered with `held: false` when the
@@ -324,8 +348,8 @@ pub(super) enum OverlayInput {
     /// The shell has already folded the modifier state into these numbers, so the machine never
     /// has to know which key was pressed — only what the user asked the region to do.
     Nudge { dx: i32, dy: i32, resize: bool },
-    /// Enter pressed.
-    ConfirmRequested,
+    /// Enter pressed, with the intent its modifiers chose: Shift pins, Ctrl edits.
+    ConfirmRequested { intent: ConfirmIntent },
     /// Escape, right-click, or an external close request.
     CancelRequested,
     /// The display configuration changed under the overlay; its geometry is no longer current.
@@ -374,6 +398,7 @@ pub(super) enum CloseOutcome {
         rect: Rect,
         kind: SelectionKind,
         window: Option<NativeWindowHandle>,
+        intent: ConfirmIntent,
     },
     Cancelled,
     /// Close without persisting geometry from a configuration that is no longer current.
@@ -436,6 +461,12 @@ pub(super) enum OverlayEffect {
     PersistRegionZoom {
         mode: LoupeMode,
     },
+    /// Ask the daemon to turn file output on or off. Not a persistence effect: the daemon starts
+    /// or stops the file worker and records `output.enabled` itself, exactly as it does for the
+    /// notification-area item, so the two places cannot disagree about what the setting means.
+    RequestFileOutput {
+        enabled: bool,
+    },
     /// Destroy the overlay window with the given outcome. Always the final effect.
     Close(CloseOutcome),
 }
@@ -453,8 +484,11 @@ pub(super) fn transition(model: &mut OverlayModel, input: OverlayInput) -> Vec<O
             point,
             window_slot,
             time_ms,
-        } => pointer_down(model, point, window_slot, time_ms),
-        OverlayInput::WindowPreviewResolved { rect } => window_preview_resolved(model, rect),
+            modifiers,
+        } => pointer_down(model, point, window_slot, time_ms, modifiers),
+        OverlayInput::WindowPreviewResolved { rect, intent } => {
+            window_preview_resolved(model, rect, intent)
+        }
         OverlayInput::SnapTargetsReady { targets } => {
             model.snap_targets = Some(targets);
             // Nothing visible changed: the inventory is requested before the first pointer move
@@ -462,13 +496,13 @@ pub(super) fn transition(model: &mut OverlayModel, input: OverlayInput) -> Vec<O
             Vec::new()
         }
         OverlayInput::PointerUp { point, modifiers } => pointer_up(model, point, modifiers),
-        OverlayInput::DoubleClicked { point } => double_clicked(model, point),
+        OverlayInput::DoubleClicked { point, modifiers } => double_clicked(model, point, modifiers),
         OverlayInput::PointerCaptureLost => pointer_capture_lost(model),
         OverlayInput::LoupeKeyChanged { held } => loupe_key_changed(model, held),
         OverlayInput::Tick { time_ms } => loupe_tick(model, time_ms),
         OverlayInput::ToggleView => toggle_view(model),
         OverlayInput::Nudge { dx, dy, resize } => nudge(model, dx, dy, resize),
-        OverlayInput::ConfirmRequested => confirm(model),
+        OverlayInput::ConfirmRequested { intent } => confirm(model, intent),
         OverlayInput::CancelRequested => cancel(model),
         OverlayInput::DisplayConfigurationInvalidated { reason } => {
             vec![OverlayEffect::Close(
@@ -594,11 +628,18 @@ fn pointer_down(
     point: POINT,
     window_slot: Option<NativeWindowHandle>,
     time_ms: u32,
+    modifiers: Modifiers,
 ) -> Vec<OverlayEffect> {
     let local = local_point(model.source, point);
     let layout = ToolbarLayout::new(model.display_environment, model.toolbar_position);
     if let Some(control) = layout.hit_test(local, model.options_open) {
-        return toolbar_control_pressed(model, control, layout.bounds.contains(local), local);
+        return toolbar_control_pressed(
+            model,
+            control,
+            layout.bounds.contains(local),
+            local,
+            modifiers,
+        );
     }
     // A press begins a new movement. The pointer's speed before it belonged to getting here.
     model.loupe.forget_motion();
@@ -700,6 +741,7 @@ fn toolbar_control_pressed(
     control: ToolbarControl,
     in_toolbar_bounds: bool,
     local: POINT,
+    modifiers: Modifiers,
 ) -> Vec<OverlayEffect> {
     model.anchor = None;
     model.dragging = false;
@@ -739,7 +781,11 @@ fn toolbar_control_pressed(
         }
         // Capture and Cancel end the run without touching the cursor or repainting: the window
         // is being destroyed (or, for a selection-less capture press, nothing changed).
-        ToolbarControl::Capture => return confirm(model),
+        // Shift and Ctrl on Capture ask for Pin and Edit, as they do on Enter and on a window
+        // preview, so all three ways of confirming read the same keys the same way.
+        ToolbarControl::Capture => return confirm_or_capture(model, confirm_intent(modifiers)),
+        ToolbarControl::Pin => return confirm(model, ConfirmIntent::Pin),
+        ToolbarControl::Edit => return confirm(model, ConfirmIntent::Edit),
         ToolbarControl::DimBackground => {
             model.dim_background = !model.dim_background;
         }
@@ -771,6 +817,18 @@ fn toolbar_control_pressed(
             effects.extend(toggle_view(model));
         }
         ToolbarControl::ClipboardDestination => {}
+        ToolbarControl::FileOutputDestination => {
+            // Optimistic: the checkmark flips at the click and the daemon acts afterwards. A start
+            // the daemon refuses (a written-off worker still holding the directory, an unwritable
+            // directory) is reported in the notification area, where the tray's own item is
+            // corrected; this run's row is not, and the next run opens on the truth.
+            if model.file_output_switchable {
+                model.file_output_enabled = !model.file_output_enabled;
+                effects.push(OverlayEffect::RequestFileOutput {
+                    enabled: model.file_output_enabled,
+                });
+            }
+        }
         ToolbarControl::Cancel => return cancel(model),
     }
     effects.push(OverlayEffect::SetCursor(CursorIntent::Arrow));
@@ -1143,12 +1201,16 @@ fn resize_region_by(region: Rect, dx: i32, dy: i32, source: Rect) -> Rect {
     Rect::from_edges(left, top, right, bottom).unwrap_or(region)
 }
 
-fn window_preview_resolved(model: &mut OverlayModel, rect: Option<Rect>) -> Vec<OverlayEffect> {
+fn window_preview_resolved(
+    model: &mut OverlayModel,
+    rect: Option<Rect>,
+    intent: ConfirmIntent,
+) -> Vec<OverlayEffect> {
     model.selection = rect;
     model.selection_kind = rect.map(|_| SelectionKind::Window);
     if model.selection.is_some() {
         // A ready preview confirms immediately; the shell attaches the captured frame.
-        confirm(model)
+        confirm_or_capture(model, intent)
     } else {
         // Not ready (or empty space): stay in the chooser. The preview cache deliberately does
         // not latch failures, so the next click retries.
@@ -1159,13 +1221,17 @@ fn window_preview_resolved(model: &mut OverlayModel, rect: Option<Rect>) -> Vec<
     }
 }
 
-fn double_clicked(model: &mut OverlayModel, point: POINT) -> Vec<OverlayEffect> {
+fn double_clicked(
+    model: &mut OverlayModel,
+    point: POINT,
+    modifiers: Modifiers,
+) -> Vec<OverlayEffect> {
     let local = local_point(model.source, point);
     let layout = ToolbarLayout::new(model.display_environment, model.toolbar_position);
     if layout.hit_test(local, model.options_open).is_some() {
         return Vec::new();
     }
-    confirm(model)
+    confirm_or_capture(model, confirm_intent(modifiers))
 }
 
 fn pointer_capture_lost(model: &mut OverlayModel) -> Vec<OverlayEffect> {
@@ -1188,16 +1254,54 @@ fn pointer_capture_lost(model: &mut OverlayModel) -> Vec<OverlayEffect> {
     effects
 }
 
-fn confirm(model: &mut OverlayModel) -> Vec<OverlayEffect> {
+/// The intent a confirming key or click carries: Shift pins and Ctrl edits, as the plain key or
+/// click captures (ADR 0010). Ctrl wins when both are held: it is the one that withholds the
+/// capture, and an edit can still be abandoned, where a capture already delivered cannot be taken
+/// back.
+pub(super) fn confirm_intent(held: Modifiers) -> ConfirmIntent {
+    if held.ctrl {
+        ConfirmIntent::Edit
+    } else if held.shift {
+        ConfirmIntent::Pin
+    } else {
+        ConfirmIntent::Capture
+    }
+}
+
+/// Confirms with `intent`, or as a plain capture when this run does not offer it. For a click
+/// that has already chosen what to confirm - a window preview, or Capture itself - a held key
+/// asking for an unavailable action must not swallow the click: one that did nothing would read
+/// as a bug.
+fn confirm_or_capture(model: &mut OverlayModel, intent: ConfirmIntent) -> Vec<OverlayEffect> {
+    let effects = confirm(model, intent);
+    if effects.is_empty() && intent != ConfirmIntent::Capture {
+        confirm(model, ConfirmIntent::Capture)
+    } else {
+        effects
+    }
+}
+
+fn confirm(model: &mut OverlayModel, intent: ConfirmIntent) -> Vec<OverlayEffect> {
     let (Some(rect), Some(kind)) = (model.selection, model.selection_kind) else {
         return Vec::new();
     };
+    // A greyed action is refused here, not merely drawn grey, so a keyboard shortcut cannot reach
+    // what the button would not.
+    let available = match intent {
+        ConfirmIntent::Capture => true,
+        ConfirmIntent::Pin => model.pin_available,
+        ConfirmIntent::Edit => model.edit_available,
+    };
+    if !available {
+        return Vec::new();
+    }
     debug_assert_eq!(model.tool, CaptureTool::from_selection_kind(kind));
     let mut effects = persist_interaction(model);
     effects.push(OverlayEffect::Close(CloseOutcome::Confirmed {
         rect,
         kind,
         window: model.selected_window,
+        intent,
     }));
     effects
 }
@@ -1634,6 +1738,11 @@ mod tests {
             toolbar_drag: None,
             options_open: false,
             dim_background: true,
+            clipboard_enabled: true,
+            file_output_enabled: false,
+            file_output_switchable: true,
+            pin_available: true,
+            edit_available: false,
             hovered_control: None,
             pointer_local: None,
             hovered: None,
@@ -1675,6 +1784,7 @@ mod tests {
                 point: point(100, 100),
                 window_slot: None,
                 time_ms: 0,
+                modifiers: Modifiers::default(),
             },
         );
         assert!(model.anchor.is_some());
@@ -1755,6 +1865,7 @@ mod tests {
                 point: point(100, 100),
                 window_slot: None,
                 time_ms: 0,
+                modifiers: Modifiers::default(),
             },
         );
         transition(
@@ -1797,6 +1908,7 @@ mod tests {
                 point: point(300, 300),
                 window_slot: None,
                 time_ms: 0,
+                modifiers: Modifiers::default(),
             },
         );
         let resize = model
@@ -1869,6 +1981,7 @@ mod tests {
                 point: point(180, 160),
                 window_slot: None,
                 time_ms: 0,
+                modifiers: Modifiers::default(),
             },
         );
         assert!(model.moving_region.is_some());
@@ -1910,6 +2023,7 @@ mod tests {
                 point: point(100, 100),
                 window_slot: None,
                 time_ms: 0,
+                modifiers: Modifiers::default(),
             },
         );
         transition(
@@ -1950,6 +2064,7 @@ mod tests {
                 point: point(10, 10),
                 window_slot: None,
                 time_ms: 0,
+                modifiers: Modifiers::default(),
             },
         );
         transition(
@@ -1998,7 +2113,12 @@ mod tests {
             });
             model.selection_kind = Some(kind);
 
-            let effects = transition(&mut model, OverlayInput::ConfirmRequested);
+            let effects = transition(
+                &mut model,
+                OverlayInput::ConfirmRequested {
+                    intent: ConfirmIntent::Capture,
+                },
+            );
             let positions: Vec<_> = effects
                 .iter()
                 .map(|effect| match effect {
@@ -2021,7 +2141,13 @@ mod tests {
     #[test]
     fn confirm_without_a_selection_does_nothing() {
         let mut model = region_model();
-        assert!(transition(&mut model, OverlayInput::ConfirmRequested).is_empty());
+        assert!(transition(
+            &mut model,
+            OverlayInput::ConfirmRequested {
+                intent: ConfirmIntent::Capture,
+            }
+        )
+        .is_empty());
     }
 
     #[test]
@@ -2203,7 +2329,10 @@ mod tests {
         };
         assert!(transition(
             &mut model,
-            OverlayInput::DoubleClicked { point: on_toolbar }
+            OverlayInput::DoubleClicked {
+                point: on_toolbar,
+                modifiers: Modifiers::default(),
+            }
         )
         .is_empty());
 
@@ -2211,12 +2340,31 @@ mod tests {
             &mut model,
             OverlayInput::DoubleClicked {
                 point: point(20, 20),
+                modifiers: Modifiers::default(),
             },
         );
-        assert!(matches!(
-            close_outcome(&effects),
-            Some(CloseOutcome::Confirmed { .. })
-        ));
+        assert_eq!(confirmed_intent(&effects), Some(ConfirmIntent::Capture));
+    }
+
+    #[test]
+    fn shift_and_ctrl_on_a_double_click_ask_for_pin_and_edit_as_they_do_on_enter() {
+        let double_click = |ctrl: bool, shift: bool| OverlayInput::DoubleClicked {
+            point: point(20, 20),
+            modifiers: Modifiers { ctrl, shift },
+        };
+        let mut model = region_model_with_selection();
+        model.edit_available = true;
+        let effects = transition(&mut model, double_click(true, false));
+        assert_eq!(confirmed_intent(&effects), Some(ConfirmIntent::Edit));
+
+        let mut model = region_model_with_selection();
+        let effects = transition(&mut model, double_click(false, true));
+        assert_eq!(confirmed_intent(&effects), Some(ConfirmIntent::Pin));
+
+        let mut model = region_model_with_selection();
+        model.edit_available = false;
+        let effects = transition(&mut model, double_click(true, false));
+        assert_eq!(confirmed_intent(&effects), Some(ConfirmIntent::Capture));
     }
 
     fn center(rect: super::super::layout::UiRect) -> POINT {
@@ -2250,6 +2398,8 @@ mod tests {
             (center(layout.window), ToolbarControl::Window, false),
             (center(layout.region), ToolbarControl::Region, false),
             (center(layout.options), ToolbarControl::Options, false),
+            (center(layout.pin), ToolbarControl::Pin, false),
+            (center(layout.edit), ToolbarControl::Edit, false),
             (center(layout.capture), ToolbarControl::Capture, false),
             (
                 center(layout.dim_background),
@@ -2271,6 +2421,11 @@ mod tests {
                 ToolbarControl::ClipboardDestination,
                 false,
             ),
+            (
+                center(layout.file_output_destination),
+                ToolbarControl::FileOutputDestination,
+                false,
+            ),
             (center(layout.cancel), ToolbarControl::Cancel, true),
         ];
         for (local, expected, closes) in cases {
@@ -2282,6 +2437,7 @@ mod tests {
                     | ToolbarControl::SnapToWindows
                     | ToolbarControl::RegionZoom
                     | ToolbarControl::ClipboardDestination
+                    | ToolbarControl::FileOutputDestination
                     | ToolbarControl::Cancel
             );
             // Give the machine an active drag to prove every dispatch clears it.
@@ -2297,6 +2453,7 @@ mod tests {
                     point: screen,
                     window_slot: None,
                     time_ms: 0,
+                    modifiers: Modifiers::default(),
                 },
             );
             assert_eq!(model.hovered_control, Some(expected));
@@ -2395,6 +2552,7 @@ mod tests {
                     point: local,
                     window_slot: None,
                     time_ms: 0,
+                    modifiers: Modifiers::default(),
                 },
             );
             let drag = model.toolbar_drag.expect("drag-handle press starts a drag");
@@ -2433,6 +2591,7 @@ mod tests {
                 point: center(layout.options),
                 window_slot: None,
                 time_ms: 0,
+                modifiers: Modifiers::default(),
             },
         );
         assert!(model.options_open);
@@ -2448,6 +2607,7 @@ mod tests {
                 point: menu_background,
                 window_slot: None,
                 time_ms: 0,
+                modifiers: Modifiers::default(),
             },
         );
         assert!(model.options_open);
@@ -2461,6 +2621,7 @@ mod tests {
                 point: center(layout.options),
                 window_slot: None,
                 time_ms: 0,
+                modifiers: Modifiers::default(),
             },
         );
         assert!(!model.options_open);
@@ -2473,6 +2634,7 @@ mod tests {
                 point: point(5, 5),
                 window_slot: None,
                 time_ms: 0,
+                modifiers: Modifiers::default(),
             },
         );
         assert!(!model.options_open);
@@ -2491,6 +2653,7 @@ mod tests {
                     point: center(layout.options),
                     window_slot: None,
                     time_ms: 0,
+                    modifiers: Modifiers::default(),
                 },
             );
             assert_eq!(model.options_open, expected_open);
@@ -2513,6 +2676,7 @@ mod tests {
                 point: center(layout.dim_background),
                 window_slot: None,
                 time_ms: 0,
+                modifiers: Modifiers::default(),
             },
         );
         assert_eq!(model.dim_background, !dimmed_before);
@@ -2521,6 +2685,242 @@ mod tests {
             "the menu stays open for further toggles"
         );
         assert_eq!(model.hovered_control, Some(ToolbarControl::DimBackground));
+        assert!(close_outcome(&effects).is_none());
+    }
+
+    fn region_model_with_selection() -> OverlayModel {
+        let mut model = region_model();
+        model.tool = CaptureTool::Region;
+        model.selection = Some(Rect {
+            x: 5,
+            y: 6,
+            width: 70,
+            height: 80,
+        });
+        model.selection_kind = Some(SelectionKind::Region);
+        model
+    }
+
+    fn confirmed_intent(effects: &[OverlayEffect]) -> Option<ConfirmIntent> {
+        match close_outcome(effects) {
+            Some(CloseOutcome::Confirmed { intent, .. }) => Some(intent),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn pin_and_edit_buttons_confirm_with_their_intent() {
+        let layout = layout_for(&region_model_with_selection());
+        let press = |at: POINT| OverlayInput::PointerDown {
+            point: at,
+            window_slot: None,
+            time_ms: 0,
+            modifiers: Modifiers::default(),
+        };
+
+        let mut model = region_model_with_selection();
+        let effects = transition(&mut model, press(center(layout.pin)));
+        assert_eq!(confirmed_intent(&effects), Some(ConfirmIntent::Pin));
+
+        let mut model = region_model_with_selection();
+        model.edit_available = true;
+        let effects = transition(&mut model, press(center(layout.edit)));
+        assert_eq!(confirmed_intent(&effects), Some(ConfirmIntent::Edit));
+
+        let mut model = region_model_with_selection();
+        let effects = transition(&mut model, press(center(layout.capture)));
+        assert_eq!(confirmed_intent(&effects), Some(ConfirmIntent::Capture));
+    }
+
+    #[test]
+    fn shift_and_ctrl_on_capture_ask_for_pin_and_edit_as_they_do_on_enter() {
+        let layout = layout_for(&region_model_with_selection());
+        let press = |ctrl: bool, shift: bool| OverlayInput::PointerDown {
+            point: center(layout.capture),
+            window_slot: None,
+            time_ms: 0,
+            modifiers: Modifiers { ctrl, shift },
+        };
+
+        let mut model = region_model_with_selection();
+        model.edit_available = true;
+        let effects = transition(&mut model, press(true, false));
+        assert_eq!(confirmed_intent(&effects), Some(ConfirmIntent::Edit));
+
+        let mut model = region_model_with_selection();
+        let effects = transition(&mut model, press(false, true));
+        assert_eq!(confirmed_intent(&effects), Some(ConfirmIntent::Pin));
+
+        // Ctrl wins when both are held, as it does on Enter.
+        let mut model = region_model_with_selection();
+        model.edit_available = true;
+        let effects = transition(&mut model, press(true, true));
+        assert_eq!(confirmed_intent(&effects), Some(ConfirmIntent::Edit));
+
+        // A run that does not offer the action still captures: the click is not swallowed.
+        let mut model = region_model_with_selection();
+        model.edit_available = false;
+        let effects = transition(&mut model, press(true, false));
+        assert_eq!(confirmed_intent(&effects), Some(ConfirmIntent::Capture));
+    }
+
+    #[test]
+    fn the_keyboard_cannot_reach_an_action_the_toolbar_greys() {
+        // Pin and Edit are both greyed in a run with no daemon behind it.
+        let mut model = region_model_with_selection();
+        let effects = transition(
+            &mut model,
+            OverlayInput::ConfirmRequested {
+                intent: ConfirmIntent::Edit,
+            },
+        );
+        assert!(
+            effects.is_empty(),
+            "an unavailable Edit leaves the run open"
+        );
+
+        let mut model = region_model_with_selection();
+        model.pin_available = false;
+        let effects = transition(
+            &mut model,
+            OverlayInput::ConfirmRequested {
+                intent: ConfirmIntent::Pin,
+            },
+        );
+        assert!(effects.is_empty(), "an unavailable Pin leaves the run open");
+
+        let mut model = region_model_with_selection();
+        let effects = transition(
+            &mut model,
+            OverlayInput::ConfirmRequested {
+                intent: ConfirmIntent::Pin,
+            },
+        );
+        assert_eq!(confirmed_intent(&effects), Some(ConfirmIntent::Pin));
+    }
+
+    #[test]
+    fn a_window_chosen_with_an_unavailable_action_is_still_captured() {
+        // A preview click confirms at once. Ctrl on that click asks for Edit, which this run does
+        // not offer; swallowing the click would leave the user wondering why nothing happened.
+        let mut model = region_model();
+        model.tool = CaptureTool::Window;
+        let effects = transition(
+            &mut model,
+            OverlayInput::WindowPreviewResolved {
+                rect: Some(Rect {
+                    x: 20,
+                    y: 30,
+                    width: 200,
+                    height: 100,
+                }),
+                intent: ConfirmIntent::Edit,
+            },
+        );
+        assert_eq!(confirmed_intent(&effects), Some(ConfirmIntent::Capture));
+
+        let mut model = region_model();
+        model.tool = CaptureTool::Window;
+        let effects = transition(
+            &mut model,
+            OverlayInput::WindowPreviewResolved {
+                rect: Some(Rect {
+                    x: 20,
+                    y: 30,
+                    width: 200,
+                    height: 100,
+                }),
+                intent: ConfirmIntent::Pin,
+            },
+        );
+        assert_eq!(confirmed_intent(&effects), Some(ConfirmIntent::Pin));
+    }
+
+    #[test]
+    fn the_save_to_disk_row_toggles_asks_the_daemon_and_keeps_the_menu_open() {
+        let mut model = region_model();
+        model.options_open = true;
+        let layout = layout_for(&model);
+        let press = || OverlayInput::PointerDown {
+            point: center(layout.file_output_destination),
+            window_slot: None,
+            time_ms: 0,
+            modifiers: Modifiers::default(),
+        };
+
+        // Off when the run opened, so the first press asks for it on.
+        let effects = transition(&mut model, press());
+        assert!(model.file_output_enabled);
+        assert!(
+            model.options_open,
+            "the menu stays open for further toggles"
+        );
+        assert_eq!(
+            model.hovered_control,
+            Some(ToolbarControl::FileOutputDestination)
+        );
+        assert!(has_effect(&effects, |e| matches!(
+            e,
+            OverlayEffect::RequestFileOutput { enabled: true }
+        )));
+        assert!(close_outcome(&effects).is_none());
+
+        let effects = transition(&mut model, press());
+        assert!(!model.file_output_enabled);
+        assert!(has_effect(&effects, |e| matches!(
+            e,
+            OverlayEffect::RequestFileOutput { enabled: false }
+        )));
+    }
+
+    #[test]
+    fn the_save_to_disk_row_is_inert_without_a_daemon_to_act_on_it() {
+        let mut model = region_model();
+        model.options_open = true;
+        model.file_output_switchable = false;
+        let layout = layout_for(&model);
+
+        let effects = transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point: center(layout.file_output_destination),
+                window_slot: None,
+                time_ms: 0,
+                modifiers: Modifiers::default(),
+            },
+        );
+        assert!(
+            !model.file_output_enabled,
+            "a stated destination does not flip"
+        );
+        assert!(!has_effect(&effects, |e| matches!(
+            e,
+            OverlayEffect::RequestFileOutput { .. }
+        )));
+        assert!(model.options_open);
+    }
+
+    #[test]
+    fn the_clipboard_row_is_stated_rather_than_switched() {
+        let mut model = region_model();
+        model.options_open = true;
+        let layout = layout_for(&model);
+
+        let effects = transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point: center(layout.clipboard_destination),
+                window_slot: None,
+                time_ms: 0,
+                modifiers: Modifiers::default(),
+            },
+        );
+        assert!(model.clipboard_enabled);
+        assert!(model.options_open);
+        assert!(!has_effect(&effects, |e| matches!(
+            e,
+            OverlayEffect::RequestFileOutput { .. }
+        )));
         assert!(close_outcome(&effects).is_none());
     }
 
@@ -2547,6 +2947,7 @@ mod tests {
                 point: center(layout.snap_to_windows),
                 window_slot: None,
                 time_ms: 0,
+                modifiers: Modifiers::default(),
             },
         );
         assert!(!model.snap_to_windows);
@@ -2576,6 +2977,7 @@ mod tests {
                 point: center(layout.snap_to_windows),
                 window_slot: None,
                 time_ms: 0,
+                modifiers: Modifiers::default(),
             },
         );
         assert!(model.snap_to_windows);
@@ -2690,6 +3092,7 @@ mod tests {
                 point: point(100, 100),
                 window_slot: None,
                 time_ms: 0,
+                modifiers: Modifiers::default(),
             },
         );
         transition(
@@ -2767,6 +3170,7 @@ mod tests {
                     point: center(layout.preview_view),
                     window_slot: None,
                     time_ms: 0,
+                    modifiers: Modifiers::default(),
                 },
             );
             assert_eq!(model.view, expected);
@@ -2796,6 +3200,7 @@ mod tests {
                 point: center(layout.preview_view),
                 window_slot: None,
                 time_ms: 0,
+                modifiers: Modifiers::default(),
             },
         );
 
@@ -2819,6 +3224,7 @@ mod tests {
                     point: center(layout.region_zoom),
                     window_slot: None,
                     time_ms: 0,
+                    modifiers: Modifiers::default(),
                 },
             );
             assert_eq!(model.loupe.mode, expected);
@@ -2857,6 +3263,7 @@ mod tests {
                 point: capture,
                 window_slot: None,
                 time_ms: 0,
+                modifiers: Modifiers::default(),
             },
         );
         assert!(
@@ -2878,6 +3285,7 @@ mod tests {
                 point: capture,
                 window_slot: None,
                 time_ms: 0,
+                modifiers: Modifiers::default(),
             },
         );
         assert!(matches!(
@@ -2906,6 +3314,7 @@ mod tests {
                 point: center(layout.cancel),
                 window_slot: None,
                 time_ms: 0,
+                modifiers: Modifiers::default(),
             },
         );
         assert_eq!(persisted_region(&effects), Some(Some(region)));
@@ -2939,6 +3348,7 @@ mod tests {
                 point: point(400, 300),
                 window_slot: Some(handle),
                 time_ms: 0,
+                modifiers: Modifiers::default(),
             },
         );
         assert_eq!(model.selected_window, Some(handle));
@@ -2963,6 +3373,7 @@ mod tests {
             &mut model,
             OverlayInput::WindowPreviewResolved {
                 rect: Some(frame_rect),
+                intent: ConfirmIntent::Capture,
             },
         );
         assert_eq!(model.selection, Some(frame_rect));
@@ -2973,7 +3384,9 @@ mod tests {
             "window confirms do not persist a region"
         );
         match close_outcome(&effects) {
-            Some(CloseOutcome::Confirmed { kind, window, rect }) => {
+            Some(CloseOutcome::Confirmed {
+                kind, window, rect, ..
+            }) => {
                 assert_eq!(kind, SelectionKind::Window);
                 assert_eq!(window, Some(handle));
                 assert_eq!(rect, frame_rect);
@@ -2995,6 +3408,7 @@ mod tests {
                     point: point(400, 300),
                     window_slot: Some(handle),
                     time_ms: 0,
+                    modifiers: Modifiers::default(),
                 },
             );
             // Every click re-requests the preview: the shell's cache is deliberately
@@ -3006,7 +3420,10 @@ mod tests {
 
             let effects = transition(
                 &mut model,
-                OverlayInput::WindowPreviewResolved { rect: None },
+                OverlayInput::WindowPreviewResolved {
+                    rect: None,
+                    intent: ConfirmIntent::Capture,
+                },
             );
             assert_eq!(model.selection, None);
             assert_eq!(model.selection_kind, None);
@@ -3034,6 +3451,7 @@ mod tests {
                 point: point(400, 300),
                 window_slot: None,
                 time_ms: 0,
+                modifiers: Modifiers::default(),
             },
         );
         assert_eq!(model.selected_window, None);
@@ -3115,6 +3533,7 @@ mod tests {
                 point: point(400, 300),
                 window_slot: None,
                 time_ms: 0,
+                modifiers: Modifiers::default(),
             },
         );
         assert!(!model.options_open);
@@ -3197,6 +3616,7 @@ mod tests {
                 point: from,
                 window_slot: None,
                 time_ms: 0,
+                modifiers: Modifiers::default(),
             },
         );
         transition(
@@ -3260,6 +3680,7 @@ mod tests {
                 point: point(403, 303),
                 window_slot: None,
                 time_ms: 0,
+                modifiers: Modifiers::default(),
             },
         );
         assert_eq!(model.anchor, Some(point(403, 303)));
@@ -3314,6 +3735,7 @@ mod tests {
                 point: point(402, 320),
                 window_slot: None,
                 time_ms: 0,
+                modifiers: Modifiers::default(),
             },
         );
         transition(
@@ -3349,6 +3771,7 @@ mod tests {
                 point: point(402, 302),
                 window_slot: None,
                 time_ms: 0,
+                modifiers: Modifiers::default(),
             },
         );
         transition(
@@ -3447,6 +3870,7 @@ mod tests {
                 point: point(596, 400),
                 window_slot: None,
                 time_ms: 0,
+                modifiers: Modifiers::default(),
             },
         );
         assert_eq!(
@@ -3492,6 +3916,7 @@ mod tests {
                 point: point(150, 150),
                 window_slot: None,
                 time_ms: 0,
+                modifiers: Modifiers::default(),
             },
         );
         assert!(model.moving_region.is_some());
@@ -3546,6 +3971,7 @@ mod tests {
                 point: point(140, 120),
                 window_slot: None,
                 time_ms: 0,
+                modifiers: Modifiers::default(),
             },
         );
         assert_eq!(
@@ -3719,6 +4145,7 @@ mod tests {
                 point: point(250, 250),
                 window_slot: None,
                 time_ms: 0,
+                modifiers: Modifiers::default(),
             },
         );
         assert!(model.moving_region.is_some());
@@ -3806,6 +4233,7 @@ mod tests {
                 point,
                 window_slot: None,
                 time_ms,
+                modifiers: Modifiers::default(),
             },
         );
         assert!(
@@ -4240,6 +4668,7 @@ mod tests {
                 point,
                 window_slot: None,
                 time_ms: now + 5_000,
+                modifiers: Modifiers::default(),
             },
         );
         assert!(!model.loupe.auto_visible);
@@ -4316,6 +4745,7 @@ mod tests {
                         point: point(200, 150),
                         window_slot: None,
                         time_ms: 0,
+                        modifiers: Modifiers::default(),
                     },
                 );
                 transition(
@@ -4389,6 +4819,7 @@ mod tests {
                 point: point(100, 100),
                 window_slot: None,
                 time_ms: 0,
+                modifiers: Modifiers::default(),
             },
         );
         assert!(has_effect(&effects, |e| matches!(
@@ -4428,6 +4859,7 @@ mod tests {
                 point: point(400, 400),
                 window_slot: None,
                 time_ms: 0,
+                modifiers: Modifiers::default(),
             },
         );
         assert!(!has_effect(&effects, |e| matches!(
@@ -4459,11 +4891,14 @@ mod tests {
     #[test]
     fn close_is_always_the_final_effect() {
         let inputs = [
-            OverlayInput::ConfirmRequested,
+            OverlayInput::ConfirmRequested {
+                intent: ConfirmIntent::Capture,
+            },
             OverlayInput::CancelRequested,
             OverlayInput::DisplayConfigurationInvalidated { reason: "test" },
             OverlayInput::DoubleClicked {
                 point: point(20, 20),
+                modifiers: Modifiers::default(),
             },
         ];
         for input in inputs {

@@ -23,11 +23,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, LoadIconW, PostMessageW,
     PostQuitMessage, PostThreadMessageW, RegisterClassW, RegisterWindowMessageW,
     SetForegroundWindow, SetWindowLongPtrW, TrackPopupMenu, TranslateMessage, UnregisterClassW,
-    CREATESTRUCTW, GWLP_USERDATA, HMENU, MB_ICONERROR, MB_OK, MF_CHECKED, MF_GRAYED, MF_SEPARATOR,
-    MF_STRING, MSG, SPI_SETLOGICALDPIOVERRIDE, SPI_SETWORKAREA, SW_SHOWNORMAL, TPM_BOTTOMALIGN,
-    TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE,
-    WM_ENDSESSION, WM_LBUTTONDBLCLK, WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_QUERYENDSESSION,
-    WM_QUIT, WM_RBUTTONUP, WM_SETTINGCHANGE, WNDCLASSW, WS_OVERLAPPED,
+    CREATESTRUCTW, GWLP_USERDATA, HMENU, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MESSAGEBOX_STYLE,
+    MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, SPI_SETLOGICALDPIOVERRIDE,
+    SPI_SETWORKAREA, SW_SHOWNORMAL, TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_COMMAND,
+    WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE, WM_ENDSESSION, WM_LBUTTONDBLCLK, WM_NCCREATE,
+    WM_NCDESTROY, WM_NULL, WM_QUERYENDSESSION, WM_QUIT, WM_RBUTTONUP, WM_SETTINGCHANGE, WNDCLASSW,
+    WS_OVERLAPPED,
 };
 
 const CLASS_NAME: PCWSTR = w!("CaptasticTrayWindow-v1");
@@ -50,6 +51,8 @@ const COMMAND_SHOW_IN_FOLDER: usize = 1_007;
 const COMMAND_PRUNE_HISTORY: usize = 1_008;
 const COMMAND_EXIT: usize = 1_009;
 const COMMAND_FILE_OUTPUT: usize = 1_010;
+const COMMAND_CLOSE_PINS: usize = 1_011;
+const COMMAND_PINS_CLICKABLE: usize = 1_012;
 const SESSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(4);
 const TRAY_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const TRAY_STOP_POLL: Duration = Duration::from_millis(5);
@@ -72,6 +75,10 @@ pub enum TrayEvent {
     PruneHistory,
     /// Start or stop writing captures to disk, and remember which the user chose.
     ToggleFileOutput,
+    /// Close every pinned capture (ADR 0010).
+    ClosePins,
+    /// Make every pinned capture clickable again, the only way back for a click-through pin.
+    MakePinsClickable,
     ToggleStartup,
     Exit,
 }
@@ -279,6 +286,16 @@ pub fn open_path(path: &Path) -> Result<(), CaptureError> {
 }
 
 pub fn show_error_dialog(message: &str) {
+    show_dialog(message, MB_ICONERROR);
+}
+
+/// A dialog for an answer rather than a failure, such as `captastic.exe --version`, which has no
+/// console to print into.
+pub fn show_info_dialog(message: &str) {
+    show_dialog(message, MB_ICONINFORMATION);
+}
+
+fn show_dialog(message: &str, icon: MESSAGEBOX_STYLE) {
     let text: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
     // SAFETY: text is null-terminated for the modal call and the title is a static wide string.
     let _ = unsafe {
@@ -286,7 +303,7 @@ pub fn show_error_dialog(message: &str) {
             HWND(0),
             PCWSTR(text.as_ptr()),
             w!("Captastic"),
-            MB_OK | MB_ICONERROR,
+            MB_OK | icon,
         )
     };
 }
@@ -557,6 +574,8 @@ mod machine {
         ShowInFolder,
         PruneHistory,
         ToggleFileOutput,
+        ClosePins,
+        MakePinsClickable,
         ToggleStartup,
         Exit,
     }
@@ -691,6 +710,13 @@ mod machine {
             ),
             TrayInput::Menu(TrayMenuCommand::PruneHistory) => (
                 vec![TrayEffect::SendEvent(TrayEvent::PruneHistory)],
+                Handled,
+            ),
+            TrayInput::Menu(TrayMenuCommand::ClosePins) => {
+                (vec![TrayEffect::SendEvent(TrayEvent::ClosePins)], Handled)
+            }
+            TrayInput::Menu(TrayMenuCommand::MakePinsClickable) => (
+                vec![TrayEffect::SendEvent(TrayEvent::MakePinsClickable)],
                 Handled,
             ),
             TrayInput::Menu(TrayMenuCommand::ToggleFileOutput) => (
@@ -888,6 +914,12 @@ fn translate_tray_message(
             }
             COMMAND_FILE_OUTPUT => {
                 TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::ToggleFileOutput))
+            }
+            COMMAND_CLOSE_PINS => {
+                TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::ClosePins))
+            }
+            COMMAND_PINS_CLICKABLE => {
+                TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::MakePinsClickable))
             }
             COMMAND_STARTUP => {
                 TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::ToggleStartup))
@@ -1283,6 +1315,22 @@ fn show_context_menu(
             )
         }
         .map_err(|error| native_error("append_prune_history_menu", error))?;
+        // Always offered rather than greyed by a count the tray would have to be told: with no
+        // pins open they do nothing, and a click-through pin must never be left without a way
+        // back because the tray had not heard about it yet.
+        // SAFETY: menu and static labels are live for each call.
+        unsafe { AppendMenuW(menu, MF_STRING, COMMAND_CLOSE_PINS, w!("Close All Pins")) }
+            .map_err(|error| native_error("append_close_pins_menu", error))?;
+        // SAFETY: menu and static labels are live for each call.
+        unsafe {
+            AppendMenuW(
+                menu,
+                MF_STRING,
+                COMMAND_PINS_CLICKABLE,
+                w!("Make Pins Clickable"),
+            )
+        }
+        .map_err(|error| native_error("append_pins_clickable_menu", error))?;
         let startup_flags = if startup_enabled {
             MF_STRING | MF_CHECKED
         } else {
@@ -1655,6 +1703,18 @@ mod tests {
             ),
             (
                 WM_COMMAND,
+                COMMAND_CLOSE_PINS,
+                0,
+                TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::ClosePins)),
+            ),
+            (
+                WM_COMMAND,
+                COMMAND_PINS_CLICKABLE,
+                0,
+                TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::MakePinsClickable)),
+            ),
+            (
+                WM_COMMAND,
                 COMMAND_STARTUP,
                 0,
                 TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::ToggleStartup)),
@@ -1742,6 +1802,11 @@ mod tests {
         let cases = [
             (TrayMenuCommand::OpenConfig, TrayEvent::OpenConfig),
             (TrayMenuCommand::OpenLogs, TrayEvent::OpenLogs),
+            (TrayMenuCommand::ClosePins, TrayEvent::ClosePins),
+            (
+                TrayMenuCommand::MakePinsClickable,
+                TrayEvent::MakePinsClickable,
+            ),
             (TrayMenuCommand::ToggleStartup, TrayEvent::ToggleStartup),
             (TrayMenuCommand::Exit, TrayEvent::Exit),
         ];

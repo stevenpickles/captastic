@@ -5,7 +5,6 @@ param()
 
 $ErrorActionPreference = 'Stop'
 $repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$testRoot = Join-Path ([System.IO.Path]::GetTempPath()) "captastic-hook-tests-$PID"
 
 function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) {
@@ -25,110 +24,92 @@ function Assert-ThrowsLike([scriptblock]$Action, [string]$Pattern) {
     throw "Expected action to fail with '$Pattern'."
 }
 
-function New-HookTestCli([string]$Path) {
-    $source = @'
-using System;
-using System.IO;
-
-public static class CaptasticHookTestCli
-{
-    public static int Main(string[] args)
-    {
-        string mode = Environment.GetEnvironmentVariable("CAPTASTIC_HOOK_TEST_MODE") ?? "not-running";
-        string statePath = Environment.GetEnvironmentVariable("CAPTASTIC_HOOK_TEST_STATE") ?? "";
-        if (args.Length == 0)
-        {
-            return 64;
-        }
-        if (args[0] == "status")
-        {
-            Console.Error.WriteLine("fixture status completed");
-            if (mode == "status-failure")
-            {
-                return 7;
-            }
-            if (mode == "malformed")
-            {
-                Console.WriteLine("not-json");
-                return 0;
-            }
-            if (mode == "unexpected")
-            {
-                Console.WriteLine("{\"status\":\"indeterminate\"}");
-                return 0;
-            }
-            if (mode == "not-running" || (mode == "running-stops" && File.Exists(statePath)))
-            {
-                Console.WriteLine("{\"status\":\"not_running\"}");
-                return 0;
-            }
-            Console.WriteLine("{\"status\":\"running\"}");
-            return 0;
-        }
-        if (args[0] == "stop")
-        {
-            Console.Error.WriteLine("fixture stop completed");
-            if (mode == "stop-failure")
-            {
-                return 9;
-            }
-            if (mode == "running-stops" && statePath.Length > 0)
-            {
-                File.WriteAllText(statePath, "stopped");
-            }
-            return 0;
-        }
-        return 64;
+function Test-EventExists([string]$Name) {
+    $handle = $null
+    if ([System.Threading.EventWaitHandle]::TryOpenExisting($Name, [ref]$handle)) {
+        $handle.Dispose()
+        return $true
     }
-}
-'@
-    $sourcePath = [System.IO.Path]::ChangeExtension($Path, '.cs')
-    [System.IO.File]::WriteAllText($sourcePath, $source, [System.Text.UTF8Encoding]::new($false))
-    $compiler = Join-Path ([Environment]::GetFolderPath('Windows')) `
-        'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
-    if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) {
-        throw "The .NET Framework C# compiler is required for hook tests: $compiler"
-    }
-    & $compiler /nologo /target:exe "/out:$Path" $sourcePath
-    if ($LASTEXITCODE -ne 0) {
-        throw "The hook test CLI failed to compile with exit code $LASTEXITCODE."
-    }
+    return $false
 }
 
+# A stand-in daemon in its own process: it holds the control event, as a real daemon does, and
+# either releases it when the event is signalled or ignores the request for longer than the hook
+# waits. Its output says whether it was asked to stop.
+function Start-FixtureDaemon([string]$Name, [bool]$StopsWhenAsked) {
+    $job = Start-Job -ArgumentList $Name, $StopsWhenAsked -ScriptBlock {
+        param([string]$Name, [bool]$StopsWhenAsked)
+        $created = $false
+        $controlEvent = New-Object System.Threading.EventWaitHandle(
+            $false, [System.Threading.EventResetMode]::ManualReset, $Name, [ref]$created)
+        try {
+            if ($StopsWhenAsked) {
+                [void]$controlEvent.WaitOne(15000)
+            } else {
+                Start-Sleep -Seconds 8
+            }
+            $controlEvent.WaitOne(0)
+        } finally {
+            $controlEvent.Dispose()
+        }
+    }
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    while (-not (Test-EventExists $Name)) {
+        if ([DateTime]::UtcNow -ge $deadline) {
+            Remove-Job -Job $job -Force
+            throw 'The fixture daemon did not create its control event.'
+        }
+        Start-Sleep -Milliseconds 50
+    }
+    return $job
+}
+
+$hookScript = Join-Path $repositoryRoot 'packaging\chocolatey\tools\chocolateyBeforeModify.ps1'
+# Never the real name: these tests must not stop a daemon running in the session they run in.
+$env:CAPTASTIC_HOOK_TEST_CONTROL_EVENT = "Local\CaptasticHookTest-$PID"
+# The hook leaves its relaunch marker in TEMP; a directory of the test's own keeps a real one alone.
+$previousTemp = $env:TEMP
+$testTemp = Join-Path ([System.IO.Path]::GetTempPath()) "captastic-hook-tests-$PID"
+New-Item -ItemType Directory -Path $testTemp -Force | Out-Null
+$env:TEMP = $testTemp
+$relaunchMarker = Join-Path $testTemp 'captastic-relaunch-after-upgrade'
+$jobs = @()
 try {
-    $hookTools = Join-Path $testRoot 'tools'
-    $hookApplication = Join-Path $hookTools 'captastic'
-    New-Item -ItemType Directory -Path $hookApplication -Force | Out-Null
-    $hookCli = Join-Path $hookApplication 'captastic.exe'
-    New-HookTestCli $hookCli
-    $hookScript = Join-Path $hookTools 'chocolateyBeforeModify.ps1'
-    Copy-Item -LiteralPath (Join-Path $repositoryRoot 'packaging\chocolatey\tools\chocolateyBeforeModify.ps1') `
-        -Destination $hookScript
-    $env:CAPTASTIC_HOOK_TEST_STATE = Join-Path $testRoot 'hook-state.txt'
-
-    $env:CAPTASTIC_HOOK_TEST_MODE = 'not-running'
+    # Nothing running: the hook has nothing to do, and nothing to start again afterwards.
     & $hookScript
+    Assert-True (-not (Test-Path -LiteralPath $relaunchMarker)) `
+        'Chocolatey before-modify hook asked for a relaunch when nothing was running.'
 
-    $env:CAPTASTIC_HOOK_TEST_MODE = 'running-stops'
-    Remove-Item -LiteralPath $env:CAPTASTIC_HOOK_TEST_STATE -Force -ErrorAction SilentlyContinue
+    $job = Start-FixtureDaemon $env:CAPTASTIC_HOOK_TEST_CONTROL_EVENT $true
+    $jobs += $job
     & $hookScript
-    Assert-True (Test-Path -LiteralPath $env:CAPTASTIC_HOOK_TEST_STATE -PathType Leaf) `
-        'Chocolatey before-modify hook did not stop a running daemon.'
+    Assert-True (-not (Test-EventExists $env:CAPTASTIC_HOOK_TEST_CONTROL_EVENT)) `
+        'Chocolatey before-modify hook returned while the daemon still held its control event.'
+    $signalled = @(Receive-Job -Job $job -Wait)[-1]
+    Assert-True ($signalled -eq $true) 'Chocolatey before-modify hook did not signal the daemon.'
+    Assert-True (Test-Path -LiteralPath $relaunchMarker -PathType Leaf) `
+        'Chocolatey before-modify hook stopped a daemon without leaving the relaunch marker.'
+    $stoppedAt = [DateTime]::Parse(
+        (Get-Content -LiteralPath $relaunchMarker -Raw).Trim(),
+        [System.Globalization.CultureInfo]::InvariantCulture,
+        [System.Globalization.DateTimeStyles]::RoundtripKind
+    )
+    Assert-True (([DateTime]::UtcNow - $stoppedAt.ToUniversalTime()).TotalMinutes -lt 1) `
+        'Chocolatey before-modify hook wrote a relaunch time that is not now.'
+    Remove-Item -LiteralPath $relaunchMarker -Force
 
-    $env:CAPTASTIC_HOOK_TEST_MODE = 'malformed'
-    Assert-ThrowsLike { & $hookScript } '*status could not be read*'
-    $env:CAPTASTIC_HOOK_TEST_MODE = 'status-failure'
-    Assert-ThrowsLike { & $hookScript } '*status failed with exit code 7*'
-    $env:CAPTASTIC_HOOK_TEST_MODE = 'unexpected'
-    Assert-ThrowsLike { & $hookScript } "*unexpected status 'indeterminate'*"
-    $env:CAPTASTIC_HOOK_TEST_MODE = 'stop-failure'
-    Assert-ThrowsLike { & $hookScript } '*stop failed with exit code 9*'
-    $env:CAPTASTIC_HOOK_TEST_MODE = 'always-running'
+    $job = Start-FixtureDaemon $env:CAPTASTIC_HOOK_TEST_CONTROL_EVENT $false
+    $jobs += $job
     Assert-ThrowsLike { & $hookScript } '*did not stop within five seconds*'
+    Assert-True (-not (Test-Path -LiteralPath $relaunchMarker)) `
+        'Chocolatey before-modify hook asked for a relaunch after failing to stop the daemon.'
 
     Write-Host "Chocolatey hook tests passed under PowerShell $($PSVersionTable.PSVersion)."
 } finally {
-    Remove-Item Env:CAPTASTIC_HOOK_TEST_MODE -ErrorAction SilentlyContinue
-    Remove-Item Env:CAPTASTIC_HOOK_TEST_STATE -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTASTIC_HOOK_TEST_CONTROL_EVENT -ErrorAction SilentlyContinue
+    $env:TEMP = $previousTemp
+    Remove-Item -LiteralPath $testTemp -Recurse -Force -ErrorAction SilentlyContinue
+    foreach ($job in $jobs) {
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    }
 }

@@ -57,15 +57,16 @@ pub use known_folders::known_pictures_folder;
 pub use overlay::{
     flush_desktop_composition, select_from_frozen_frame, select_from_frozen_frame_with_controller,
     select_from_frozen_frame_with_initial_tool, select_from_frozen_frame_with_initial_tool_and_ui,
-    select_from_preview_source_with_initial_tool_and_ui, InitialSelectionTool, NativeWindowHandle,
-    OverlayController, OverlayResources, OverlaySelection, OverlayUiUpdate, PreviewView,
-    SelectionKind, SelectionOutcome, SelectionPreviewSource, DISPLAY_CHANGE_MONITORS,
+    select_from_preview_source_with_initial_tool_and_ui, ConfirmIntent, DesktopUi, EditOutcome,
+    InitialSelectionTool, NativeWindowHandle, OverlayController, OverlayDestinations,
+    OverlayResources, OverlaySelection, OverlayUiUpdate, PreviewView, SelectionKind,
+    SelectionOutcome, SelectionPreviewSource, DISPLAY_CHANGE_MONITORS,
 };
 #[cfg(windows)]
 pub use session::{desktop_state, DesktopState};
 #[cfg(windows)]
 pub use startup::{disable_startup, enable_startup, startup_command};
 #[cfg(windows)]
-pub use tray::{open_path, show_error_dialog, TrayEvent, TrayIcon};
+pub use tray::{open_path, show_error_dialog, show_info_dialog, TrayEvent, TrayIcon};
 #[cfg(windows)]
 pub use window_capture::{captured_window_frame, materialize_selection};

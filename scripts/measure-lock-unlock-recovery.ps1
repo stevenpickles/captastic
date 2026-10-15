@@ -65,7 +65,7 @@ param(
     [int] $AfterUnlockSeconds = 60,
     # The lock-flag timeline this script keeps for itself, independent of the daemon under test.
     [int] $SampleMs = 1000,
-    [string] $Exe = (Join-Path (Split-Path $PSScriptRoot -Parent) 'target\debug\captastic.exe'),
+    [string] $Exe = (Join-Path (Split-Path $PSScriptRoot -Parent) 'target\debug\captastic-dev.exe'),
     [string] $UserExe = 'C:\ProgramData\chocolatey\lib\captastic\tools\captastic\captastic.exe'
 )
 
@@ -256,7 +256,9 @@ try {
     # user's daemon stays down.
     if ($userWasRunning) {
         Write-Line 'stopping the installed daemon for the duration'
-        & $UserExe stop 2>&1 | Out-Null
+        # The installed captastic.exe has no command line; the developer one stops whichever daemon
+        # holds this session's control event, the installed one included.
+        & $Exe stop 2>&1 | Out-Null
         Start-Sleep -Seconds 3
     }
 
@@ -378,10 +380,10 @@ try {
         if (-not $daemon.HasExited) { Stop-Process -Id $daemon.Id -Force }
     }
     if ($userWasRunning) {
-        # The same call install.ps1 makes: captastic-desktop.exe is the entry point that brings the
-        # tray daemon back, and it runs from its own directory.
+        # The same call install.ps1 makes: captastic.exe is the tray daemon, run from its own
+        # directory.
         $tools = Split-Path $UserExe -Parent
-        Start-Process -FilePath (Join-Path $tools 'captastic-desktop.exe') -WorkingDirectory $tools -WindowStyle Hidden
+        Start-Process -FilePath $UserExe -WorkingDirectory $tools
         Start-Sleep -Seconds 4
         $back = Get-Process captastic -ErrorAction SilentlyContinue
         Write-Line ('installed daemon: ' + $(if ($back) { "restarted (pid $($back.Id))" } else { 'NOT RUNNING - restart it by hand' }))

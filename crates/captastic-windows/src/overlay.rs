@@ -8,8 +8,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
+mod desktop_ui;
+mod editor;
 mod layout;
 mod machine;
+mod pin;
 mod raster;
 mod shell;
 mod snap;
@@ -22,10 +25,11 @@ use layout::{
 };
 use raster::{
     apply_dim_wash, build_blurred_background, draw_antialiased_rounded_outline, draw_camera_icon,
-    draw_checkmark, draw_display_icon, draw_filled_ellipse, draw_lines, draw_outline,
-    draw_outline_rect, draw_region_icon, draw_resize_handles, draw_round_box, draw_surface_nearest,
-    draw_text, draw_window_icon, draw_window_surface, fill_device_rect, fill_live_background,
-    fitted_surface_rect, measure_ui_text, rgb, scaled_corner_radius, TextAlignment,
+    draw_checkmark, draw_display_icon, draw_edit_icon, draw_filled_ellipse, draw_lines,
+    draw_outline, draw_outline_rect, draw_pin_icon, draw_region_icon, draw_resize_handles,
+    draw_round_box, draw_surface_nearest, draw_text, draw_window_icon, draw_window_surface,
+    fill_device_rect, fill_live_background, fitted_surface_rect, measure_ui_text, rgb,
+    scaled_corner_radius, TextAlignment,
 };
 pub use shell::flush_desktop_composition;
 use shell::{
@@ -39,15 +43,15 @@ use shell::{
 use snap::{SnapAxis, SnapTarget, SnapTargetKind, SnapTargets, NO_SNAPS};
 use window_enumeration::{enumerate_visible_windows, WindowCandidate};
 
+use machine::{
+    confirm_intent, default_region_for_source, fit_region_to_source, initial_selection,
+    local_point, transition, CaptureTool, CloseOutcome, CursorIntent, OverlayEffect, OverlayInput,
+    OverlayModel, ResizeHandle,
+};
 #[cfg(test)]
 use machine::{
     contains, hit_test_resize_handle, latest_interaction_region, move_region, rect_from_points,
     resize_region,
-};
-use machine::{
-    default_region_for_source, fit_region_to_source, initial_selection, local_point, transition,
-    CaptureTool, CloseOutcome, CursorIntent, OverlayEffect, OverlayInput, OverlayModel,
-    ResizeHandle,
 };
 
 use crate::dwm_thumbnail::{fit_source_in_bounds, DwmThumbnail};
@@ -115,13 +119,31 @@ const UI_FONT_HEIGHT: i32 = 21;
 ///
 /// "Snap to Window Edges" would be plainer but measures 200 px against the 192 px a menu row has
 /// for text at 96 DPI, and widening the menu for one row is a worse trade than the shorter name.
+pub use desktop_ui::DesktopUi;
+pub use editor::EditOutcome;
+
 const SNAP_TO_WINDOWS_LABEL: &str = "Snap to Edges";
+/// The Options row for file output. Shorter than the notification area's "Save Captures to Disk"
+/// for the same reason as the snap row: the menu is 192 px wide for text at 96 DPI, and the menu
+/// already says these rows are about captures.
+const FILE_OUTPUT_LABEL: &str = "Save to Disk";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SelectionKind {
     Display,
     Region,
     Window,
+}
+
+/// What the user asked for when they confirmed (ADR 0010).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfirmIntent {
+    /// **Capture** or Enter: deliver the selection to the destinations.
+    Capture,
+    /// **Pin** or Shift+Enter: deliver it as Capture would, and keep it on screen.
+    Pin,
+    /// **Edit** or Ctrl+Enter: withhold it until the editor publishes the edited image.
+    Edit,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -199,6 +221,8 @@ impl NativeWindowHandle {
 pub struct OverlaySelection {
     pub rect: Rect,
     pub kind: SelectionKind,
+    /// Capture, Pin, or Edit: what the confirmation asked the caller to do with the pixels.
+    pub intent: ConfirmIntent,
     pub window: Option<NativeWindowHandle>,
     /// The captured window's title, for naming the capture after it. Set by whichever application
     /// owns the window, so every consumer treats it as untrusted text.
@@ -238,6 +262,7 @@ impl OverlaySelection {
         Self {
             rect,
             kind,
+            intent: ConfirmIntent::Capture,
             window: None,
             window_title: None,
             window_application: None,
@@ -316,6 +341,39 @@ impl SelectionOutcome {
     }
 }
 
+/// Where a confirmed capture will be delivered, as the Options menu states it when a run opens.
+///
+/// The overlay does not deliver captures and does not decide where they go; it shows the answer
+/// the caller gives it and, for file output, relays a request to change it. The clipboard is
+/// stated only: there is no place in the product that switches it at runtime, and a row that
+/// offered to would be lying about what a click could do.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OverlayDestinations {
+    /// Whether the clipboard receives captures.
+    pub clipboard: bool,
+    /// Whether captures are written to disk, as it stands when the run opens.
+    pub file_output: bool,
+    /// Whether a daemon is behind this run to act on [`OverlayUiUpdate::FileOutput`]. False for a
+    /// one-shot capture, whose row states the destination and does not offer to change it.
+    pub file_output_switchable: bool,
+    /// Whether **Pin** is offered. Only a daemon can keep a pinned window open after the overlay
+    /// closes, so a one-shot capture greys it.
+    pub pin_available: bool,
+    /// Whether **Edit** is offered. Greyed until the editor exists (ADR 0010, slice 2).
+    pub edit_available: bool,
+}
+
+impl OverlayDestinations {
+    /// The destinations a run without a daemon has: the clipboard, and nothing to switch.
+    pub const CLIPBOARD_ONLY: Self = Self {
+        clipboard: true,
+        file_output: false,
+        file_output_switchable: false,
+        pin_available: false,
+        edit_available: false,
+    };
+}
+
 #[derive(Clone, Debug)]
 pub enum OverlayUiUpdate {
     Interaction {
@@ -339,6 +397,10 @@ pub enum OverlayUiUpdate {
     SnapToWindows { enabled: bool },
     /// When the region tool's magnifier appears. Global, for the same reason.
     RegionZoom { mode: captastic_config::RegionZoom },
+    /// The user asked, from the Options menu, for captures to be saved to disk or not. Not a
+    /// UI preference: the receiver hands it to the daemon, which starts or stops the file worker
+    /// and records `output.enabled` exactly as it does for the notification-area item.
+    FileOutput { enabled: bool },
 }
 
 #[derive(Clone, Default)]
@@ -507,6 +569,7 @@ pub fn select_from_frozen_frame_with_initial_tool_and_ui(
         controller,
         initial_tool,
         remembered_ui,
+        OverlayDestinations::CLIPBOARD_ONLY,
         resources,
     )
 }
@@ -575,6 +638,7 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
     controller: &OverlayController,
     initial_tool: InitialSelectionTool,
     remembered_ui: Option<captastic_config::DisplayUiState>,
+    destinations: OverlayDestinations,
     resources: &mut OverlayResources,
 ) -> Result<SelectionOutcome, CaptureError> {
     let preparation_started = Instant::now();
@@ -709,6 +773,11 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
             toolbar_drag: None,
             options_open: false,
             dim_background: true,
+            clipboard_enabled: destinations.clipboard,
+            file_output_enabled: destinations.file_output,
+            file_output_switchable: destinations.file_output_switchable,
+            pin_available: destinations.pin_available,
+            edit_available: destinations.edit_available,
             hovered_control: None,
             pointer_local: None,
             hovered: None,
@@ -1152,6 +1221,9 @@ fn apply_overlay_ui_update(state: &mut LiveUiState, update: &OverlayUiUpdate) {
     match update {
         OverlayUiUpdate::SnapToWindows { enabled } => state.snap_to_windows = Some(*enabled),
         OverlayUiUpdate::RegionZoom { mode } => state.region_zoom = Some(*mode),
+        // Not UI state: the daemon owns the answer, and every run is told it afresh from the
+        // destination set rather than from what an earlier run asked for.
+        OverlayUiUpdate::FileOutput { .. } => {}
         OverlayUiUpdate::Interaction {
             display_id,
             tool,
@@ -1575,6 +1647,7 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                     point,
                     window_slot,
                     time_ms: message_time_ms(),
+                    modifiers: modifiers(),
                 }
             };
             run_machine(hwnd, state_pointer, input)
@@ -1600,10 +1673,22 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                 let state = unsafe { &*state_pointer };
                 screen_point(state.model.source, lparam)
             };
-            run_machine(hwnd, state_pointer, OverlayInput::DoubleClicked { point })
+            run_machine(
+                hwnd,
+                state_pointer,
+                OverlayInput::DoubleClicked {
+                    point,
+                    modifiers: modifiers(),
+                },
+            )
         }
         WM_KEYDOWN if wparam.0 == usize::from(VK_RETURN.0) => {
-            run_machine(hwnd, state_pointer, OverlayInput::ConfirmRequested)
+            let intent = confirm_intent(modifiers());
+            run_machine(
+                hwnd,
+                state_pointer,
+                OverlayInput::ConfirmRequested { intent },
+            )
         }
         WM_KEYDOWN if wparam.0 == usize::from(VK_ESCAPE.0) => {
             run_machine(hwnd, state_pointer, OverlayInput::CancelRequested)
@@ -1736,6 +1821,7 @@ fn build_overlay_selection(
     state: &OverlayState,
     rect: Rect,
     kind: SelectionKind,
+    intent: ConfirmIntent,
     window: Option<NativeWindowHandle>,
     window_frame: Option<CpuFrame>,
 ) -> OverlaySelection {
@@ -1757,6 +1843,7 @@ fn build_overlay_selection(
     OverlaySelection {
         rect,
         kind,
+        intent,
         window,
         window_title,
         window_application,
@@ -1939,11 +2026,14 @@ fn apply_overlay_effects(
                         .as_ref()
                         .map(|frame| frame.metadata.source_rect)
                 };
+                // Read now, while the click that chose the window is still being handled: the
+                // preview render above is synchronous, so the keys are the ones held for it.
+                let intent = confirm_intent(modifiers());
                 // Feed the outcome back so the machine decides confirm versus stay-in-chooser.
-                // SAFETY: The Box remains alive; this borrow ends at the semicolon.
                 let effects = transition(
+                    // SAFETY: The Box remains alive; this borrow ends at the semicolon.
                     unsafe { &mut (*state_pointer).model },
-                    OverlayInput::WindowPreviewResolved { rect },
+                    OverlayInput::WindowPreviewResolved { rect, intent },
                 );
                 apply_overlay_effects(hwnd, state_pointer, effects);
             }
@@ -1982,6 +2072,13 @@ fn apply_overlay_effects(
                     });
                 }
             }
+            OverlayEffect::RequestFileOutput { enabled } => {
+                // SAFETY: Shared borrow released at the block's end.
+                let state = unsafe { &*state_pointer };
+                if let Some(sink) = state.ui_updates.as_ref() {
+                    sink.submit(OverlayUiUpdate::FileOutput { enabled });
+                }
+            }
             OverlayEffect::PersistInteraction { region } => {
                 // SAFETY: Shared borrow released at the block's end.
                 let state = unsafe { &*state_pointer };
@@ -1996,7 +2093,12 @@ fn apply_overlay_effects(
             }
             OverlayEffect::Close(outcome) => {
                 match outcome {
-                    CloseOutcome::Confirmed { rect, kind, window } => {
+                    CloseOutcome::Confirmed {
+                        rect,
+                        kind,
+                        window,
+                        intent,
+                    } => {
                         // SAFETY: The borrow ends before close_overlay dispatches destruction.
                         let state = unsafe { &mut *state_pointer };
                         let window_frame = (kind == SelectionKind::Window)
@@ -2006,8 +2108,14 @@ fn apply_overlay_effects(
                             .as_ref()
                             .map(|frame| frame.metadata.source_rect)
                             .unwrap_or(rect);
-                        let selection =
-                            build_overlay_selection(state, rect, kind, window, window_frame);
+                        let selection = build_overlay_selection(
+                            state,
+                            rect,
+                            kind,
+                            intent,
+                            window,
+                            window_frame,
+                        );
                         state.result = Some(selection);
                         close_overlay(hwnd);
                     }
@@ -3864,6 +3972,23 @@ fn draw_toolbar(state: &OverlayState) {
         tokens.icon_stroke,
     );
 
+    draw_action_button(
+        device,
+        layout.pin,
+        ToolbarControl::Pin,
+        state.model.pin_available,
+        state,
+        draw_pin_icon,
+    );
+    draw_action_button(
+        device,
+        layout.edit,
+        ToolbarControl::Edit,
+        state.model.edit_available,
+        state,
+        draw_edit_icon,
+    );
+
     let capture_enabled = state.model.selection.is_some();
     let capture_color = if capture_enabled {
         if state.model.hovered_control == Some(ToolbarControl::Capture) {
@@ -3909,6 +4034,31 @@ fn draw_toolbar(state: &OverlayState) {
     draw_hover_tooltip(device, state, layout);
 }
 
+/// Pin or Edit: an icon button that ends the run like Capture does, greyed when this run does not
+/// offer it or there is nothing selected yet.
+fn draw_action_button(
+    device: HDC,
+    bounds: UiRect,
+    control: ToolbarControl,
+    available: bool,
+    state: &OverlayState,
+    icon: fn(HDC, UiRect, COLORREF, UiMetrics),
+) {
+    let metrics = state.model.display_environment.metrics;
+    let tokens = metrics.toolbar_tokens();
+    let enabled = available && state.model.selection.is_some();
+    if enabled && state.model.hovered_control == Some(control) {
+        let color = rgb(58, 58, 63);
+        draw_round_box(device, bounds, color, color, tokens.control_corner_radius);
+    }
+    let color = if enabled {
+        rgb(245, 245, 247)
+    } else {
+        rgb(110, 110, 116)
+    };
+    icon(device, bounds, color, metrics);
+}
+
 fn draw_tool_button(
     device: HDC,
     bounds: UiRect,
@@ -3949,9 +4099,29 @@ fn draw_hover_tooltip(device: HDC, state: &OverlayState, layout: ToolbarLayout) 
         Some(ToolbarControl::Window) => (layout.window, "Capture a window".to_owned()),
         Some(ToolbarControl::Region) => (layout.region, "Select a region".to_owned()),
         Some(ToolbarControl::Options) => (layout.options, "Capture options".to_owned()),
+        Some(ToolbarControl::Pin) => {
+            let value = if !state.model.pin_available {
+                "Pinning needs Captastic running in the notification area"
+            } else if state.model.selection.is_some() {
+                "Copy and pin on screen (Shift+Enter)"
+            } else {
+                "Select something to pin"
+            };
+            (layout.pin, value.to_owned())
+        }
+        Some(ToolbarControl::Edit) => {
+            let value = if !state.model.edit_available {
+                "Editing needs Captastic running in the notification area"
+            } else if state.model.selection.is_some() {
+                "Edit before copying (Ctrl+Enter)"
+            } else {
+                "Select something to edit"
+            };
+            (layout.edit, value.to_owned())
+        }
         Some(ToolbarControl::Capture) => {
             let value = if state.model.selection.is_some() {
-                "Copy selection to clipboard"
+                "Copy selection (Shift+click to pin, Ctrl+click to edit)"
             } else {
                 "Select something to capture"
             };
@@ -4108,6 +4278,10 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
             ToolbarControl::ClipboardDestination,
             layout.clipboard_destination,
         ),
+        (
+            ToolbarControl::FileOutputDestination,
+            layout.file_output_destination,
+        ),
         (ToolbarControl::Cancel, layout.cancel),
     ];
     for (control, row) in rows {
@@ -4201,13 +4375,19 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
         TextAlignment::Left,
         tokens.font_height,
     );
-    draw_checkmark(
-        device,
-        layout.clipboard_destination.left + tokens.menu_check_offset,
-        (layout.clipboard_destination.top + layout.clipboard_destination.bottom) / 2,
-        rgb(86, 156, 255),
-        metrics,
-    );
+    // Both destination rows state where the confirmation will go. The clipboard row is greyed
+    // because nothing here can change it; the disk row is greyed only when the run has no daemon
+    // to hand the request to, and otherwise reads as the toggle it is - the same setting as the
+    // notification area's `Save Captures to Disk`.
+    if state.model.clipboard_enabled {
+        draw_checkmark(
+            device,
+            layout.clipboard_destination.left + tokens.menu_check_offset,
+            (layout.clipboard_destination.top + layout.clipboard_destination.bottom) / 2,
+            rgb(86, 156, 255),
+            metrics,
+        );
+    }
     draw_text(
         device,
         UiRect {
@@ -4218,6 +4398,32 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
         },
         "Copy to Clipboard",
         rgb(210, 210, 214),
+        TextAlignment::Left,
+        tokens.font_height,
+    );
+    if state.model.file_output_enabled {
+        draw_checkmark(
+            device,
+            layout.file_output_destination.left + tokens.menu_check_offset,
+            (layout.file_output_destination.top + layout.file_output_destination.bottom) / 2,
+            rgb(86, 156, 255),
+            metrics,
+        );
+    }
+    draw_text(
+        device,
+        UiRect {
+            left: layout.file_output_destination.left + tokens.menu_text_offset,
+            top: layout.file_output_destination.top,
+            right: layout.file_output_destination.right - tokens.text_padding,
+            bottom: layout.file_output_destination.bottom,
+        },
+        FILE_OUTPUT_LABEL,
+        if state.model.file_output_switchable {
+            rgb(245, 245, 247)
+        } else {
+            rgb(210, 210, 214)
+        },
         TextAlignment::Left,
         tokens.font_height,
     );
@@ -4335,6 +4541,7 @@ mod tests {
                 height: 10,
             },
             kind: SelectionKind::Region,
+            intent: crate::overlay::ConfirmIntent::Capture,
             window: None,
             window_title: None,
             window_application: None,
@@ -4380,6 +4587,54 @@ mod tests {
         ] {
             assert!(latch_view_switch(switched, before, after));
         }
+    }
+
+    #[test]
+    #[ignore = "opens a pinned window on the interactive desktop"]
+    fn a_pinned_capture_is_never_a_window_chooser_or_snap_candidate() {
+        // ADR 0010: a pin is visible in captures but never a capture target. That rests entirely
+        // on window enumeration rejecting this process's windows before any other filter, so this
+        // pins the guarantee to a real pin rather than to the filter's description of itself.
+        use std::time::Duration;
+        use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+
+        let mut metadata = frame_metadata_for_tests();
+        metadata.source_rect = Rect {
+            x: 40,
+            y: 40,
+            width: 4,
+            height: 4,
+        };
+        let frame = CpuFrame::new(
+            Arc::from(vec![0x80_u8; 64]),
+            4,
+            4,
+            16,
+            PixelFormat::Bgra8Unorm,
+            FrameOrigin::TopLeft,
+            ColorSpace::Srgb,
+            metadata,
+        )
+        .expect("a valid four-pixel frame");
+        let host = DesktopUi::start().expect("the desktop UI thread starts");
+        host.pin(frame.detached(), frame.metadata.source_rect)
+            .expect("the pin request is accepted");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pin = loop {
+            // SAFETY: Looks a window up by its class name only.
+            let found = unsafe { FindWindowW(w!("CaptasticPinnedCapture-v1"), PCWSTR::null()) };
+            if found.0 != 0 {
+                break found;
+            }
+            assert!(Instant::now() < deadline, "the pin never appeared");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            window_enumeration::is_own_process_window(pin),
+            "a pin must be rejected by the first filter window enumeration applies"
+        );
+        assert!(host.stop(Instant::now() + Duration::from_secs(2)));
     }
 
     #[test]
@@ -5436,17 +5691,17 @@ mod tests {
     fn toolbar_position_restores_from_normalized_work_area_coordinates() {
         let environment = test_display_environment(2560, 1440, 1400, 144);
         let layout = ToolbarLayout::new(environment, ToolbarLayout::default_origin(environment));
-        assert_eq!(layout.bounds.width(), 627);
+        assert_eq!(layout.bounds.width(), 771);
         assert_eq!(layout.bounds.height(), 84);
         assert!(layout.bounds.bottom <= environment.work_area.bottom);
         assert_eq!(
             remembered_toolbar_position(Some((0.5, 0.5)), None, environment),
-            Some(POINT { x: 967, y: 658 })
+            Some(POINT { x: 895, y: 658 })
         );
         let smaller = test_display_environment(1920, 1080, 1040, 96);
         assert_eq!(
             remembered_toolbar_position(Some((0.5, 0.5)), None, smaller),
-            Some(POINT { x: 751, y: 492 })
+            Some(POINT { x: 703, y: 492 })
         );
     }
 
@@ -5455,7 +5710,7 @@ mod tests {
         let environment = test_display_environment(1920, 1080, 1040, 96);
         assert_eq!(
             remembered_toolbar_position(None, Some((3700, 2000)), environment),
-            Some(POINT { x: 1494, y: 976 })
+            Some(POINT { x: 1398, y: 976 })
         );
     }
 
@@ -5717,6 +5972,13 @@ mod tests {
                         - tokens.menu_text_offset
                         - tokens.text_padding,
                     layout.clipboard_destination.height(),
+                ),
+                (
+                    FILE_OUTPUT_LABEL,
+                    layout.file_output_destination.width()
+                        - tokens.menu_text_offset
+                        - tokens.text_padding,
+                    layout.file_output_destination.height(),
                 ),
                 (
                     "Cancel Capture",

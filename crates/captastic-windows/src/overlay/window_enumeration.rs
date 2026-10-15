@@ -233,7 +233,7 @@ fn native_window_display_id(hwnd: HWND, displays: &[DisplayInfo]) -> Option<Disp
 ///
 /// A handle that no longer resolves to a thread counts as ours: it is useless as a capture target
 /// and must not be queried further.
-fn is_own_process_window(hwnd: HWND) -> bool {
+pub(super) fn is_own_process_window(hwnd: HWND) -> bool {
     let mut process_id = 0_u32;
     // SAFETY: process_id is writable storage and hwnd is inspected synchronously.
     let thread_id = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };

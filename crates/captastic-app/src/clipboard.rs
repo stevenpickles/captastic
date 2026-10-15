@@ -10,6 +10,9 @@ use serde_json::json;
 
 use crate::error::AppError;
 
+/// The clipboard's name in the destination set, so a reader of the set can ask whether the
+/// clipboard is in it without knowing how the set was built.
+pub const DESTINATION_NAME: &str = "clipboard";
 // A terminal publish can consume three 250 ms backoffs plus native clipboard open waits.
 const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const WORKER_STOP_POLL: Duration = Duration::from_millis(5);
@@ -202,7 +205,7 @@ impl ClipboardWorker {
     /// The clipboard as a destination, addressable without knowing it is the clipboard.
     pub fn sink(&self) -> crate::output::ChannelSink {
         crate::output::ChannelSink::new(
-            "clipboard",
+            DESTINATION_NAME,
             self.sender
                 .as_ref()
                 .expect("clipboard worker is running")

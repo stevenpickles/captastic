@@ -1,45 +1,19 @@
 $ErrorActionPreference = 'Stop'
 
-$toolsDirectory = Split-Path -Parent $MyInvocation.MyCommand.Definition
-$cli = Join-Path $toolsDirectory 'captastic\captastic.exe'
+# Chocolatey runs chocolateyBeforeModify.ps1 first, which stops a running daemon and fails the
+# uninstall if it cannot. What is left here is what only an uninstall removes.
 
-function Invoke-CaptasticCommand([string[]]$Arguments) {
-    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $startInfo.FileName = $cli
-    $startInfo.Arguments = $Arguments -join ' '
-    $startInfo.UseShellExecute = $false
-    $startInfo.CreateNoWindow = $true
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
-    $process = New-Object System.Diagnostics.Process
-    $process.StartInfo = $startInfo
-    try {
-        if (-not $process.Start()) {
-            throw 'Captastic process did not start.'
-        }
-        $process.StandardOutput.ReadToEnd() | Out-Null
-        $process.StandardError.ReadToEnd() | Out-Null
-        $process.WaitForExit()
-        return $process.ExitCode
-    } finally {
-        $process.Dispose()
-    }
+# Launch at login, if it was turned on. The entry is per-user and names this package's executable.
+$runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+if ($null -ne (Get-ItemProperty -LiteralPath $runKey -Name 'Captastic' -ErrorAction SilentlyContinue)) {
+    Remove-ItemProperty -LiteralPath $runKey -Name 'Captastic'
 }
 
-if (Test-Path -LiteralPath $cli -PathType Leaf) {
-    # Captastic writes operational logs to stderr on successful commands;
-    # suppress them because Chocolatey's host promotes native stderr to errors.
-    $exitCode = Invoke-CaptasticCommand @('stop')
-    if ($exitCode -ne 0) {
-        Write-Warning "Captastic stop returned exit code $exitCode."
-    }
-    $exitCode = Invoke-CaptasticCommand @('startup', 'disable')
-    if ($exitCode -ne 0) {
-        Write-Warning "Disabling Captastic startup returned exit code $exitCode."
-    }
-}
+# The before-modify hook leaves this for an upgrade's install; an uninstall has no install to read it.
+Remove-Item -LiteralPath (Join-Path $env:TEMP 'captastic-relaunch-after-upgrade') -Force -ErrorAction SilentlyContinue
 
 Uninstall-BinFile -Name 'captastic'
+# Created by 0.2 and earlier, and removed here in case an upgrade's own clean-up did not run.
 Uninstall-BinFile -Name 'captastic-desktop'
 
 $shortcutPath = Join-Path ([Environment]::GetFolderPath('CommonPrograms')) 'Captastic.lnk'

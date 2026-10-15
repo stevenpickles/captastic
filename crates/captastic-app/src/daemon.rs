@@ -1118,7 +1118,12 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         .register_file_output(file_output_worker.take())
         .register_hotkey(hotkey);
     let startup_enabled = match captastic_windows::startup_command() {
-        Ok(command) => command.is_some(),
+        Ok(command) => {
+            if let Some(command) = command.as_deref() {
+                migrate_legacy_startup(command);
+            }
+            command.is_some()
+        }
         Err(error) => {
             crate::logging::warn(format_args!(
                 "failed to read launch-at-login state: {error}"
@@ -1321,6 +1326,25 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                         }
                     }
                 }
+                // The Options menu's Save to Disk row, acted on here because the worker registry
+                // and the destination set live on this thread. The request normally lands within
+                // a tick of the click, while the overlay is still open, so the confirmation that
+                // follows goes to the set as the user just left it; one confirmed inside that
+                // tick still goes to the set as it was.
+                if let Some(requested) = workers
+                    .selection()
+                    .and_then(crate::selection::SelectionWorker::take_file_output_request)
+                {
+                    set_file_output_enabled(
+                        &args,
+                        &mut workers,
+                        &destinations,
+                        tray.as_ref(),
+                        &mut last_persistence_notification,
+                        requested,
+                        "overlay",
+                    );
+                }
                 if let Some(worker) = workers.selection() {
                     while let Some(failure) = worker.try_recv_persistence_failure() {
                         if let Some(tray) = tray.as_ref() {
@@ -1410,13 +1434,26 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                 );
                             }
                             captastic_windows::TrayEvent::ToggleFileOutput => {
-                                toggle_file_output_from_tray(
+                                let requested = workers.file_output().is_none();
+                                set_file_output_enabled(
                                     &args,
                                     &mut workers,
                                     &destinations,
-                                    tray,
+                                    Some(tray),
                                     &mut last_persistence_notification,
+                                    requested,
+                                    "notification area",
                                 );
+                            }
+                            captastic_windows::TrayEvent::ClosePins => {
+                                if let Some(worker) = workers.selection() {
+                                    worker.close_all_pins();
+                                }
+                            }
+                            captastic_windows::TrayEvent::MakePinsClickable => {
+                                if let Some(worker) = workers.selection() {
+                                    worker.make_pins_clickable();
+                                }
                             }
                             captastic_windows::TrayEvent::ToggleStartup => {
                                 toggle_startup_from_tray(tray)
@@ -1718,6 +1755,12 @@ fn detached_file_output_blocking_start(
 
 /// Starts or stops writing captures to disk, and remembers which the user chose.
 ///
+/// One function behind two places the user can ask from - the notification area's item and the
+/// overlay's Options row - so the two cannot drift in what the setting means. Takes the state
+/// asked for rather than a toggle: the overlay reports where the user left the row, and that can
+/// already be the case if the notification area was used while the overlay was open, or if two
+/// clicks cancelled out. Such a request is satisfied by doing nothing.
+///
 /// Runs on the daemon thread, never the capture thread: starting the worker validates the
 /// filename template and creates the output directory, and stopping it joins a thread. Both are
 /// fine here and neither may ever sit on the capture path (ADR 0002).
@@ -1727,13 +1770,22 @@ fn detached_file_output_blocking_start(
 /// Disabling removes the sink first, so no capture is queued to a worker that is already
 /// stopping.
 #[cfg(windows)]
-fn toggle_file_output_from_tray(
+fn set_file_output_enabled(
     args: &ResolvedDaemonArgs,
     workers: &mut crate::worker_registry::WorkerRegistry,
     destinations: &crate::output::OutputDestinations,
-    tray: &captastic_windows::TrayIcon,
+    tray: Option<&captastic_windows::TrayIcon>,
     last_persistence_notification: &mut Option<String>,
+    requested: bool,
+    source: &'static str,
 ) {
+    if requested == workers.file_output().is_some() {
+        log::info!(
+            "captures are already {} saved to disk ({source})",
+            if requested { "being" } else { "not being" }
+        );
+        return;
+    }
     let enabled = if workers.file_output().is_some() {
         destinations.remove(crate::file_output::DESTINATION_NAME);
         let mut abandoned = 0_u64;
@@ -1760,10 +1812,10 @@ fn toggle_file_output_from_tray(
         // file output off is the one person who needs to know a capture was still in the queue.
         if abandoned > 0 {
             log::warn!(
-                "captures are no longer saved to disk (notification area); {abandoned} capture(s) were still queued and were not written"
+                "captures are no longer saved to disk ({source}); {abandoned} capture(s) were still queued and were not written"
             );
         } else {
-            log::info!("captures are no longer saved to disk (notification area)");
+            log::info!("captures are no longer saved to disk ({source})");
         }
         false
     } else if workers.is_shutting_down() {
@@ -1785,20 +1837,19 @@ fn toggle_file_output_from_tray(
             detached.total
         );
         crate::logging::error(format_args!("refusing to start file output: {message}"));
-        if let Err(error) =
-            tray.show_error_with_title("Captastic could not save captures to disk", message)
-        {
-            crate::logging::warn(format_args!(
-                "failed to surface a refused file-output start in the notification area: {error}"
-            ));
-        }
+        surface_in_tray(
+            tray,
+            "Captastic could not save captures to disk",
+            message,
+            "a refused file-output start",
+        );
         return;
     } else {
         match start_file_output(args) {
             Ok(worker) => {
                 destinations.insert(std::sync::Arc::new(worker.sink()));
                 log::info!(
-                    "saving captures to {} (notification area)",
+                    "saving captures to {} ({source})",
                     worker.directory().display()
                 );
                 workers.register_file_output(Some(worker));
@@ -1811,21 +1862,22 @@ fn toggle_file_output_from_tray(
                 // can fix.
                 let message = format!("Captastic could not start saving captures to disk. {error}");
                 crate::logging::warn(format_args!("{message}"));
-                if let Err(error) =
-                    tray.show_error_with_title("Captastic could not save captures to disk", message)
-                {
-                    crate::logging::warn(format_args!(
-                        "failed to surface a file-output start failure in the notification area: {error}"
-                    ));
-                }
+                surface_in_tray(
+                    tray,
+                    "Captastic could not save captures to disk",
+                    message,
+                    "a file-output start failure",
+                );
                 return;
             }
         }
     };
-    if let Err(error) = tray.set_file_output_enabled(enabled) {
-        crate::logging::warn(format_args!(
-            "file output changed but the tray menu did not update: {error}"
-        ));
+    if let Some(tray) = tray {
+        if let Err(error) = tray.set_file_output_enabled(enabled) {
+            crate::logging::warn(format_args!(
+                "file output changed but the tray menu did not update: {error}"
+            ));
+        }
     }
     if destinations.is_empty() {
         // Not refused. The user switched off the only destination this daemon had — a legitimate
@@ -1833,13 +1885,12 @@ fn toggle_file_output_from_tray(
         // declines is worse than one that does what it says and then says what it cost.
         let message = "Captures are no longer delivered anywhere: saving to disk is off and the clipboard is disabled in this configuration.".to_owned();
         crate::logging::warn(format_args!("{message}"));
-        if let Err(error) =
-            tray.show_error_with_title("Captastic has nowhere to put a capture", message)
-        {
-            crate::logging::warn(format_args!(
-                "failed to surface the empty-destination warning in the notification area: {error}"
-            ));
-        }
+        surface_in_tray(
+            tray,
+            "Captastic has nowhere to put a capture",
+            message,
+            "the empty-destination warning",
+        );
     } else {
         log::info!(
             "captures are now delivered to [{}]",
@@ -1860,7 +1911,7 @@ fn toggle_file_output_from_tray(
 fn persist_file_output_preference(
     args: &ResolvedDaemonArgs,
     enabled: bool,
-    tray: &captastic_windows::TrayIcon,
+    tray: Option<&captastic_windows::TrayIcon>,
     last_notification: &mut Option<String>,
 ) {
     // The profile this daemon is actually running on: an explicit `--config` path, or the default
@@ -1893,7 +1944,7 @@ fn persist_file_output_preference(
 #[cfg(windows)]
 fn notify_preference_not_saved(
     message: String,
-    tray: &captastic_windows::TrayIcon,
+    tray: Option<&captastic_windows::TrayIcon>,
     last_notification: &mut Option<String>,
 ) {
     crate::logging::warn(format_args!("{message}"));
@@ -1901,23 +1952,87 @@ fn notify_preference_not_saved(
         return;
     }
     *last_notification = Some(message.clone());
-    if let Err(error) = tray.show_error_with_title("Captastic preferences were not saved", message)
-    {
+    surface_in_tray(
+        tray,
+        "Captastic preferences were not saved",
+        message,
+        "a preference-persistence error",
+    );
+}
+
+/// Raises a balloon when there is a notification area to raise it in.
+///
+/// Every caller has already written the message to the log, so a daemon whose tray never started
+/// loses the balloon and nothing else. `what` names the balloon in the warning that says it could
+/// not be shown.
+#[cfg(windows)]
+fn surface_in_tray(
+    tray: Option<&captastic_windows::TrayIcon>,
+    title: &str,
+    message: String,
+    what: &str,
+) {
+    let Some(tray) = tray else {
+        return;
+    };
+    if let Err(error) = tray.show_error_with_title(title, message) {
         crate::logging::warn(format_args!(
-            "failed to surface a preference-persistence error in the notification area: {error}"
+            "failed to surface {what} in the notification area: {error}"
         ));
     }
+}
+
+/// Points a launch-at-login entry left by Captastic 0.2 or earlier at the one executable.
+///
+/// Those versions registered `captastic-desktop.exe`, a launcher that no longer ships. An upgrade
+/// removes the file and leaves the entry naming it, so the next login would start nothing and say
+/// nothing. Only an entry for the launcher beside this executable is rewritten: one naming another
+/// install is that install's to manage, and a developer build must not take over the user's.
+#[cfg(windows)]
+fn migrate_legacy_startup(command: &str) {
+    let Ok(executable) = crate::desktop_executable() else {
+        return;
+    };
+    if !names_legacy_launcher_beside(command, &executable) || !executable.is_file() {
+        return;
+    }
+    match captastic_windows::enable_startup(&executable) {
+        Ok(()) => log::info!(
+            "launch at login now starts {} instead of the retired captastic-desktop.exe",
+            executable.display()
+        ),
+        Err(error) => crate::logging::warn(format_args!(
+            "launch at login still names the retired captastic-desktop.exe and could not be updated: {error}"
+        )),
+    }
+}
+
+/// Whether a Run-key command names `captastic-desktop.exe` in the same directory as `executable`.
+#[cfg(windows)]
+fn names_legacy_launcher_beside(command: &str, executable: &std::path::Path) -> bool {
+    let registered = std::path::Path::new(command.trim().trim_matches('"'));
+    let same_name = registered
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("captastic-desktop.exe"));
+    let same_directory = match (registered.parent(), executable.parent()) {
+        (Some(registered), Some(installed)) => registered
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&installed.to_string_lossy()),
+        _ => false,
+    };
+    same_name && same_directory
 }
 
 #[cfg(windows)]
 fn toggle_startup_from_tray(tray: &captastic_windows::TrayIcon) {
     let result = match captastic_windows::startup_command() {
         Ok(Some(_)) => captastic_windows::disable_startup().map(|_| false),
-        Ok(None) => desktop_launcher_path()
+        Ok(None) => crate::desktop_executable()
             .map_err(|error| captastic_core::CaptureError {
                 kind: CaptureErrorKind::SourceUnavailable,
                 backend: "windows-startup",
-                operation: "locate_desktop_launcher",
+                operation: "locate_desktop_executable",
                 message: error.to_string(),
                 retryable: false,
                 native_code: None,
@@ -1941,13 +2056,6 @@ fn toggle_startup_from_tray(tray: &captastic_windows::TrayIcon) {
             "failed to change launch-at-login state: {error}"
         )),
     }
-}
-
-#[cfg(windows)]
-fn desktop_launcher_path() -> Result<std::path::PathBuf, std::io::Error> {
-    let mut path = std::env::current_exe()?;
-    path.set_file_name("captastic-desktop.exe");
-    Ok(path)
 }
 
 #[cfg(windows)]
@@ -3085,6 +3193,35 @@ fn ns_to_ms(ns: u64) -> f64 {
 
 #[cfg(all(test, windows))]
 mod tests {
+    #[test]
+    fn only_the_retired_launcher_beside_this_executable_is_migrated() {
+        use super::names_legacy_launcher_beside;
+        use std::path::Path;
+
+        let installed =
+            Path::new(r"C:\ProgramData\chocolatey\lib\captastic\tools\captastic\captastic.exe");
+        // What 0.2 wrote: quoted, and the case Windows reports may differ from the one written.
+        assert!(names_legacy_launcher_beside(
+            r#""C:\ProgramData\chocolatey\lib\captastic\tools\captastic\captastic-desktop.exe""#,
+            installed
+        ));
+        assert!(names_legacy_launcher_beside(
+            r"c:\programdata\chocolatey\lib\captastic\tools\captastic\Captastic-Desktop.exe",
+            installed
+        ));
+        // Another install's launcher, and an entry that already names the one executable, are
+        // left alone.
+        assert!(!names_legacy_launcher_beside(
+            r#""C:\Users\me\AppData\Local\Programs\Captastic\captastic-desktop.exe""#,
+            installed
+        ));
+        assert!(!names_legacy_launcher_beside(
+            r#""C:\ProgramData\chocolatey\lib\captastic\tools\captastic\captastic.exe""#,
+            installed
+        ));
+        assert!(!names_legacy_launcher_beside("", installed));
+    }
+
     #[test]
     fn a_detached_file_worker_blocks_the_next_one_until_it_returns() {
         // The ceiling exists because a detached worker may still be writing into the output
