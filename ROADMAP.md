@@ -735,14 +735,15 @@ length.
 
 ### Proposed slices
 
-1. **The recording engine.** Frames from the existing sources at a steady rate into a bounded queue,
-   a recording state the daemon owns, still captures refused while it runs, and a stop path that
-   always finalizes a valid file.
-2. **Animated GIF output.** NeuQuant quantization, transparent unchanged pixels and streaming encode
-   on a worker, with the dimension and duration limits.
-3. **Starting, seeing and stopping a recording.** The **Record** button, the **Record As** row, the
-   excluded border and its **Stop** bar, the time limit, and the saved-file balloon.
-4. **MP4 output** through Media Foundation's sink writer.
+1. **The recording engine** (#117). Frames from the existing sources at a steady rate into a bounded
+   queue, a recording state the daemon owns, still captures refused while it runs, and a stop path
+   that always finalizes a valid file.
+2. **Animated GIF output** (#115). NeuQuant quantization, transparent unchanged pixels and streaming
+   encode on a worker, with the dimension and duration limits.
+3. **Starting, seeing and stopping a recording** (`feature/75/record-button`). The **Record**
+   button, the **Record As** row, the excluded border and its **Stop** bar, the time limit, and the
+   saved-file balloon.
+4. **MP4 output** (#116) through Media Foundation's sink writer.
 
 All four gate the 0.4.0 tag.
 
