@@ -50,9 +50,10 @@ resize-handle geometry.
 
 | Element | DIP baseline |
 | --- | ---: |
-| Toolbar | 418 x 56 |
+| Toolbar | 514 x 56 |
 | Tool control hit target | 44 x 44 |
 | Options control | 100 x 44 |
+| Pin and Edit controls | 44 x 44 each |
 | Capture control | 120 x 44 |
 | Options menu | 248 x 292 |
 | Menu row | 236 x 40 |
@@ -64,10 +65,10 @@ Expected physical sizes are:
 
 | Scaling | DPI | Toolbar (px) | Options menu (px) |
 | --- | ---: | ---: | ---: |
-| 100% | 96 | 418 x 56 | 248 x 292 |
-| 125% | 120 | 523 x 70 | 310 x 365 |
-| 150% | 144 | 627 x 84 | 372 x 438 |
-| 200% | 192 | 836 x 112 | 496 x 584 |
+| 100% | 96 | 514 x 56 | 248 x 292 |
+| 125% | 120 | 643 x 70 | 310 x 365 |
+| 150% | 144 | 771 x 84 | 372 x 438 |
+| 200% | 192 | 1028 x 112 | 496 x 584 |
 
 The magnifier is a fixed 31 x 31 square of physical pixels, enlarged 6, 8, 9
 and 12 times at 100%, 125%, 150% and 200%. The sampled square is deliberately

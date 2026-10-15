@@ -47,9 +47,11 @@ not redacted by anything an editor does afterwards.
 **Pins and editors are concurrent.** Any number of pinned windows, and any number of editors, may be
 open while the hotkey keeps working, and a new overlay run neither waits for them nor closes them.
 They live on one new UI thread, `captastic-desktop-ui`, with its own message pump. It is started on
-the first Pin or Edit and not before, so a daemon that never pins or edits never creates it. It is
-registered with the worker registry and stopped at shutdown under ADR 0005's detach rules like any
-other worker.
+the first Pin or Edit and not before, so a daemon that never pins or edits never creates it. The
+selection worker owns it and stops it in its own shutdown, after the selection thread has ended so
+that no late Pin can start another; the worker registry already stops the selection worker, so the
+thread needs no entry of its own. A thread that overruns the deadline holds nothing but windows and
+ends with the process.
 
 **Pins are visible on screen and in screenshots, but never a capture target.** A pinned window does
 not use `WDA_EXCLUDEFROMCAPTURE`: it appears in display and region captures like anything else on
