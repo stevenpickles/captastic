@@ -31,8 +31,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GWLP_USERDATA, GWL_EXSTYLE, HTCAPTION, HWND_MESSAGE, IDC_SIZEALL, MF_CHECKED, MF_POPUP,
     MF_SEPARATOR, MF_STRING, MSG, SW_SHOWNOACTIVATE, TPM_RIGHTBUTTON, ULW_ALPHA, WINDOW_EX_STYLE,
     WM_APP, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_KEYDOWN, WM_MOUSEWHEEL, WM_NCCREATE,
-    WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NULL, WNDCLASSW, WS_EX_LAYERED,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_NULL,
+    WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 use super::shell::{query_display_environment, FrozenSurface, ThreadDpiContext};
@@ -605,6 +605,16 @@ unsafe extern "system" fn pin_window_proc(
             let _ = unsafe { DestroyWindow(hwnd) };
             LRESULT(0)
         }
+        // The whole pin answers as a caption, so a right-click arrives as a non-client click. Left
+        // to DefWindowProc, the press starts the caption's own system-menu tracking - a pin has
+        // no system menu - and the release never becomes WM_CONTEXTMENU, so the menu is shown from
+        // the release here, and the press is swallowed so that tracking never starts.
+        WM_NCRBUTTONDOWN => LRESULT(0),
+        WM_NCRBUTTONUP => {
+            show_pin_menu(hwnd, state_pointer);
+            LRESULT(0)
+        }
+        // Still reached from the keyboard: the menu key, or Shift+F10.
         WM_CONTEXTMENU => {
             show_pin_menu(hwnd, state_pointer);
             LRESULT(0)
