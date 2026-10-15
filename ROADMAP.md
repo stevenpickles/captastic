@@ -89,6 +89,34 @@ procedure in [benchmarks/README.md](benchmarks/README.md) has been run and the s
 figure are committed. Every release so far has published no absolute number, which satisfies
 Milestone 5's criterion vacuously and on purpose.
 
+## Release readiness — v0.4.0
+
+**Status:** planning on `dev` (workspace version 0.4.0). Decided on 2026-10-15:
+
+- **Theme: recording.** 0.4.0 adds recording a region, window or display as an **animated GIF**,
+  with recording to video as the same feature's second output; see
+  [Milestone 9](#milestone-9--screen-recording-and-animated-gif). Its design comes first, as an
+  ADR, because it opens questions pinning and editing never had to answer: how a recording is
+  started, seen and stopped, what bounds its length and memory, and where the file goes.
+- **The editor keeps improving alongside it.** Antialiased pen, marker, highlighter and swatch
+  icons are the first 0.4.0 change; arrows and text (Milestone 6 slices 3 and 4) follow, and may
+  ship in 0.4.0 or a 0.4.x on their own schedule.
+- **Carried from 0.3.0:** the disposable-VM checklist v0.3.0 shipped without, and seeing the first
+  Chocolatey community submission through moderation.
+
+### Gates — before the tag
+
+- **Milestone 9's first slices merged and their exit criteria met**: at minimum recording a region
+  to an animated GIF on disk, started from the overlay and stopped from the notification area or a
+  hotkey, with a visible indicator for the whole recording. Video may follow in 0.4.x; a recording
+  that cannot be seen to be running, or cannot be stopped, may not ship.
+- **A manual desktop checklist for every slice that changes overlay or desktop behaviour**, run
+  before merge.
+- **The disposable-VM checklist** in [docs/chocolatey.md](docs/chocolatey.md), this time before the
+  tag.
+- **Release notes** that say plainly what a recording contains (the region and the pointer, never
+  audio) and that the indicator itself is never recorded.
+
 ## Release readiness — v0.3.0
 
 **Status:** shipped 2026-10-15 (tag `v0.3.0` on `main` at c9763fe, published with its archive,
@@ -677,6 +705,60 @@ still when the desktop will not.
   trip through a running daemon was observed on 2026-09-17 (PR #89 checklist 11, PR #92
   checklist 7).
 
+## Milestone 9 — Screen recording and animated GIF
+
+**Outcome:** a region, window or display can be recorded for a few seconds to a minute and saved as
+an animated GIF, small enough to drop into a chat, an issue or a document, and later as video, with
+the same overlay, the same destinations, and no effect on still captures.
+
+The capture engine already produces timed frames: DXGI duplication for displays and regions, and
+Windows Graphics Capture for windows. Recording reuses those sources at a steady frame rate and adds
+a streaming encoder, so a recording's memory is bounded by the encoder's window rather than its
+length.
+
+### Questions for its ADR (0011)
+
+- **Entry point.** A **Record** action on the overlay toolbar beside Capture, Pin and Edit, a
+  dedicated hotkey that opens the overlay in a recording mode, or both.
+- **Seeing and stopping it.** A border around the recorded area that is excluded from the recording
+  itself, a notification-area state, and how it stops: the hotkey again, a stop button, the tray, a
+  time limit. A recording must never be running unseen.
+- **Formats.** GIF first, which needs palette quantization (per frame or shared), optional
+  dithering, and frame differencing to stay small; then MP4/H.264 through Windows Media Foundation,
+  which encodes in hardware where it can and adds no dependency. The GIF quantizer's licence matters:
+  `imagequant` is GPL, so the candidate is a permissively licensed one such as `color_quant`.
+- **Limits.** Frame rate (10–15 fps is ample for GIF), a maximum duration and output size, and what
+  happens at the limit.
+- **Contents.** The pointer is composited, as it is for stills, with click highlighting an option to
+  decide; audio is out of scope.
+- **Destination.** A file in the output directory and capture history, whether or not still-capture
+  file output is on, with the clipboard given the file (`CF_HDROP`) rather than pixels.
+- **Editing.** Whether a recording can be trimmed before it is saved, which would be the editor's
+  first non-still use.
+
+### Proposed slices
+
+1. **ADR 0011**, settling the questions above.
+2. **The recording engine.** Frames from the existing sources at a steady rate into a bounded queue,
+   a recording state the daemon owns, and a stop path that always finalizes a valid file.
+3. **Animated GIF output.** Quantization, frame differencing and streaming encode on a worker, with
+   size and duration limits.
+4. **Starting, seeing and stopping a recording.** The overlay entry, the excluded border, the
+   notification-area state, and the stop controls, with the result saved and reported.
+5. **Video output.** MP4 through Media Foundation, offered beside GIF.
+6. **Trim before saving**, if the ADR decides it belongs in 0.4.
+
+Slices 1–4 gate the 0.4.0 tag; 5 and 6 may follow in 0.4.x.
+
+### Exit criteria
+
+- Still-capture latency and memory are unchanged when no recording is running.
+- A recording is visible for its whole duration, and the indicator never appears in it.
+- Every way a recording ends - stop, limit, error, Captastic exiting - leaves either a valid file or
+  nothing, and says which.
+- A one-minute recording at the default settings stays within a documented memory ceiling, however
+  large the area.
+
 ## Architecture hardening backlog
 
 These items were deliberately separated from the code-review remediation branch because each
@@ -770,21 +852,23 @@ The order below reflects what remains.
 
 1. See the first Chocolatey community submission through validation and moderation, and run the
    disposable-VM checklist that v0.3.0 shipped without; a defect it finds is a 0.3.x patch.
-2. Milestone 6's remaining slices: arrows and text on the editor model, then reopening a capture
-   from history in the editor.
-3. Finish Milestone 5's evidence work, which is now measurement rather than code: the operator
+2. 0.4.0's theme, recording ([Milestone 9](#milestone-9--screen-recording-and-animated-gif)):
+   ADR 0011 first, then the engine, GIF output, and the controls to start, see and stop it.
+3. Milestone 6's remaining slices beside it: arrows and text on the editor model, then reopening a
+   capture from history in the editor.
+4. Finish Milestone 5's evidence work, which is now measurement rather than code: the operator
    claim runs from [benchmarks/README.md](benchmarks/README.md), after which the absolute budget
    ceilings can be set and a figure can be published. The sequence-marker workload and Milestone 3's
    window-capture backend trait stay deferred — the first needs a desk, a mouse and a rotatable
    display and gates no release claim; the second changes no user-visible contract.
-4. Complete Milestone 1 (multi-adapter composition and the hardware validation matrix) when the
+5. Complete Milestone 1 (multi-adapter composition and the hardware validation matrix) when the
    hardware is available; it needs a second adapter, not design.
-5. Settle the outstanding design decisions — latest-mode currency on an idle desktop,
+6. Settle the outstanding design decisions — latest-mode currency on an idle desktop,
    `fresh` + `virtual_desktop`, and control-event hardening. Milestone 4's two product questions are
    answered (ADR 0008), and the mouse-capture/software-KVM contract is settled in ADR 0009: each use
    takes the pointer source that answers its own question, and Captastic promises nothing about
    where a foreign owner has put the mouse.
-6. Cross-platform work (Milestone 7), the decision gate's other candidate, after Milestone 6.
+7. Cross-platform work (Milestone 7), the decision gate's other candidate, after Milestone 6.
 
 ### Lifecycle recovery: what the investigation settled
 
@@ -800,10 +884,12 @@ not reproduced on demand, is in
 
 ## Recommended next branch
 
-Milestone 6 slice 3's remainder: an arrow tool on the editor model, then text with DPI-correct
-font rendering in the exported pixels (slice 4). Before either, the disposable-VM checklist in
-[docs/chocolatey.md](docs/chocolatey.md) that v0.3.0 shipped without, and whatever the Chocolatey
-moderators ask of the first submission.
+`docs/adr-0011-recording`: ADR 0011, settling Milestone 9's questions (entry point, the indicator
+and stopping, formats, limits, contents, destination, trimming) before any recording code. The
+antialiased editor icons (`feature/71/editor-icons`) are the first 0.4.0 change, already built.
+Alongside: the disposable-VM checklist in [docs/chocolatey.md](docs/chocolatey.md) that v0.3.0
+shipped without, whatever the Chocolatey moderators ask of the first submission, and Milestone 6's
+arrow tool when it fits.
 
 FakeBackend fidelity keeps its leverage and is worth extending as gaps appear: much of Milestone 4
 shipped with daemon-side behaviour verified only by unit tests, because a second daemon cannot start
