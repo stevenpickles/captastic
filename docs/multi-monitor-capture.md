@@ -86,7 +86,7 @@ resize handles, toolbar, and open menu where practical. Exact region dimensions
 are never converted to DIPs.
 
 The compact toolbar uses a 418 x 56 DIP shell with 44 x 44 DIP tool hit targets
-and a 248 x 132 DIP Options menu. Painting, hit testing, popup placement, and
+and a 248 x 292 DIP Options menu. Painting, hit testing, popup placement, and
 work-area clamping share the same per-monitor metrics.
 
 For virtual-desktop capture, use one overlay window per display in a shared
