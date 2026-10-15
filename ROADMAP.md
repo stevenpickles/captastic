@@ -87,7 +87,8 @@ Milestone 5's criterion vacuously and on purpose.
 
 ## Release readiness — v0.3.0
 
-**Status:** in progress on `dev` (workspace version 0.3.0). Decided on 2026-10-15:
+**Status:** feature-complete on `dev` (workspace version 0.3.0); release preparation under way.
+Decided on 2026-10-15:
 
 - **Theme: pinning and annotation (Milestone 6).** It was the decision gate's open choice against a
   first cross-platform proof; it wins because it is user-visible, ungated, and buildable and
@@ -98,10 +99,14 @@ Milestone 5's criterion vacuously and on purpose.
   "Captastic stopped" dialogs.
 - **The Chocolatey community push waits for 0.3.0** rather than catching up v0.1.0 or v0.2.0.
 
-Already on `dev`: PR #99 (a host-independent compare test), #100 (the overlay's Save to Disk row and
-an honest clipboard row), #101, #102 (this plan) and #103 (relaunching Captastic after a Chocolatey
-upgrade that stopped it, merged with its desktop check still to run). Milestone 6's design is
-settled in [ADR 0010](docs/adr/0010-pinning-and-annotation.md).
+On `dev`: PR #99 (a host-independent compare test), #100 (the overlay's Save to Disk row and an
+honest clipboard row), #101, #102 (this plan), #103 (relaunching Captastic after a Chocolatey
+upgrade that stopped it, checked on the desktop 2026-10-15), and Milestone 6 as
+[ADR 0010](docs/adr/0010-pinning-and-annotation.md) (#104) settles it: pinning (#105), the editor
+with crop and redaction (#106), and boxes, pen, marker and highlighter (#107). Arrows, text and
+history integration are left for 0.3.x. The release notes are drafted in
+[docs/release-notes-v0.3.0.md](docs/release-notes-v0.3.0.md), and the disposable-VM checklist is
+written out step by step in [docs/chocolatey.md](docs/chocolatey.md).
 
 ### Gates — before the tag
 
@@ -758,12 +763,11 @@ disposition are recorded in
 [docs/investigations.md](docs/investigations.md#the-2026-08-code-architecture-and-roadmap-review).
 The order below reflects what remains.
 
-1. Merge Milestone 6 slices 1 and 2 as [ADR 0010](docs/adr/0010-pinning-and-annotation.md) settles
-   them — pinning (checked on the desktop) and the editor with crop and redaction, once its manual
-   checklist passes. They gate the 0.3.0 tag. #103's upgrade relaunch was checked on 2026-10-15.
-2. Ship 0.3.0: the disposable-VM checklist (portable installer and upgrade relaunch included),
-   release notes, the branch model, and the first Chocolatey community push. Milestone 6's
-   remaining slices can follow as 0.3.x.
+1. Ship 0.3.0: `release/v0.3.0` to `main`, the disposable-VM checklist (portable installer and
+   upgrade relaunch included), the tag, the release notes, the back-merge and version bump, and the
+   first Chocolatey community push.
+2. Milestone 6's remaining slices as 0.3.x: arrows and text on the editor model, then reopening a
+   capture from history in the editor.
 3. Finish Milestone 5's evidence work, which is now measurement rather than code: the operator
    claim runs from [benchmarks/README.md](benchmarks/README.md), after which the absolute budget
    ceilings can be set and a figure can be published. The sequence-marker workload and Milestone 3's
@@ -792,13 +796,11 @@ not reproduced on demand, is in
 
 ## Recommended next branch
 
-The 0.3.0 release preparation, once slices 1 and 2 are merged: release notes covering the single
-executable, Save to Disk in the overlay, the upgrade relaunch, pinning and the editor (including the
-plain statement that only **Edit** withholds a capture), the disposable-VM checklist, and the
-release branch model. Slice 2's manual checklist comes first: the editor at 100 % and 150 %
-scaling, a crop and a redaction each published through **Done** to the clipboard and to disk, a
-cancelled edit leaving the clipboard as it was, an editor moved between displays of different
-scaling, and an editor left open when Captastic exits.
+`release/v0.3.0`, cut from `dev` once this preparation is merged, and its pull request to `main`.
+The tag waits for the disposable-VM checklist in [docs/chocolatey.md](docs/chocolatey.md); after
+it, the release workflow publishes the GitHub release, the drafted notes are pasted in, the release
+branch is merged back to `dev` with the workspace version advanced to 0.4.0, and the Chocolatey
+package is pushed by hand.
 
 FakeBackend fidelity keeps its leverage and is worth extending as gaps appear: much of Milestone 4
 shipped with daemon-side behaviour verified only by unit tests, because a second daemon cannot start

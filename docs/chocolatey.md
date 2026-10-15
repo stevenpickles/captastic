@@ -110,11 +110,44 @@ explicit opt-in because it changes the machine's installed Chocolatey state:
     -AllowSystemChanges
 ```
 
-Use a disposable interactive Windows VM for the final release check. Confirm that the Start Menu
-entry launches the tray application, the global hotkey captures successfully, an upgrade stops a
-running daemon cleanly, and `~/.captastic` remains after uninstall. Hosted CI verifies silent
+Use a disposable interactive Windows VM for the final release check. Hosted CI verifies silent
 install, non-launching first install, shims, shortcut creation, upgrade, uninstall cleanup, and a
-preserved settings fixture, but it has no interactive desktop for the capture workflow.
+preserved settings fixture, but it has no interactive desktop for the capture workflow. The VM
+covers what only a desktop can, on a machine that has never seen Captastic. Use the release's own
+artifacts, downloaded from the GitHub release once it exists (or from the release workflow's run
+before then). The upgrade steps also need an *earlier* package of the same release line to upgrade
+from, since a prerelease sorts below its release: build one from the release commit with
+`-PrereleaseLabel vm.1` and a `-SourceUrl` naming that commit (for example `0.3.0-vm.1`), which
+carries the same relaunch hook.
+
+**Disposable-VM checklist.** Take a snapshot first; restore it between the two halves.
+
+Portable package, as a standard user:
+
+1. Download the ZIP and its `.sha256`, check the hash, `Unblock-File` the ZIP, extract it, and run
+   `.\install.ps1`. Captastic appears in the notification area with no console window, and its Start
+   Menu shortcut exists.
+2. Press the hotkey, choose a region, and press Enter: the clipboard holds the region.
+3. Confirm with **Pin** (Shift+Enter) and with **Edit** (Ctrl+Enter), then press **Done**: a pin
+   appears, and the edited image reaches the clipboard.
+4. Turn on **Start with Windows**, sign out and back in: Captastic starts with no console.
+5. Run the installed `uninstall.ps1`: Captastic stops, the shortcut and login entry are gone, and
+   `~/.captastic` remains.
+
+Chocolatey package, from an elevated prompt, after restoring the snapshot:
+
+6. `choco install captastic --version <version>-vm.1 --pre --source <folder>`: nothing launches.
+   Start it from the Start Menu; there is no console, and `(Get-Command captastic).Source` is the
+   Chocolatey shim.
+7. Repeat steps 2 and 3.
+8. With Captastic running, `choco upgrade captastic --version <version> --source <folder>` to the
+   release package: it stops, and comes back on its own within a few seconds. Task Manager's
+   **Details** tab, with the **Elevated** column shown, reports `captastic.exe` as **No**, and the
+   log's `starting daemon version=` line names the release.
+9. `choco uninstall captastic`: Captastic stops, the shim, shortcut and login entry are gone, and
+   `~/.captastic` remains.
+
+Record the result in the release notes' "What was not observed" section before publishing.
 
 ## Release and publish
 
