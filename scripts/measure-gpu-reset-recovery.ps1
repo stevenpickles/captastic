@@ -40,7 +40,7 @@ $log = Join-Path $OutDir 'daemon.log'
 $out = Join-Path $OutDir 'daemon.out'
 $err = Join-Path $OutDir 'daemon.err'
 
-$exe = Join-Path $Repo 'target\debug\captastic.exe'
+$exe = Join-Path $Repo 'target\debug\captastic-dev.exe'
 if (-not (Test-Path $exe)) {
     throw "$exe is missing; build it first with: cargo build -p captastic-app"
 }
@@ -54,7 +54,9 @@ $userWasRunning = [bool] (Get-Process captastic -ErrorAction SilentlyContinue)
 $process = $null
 try {
     if ($userWasRunning) {
-        & $UserExe stop 2>&1 | Out-Null
+        # The installed captastic.exe has no command line; the developer one stops whichever daemon
+        # holds this session's control event, the installed one included.
+        & $exe stop 2>&1 | Out-Null
         Start-Sleep -Seconds 2
     }
 
