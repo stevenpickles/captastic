@@ -439,8 +439,15 @@ one-shot capture greys it. See [ADR 0010](docs/adr/0010-pinning-and-annotation.m
 **Edit** opens the selection in an editor window on the display it was taken from, at its physical
 pixel size where there is room and scaled down where there is not. **Crop** (C) draws the part to
 keep, and its edges, corners and handles move and resize it; what falls outside is dimmed. **Redact**
-(R) draws opaque black boxes over anything that must not be shared. **Undo** and **Redo** (Ctrl+Z,
-and Ctrl+Y or Ctrl+Shift+Z) step through both. **Done** (Enter) copies the edited image to the
+(R) draws opaque black boxes over anything that must not be shared. To point things out, **Box**
+(B) draws a coloured rectangle outline, **Pen** (P) a thin freehand line, **Marker** (M) a thick one,
+and **Highlighter** (H) a wide translucent stroke that tints what is under it without hiding it. The
+six swatches (1-6: red, yellow, green, blue, black, white) set the colour of the drawing tool in
+hand, and each tool remembers its own, so the highlighter starts yellow and the rest red. Marks are
+laid down in the order you draw them, so one drawn over a redaction sits on top of the black and
+never uncovers what is beneath it. Line widths follow the scaling of the display the capture came
+from. **Undo** and **Redo** (Ctrl+Z, and Ctrl+Y or Ctrl+Shift+Z) step through every crop and mark.
+**Done** (Enter) copies the edited image to the
 clipboard, and to disk if file output is on; **Cancel** (Escape) or closing the window discards it,
 asking first if you had made changes.
 
