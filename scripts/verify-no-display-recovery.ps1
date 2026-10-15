@@ -23,14 +23,17 @@ New-Item -ItemType Directory -Force $OutDir | Out-Null
 $log = Join-Path $OutDir 'daemon.log'
 $err = Join-Path $OutDir 'daemon.err'
 
+$exe = Join-Path $Repo 'target\debug\captastic-dev.exe'
+
 $userDaemon = Get-Process captastic -ErrorAction SilentlyContinue
 if ($userDaemon) {
-    & $UserExe stop 2>&1 | Out-Null
+    # The installed captastic.exe has no command line; the developer one stops whichever daemon
+    # holds this session's control event, the installed one included.
+    & $exe stop 2>&1 | Out-Null
     Start-Sleep -Seconds 2
 }
 
 $env:CAPTASTIC_TEST_NO_DISPLAYS_MS = "$BlackoutMs"
-$exe = Join-Path $Repo 'target\debug\captastic.exe'
 # Clipboard and selection off: this is about the capture engine's lifecycle, and a soak that
 # quietly replaces the user's clipboard is how their clipboard got destroyed twice before.
 $args = @(

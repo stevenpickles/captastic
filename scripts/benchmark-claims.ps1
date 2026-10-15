@@ -30,7 +30,7 @@ Push-Location $repo
 try {
     Write-Host '== build =='
     cargo build --release -p captastic-app
-    $exe = Join-Path $repo 'target\release\captastic.exe'
+    $exe = Join-Path $repo 'target\release\captastic-dev.exe'
 
     Write-Host "`n== preflight (benchmarks\README.md step 2 says what each must be) =="
     $doctor = & $exe doctor --json | ConvertFrom-Json

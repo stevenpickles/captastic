@@ -2,15 +2,12 @@ $ErrorActionPreference = 'Stop'
 
 $toolsDirectory = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $applicationDirectory = Join-Path $toolsDirectory 'captastic'
-$cli = Join-Path $applicationDirectory 'captastic.exe'
-$desktop = Join-Path $applicationDirectory 'captastic-desktop.exe'
+$executable = Join-Path $applicationDirectory 'captastic.exe'
 
-foreach ($requiredFile in @($cli, $desktop)) {
-    if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
-        throw "The Captastic Chocolatey package is incomplete: $requiredFile is missing."
-    }
-    Unblock-File -LiteralPath $requiredFile
+if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
+    throw "The Captastic Chocolatey package is incomplete: $executable is missing."
 }
+Unblock-File -LiteralPath $executable
 
 # A user moving from the portable installer should not be left with an old daemon
 # holding Captastic's session control event. Its uninstaller preserves ~/.captastic.
@@ -19,7 +16,7 @@ $legacyCli = Join-Path $legacyDirectory 'captastic.exe'
 $legacyUninstaller = Join-Path $legacyDirectory 'uninstall.ps1'
 if ((Test-Path -LiteralPath $legacyCli -PathType Leaf) -and
     -not [System.IO.Path]::GetFullPath($legacyCli).Equals(
-        [System.IO.Path]::GetFullPath($cli),
+        [System.IO.Path]::GetFullPath($executable),
         [System.StringComparison]::OrdinalIgnoreCase
     )) {
     if (Test-Path -LiteralPath $legacyUninstaller -PathType Leaf) {
@@ -33,17 +30,31 @@ if ((Test-Path -LiteralPath $legacyCli -PathType Leaf) -and
     }
 }
 
-# Suppression files in the generated package prevent Chocolatey's automatic shim
-# behavior so both public commands can be exposed explicitly and predictably.
-Install-BinFile -Name 'captastic' -Path $cli
-Install-BinFile -Name 'captastic-desktop' -Path $desktop
+# A suppression file in the generated package prevents Chocolatey's automatic shim so the one
+# command is exposed explicitly. -UseStart makes it a GUI shim: captastic.exe is a windowless
+# program, and a console shim would hold a console open for as long as Captastic runs.
+Install-BinFile -Name 'captastic' -Path $executable -UseStart
+# 0.2 and earlier shipped a separate launcher with a shim of its own.
+Uninstall-BinFile -Name 'captastic-desktop'
+
+# Launch at login, as 0.2 and earlier registered it, names a launcher this package no longer
+# contains; repoint it at the one executable so the next login still starts Captastic. Only an
+# entry for this package's own directory is touched. captastic.exe repeats this check when it
+# starts, for the user whose entry this elevated session could not see.
+$runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+$legacyLauncher = Join-Path $applicationDirectory 'captastic-desktop.exe'
+$startup = (Get-ItemProperty -LiteralPath $runKey -Name 'Captastic' -ErrorAction SilentlyContinue).Captastic
+if ($startup -and $startup.Trim().Trim('"').Equals($legacyLauncher, [System.StringComparison]::OrdinalIgnoreCase)) {
+    Set-ItemProperty -LiteralPath $runKey -Name 'Captastic' -Value ('"{0}"' -f $executable)
+    Write-Host 'Launch at login now starts captastic.exe.'
+}
 
 $shortcutPath = Join-Path ([Environment]::GetFolderPath('CommonPrograms')) 'Captastic.lnk'
 Install-ChocolateyShortcut `
     -ShortcutFilePath $shortcutPath `
-    -TargetPath $desktop `
+    -TargetPath $executable `
     -WorkingDirectory $applicationDirectory `
-    -IconLocation $desktop `
+    -IconLocation $executable `
     -Description 'Start Captastic screenshot capture'
 
 

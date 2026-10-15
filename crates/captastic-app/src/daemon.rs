@@ -1118,7 +1118,12 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         .register_file_output(file_output_worker.take())
         .register_hotkey(hotkey);
     let startup_enabled = match captastic_windows::startup_command() {
-        Ok(command) => command.is_some(),
+        Ok(command) => {
+            if let Some(command) = command.as_deref() {
+                migrate_legacy_startup(command);
+            }
+            command.is_some()
+        }
         Err(error) => {
             crate::logging::warn(format_args!(
                 "failed to read launch-at-login state: {error}"
@@ -1967,15 +1972,57 @@ fn surface_in_tray(
     }
 }
 
+/// Points a launch-at-login entry left by Captastic 0.2 or earlier at the one executable.
+///
+/// Those versions registered `captastic-desktop.exe`, a launcher that no longer ships. An upgrade
+/// removes the file and leaves the entry naming it, so the next login would start nothing and say
+/// nothing. Only an entry for the launcher beside this executable is rewritten: one naming another
+/// install is that install's to manage, and a developer build must not take over the user's.
+#[cfg(windows)]
+fn migrate_legacy_startup(command: &str) {
+    let Ok(executable) = crate::desktop_executable() else {
+        return;
+    };
+    if !names_legacy_launcher_beside(command, &executable) || !executable.is_file() {
+        return;
+    }
+    match captastic_windows::enable_startup(&executable) {
+        Ok(()) => log::info!(
+            "launch at login now starts {} instead of the retired captastic-desktop.exe",
+            executable.display()
+        ),
+        Err(error) => crate::logging::warn(format_args!(
+            "launch at login still names the retired captastic-desktop.exe and could not be updated: {error}"
+        )),
+    }
+}
+
+/// Whether a Run-key command names `captastic-desktop.exe` in the same directory as `executable`.
+#[cfg(windows)]
+fn names_legacy_launcher_beside(command: &str, executable: &std::path::Path) -> bool {
+    let registered = std::path::Path::new(command.trim().trim_matches('"'));
+    let same_name = registered
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("captastic-desktop.exe"));
+    let same_directory = match (registered.parent(), executable.parent()) {
+        (Some(registered), Some(installed)) => registered
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&installed.to_string_lossy()),
+        _ => false,
+    };
+    same_name && same_directory
+}
+
 #[cfg(windows)]
 fn toggle_startup_from_tray(tray: &captastic_windows::TrayIcon) {
     let result = match captastic_windows::startup_command() {
         Ok(Some(_)) => captastic_windows::disable_startup().map(|_| false),
-        Ok(None) => desktop_launcher_path()
+        Ok(None) => crate::desktop_executable()
             .map_err(|error| captastic_core::CaptureError {
                 kind: CaptureErrorKind::SourceUnavailable,
                 backend: "windows-startup",
-                operation: "locate_desktop_launcher",
+                operation: "locate_desktop_executable",
                 message: error.to_string(),
                 retryable: false,
                 native_code: None,
@@ -1999,13 +2046,6 @@ fn toggle_startup_from_tray(tray: &captastic_windows::TrayIcon) {
             "failed to change launch-at-login state: {error}"
         )),
     }
-}
-
-#[cfg(windows)]
-fn desktop_launcher_path() -> Result<std::path::PathBuf, std::io::Error> {
-    let mut path = std::env::current_exe()?;
-    path.set_file_name("captastic-desktop.exe");
-    Ok(path)
 }
 
 #[cfg(windows)]
@@ -3143,6 +3183,35 @@ fn ns_to_ms(ns: u64) -> f64 {
 
 #[cfg(all(test, windows))]
 mod tests {
+    #[test]
+    fn only_the_retired_launcher_beside_this_executable_is_migrated() {
+        use super::names_legacy_launcher_beside;
+        use std::path::Path;
+
+        let installed =
+            Path::new(r"C:\ProgramData\chocolatey\lib\captastic\tools\captastic\captastic.exe");
+        // What 0.2 wrote: quoted, and the case Windows reports may differ from the one written.
+        assert!(names_legacy_launcher_beside(
+            r#""C:\ProgramData\chocolatey\lib\captastic\tools\captastic\captastic-desktop.exe""#,
+            installed
+        ));
+        assert!(names_legacy_launcher_beside(
+            r"c:\programdata\chocolatey\lib\captastic\tools\captastic\Captastic-Desktop.exe",
+            installed
+        ));
+        // Another install's launcher, and an entry that already names the one executable, are
+        // left alone.
+        assert!(!names_legacy_launcher_beside(
+            r#""C:\Users\me\AppData\Local\Programs\Captastic\captastic-desktop.exe""#,
+            installed
+        ));
+        assert!(!names_legacy_launcher_beside(
+            r#""C:\ProgramData\chocolatey\lib\captastic\tools\captastic\captastic.exe""#,
+            installed
+        ));
+        assert!(!names_legacy_launcher_beside("", installed));
+    }
+
     #[test]
     fn a_detached_file_worker_blocks_the_next_one_until_it_returns() {
         // The ceiling exists because a detached worker may still be writing into the output

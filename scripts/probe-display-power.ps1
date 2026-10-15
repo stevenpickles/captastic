@@ -25,7 +25,7 @@
 param(
     # Defaults to the release build of the repository this script lives in, so the script
     # works from a clone rather than from one machine's home directory.
-    [string] $Exe = (Join-Path (Split-Path $PSScriptRoot -Parent) 'target\release\captastic.exe'),
+    [string] $Exe = (Join-Path (Split-Path $PSScriptRoot -Parent) 'target\release\captastic-dev.exe'),
     [string] $UserExe = 'C:\ProgramData\chocolatey\lib\captastic\tools\captastic\captastic.exe',
     [Parameter(Mandatory)] [string] $OutDir,
     [int] $BaselineSeconds = 30,
@@ -96,7 +96,9 @@ $daemon = $null
 try {
     if ($userWasRunning) {
         Write-Line 'stopping the user daemon for the duration'
-        & $UserExe stop 2>&1 | Out-Null
+        # The installed captastic.exe has no command line; the developer one stops whichever daemon
+        # holds this session's control event, the installed one included.
+        & $Exe stop 2>&1 | Out-Null
         Start-Sleep -Seconds 3
     }
 

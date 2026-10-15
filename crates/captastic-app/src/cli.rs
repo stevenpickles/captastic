@@ -7,9 +7,9 @@ use crate::error::AppError;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "captastic",
+    name = "captastic-dev",
     version = build_info::BUILD_VERSION,
-    about = "Fast native screenshot capture for Windows"
+    about = "Captastic's developer command line: capture, benchmark, and inspect a daemon"
 )]
 pub struct Cli {
     /// Persistent log file (defaults to %USERPROFILE%\.captastic\logs\captastic.log on Windows).

@@ -1,19 +1,27 @@
 # Chocolatey packaging
 
-Captastic's Chocolatey package is self-contained: the release executables, licenses,
+Captastic's Chocolatey package is self-contained: the release executable, licenses,
 documentation, and example configuration are embedded in the `.nupkg`. Installation and
-upgrades therefore do not download or execute a second installer. The package exposes both
-`captastic.exe` and `captastic-desktop.exe` on `PATH` and adds the console-free desktop launcher
-to the all-users Start Menu (`CommonPrograms`); the portable installer's shortcut is per-user
-instead. The all-users shortcut is a Chocolatey packaging convention only — the installed startup
+upgrades therefore do not download or execute a second installer. The package exposes
+`captastic.exe` on `PATH` through a GUI shim, so the shim holds no console open while Captastic
+runs, and adds it to the all-users Start Menu (`CommonPrograms`); the portable installer's shortcut
+is per-user instead. The developer command line, `captastic-dev.exe`, is not packaged. The all-users shortcut is a Chocolatey packaging convention only — the installed startup
 entry, configuration, and daemon control remain scoped to the installing user's session.
 
 The package intentionally does not launch Captastic on its first installation. Start it from
-the Start Menu, then use the tray menu or `captastic startup enable` if it should start with
-Windows. When upgrading a running installation, the Chocolatey hook stops the daemon before
-replacing its files; reopen Captastic from the Start Menu after the upgrade. The package never
-starts an elevated tray process from Chocolatey. Uninstall removes both command shims and the shortcut
-but preserves configuration and logs under `~/.captastic`.
+the Start Menu, then turn on **Start with Windows** in the tray menu if it should start with
+Windows. When upgrading or uninstalling a running installation, the Chocolatey before-modify hook
+stops the daemon before touching its files, by signalling the session control event
+`Local\CaptasticDaemonControl-v1` and waiting for the daemon to release it. That needs no Captastic
+executable, so the same hook stops a 0.2 daemon and a 0.3 one. Reopen Captastic from the Start Menu
+after an upgrade. The package never starts an elevated tray process from Chocolatey. Uninstall
+removes the command shim, the login entry and the shortcut but preserves configuration and logs
+under `~/.captastic`.
+
+Upgrading from 0.2 or earlier also retires `captastic-desktop.exe`, the console-free launcher those
+versions shipped: the install removes its shim and repoints a login entry that names it at
+`captastic.exe`. `captastic.exe` repeats that repair when it starts, for an entry the elevated
+install could not see.
 
 The Chocolatey package supports installation, upgrade, and removal by the same interactive
 Windows user. Deployment as `SYSTEM`, elevation with a different administrator account, and
@@ -59,8 +67,9 @@ pull request from `main` instead if that ever matters.
 
 The workspace version represents the next formal release. Advance it on `dev` immediately after the
 release branch is merged back—for example, move from `0.1.0` to the intended `0.2.0` or `1.0.0` line—so subsequent `dev` and
-`ci` identifiers are prereleases of the correct future version. `captastic --version`, `captastic
-version --json`, and the Windows executable properties report the identity actually embedded in a
+`ci` identifiers are prereleases of the correct future version. `captastic-dev --version`,
+`captastic-dev version --json`, `captastic.exe --version` (shown in a dialog), and the Windows
+executable properties report the identity actually embedded in a
 package; `artifacts.json` records that as `buildVersion` even when a lifecycle test deliberately
 assigns two package versions to the same binaries.
 
@@ -78,8 +87,8 @@ directory:
 
 ```powershell
 choco install captastic --version <version> --source ./dist --yes
-captastic doctor
-Get-Command captastic, captastic-desktop
+(Get-Command captastic).Source
+(Get-Item "$env:ChocolateyInstall\lib\captastic\tools\captastic\captastic.exe").VersionInfo.ProductVersion
 choco upgrade captastic --version <version> --source ./dist --yes --force
 choco uninstall captastic --yes
 ```

@@ -23,11 +23,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, LoadIconW, PostMessageW,
     PostQuitMessage, PostThreadMessageW, RegisterClassW, RegisterWindowMessageW,
     SetForegroundWindow, SetWindowLongPtrW, TrackPopupMenu, TranslateMessage, UnregisterClassW,
-    CREATESTRUCTW, GWLP_USERDATA, HMENU, MB_ICONERROR, MB_OK, MF_CHECKED, MF_GRAYED, MF_SEPARATOR,
-    MF_STRING, MSG, SPI_SETLOGICALDPIOVERRIDE, SPI_SETWORKAREA, SW_SHOWNORMAL, TPM_BOTTOMALIGN,
-    TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE,
-    WM_ENDSESSION, WM_LBUTTONDBLCLK, WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_QUERYENDSESSION,
-    WM_QUIT, WM_RBUTTONUP, WM_SETTINGCHANGE, WNDCLASSW, WS_OVERLAPPED,
+    CREATESTRUCTW, GWLP_USERDATA, HMENU, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MESSAGEBOX_STYLE,
+    MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, SPI_SETLOGICALDPIOVERRIDE,
+    SPI_SETWORKAREA, SW_SHOWNORMAL, TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_COMMAND,
+    WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE, WM_ENDSESSION, WM_LBUTTONDBLCLK, WM_NCCREATE,
+    WM_NCDESTROY, WM_NULL, WM_QUERYENDSESSION, WM_QUIT, WM_RBUTTONUP, WM_SETTINGCHANGE, WNDCLASSW,
+    WS_OVERLAPPED,
 };
 
 const CLASS_NAME: PCWSTR = w!("CaptasticTrayWindow-v1");
@@ -279,6 +280,16 @@ pub fn open_path(path: &Path) -> Result<(), CaptureError> {
 }
 
 pub fn show_error_dialog(message: &str) {
+    show_dialog(message, MB_ICONERROR);
+}
+
+/// A dialog for an answer rather than a failure, such as `captastic.exe --version`, which has no
+/// console to print into.
+pub fn show_info_dialog(message: &str) {
+    show_dialog(message, MB_ICONINFORMATION);
+}
+
+fn show_dialog(message: &str, icon: MESSAGEBOX_STYLE) {
     let text: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
     // SAFETY: text is null-terminated for the modal call and the title is a static wide string.
     let _ = unsafe {
@@ -286,7 +297,7 @@ pub fn show_error_dialog(message: &str) {
             HWND(0),
             PCWSTR(text.as_ptr()),
             w!("Captastic"),
-            MB_OK | MB_ICONERROR,
+            MB_OK | icon,
         )
     };
 }

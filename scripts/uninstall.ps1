@@ -6,33 +6,34 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-function Wait-CaptasticStopped {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Executable,
-        [int]$TimeoutSeconds = 5
-    )
+# Stops a running Captastic through its session control event: the event every version's daemon
+# holds while it runs and every version's `stop` command signalled. Going to the event rather than
+# to an executable is what lets this script stop a 0.2 daemon and a 0.3 one alike; 0.3 ships no
+# command line to ask.
+function Stop-Captastic {
+    param([int]$TimeoutSeconds = 5)
 
+    $name = 'Local\CaptasticDaemonControl-v1'
+    $controlEvent = $null
+    if (-not [System.Threading.EventWaitHandle]::TryOpenExisting($name, [ref]$controlEvent)) {
+        return
+    }
+    try {
+        [void]$controlEvent.Set()
+    } finally {
+        $controlEvent.Dispose()
+    }
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
-    while ($true) {
-        $statusResult = & $Executable status --json | ConvertFrom-Json
-        if ($LASTEXITCODE -ne 0) {
-            throw "Captastic status failed with exit code $LASTEXITCODE."
+    do {
+        Start-Sleep -Milliseconds 100
+        $controlEvent = $null
+        $running = [System.Threading.EventWaitHandle]::TryOpenExisting($name, [ref]$controlEvent)
+        if ($running) {
+            $controlEvent.Dispose()
         }
-        switch ($statusResult.status) {
-            'not_running' {
-                return
-            }
-            'running' {
-                if ([DateTime]::UtcNow -ge $deadline) {
-                    throw "The running Captastic daemon did not stop within $TimeoutSeconds seconds."
-                }
-                Start-Sleep -Milliseconds 100
-            }
-            default {
-                throw "Captastic returned an unexpected daemon status: $($statusResult.status)"
-            }
-        }
+    } while ($running -and [DateTime]::UtcNow -lt $deadline)
+    if ($running) {
+        throw "The running Captastic daemon did not stop within $TimeoutSeconds seconds."
     }
 }
 
@@ -41,18 +42,13 @@ $installRoot = [System.IO.Path]::GetPathRoot($InstallDirectory)
 if ($InstallDirectory.TrimEnd('\') -eq $installRoot.TrimEnd('\')) {
     throw 'The installation directory cannot be a filesystem root.'
 }
-$installedCli = Join-Path $InstallDirectory 'captastic.exe'
+if (Test-Path -LiteralPath (Join-Path $InstallDirectory 'captastic.exe') -PathType Leaf) {
+    Stop-Captastic
+}
 
-if (Test-Path -LiteralPath $installedCli -PathType Leaf) {
-    & $installedCli stop | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        throw "Captastic stop failed with exit code $LASTEXITCODE."
-    }
-    Wait-CaptasticStopped -Executable $installedCli
-    & $installedCli startup disable | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        throw "Disabling Captastic startup failed with exit code $LASTEXITCODE."
-    }
+$runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+if ($null -ne (Get-ItemProperty -LiteralPath $runKey -Name 'Captastic' -ErrorAction SilentlyContinue)) {
+    Remove-ItemProperty -LiteralPath $runKey -Name 'Captastic'
 }
 
 $shortcutPath = Join-Path ([Environment]::GetFolderPath('Programs')) 'Captastic.lnk'

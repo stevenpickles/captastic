@@ -22,7 +22,7 @@
 param(
     [string] $ProcessName = 'captastic',
     # Pin the sample to one process. Without this the newest process of that name is sampled, and a
-    # second short-lived instance - a `captastic status`, a daemon that failed to start - silently
+    # second short-lived instance - a `captastic-dev status`, a daemon that failed to start - silently
     # substitutes its own counters into the series. That happened during the 2026-08-17 soak and
     # produced four samples that looked like a 60% drop in handles.
     [int] $ProcessId = 0,
