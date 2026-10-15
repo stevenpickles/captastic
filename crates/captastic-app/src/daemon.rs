@@ -1913,11 +1913,11 @@ fn notify_preference_not_saved(
 fn toggle_startup_from_tray(tray: &captastic_windows::TrayIcon) {
     let result = match captastic_windows::startup_command() {
         Ok(Some(_)) => captastic_windows::disable_startup().map(|_| false),
-        Ok(None) => desktop_launcher_path()
+        Ok(None) => crate::desktop_executable()
             .map_err(|error| captastic_core::CaptureError {
                 kind: CaptureErrorKind::SourceUnavailable,
                 backend: "windows-startup",
-                operation: "locate_desktop_launcher",
+                operation: "locate_desktop_executable",
                 message: error.to_string(),
                 retryable: false,
                 native_code: None,
@@ -1941,13 +1941,6 @@ fn toggle_startup_from_tray(tray: &captastic_windows::TrayIcon) {
             "failed to change launch-at-login state: {error}"
         )),
     }
-}
-
-#[cfg(windows)]
-fn desktop_launcher_path() -> Result<std::path::PathBuf, std::io::Error> {
-    let mut path = std::env::current_exe()?;
-    path.set_file_name("captastic-desktop.exe");
-    Ok(path)
 }
 
 #[cfg(windows)]

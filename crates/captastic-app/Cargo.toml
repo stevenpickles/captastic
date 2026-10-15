@@ -5,15 +5,22 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 build = "build.rs"
-default-run = "captastic"
+default-run = "captastic-dev"
 
+[lib]
+name = "captastic_app"
+path = "src/lib.rs"
+
+# The one executable that ships: the notification-area daemon, built for the Windows subsystem so
+# it never opens a console.
 [[bin]]
 name = "captastic"
 path = "src/main.rs"
 
+# The developer command line. Packaging never includes it.
 [[bin]]
-name = "captastic-desktop"
-path = "src/bin/captastic-desktop.rs"
+name = "captastic-dev"
+path = "src/bin/captastic-dev.rs"
 
 [dependencies]
 anstream.workspace = true

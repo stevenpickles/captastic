@@ -119,7 +119,11 @@ fn describe_existing_holder() -> String {
             .to_owned();
     };
     match process_image_name(pid) {
-        Some(image) if image.eq_ignore_ascii_case("captastic.exe") => {
+        // The shipped executable, or the developer command line's `daemon` subcommand.
+        Some(image)
+            if image.eq_ignore_ascii_case("captastic.exe")
+                || image.eq_ignore_ascii_case("captastic-dev.exe") =>
+        {
             format!("another Captastic daemon is already running in this session (process {pid})")
         }
         Some(image) => format!(

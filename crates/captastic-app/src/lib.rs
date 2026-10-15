@@ -1,0 +1,1806 @@
+//! Captastic's application layer, driven by two binaries.
+//!
+//! `captastic` is the shipped program: a Windows-subsystem executable that runs the
+//! notification-area daemon and nothing else, so starting it at login or from the Start Menu opens
+//! no console window. `captastic-dev` is the developer command line - capture, benchmark, status,
+//! doctor and the rest - built from the workspace and never packaged. Both are thin: everything
+//! they do lives here, so the two cannot drift apart in what a daemon run means.
+
+#![deny(unsafe_code)]
+
+mod benchmark;
+mod budget;
+mod build_info;
+mod cli;
+#[cfg(windows)]
+mod clipboard;
+mod clock;
+mod compare;
+mod daemon;
+#[cfg(windows)]
+mod desktop;
+mod error;
+#[cfg(windows)]
+mod file_output;
+#[cfg(windows)]
+mod filename_template;
+mod fingerprint;
+mod logging;
+#[cfg(windows)]
+mod output;
+#[cfg(windows)]
+mod output_metrics;
+#[cfg(windows)]
+mod selection;
+#[cfg(windows)]
+mod worker_registry;
+
+use std::path::Path;
+use std::process;
+use std::time::Instant;
+
+use captastic_config::{AppConfig, LoggingConfig};
+use captastic_core::{
+    CaptureBackend, CaptureId, CaptureMode, CaptureRequest, CaptureSource, CursorMode, DisplayId,
+    EventRecorder, PerfEventKind,
+};
+use clap::Parser;
+#[cfg(windows)]
+use cli::PreviewArg;
+use cli::{BenchmarkArgs, BenchmarkCommand, Cli, Command, ConfigCommand, ModeArg, StartupCommand};
+use error::AppError;
+use serde_json::json;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DisplayPolicy {
+    Pointer,
+    Primary,
+    Fixed(DisplayId),
+    VirtualDesktop,
+}
+
+impl DisplayPolicy {
+    #[cfg(windows)]
+    fn as_config_value(&self) -> String {
+        match self {
+            Self::Pointer => "pointer".to_owned(),
+            Self::Primary => "primary".to_owned(),
+            Self::Fixed(id) => format!("display:{}", id.0),
+            Self::VirtualDesktop => "virtual_desktop".to_owned(),
+        }
+    }
+}
+
+#[cfg(windows)]
+pub use desktop::main as desktop_main;
+
+/// The shipped executable's file name. Launch at login and the Start Menu name this file, never the
+/// developer command line, whichever of the two asked for the registration.
+#[cfg(windows)]
+const DESKTOP_EXECUTABLE: &str = "captastic.exe";
+
+/// The shipped executable beside the one running, which is where every install puts it and where
+/// `cargo build` leaves both binaries.
+#[cfg(windows)]
+fn desktop_executable() -> std::io::Result<std::path::PathBuf> {
+    Ok(std::env::current_exe()?.with_file_name(DESKTOP_EXECUTABLE))
+}
+
+/// The developer command line: `captastic-dev`.
+pub fn cli_main() {
+    let cli = Cli::parse();
+    let invocation = invocation_name(cli.command.as_ref());
+    let persistent_logging = uses_persistent_logging(&cli);
+    let logging_available = init_logging(&cli, persistent_logging);
+    if let Err(error) = run(cli) {
+        if logging_available {
+            log::error!("captastic {invocation} failed: {error}");
+            log::logger().flush();
+        } else {
+            eprintln!("captastic: {error}");
+        }
+        process::exit(error.exit_code());
+    }
+    // Only where it earns its place. In a persistent log this pairs with the start line above and
+    // says the process came down cleanly, which is worth having for `daemon` and `capture`. On the
+    // console after a read-only command it is noise the exit code already carries — and worse than
+    // noise, because "Captastic stopped successfully" printed under a `status` that just reported
+    // the daemon *running* reads as an announcement that the check killed it (issue #67).
+    if persistent_logging && logging_available {
+        log::info!("captastic {invocation} finished successfully");
+        log::logger().flush();
+    }
+}
+
+/// Starts logging for an invocation and says whether it is available.
+///
+/// A failure is reported on stderr, which the windowless executable does not have; it carries on
+/// without a log either way, because a capture tool that refuses to run for want of a log file
+/// helps nobody.
+fn init_logging(cli: &Cli, persistent_logging: bool) -> bool {
+    let logging_config = resolve_logging_config(cli);
+    let logging_result = if persistent_logging {
+        logging::init(&logging_config).map(Some)
+    } else {
+        logging::init_console(&logging_config).map(|()| None)
+    };
+    match logging_result {
+        Ok(path) => {
+            if let Some(path) = path {
+                log::info!(
+                    "Captastic {} started; persistent log file is {}",
+                    build_info::BUILD_VERSION,
+                    path.display()
+                );
+            }
+            true
+        }
+        Err(error) => {
+            eprintln!("captastic: persistent logging unavailable: {error}");
+            false
+        }
+    }
+}
+
+/// What to call this invocation in the lines that mark it failing or finishing.
+///
+/// The exit lines used to be about *Captastic* rather than about *this process*, and said the same
+/// thing whatever had run. Naming the subcommand is what stops a `status` line from being read as
+/// a lifecycle event: "captastic status finished successfully" cannot be mistaken for the daemon
+/// stopping, and "Captastic stopped successfully" always could.
+fn invocation_name(command: Option<&Command>) -> &'static str {
+    let Some(command) = command else {
+        // No subcommand runs the daemon, so it is named as one.
+        return "daemon";
+    };
+    // Matched exhaustively rather than with a fallback, so a subcommand added later cannot quietly
+    // inherit a name that is wrong for it.
+    match command {
+        Command::Daemon(_) => "daemon",
+        Command::Status { .. } => "status",
+        Command::Stop => "stop",
+        Command::Displays { .. } => "displays",
+        Command::Capture(_) => "capture",
+        Command::Benchmark(_) => "benchmark",
+        Command::Version { .. } => "version",
+        Command::Doctor { .. } => "doctor",
+        Command::Startup { .. } => "startup",
+        Command::Config { .. } => "config",
+    }
+}
+
+fn uses_persistent_logging(cli: &Cli) -> bool {
+    cli.log_file.is_some()
+        || matches!(
+            cli.command.as_ref(),
+            None | Some(Command::Daemon(_) | Command::Capture(_) | Command::Benchmark(_))
+        )
+}
+
+fn resolve_logging_config(cli: &Cli) -> LoggingConfig {
+    let mut logging = match &cli.command {
+        Some(Command::Daemon(args)) => {
+            let config = match args.config.as_deref() {
+                Some(path) => AppConfig::load(path),
+                None => AppConfig::load_default(),
+            };
+            config.map_or_else(|_| LoggingConfig::default(), |config| config.logging)
+        }
+        None => AppConfig::load_default()
+            .map_or_else(|_| LoggingConfig::default(), |config| config.logging),
+        _ => AppConfig::load_default()
+            .map_or_else(|_| LoggingConfig::default(), |config| config.logging),
+    };
+    if let Some(path) = &cli.log_file {
+        logging.file = Some(path.clone());
+    }
+    if let Some(level) = &cli.log_level {
+        logging.level.clone_from(level);
+    }
+    if let Some(format) = &cli.log_format {
+        logging.format.clone_from(format);
+    }
+    logging
+}
+
+fn run(cli: Cli) -> Result<(), AppError> {
+    match cli.command.unwrap_or_default() {
+        Command::Daemon(args) => daemon::run(args),
+        Command::Status { json } => status(json),
+        Command::Stop => stop(),
+        Command::Displays { backend, json } => {
+            let displays = enumerate_displays(&backend)?;
+            print_value(json, &displays)
+        }
+        Command::Capture(args) => capture(args),
+        Command::Benchmark(args) => benchmark(args),
+        Command::Version { json } => version(json),
+        Command::Doctor { json } => doctor(json),
+        Command::Startup { command } => startup(command),
+        Command::Config { command } => config(command),
+    }
+}
+
+fn version(json_output: bool) -> Result<(), AppError> {
+    print_value(json_output, &build_info::BUILD_INFO)
+}
+
+#[cfg(windows)]
+fn startup(command: StartupCommand) -> Result<(), AppError> {
+    match command {
+        StartupCommand::Enable => {
+            let executable = desktop_executable().map_err(|error| {
+                AppError::BackendUnavailable(format!(
+                    "failed to locate Captastic executable: {error}"
+                ))
+            })?;
+            captastic_windows::enable_startup(&executable)?;
+            println!("Captastic will start with Windows");
+            Ok(())
+        }
+        StartupCommand::Disable => {
+            if captastic_windows::disable_startup()? {
+                println!("Captastic will no longer start with Windows");
+            } else {
+                println!("Captastic startup was already disabled");
+            }
+            Ok(())
+        }
+        StartupCommand::Status { json } => {
+            let command = captastic_windows::startup_command()?;
+            print_value(
+                json,
+                &json!({
+                    "schema_version": 1,
+                    "enabled": command.is_some(),
+                    "command": command,
+                }),
+            )
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn startup(_command: StartupCommand) -> Result<(), AppError> {
+    Err(AppError::BackendUnavailable(
+        "launch at login is currently available only on Windows".to_owned(),
+    ))
+}
+
+#[cfg(windows)]
+fn status(json_output: bool) -> Result<(), AppError> {
+    let running = captastic_windows::DaemonControl::is_running();
+    print_value(
+        json_output,
+        &json!({
+            "schema_version": 1,
+            "status": if running { "running" } else { "not_running" },
+        }),
+    )
+}
+
+#[cfg(not(windows))]
+fn status(json_output: bool) -> Result<(), AppError> {
+    print_value(
+        json_output,
+        &json!({
+            "schema_version": 1,
+            "status": "unsupported",
+            "reason": "the native hotkey daemon is currently available only on Windows",
+        }),
+    )
+}
+
+#[cfg(windows)]
+fn stop() -> Result<(), AppError> {
+    if captastic_windows::DaemonControl::request_stop()? {
+        println!("Captastic daemon stop requested");
+    } else {
+        println!("Captastic daemon is not running");
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn stop() -> Result<(), AppError> {
+    Err(AppError::BackendUnavailable(
+        "daemon control is currently available only on Windows".to_owned(),
+    ))
+}
+
+/// The one-shot capture, with an optional selection over it.
+///
+/// One path for every preview mode. A selection always captures first - the overlay needs those
+/// pixels to be able to show the frozen view at all - and then materializes from whichever view
+/// the user was looking at when they confirmed, taking a second capture only when that view was
+/// the live desktop.
+fn capture(args: cli::CaptureArgs) -> Result<(), AppError> {
+    if (args.selection || args.clipboard) && !args.cpu_frame {
+        return Err(AppError::InvalidArgument(
+            "selection and clipboard output require --cpu-frame true".to_owned(),
+        ));
+    }
+    let config = one_shot_config(args.config.as_deref())?;
+    let display_policy = resolve_display_policy(&args.display)?;
+    // A one-shot has no selection queue behind it: at most the snapshot the overlay is showing
+    // and the confirmation capture that may replace it.
+    let mut backend = create_backend(
+        &args.backend,
+        &display_policy,
+        cpu_slot_count(config.capture.buffer_slots, args.selection, 0),
+    )?;
+    let source = resolve_capture_source(&display_policy, backend.displays())?;
+    let mut recorder = EventRecorder::with_capacity(24);
+    let request = CaptureRequest {
+        id: CaptureId(1),
+        triggered_at: Instant::now(),
+        source: source.clone(),
+        mode: capture_mode(args.mode),
+        cpu_frame: args.cpu_frame,
+        retain_native_frame: args.selection,
+        cursor: configured_cursor_mode(&config),
+    };
+    recorder.record(request.id, PerfEventKind::HotkeyReceived, 0);
+    recorder.record(request.id, PerfEventKind::TriggerEnqueued, 0);
+    recorder.record(request.id, PerfEventKind::TriggerDequeued, 0);
+    let outcome = backend.capture(&request, &mut recorder)?;
+    let frame = outcome.frame;
+    #[cfg(windows)]
+    let mut frame = frame;
+    let native_frame = outcome.native_frame;
+    // Reported from the frame that was actually materialized from: a live-view confirmation
+    // replaces the trigger capture's texture with its own, and a window render has none.
+    let native_frame_retained = native_frame.is_some();
+    #[cfg(windows)]
+    let mut native_frame_retained = native_frame_retained;
+    #[cfg(windows)]
+    let mut native_frame = native_frame;
+    #[cfg(windows)]
+    let mut selection_value = None;
+    #[cfg(not(windows))]
+    let selection_value: Option<serde_json::Value> = None;
+    // The UI-state worker outlives the overlay so that persisting selection preferences never
+    // stands between a confirmed selection and the capture it produces.
+    #[cfg(windows)]
+    let mut ui_worker: Option<selection::OneShotUiStateWorker> = None;
+    if args.selection {
+        #[cfg(windows)]
+        {
+            let full_frame = frame.take().ok_or_else(|| {
+                AppError::BackendUnavailable(
+                    "selection was requested but no CPU frame was returned".to_owned(),
+                )
+            })?;
+            recorder.record(request.id, PerfEventKind::SelectionStarted, 0);
+            let ui_store = captastic_config::UiStateStore::for_default_storage();
+            let remembered_ui =
+                load_optional_one_shot_ui_state(&ui_store, &full_frame.metadata.display_id.0);
+            let worker = selection::OneShotUiStateWorker::start(ui_store)?;
+            // One-shot: the resources live for this single run and drop with it.
+            let mut overlay_resources = captastic_windows::OverlayResources::new();
+            let selection = captastic_windows::select_from_preview_source_with_initial_tool_and_ui(
+                captastic_windows::SelectionPreviewSource::snapshot(
+                    &full_frame,
+                    match args.selection_preview {
+                        PreviewArg::Frozen => captastic_windows::PreviewView::Frozen,
+                        PreviewArg::Auto | PreviewArg::Live => captastic_windows::PreviewView::Live,
+                    },
+                    args.selection_preview == PreviewArg::Live,
+                ),
+                worker.controller(),
+                captastic_windows::InitialSelectionTool::Remembered,
+                Some(remembered_ui),
+                &mut overlay_resources,
+            )?;
+            let selection = match selection {
+                captastic_windows::SelectionOutcome::Selected(selection) => *selection,
+                outcome => {
+                    finish_one_shot_ui_state(Some(worker));
+                    recorder.record(request.id, PerfEventKind::AttemptFinished, 0);
+                    captastic_core::validate_event_order(recorder.events())?;
+                    report_selection_without_capture(request.id, &outcome, args.json)?;
+                    return Ok(());
+                }
+            };
+            ui_worker = Some(worker);
+            recorder.record(
+                request.id,
+                PerfEventKind::SelectionConfirmed,
+                selection.selection_ns,
+            );
+            // The view that was showing at the button press decides which pixels are published.
+            // A window click is its own answer whichever view was up: it renders that window
+            // fresh, so it is confirmation-anchored either way.
+            let confirmation_anchored = selection.kind == captastic_windows::SelectionKind::Window
+                || selection.view == captastic_windows::PreviewView::Live;
+            let (source_frame, source_native_frame) = if selection.kind
+                == captastic_windows::SelectionKind::Window
+            {
+                let ready_offset_ns = duration_ns(request.triggered_at.elapsed());
+                recorder.record(request.id, PerfEventKind::CaptureRequested, ready_offset_ns);
+                recorder.record(request.id, PerfEventKind::NativeFrameReady, ready_offset_ns);
+                recorder.record(request.id, PerfEventKind::CpuFrameReady, ready_offset_ns);
+                (full_frame, None)
+            } else if selection.view == captastic_windows::PreviewView::Live {
+                // The user was looking at the desktop itself, so the pixels they chose are the
+                // current ones. The snapshot is dropped before the second capture rather than
+                // after it, so two full-display frames are never resident at once.
+                drop(full_frame);
+                drop(native_frame.take());
+                if let Err(error) = captastic_windows::flush_desktop_composition() {
+                    log::warn!(
+                        "one-shot selection could not synchronize overlay removal before capture: {error}"
+                    );
+                }
+                let confirmation = CaptureRequest {
+                    id: request.id,
+                    triggered_at: Instant::now(),
+                    source: source.clone(),
+                    mode: capture_mode(args.mode),
+                    cpu_frame: true,
+                    retain_native_frame: selection.kind == captastic_windows::SelectionKind::Region,
+                    // Suppressed for the same reason as the daemon's confirmation capture: this
+                    // frame is taken the instant the user confirms, with the pointer on
+                    // Captastic's own overlay.
+                    cursor: CursorMode::Exclude,
+                };
+                let outcome = backend.capture(&confirmation, &mut recorder)?;
+                let confirmed = outcome.frame.ok_or_else(|| {
+                    AppError::BackendUnavailable(
+                        "confirmation capture returned no CPU frame".to_owned(),
+                    )
+                })?;
+                (confirmed, outcome.native_frame)
+            } else {
+                (full_frame, native_frame.take())
+            };
+            let materialize_started = Instant::now();
+            let mut materialization = match (selection.kind, confirmation_anchored) {
+                (captastic_windows::SelectionKind::Display, false) => "frozen_display",
+                (captastic_windows::SelectionKind::Display, true) => "confirmation_display",
+                (captastic_windows::SelectionKind::Region, false) => "frozen_desktop_crop",
+                (captastic_windows::SelectionKind::Region, true) => "confirmation_desktop_crop",
+                (captastic_windows::SelectionKind::Window, _) => "native_window_render",
+            };
+            let mut gpu_materialization = None;
+            let mut gpu_fallback_error = None;
+            let gpu_result = if selection.kind == captastic_windows::SelectionKind::Region {
+                source_native_frame.as_deref().map(|native_frame| {
+                    captastic_windows::materialize_native_region(native_frame, selection.rect)
+                })
+            } else {
+                None
+            };
+            let selected_frame = match gpu_result.transpose() {
+                Ok(Some(Some(result))) => {
+                    materialization = "dxgi_gpu_region";
+                    gpu_materialization = Some(json!({
+                        "gpu_copy_submit_ns": result.gpu_copy_submit_ns,
+                        "map_wait_ns": result.map_wait_ns,
+                        "cpu_copy_ns": result.cpu_copy_ns,
+                        "total_ns": result.total_ns,
+                        "bytes_read": result.bytes_read,
+                        "full_frame_bytes": result.full_frame_bytes,
+                        "bytes_avoided": result.bytes_avoided,
+                        "contiguous_rows": result.contiguous_rows,
+                    }));
+                    result.frame
+                }
+                Ok(Some(None)) | Ok(None) => {
+                    captastic_windows::materialize_selection(&source_frame, &selection)?
+                }
+                Err(error) => {
+                    crate::logging::warn(format_args!(
+                        "capture {} GPU region materialization failed; using CPU crop: {error}",
+                        request.id.0
+                    ));
+                    gpu_fallback_error = Some(error.to_string());
+                    captastic_windows::materialize_selection(&source_frame, &selection)?
+                }
+            };
+            let materialization_ns = duration_ns(materialize_started.elapsed());
+            recorder.record(request.id, PerfEventKind::CropFinished, materialization_ns);
+            native_frame_retained = source_native_frame.is_some();
+            selection_value = Some(json!({
+                "kind": match selection.kind {
+                    captastic_windows::SelectionKind::Display => "display",
+                    captastic_windows::SelectionKind::Region => "region",
+                    captastic_windows::SelectionKind::Window => "window",
+                },
+                "rect": selection.rect,
+                "selection_ns": selection.selection_ns,
+                "requested_preview_mode": match args.selection_preview {
+                    PreviewArg::Auto => "auto",
+                    PreviewArg::Live => "live",
+                    PreviewArg::Frozen => "frozen",
+                },
+                "preview_mode": selection.view.label(),
+                "preview_fallback_reason": selection.presenter_fallback_reason.as_deref(),
+                "capture_anchor": if confirmation_anchored { "confirmation" } else { "trigger" },
+                "overlay_preparation_ns": selection.preparation_ns,
+                "window_overview_ns": selection.window_overview_ns,
+                "window_preview_count": selection.window_preview_count,
+                "window_live_preview_count": selection.window_live_preview_count,
+                "window_frozen_preview_count": selection.window_frozen_preview_count,
+                "window_preview_bytes": selection.window_preview_bytes,
+                "materialization": materialization,
+                "materialization_ns": materialization_ns,
+                "gpu_materialization": gpu_materialization,
+                "gpu_fallback_error": gpu_fallback_error,
+                "view_switched": selection.view_switched,
+            }));
+            frame = Some(selected_frame);
+        }
+        #[cfg(not(windows))]
+        {
+            return Err(AppError::BackendUnavailable(
+                "native selection is currently available only on Windows".to_owned(),
+            ));
+        }
+    }
+    #[cfg(windows)]
+    let mut clipboard_value = None;
+    #[cfg(not(windows))]
+    let clipboard_value: Option<serde_json::Value> = None;
+    if args.clipboard {
+        #[cfg(windows)]
+        {
+            let clipboard_frame = frame.as_ref().ok_or_else(|| {
+                AppError::BackendUnavailable(
+                    "clipboard output was requested but no CPU frame was returned".to_owned(),
+                )
+            })?;
+            recorder.record(request.id, PerfEventKind::ClipboardStarted, 0);
+            let payload = captastic_windows::ClipboardPayload::prepare(clipboard_frame)?;
+            let mut publisher =
+                captastic_windows::ClipboardPublisher::new(one_shot_clipboard_retention(&config))?;
+            let report = publisher.publish(&payload).map_err(report_clipboard_loss)?;
+            recorder.record(
+                request.id,
+                PerfEventKind::ClipboardCommitted,
+                report.publish_ns,
+            );
+            clipboard_value = Some(json!({
+                "payload_bytes": report.payload_bytes,
+                "png_payload_bytes": report.png_payload_bytes,
+                "png_encode_ns": report.png_encode_ns,
+                "allocation_copy_ns": report.allocation_copy_ns,
+                "open_wait_ns": report.open_wait_ns,
+                "open_retries": report.open_retries,
+                "publish_ns": report.publish_ns,
+                "history_excluded": report.history_excluded,
+                "cloud_sync_excluded": report.cloud_sync_excluded,
+            }));
+        }
+        #[cfg(not(windows))]
+        {
+            return Err(AppError::BackendUnavailable(
+                "native clipboard output is currently available only on Windows".to_owned(),
+            ));
+        }
+    }
+    #[cfg(windows)]
+    let file_output_value =
+        write_one_shot_file_output(&config, frame.as_ref(), &mut recorder, request.id)?;
+    #[cfg(not(windows))]
+    let file_output_value: Option<serde_json::Value> = None;
+    recorder.record(request.id, PerfEventKind::AttemptFinished, 0);
+    captastic_core::validate_event_order(recorder.events())?;
+    let metadata = frame
+        .as_ref()
+        .map(|frame| frame.metadata.clone())
+        .unwrap_or(outcome.metadata);
+    let value = json!({
+        "schema_version": 1,
+        "synthetic": backend.name() == "fake",
+        "metadata": metadata,
+        "cpu_frame_bytes": frame.as_ref().map(|frame| frame.required_bytes()),
+        "native_frame_retained": native_frame_retained,
+        "selection": selection_value,
+        "clipboard": clipboard_value,
+        "file_output": file_output_value,
+    });
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        log::info!("capture {} complete: {}", request.id.0, value);
+    }
+    #[cfg(windows)]
+    finish_one_shot_ui_state(ui_worker);
+    Ok(())
+}
+
+/// The configuration a one-shot command runs under.
+///
+/// `--config` names a file the user is pointing at, so one that cannot be read or parsed is an
+/// error rather than a silent fall back to defaults: a run that quietly measures different
+/// settings than the ones under test is worse than a run that refuses. Without the flag this is
+/// the default file, and a configuration that fails to load falls back to `Default` — which is
+/// what every one-shot command did before the flag existed, and whose failure mode is the
+/// conservative one.
+fn one_shot_config(path: Option<&Path>) -> Result<AppConfig, AppError> {
+    match path {
+        Some(path) => Ok(AppConfig::load(path)?),
+        None => Ok(AppConfig::load_default().unwrap_or_default()),
+    }
+}
+
+/// What a one-shot capture lets Windows keep of the clipboard it publishes.
+///
+/// Read from the same `[clipboard]` configuration the daemon uses, so `captastic capture
+/// --clipboard` cannot be a quieter way around a decision the user made once.
+#[cfg(windows)]
+fn one_shot_clipboard_retention(config: &AppConfig) -> captastic_windows::ClipboardRetention {
+    captastic_windows::ClipboardRetention {
+        history: config.clipboard.allow_history,
+        cloud_sync: config.clipboard.allow_cloud_sync,
+    }
+}
+
+/// Writes a one-shot capture to disk when `[output]` is enabled.
+///
+/// One-shot commands read the same configuration the daemon does, so a user who has turned file
+/// output on gets it from `captastic capture` too rather than only from the background daemon.
+#[cfg(windows)]
+fn write_one_shot_file_output(
+    config: &AppConfig,
+    frame: Option<&captastic_core::CpuFrame>,
+    recorder: &mut captastic_core::EventRecorder,
+    capture_id: captastic_core::CaptureId,
+) -> Result<Option<serde_json::Value>, AppError> {
+    if !config.output.enabled {
+        return Ok(None);
+    }
+    let Some(frame) = frame else {
+        return Err(AppError::BackendUnavailable(
+            "file output was requested but no CPU frame was returned".to_owned(),
+        ));
+    };
+    let directory = configured_output_directory(config)?;
+    // Said before the write rather than after it, so a capture that fails on an unwritable
+    // directory still names the directory it was refused by.
+    log::info!("saving this capture to {}", directory.display());
+    recorder.record(capture_id, PerfEventKind::EncodeStarted, 0);
+    let (path, bytes, encode_ns, write_ns) = file_output::write_capture_now(
+        &directory,
+        &config.output.filename_template,
+        captastic_config::HotkeyAction::FullDisplay,
+        frame,
+        config.output.format,
+        // The same `Compact` PNG effort the daemon's worker uses; only the JPEG quality is the
+        // user's to set.
+        &captastic_core::EncodeOptions {
+            jpeg_quality: config.output.jpeg_quality,
+            ..captastic_core::EncodeOptions::default()
+        },
+    )?;
+    recorder.record(capture_id, PerfEventKind::EncodeFinished, encode_ns);
+    recorder.record(capture_id, PerfEventKind::FileWriteStarted, 0);
+    recorder.record(capture_id, PerfEventKind::FileWriteFinished, write_ns);
+    // One-shot captures join the same history the daemon writes, so "Open Last Capture" means
+    // the last capture rather than the last one the daemon happened to take.
+    let policy = config.history.retention();
+    if policy.max_items > 0 {
+        let entry = captastic_config::HistoryEntry {
+            path: path.clone(),
+            captured_at_micros: captastic_config::HistoryEntry::micros_since_epoch(
+                std::time::SystemTime::now(),
+            ),
+            bytes: bytes as u64,
+            width: frame.width(),
+            height: frame.height(),
+            display: frame.metadata.display_id.0.clone(),
+            mode: "full_display".to_owned(),
+        };
+        if let Err(error) = captastic_config::HistoryStore::for_default_storage().record(
+            entry,
+            policy,
+            std::time::SystemTime::now(),
+        ) {
+            // The capture is already on disk; losing the note is the smaller harm.
+            crate::logging::warn(format_args!(
+                "capture was written but could not be recorded in history: {error}"
+            ));
+        }
+    }
+    Ok(Some(json!({
+        "format": config.output.format.as_str(),
+        "path": path.display().to_string(),
+        "bytes": bytes,
+        "encode_ns": encode_ns,
+        "write_ns": write_ns,
+    })))
+}
+
+/// Converts a failed one-shot clipboard publish, saying so when it cost the user their clipboard.
+///
+/// Win32 requires emptying the clipboard to take ownership of it, so a publish that fails after
+/// that point leaves the user with neither their capture nor what they had copied before. A
+/// one-shot command has no notification area to raise this in, so it goes in the log and the error.
+#[cfg(windows)]
+fn report_clipboard_loss(failure: captastic_windows::ClipboardPublishError) -> AppError {
+    if failure.cleared_previous_contents {
+        crate::logging::warn(format_args!(
+            "clipboard publication failed after the clipboard was emptied; the previous clipboard contents were lost: {}",
+            failure.error
+        ));
+    }
+    AppError::from(failure.error)
+}
+
+/// Reports a one-shot selection that produced no capture, naming a display change as one.
+///
+/// The daemon tells the user through a notification balloon; a one-shot `capture --selection` has
+/// no notification area, so this line and this JSON event are the whole of what anybody sees. A
+/// press the display configuration took away is still reported as a success at the process level —
+/// nothing failed, the selection simply stopped being about a desktop that exists — but it is not
+/// filed as a cancellation, because the user cancelled nothing.
+#[cfg(windows)]
+fn report_selection_without_capture(
+    capture_id: CaptureId,
+    outcome: &captastic_windows::SelectionOutcome,
+    json: bool,
+) -> Result<(), AppError> {
+    let display_change = match outcome {
+        captastic_windows::SelectionOutcome::DisplayConfigurationChanged(reason) => Some(*reason),
+        _ => None,
+    };
+    let event = if display_change.is_some() {
+        "selection_display_changed"
+    } else {
+        "selection_cancelled"
+    };
+    if json {
+        let value = json!({
+            "schema_version": 1,
+            "event": event,
+            "capture_id": capture_id,
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else if let Some(reason) = display_change {
+        crate::logging::warn(format_args!(
+            "selection {} was abandoned because {} (reason={reason})",
+            capture_id.0,
+            selection::display_change_clause(reason)
+        ));
+    } else {
+        log::info!("selection {} cancelled", capture_id.0);
+    }
+    Ok(())
+}
+
+/// Retires the one-shot UI-state worker without letting a preference write failure destroy the
+/// capture it produced. The daemon treats the same failure as a non-fatal notification, so the
+/// one-shot command reports it and still exits successfully.
+#[cfg(windows)]
+fn finish_one_shot_ui_state(worker: Option<selection::OneShotUiStateWorker>) {
+    let Some(worker) = worker else {
+        return;
+    };
+    if let Err(error) = worker.finish() {
+        crate::logging::warn(format_args!("{}", one_shot_ui_state_warning(&error)));
+    }
+}
+
+#[cfg(windows)]
+fn one_shot_ui_state_warning(error: &AppError) -> String {
+    format!("Captastic could not save selection preferences. {error}")
+}
+
+#[cfg(windows)]
+fn load_optional_one_shot_ui_state(
+    store: &captastic_config::UiStateStore,
+    display_id: &str,
+) -> captastic_config::DisplayUiState {
+    match store.load_display_ui_state(display_id) {
+        Ok(state) => state,
+        Err(error) => {
+            crate::logging::warn(format_args!(
+                "could not load remembered selection preferences; continuing with defaults: {error}"
+            ));
+            captastic_config::DisplayUiState::default()
+        }
+    }
+}
+
+fn benchmark(args: BenchmarkArgs) -> Result<(), AppError> {
+    match args.command {
+        Some(BenchmarkCommand::Compare {
+            baseline,
+            candidate,
+            json,
+            noise_percent,
+        }) => benchmark_compare(&baseline, &candidate, json, noise_percent),
+        None => benchmark_run(args.run),
+    }
+}
+
+/// Holds a recorded run against an accepted baseline, or refuses to.
+///
+/// Only the refusal is an error. A `slower` verdict exits zero: a comparison is a measurement the
+/// operator is still interpreting, and a command that fails on one is a command that gets run with
+/// `|| true` until the day it would have mattered.
+fn benchmark_compare(
+    baseline: &Path,
+    candidate: &Path,
+    json_output: bool,
+    noise_percent: f64,
+) -> Result<(), AppError> {
+    let baseline_set = compare::load(baseline)?;
+    let candidate_set = compare::load(candidate)?;
+    let comparison = compare::compare(&baseline_set, &candidate_set, noise_percent)?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&comparison)?);
+    } else {
+        compare::report(&comparison, &baseline_set.label, &candidate_set.label);
+    }
+    Ok(())
+}
+
+fn benchmark_run(args: cli::BenchmarkRunArgs) -> Result<(), AppError> {
+    args.validate()?;
+    let display_policy = resolve_display_policy(&args.display)?;
+    let mut native_backend = if args.backend == "fake" {
+        None
+    } else {
+        Some(create_backend(
+            &args.backend,
+            &display_policy,
+            BASE_CPU_BUFFER_SLOTS,
+        )?)
+    };
+    let source = match native_backend.as_deref() {
+        Some(backend) => resolve_capture_source(&display_policy, backend.displays())?,
+        None => match &display_policy {
+            DisplayPolicy::Primary => CaptureSource::Display(DisplayId::primary()),
+            DisplayPolicy::Fixed(id) => CaptureSource::Display(id.clone()),
+            DisplayPolicy::Pointer => {
+                return Err(AppError::InvalidArgument(
+                    "the fake benchmark backend does not support pointer display selection"
+                        .to_owned(),
+                ));
+            }
+            DisplayPolicy::VirtualDesktop => {
+                return Err(AppError::InvalidArgument(
+                    "the fake benchmark backend does not support virtual-desktop capture"
+                        .to_owned(),
+                ));
+            }
+        },
+    };
+    let options = benchmark::BenchmarkOptions {
+        iterations: args.iterations,
+        warmup: args.warmup,
+        // Paired with `--frame-age-us`: one sets how stale the retained frame is, the other how
+        // stale the caller will accept, which is what makes the staleness path reachable here.
+        mode: match args.mode {
+            cli::ModeArg::Latest => CaptureMode::Latest {
+                max_age_ms: (args.max_frame_age_ms != 0).then_some(args.max_frame_age_ms),
+            },
+            other => capture_mode(other),
+        },
+        cpu_frame: args.cpu_frame,
+        cursor: match args.cursor {
+            cli::CursorArg::Include => CursorMode::Include,
+            cli::CursorArg::Exclude => CursorMode::Exclude,
+        },
+        source,
+        trigger_queue_capacity: 4,
+        metrics_capacity: args.iterations.saturating_mul(10).saturating_add(32),
+        fake: benchmark::fake_config(
+            args.native_delay_us,
+            args.readback_delay_us,
+            args.frame_age_us,
+        ),
+    };
+    // More than one run is a different question - do these results agree well enough to support a
+    // claim - so it takes a different path and a different report rather than printing one summary
+    // three times and leaving the reader to compare them by eye.
+    if args.repeat > 1 {
+        // The backend created above resolved the capture source, and it is still holding a
+        // duplication. Every repeat builds its own - deliberately, so each run pays the first
+        // capture's allocation cost - and DXGI refuses a second duplication of the same output
+        // from the same process with "the parameter is incorrect", which is how this surfaced on
+        // real hardware after passing every test against the fake backend.
+        drop(native_backend.take());
+        let backend_name = args.backend.clone();
+        let display_policy = display_policy.clone();
+        // Cleared before a single capture is taken. A set that cannot have its artifacts written
+        // should not cost the operator the minutes of held-still mouse and playing video it takes
+        // to produce one.
+        let output_dir = args.output_dir.clone();
+        let write_events = args.raw_events.is_some();
+        if let Some(directory) = output_dir.as_deref() {
+            benchmark::prepare_output_dir(directory, args.overwrite)?;
+            if let Some(path) = args.raw_events.as_deref() {
+                // Said out loud rather than left as a help-text footnote: the path was asked for
+                // and is not where the events land.
+                log::info!(
+                    "--repeat writes one event stream per run to {}\\run-N.events.jsonl; {} is not used",
+                    directory.display(),
+                    path.display()
+                );
+            }
+        }
+        // Written run by run rather than at the end, so a failure on run 3 leaves runs 1 and 2 on
+        // disk. They are evidence in their own right and cannot be reconstructed.
+        let repeated = benchmark::run_repeated(
+            &options,
+            args.repeat,
+            move || create_backend(&backend_name, &display_policy, BASE_CPU_BUFFER_SLOTS),
+            |number, run| match output_dir.as_deref() {
+                Some(directory) => {
+                    benchmark::write_run_artifacts(directory, number, run, write_events)
+                }
+                None => Ok(()),
+            },
+        )?;
+        // Budgets apply to a repeat set too, and per run rather than to their average: a mean
+        // hides one run in three breaching, and "usually under 2 ms" is not a latency figure worth
+        // publishing. Silently ignoring --budgets here - which is what this did first - is the
+        // worst of the options, because the check was asked for and did nothing.
+        let budget_outcomes = args
+            .budgets
+            .as_deref()
+            .map(|path| budget::load(path).map(|file| budget::evaluate_each(&file, &repeated.runs)))
+            .transpose()?;
+        // One typed envelope, printed and written. The hand-built JSON object this replaced meant
+        // the file an operator commits and the JSON the command prints were assembled separately,
+        // so nothing stopped them drifting - and nothing could read either of them back.
+        let combined = benchmark::RepeatedBenchmarkFile {
+            schema_version: benchmark::REPEATED_FILE_SCHEMA_VERSION,
+            repeated,
+            budgets: budget_outcomes,
+        };
+        if let Some(path) = args.output_results.as_deref() {
+            benchmark::write_json(path, &combined)?;
+        }
+        // The set file is the only artifact that cannot be written until every run is in.
+        if let Some(directory) = args.output_dir.as_deref() {
+            benchmark::write_repeat_set(directory, &combined)?;
+        }
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&combined)?);
+        } else {
+            report_repeated(&combined.repeated);
+            if let Some(outcomes) = combined.budgets.as_deref() {
+                for (index, outcome) in outcomes.iter().enumerate() {
+                    let heading = format!("run {}", index + 1);
+                    if outcome.applied() {
+                        log::info!("{heading}: {outcome}");
+                    } else {
+                        log::warn!("{heading}: {outcome}");
+                    }
+                }
+            }
+        }
+        if !combined.repeated.incompatibilities.is_empty() {
+            return Err(AppError::InvalidArgument(
+                "repeat runs are not comparable; see the reported differences".to_owned(),
+            ));
+        }
+        if combined
+            .budgets
+            .as_deref()
+            .is_some_and(budget::any_breached)
+        {
+            return Err(AppError::InvalidArgument(
+                "a repeat run breached a performance budget that applies to this host".to_owned(),
+            ));
+        }
+        return Ok(());
+    }
+    let run = if args.backend == "fake" {
+        benchmark::run(&options)?
+    } else {
+        benchmark::run_with_backend(
+            native_backend
+                .as_deref_mut()
+                .expect("non-fake backend initialized above"),
+            &options,
+        )?
+    };
+    // Judged before the artifacts are written, so a breach cannot be mistaken for a clean run by
+    // whoever reads the files rather than the console.
+    let budget_outcome = args
+        .budgets
+        .as_deref()
+        .map(|path| budget::load(path).map(|file| budget::evaluate(&file, &run.report)))
+        .transpose()?;
+    if let Some(path) = args.output_results.as_deref() {
+        benchmark::write_json(path, &run.report)?;
+    }
+    if let Some(path) = args.raw_events.as_deref() {
+        benchmark::write_json_lines(path, &run.events)?;
+    }
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&run.report)?);
+    } else {
+        log::info!(
+            "Captastic {} benchmark: {} successful / {} total ({})",
+            run.report.backend,
+            run.report.successes,
+            run.report.timed_iterations,
+            run.report.mode
+        );
+        print_latency("trigger-to-dequeue", &run.report.trigger_to_dequeue_latency);
+        print_latency("native frame", &run.report.native_frame_latency);
+        if let Some(summary) = &run.report.cpu_frame_latency {
+            print_latency("CPU frame", summary);
+        }
+        if let Some(summary) = &run.report.readback_latency {
+            print_latency("native-to-CPU readback", summary);
+        }
+        print_latency("frame age", &run.report.frame_age);
+        log::info!(
+            "critical-path event order: {}",
+            if run.report.critical_path_order_verified {
+                "verified"
+            } else {
+                "invalid"
+            }
+        );
+    }
+    if let Some(outcome) = budget_outcome {
+        if outcome.applied() {
+            log::info!("{outcome}");
+        } else {
+            // A skip is not a pass. Reported at warning level so it cannot be read as silence.
+            log::warn!("{outcome}");
+        }
+        if outcome.breached() {
+            return Err(AppError::InvalidArgument(
+                "the run breached a performance budget that applies to this host".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn config(command: ConfigCommand) -> Result<(), AppError> {
+    match command {
+        ConfigCommand::Show { path, json } => {
+            let config = match path {
+                Some(path) => AppConfig::load(&path)?,
+                None => AppConfig::load_default()?,
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&config)?);
+            } else {
+                print!("{}", config.to_toml_pretty()?);
+            }
+            Ok(())
+        }
+        ConfigCommand::Validate { path } => {
+            AppConfig::load(&path)?;
+            println!("valid: {}", path.display());
+            Ok(())
+        }
+    }
+}
+
+/// Where the Windows shell says the user's Pictures folder is, or `None` off Windows.
+///
+/// The probe lives in `captastic-windows` because it is a Win32 call; `captastic-config` stays
+/// platform-neutral and knows nothing about it. This is the one place the two meet.
+///
+/// Off Windows nothing reaches this: every caller sits behind the same `cfg(windows)` the file
+/// destination itself does. The `not(windows)` arm is what makes the question answerable in a
+/// build that could one day have one.
+#[cfg(windows)]
+fn known_pictures_folder() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        captastic_windows::known_pictures_folder()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// Decides where captures go, for the daemon and for a one-shot alike.
+///
+/// Three answers in order, and only the first two are anybody's preference:
+///
+/// 1. `output.directory`, because a user who named a directory meant it.
+/// 2. `Captastic` inside the Pictures folder *the shell reports*. Not `%USERPROFILE%\Pictures`:
+///    OneDrive's Known Folder Move, a roaming profile, and group policy all redirect it, and on a
+///    redirected machine the old path commonly still exists as an empty leftover — so writing
+///    there succeeds and the user, looking at the Pictures folder Explorer shows them, sees no
+///    captures at all. That was the 2026-09-17 report.
+/// 3. [`captastic_config::default_output_directory`], which is the home-relative guess. Off
+///    Windows there is no known folder to ask, and on Windows this is what is left when the shell
+///    declines to answer.
+///
+/// `known_pictures` is a parameter rather than a call so the order above is testable on a host
+/// that has no known folders at all — which is every non-Windows host the test suite runs on, and
+/// why this one function is compiled there while its two callers are not.
+#[cfg(any(windows, test))]
+fn resolve_output_directory(
+    configured: Option<&Path>,
+    known_pictures: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    configured
+        .map(Path::to_path_buf)
+        .or_else(|| known_pictures.map(|pictures| pictures.join("Captastic")))
+        .or_else(captastic_config::default_output_directory)
+}
+
+/// [`resolve_output_directory`] against the live machine, or the error the caller reports.
+#[cfg(windows)]
+fn configured_output_directory(config: &AppConfig) -> Result<std::path::PathBuf, AppError> {
+    resolve_output_directory(config.output.directory.as_deref(), known_pictures_folder())
+        .ok_or_else(|| {
+            AppError::BackendUnavailable(
+                "unable to determine a default output directory from the shell's Pictures folder, \
+                 USERPROFILE, or HOME"
+                    .to_owned(),
+            )
+        })
+}
+
+/// The cursor policy from configuration.
+///
+/// One-shot captures have no `--cursor` flag: the policy is a standing preference rather than a
+/// per-capture choice, and duplicating it on the command line would let the two disagree.
+fn configured_cursor_mode(config: &AppConfig) -> CursorMode {
+    if config.capture.cursor == "include" {
+        CursorMode::Include
+    } else {
+        CursorMode::Exclude
+    }
+}
+
+fn capture_mode(mode: ModeArg) -> CaptureMode {
+    match mode {
+        ModeArg::Fresh => CaptureMode::Fresh { timeout_ms: 100 },
+        ModeArg::Latest => CaptureMode::Latest { max_age_ms: None },
+    }
+}
+
+fn resolve_display_policy(value: &str) -> Result<DisplayPolicy, AppError> {
+    let value = value.trim();
+    if value == "pointer" {
+        return Ok(DisplayPolicy::Pointer);
+    }
+    if value == "primary" {
+        return Ok(DisplayPolicy::Primary);
+    }
+    if value == "virtual_desktop" {
+        return Ok(DisplayPolicy::VirtualDesktop);
+    }
+    if let Some(id) = value.strip_prefix("display:") {
+        let id = id.trim();
+        if !id.is_empty() {
+            return Ok(DisplayPolicy::Fixed(DisplayId(id.to_owned())));
+        }
+    }
+    Err(AppError::InvalidArgument(
+        "display must be pointer, primary, virtual_desktop, or display:<persistent-id>".to_owned(),
+    ))
+}
+
+#[cfg(windows)]
+fn resolve_capture_source(
+    policy: &DisplayPolicy,
+    displays: &[captastic_core::DisplayInfo],
+) -> Result<CaptureSource, captastic_core::CaptureError> {
+    match policy {
+        DisplayPolicy::Pointer => {
+            pointer_source_or_primary(captastic_windows::display_containing_pointer(displays))
+        }
+        DisplayPolicy::Primary => Ok(CaptureSource::Display(DisplayId::primary())),
+        DisplayPolicy::Fixed(id) => Ok(CaptureSource::Display(id.clone())),
+        DisplayPolicy::VirtualDesktop => Ok(CaptureSource::VirtualDesktop),
+    }
+}
+
+/// Turns a resolved pointer display into a capture source, falling back to the primary display
+/// when the pointer is on no display at all.
+///
+/// A capture is worth more than the policy that chose its display. Every non-rectangular monitor
+/// arrangement — two screens of different heights, an L of three — has coordinates inside its
+/// bounding box that belong to no display, and the pointer can be resting in one when the hotkey
+/// is pressed. Failing there would mean a screenshot tool that declines to take a screenshot
+/// because of where the mouse is, which is a worse answer than a screenshot of the primary
+/// display. The choice is logged rather than made silently, because the resulting capture is of a
+/// display the user did not point at.
+///
+/// Every other failure still fails: a denied cursor query — whether it is a genuine permissions
+/// problem or the lock that explains one — is something the user needs to see, not a reason to
+/// quietly photograph a different screen.
+#[cfg(windows)]
+fn pointer_source_or_primary(
+    resolved: Result<DisplayId, captastic_core::CaptureError>,
+) -> Result<CaptureSource, captastic_core::CaptureError> {
+    match resolved {
+        Ok(display) => Ok(CaptureSource::Display(display)),
+        Err(error) if error.kind == captastic_core::CaptureErrorKind::PointerOutsideDisplays => {
+            crate::logging::warn(format_args!(
+                "{error}; capturing the primary display instead"
+            ));
+            Ok(CaptureSource::Display(DisplayId::primary()))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(windows))]
+fn resolve_capture_source(
+    policy: &DisplayPolicy,
+    _displays: &[captastic_core::DisplayInfo],
+) -> Result<CaptureSource, captastic_core::CaptureError> {
+    match policy {
+        DisplayPolicy::Primary => Ok(CaptureSource::Display(DisplayId::primary())),
+        DisplayPolicy::Fixed(id) => Ok(CaptureSource::Display(id.clone())),
+        DisplayPolicy::VirtualDesktop => Ok(CaptureSource::VirtualDesktop),
+        DisplayPolicy::Pointer => Err(captastic_core::CaptureError {
+            kind: captastic_core::CaptureErrorKind::Unsupported,
+            backend: "platform",
+            operation: "resolve_pointer_display",
+            message: "pointer display selection is currently available only on Windows".to_owned(),
+            retryable: false,
+            native_code: None,
+        }),
+    }
+}
+
+fn enumerate_displays(backend: &str) -> Result<Vec<captastic_core::DisplayInfo>, AppError> {
+    match backend {
+        "fake" => {
+            let backend = captastic_core::FakeBackend::new(Default::default());
+            Ok(backend.displays().to_vec())
+        }
+        "auto" | "dxgi" => enumerate_dxgi_displays(),
+        other => Err(AppError::BackendUnavailable(format!(
+            "unknown backend {other}; available backends: fake, dxgi"
+        ))),
+    }
+}
+
+#[cfg(windows)]
+fn enumerate_dxgi_displays() -> Result<Vec<captastic_core::DisplayInfo>, AppError> {
+    captastic_windows::enumerate_displays().map_err(AppError::from)
+}
+
+#[cfg(not(windows))]
+fn enumerate_dxgi_displays() -> Result<Vec<captastic_core::DisplayInfo>, AppError> {
+    Err(AppError::BackendUnavailable(
+        "DXGI is available only on Windows".to_owned(),
+    ))
+}
+
+/// The readback-pool base for the paths that never load a configuration: `benchmark` and
+/// `doctor`, neither of which opens a selection overlay. Pinned to `capture.buffer_slots`'s
+/// default by a test, so the two cannot drift apart.
+const BASE_CPU_BUFFER_SLOTS: usize = 3;
+
+/// How many CPU readback slots the capture engine needs for this configuration.
+///
+/// A pooled slot is recycled only when nothing else holds its `Arc`, so the pool has to cover
+/// every frame that can be pinned at the same time. `base` covers the capture pipeline itself: a
+/// capture in flight, a frame a destination worker is still writing, and one spare.
+///
+/// Selection adds to it, and that is new. Every overlay press now opens over the frame captured
+/// at that press and holds it for the whole interaction - seconds, not milliseconds - and the
+/// selection queue can hold `queue_capacity` more jobs each pinning their own. With the base
+/// three alone, a `full_display` capture still in the clipboard sink plus two selections open or
+/// queued left no slot, and the next capture - or the confirmation capture the open overlay was
+/// about to ask for - died with `BufferExhausted`.
+///
+/// Slots are allocated on first use, so the larger ceiling costs nothing until that many frames
+/// really are in flight.
+fn cpu_slot_count(base: usize, selection_enabled: bool, queue_capacity: usize) -> usize {
+    if !selection_enabled {
+        return base;
+    }
+    // One for the overlay the user is looking at, plus one per job the queue can hold behind it.
+    base.saturating_add(queue_capacity).saturating_add(1)
+}
+
+fn create_backend(
+    name: &str,
+    display_policy: &DisplayPolicy,
+    cpu_slots: usize,
+) -> Result<Box<dyn CaptureBackend>, AppError> {
+    match name {
+        "fake" => Ok(Box::new(captastic_core::FakeBackend::new(
+            Default::default(),
+        ))),
+        "auto" | "dxgi" => create_dxgi_backend(display_policy, cpu_slots),
+        other => Err(AppError::BackendUnavailable(format!(
+            "unknown backend {other}; available backends: fake, dxgi"
+        ))),
+    }
+}
+
+#[cfg(windows)]
+fn create_dxgi_backend(
+    display_policy: &DisplayPolicy,
+    cpu_slots: usize,
+) -> Result<Box<dyn CaptureBackend>, AppError> {
+    match display_policy {
+        DisplayPolicy::Pointer => Ok(Box::new(
+            captastic_windows::DxgiDisplayManager::with_cpu_slots(cpu_slots)?,
+        )),
+        DisplayPolicy::Primary => Ok(Box::new(captastic_windows::DxgiBackend::with_cpu_slots(
+            &DisplayId::primary(),
+            cpu_slots,
+        )?)),
+        DisplayPolicy::Fixed(id) => Ok(Box::new(captastic_windows::DxgiBackend::with_cpu_slots(
+            id, cpu_slots,
+        )?)),
+        DisplayPolicy::VirtualDesktop => Ok(Box::new(
+            captastic_windows::DxgiDisplayManager::with_cpu_slots(cpu_slots)?,
+        )),
+    }
+}
+
+#[cfg(not(windows))]
+fn create_dxgi_backend(
+    _display_policy: &DisplayPolicy,
+    _cpu_slots: usize,
+) -> Result<Box<dyn CaptureBackend>, AppError> {
+    Err(AppError::BackendUnavailable(
+        "DXGI is available only on Windows".to_owned(),
+    ))
+}
+
+fn doctor(json_output: bool) -> Result<(), AppError> {
+    let (native_status, native_error, displays) =
+        match create_dxgi_backend(&DisplayPolicy::Primary, BASE_CPU_BUFFER_SLOTS) {
+            Ok(backend) => ("available", None, Some(backend.displays().to_vec())),
+            Err(error) => ("unavailable", Some(error.to_string()), None),
+        };
+    let windows_clipboard = if cfg!(windows) {
+        "available_as_uncompressed_dibv5"
+    } else {
+        "unavailable_on_this_platform"
+    };
+    let windows_selection_overlay = if cfg!(windows) {
+        "available_for_regions_and_native_window_rendering"
+    } else {
+        "unavailable_on_this_platform"
+    };
+    // The same fingerprint a benchmark report carries, so the operator procedure has one command
+    // to check the host with before a measuring run: session, power source, software adapter and
+    // dirty build are all visible here, and a run started under the wrong one of those measures
+    // something that cannot be published.
+    let environment =
+        fingerprint::EnvironmentFingerprint::collect(displays.as_deref().unwrap_or_default());
+    print_value(
+        json_output,
+        &json!({
+            // 2: gained "environment".
+            "schema_version": 2,
+            "build": build_info::BUILD_INFO,
+            "phase": 1,
+            "platform": std::env::consts::OS,
+            "fake_backend": "available",
+            "dxgi_backend": native_status,
+            "dxgi_error": native_error,
+            "dxgi_displays": displays,
+            "cpu_readback": "available_for_unrotated_bgra8_outputs",
+            "windows_clipboard": windows_clipboard,
+            "windows_selection_overlay": windows_selection_overlay,
+            "latest_warm_frame": "available",
+            "critical_path_policy": "configured",
+            "environment": environment,
+        }),
+    )
+}
+
+fn print_value<T: serde::Serialize + std::fmt::Debug + ?Sized>(
+    json_output: bool,
+    value: &T,
+) -> Result<(), AppError> {
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(value)?);
+    } else {
+        println!("{value:#?}");
+    }
+    Ok(())
+}
+
+fn print_latency(label: &str, summary: &captastic_core::LatencySummary) {
+    log::info!(
+        "{label}: p50 {:.3} ms, p95 {:.3} ms, p99 {:.3} ms (n={})",
+        ns_to_ms(summary.p50_ns),
+        ns_to_ms(summary.p95_ns),
+        ns_to_ms(summary.p99_ns),
+        summary.count
+    );
+}
+
+fn ns_to_ms(ns: u64) -> f64 {
+    ns as f64 / 1_000_000.0
+}
+
+#[cfg(windows)]
+fn duration_ns(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Prints what several repeat runs agreed on, or why they cannot be compared.
+///
+/// The spread leads rather than the average. Three runs whose medians differ by a third do not
+/// support a performance claim however tidy their mean is, and a reader who sees only a mean has
+/// no way to know that.
+fn report_repeated(repeated: &benchmark::RepeatedBenchmark) {
+    if !repeated.incompatibilities.is_empty() {
+        log::error!(
+            "these {} runs cannot be compared, so no figure is reported from them:",
+            repeated.runs.len()
+        );
+        for difference in &repeated.incompatibilities {
+            log::error!("  {difference}");
+        }
+        return;
+    }
+    let Some(agreement) = repeated.agreement.as_ref() else {
+        return;
+    };
+    log::info!(
+        "{} compatible runs: {} successful, {} failed",
+        agreement.runs,
+        agreement.total_successes,
+        agreement.total_failures
+    );
+    log::info!(
+        "  native frame p50 spread {:.1}% across {:?} ns",
+        agreement.native_p50_spread_percent,
+        agreement.native_p50_ns
+    );
+    if !agreement.cpu_p50_ns.is_empty() {
+        log::info!(
+            "  CPU frame p50 spread {:.1}% across {:?} ns",
+            agreement.cpu_p50_spread_percent,
+            agreement.cpu_p50_ns
+        );
+    }
+    // Every stage, at every percentile a claim gets quoted at. The acceptance rule the claim
+    // procedure states is "every stage agreed", and a reader who is shown only the two stages
+    // above cannot apply it - a set whose medians agree and whose tails do not looks identical.
+    for stage in &agreement.stages {
+        log::info!(
+            "  {} spread: p50 {:.1}%, p95 {:.1}%, p99 {:.1}% (p50 {:?} ns)",
+            stage.stage,
+            stage.p50_spread_percent,
+            stage.p95_spread_percent,
+            stage.p99_spread_percent,
+            stage.p50_ns
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(windows)]
+    use std::fs;
+
+    use super::*;
+
+    /// An explicit `output.directory` wins, and it wins unchanged.
+    ///
+    /// A user who named a directory named the directory, not its parent: nothing is appended to
+    /// it, including `Captastic`.
+    #[test]
+    fn a_configured_output_directory_is_used_exactly_as_written() {
+        let configured = std::path::PathBuf::from(if cfg!(windows) {
+            r"D:\shots"
+        } else {
+            "/srv/shots"
+        });
+        let pictures = std::path::PathBuf::from(if cfg!(windows) {
+            r"C:\Users\someone\OneDrive\Pictures"
+        } else {
+            "/home/someone/Pictures"
+        });
+        assert_eq!(
+            resolve_output_directory(Some(&configured), Some(pictures)),
+            Some(configured.clone())
+        );
+        // And it still wins when the shell has nothing to say.
+        assert_eq!(
+            resolve_output_directory(Some(&configured), None),
+            Some(configured)
+        );
+    }
+
+    /// With no configured directory, the shell's Pictures folder decides — redirected or not.
+    ///
+    /// The redirected path here is the real one from the 2026-09-17 report: captures were landing
+    /// in `C:\Users\Steven\Pictures\Captastic`, a leftover directory Explorer no longer shows as
+    /// Pictures, while OneDrive's Known Folder Move had moved the real one.
+    #[test]
+    fn without_a_configured_directory_the_shells_pictures_folder_decides() {
+        let redirected = std::path::PathBuf::from(if cfg!(windows) {
+            r"C:\Users\Steven\OneDrive\Pictures"
+        } else {
+            "/home/steven/OneDrive/Pictures"
+        });
+        let resolved = resolve_output_directory(None, Some(redirected.clone()))
+            .expect("a known folder is enough on its own");
+        assert_eq!(resolved, redirected.join("Captastic"));
+        // `Path::ends_with` compares components, so one form covers both separators.
+        assert!(
+            resolved.ends_with("OneDrive/Pictures/Captastic"),
+            "{resolved:?}"
+        );
+    }
+
+    /// No configured directory and no known folder falls back to the home-relative guess.
+    ///
+    /// Which is the only answer available off Windows, and the last one on a Windows machine
+    /// whose shell declines to name a Pictures folder.
+    #[test]
+    fn with_neither_the_home_relative_default_is_the_fallback() {
+        assert_eq!(
+            resolve_output_directory(None, None),
+            captastic_config::default_output_directory()
+        );
+    }
+
+    #[test]
+    fn the_readback_pool_covers_every_frame_a_selection_can_pin() {
+        // The base is the capture pipeline's own: a capture in flight, a frame a destination
+        // worker is still writing, and one spare. Nothing about selection changes it.
+        assert_eq!(cpu_slot_count(3, false, 1), 3);
+        assert_eq!(cpu_slot_count(3, false, 4), 3);
+
+        // With selection on, every open overlay pins the frame from its own hotkey press for the
+        // length of a human interaction, and the queue can hold more behind it. Three slots plus
+        // a `full_display` capture still in the clipboard sink used to leave nothing for the next
+        // press, or for the confirmation capture the open overlay was about to ask for.
+        assert_eq!(cpu_slot_count(3, true, 1), 5);
+        assert_eq!(cpu_slot_count(3, true, 4), 8);
+        // A one-shot has no queue behind it, only the overlay itself.
+        assert_eq!(cpu_slot_count(3, true, 0), 4);
+
+        // The constant the configuration-free paths use must not drift from the default it
+        // stands in for.
+        assert_eq!(
+            BASE_CPU_BUFFER_SLOTS,
+            captastic_config::CaptureConfig::default().buffer_slots
+        );
+    }
+
+    /// Every subcommand names itself in the line that marks it finishing.
+    ///
+    /// Parsed from argv rather than built by hand, so this exercises the path `main` actually
+    /// takes - including the bare invocation, where clap yields no subcommand at all and the name
+    /// has to come from knowing what that runs.
+    #[test]
+    fn every_subcommand_names_itself_on_the_way_out() {
+        for (argv, expected) in [
+            (vec!["captastic"], "daemon"),
+            (vec!["captastic", "daemon"], "daemon"),
+            (vec!["captastic", "status"], "status"),
+            (vec!["captastic", "stop"], "stop"),
+            (vec!["captastic", "displays"], "displays"),
+            (vec!["captastic", "capture"], "capture"),
+            (vec!["captastic", "benchmark"], "benchmark"),
+            (vec!["captastic", "version"], "version"),
+            (vec!["captastic", "doctor"], "doctor"),
+            (vec!["captastic", "startup", "status"], "startup"),
+            (vec!["captastic", "config", "show"], "config"),
+        ] {
+            let cli = Cli::try_parse_from(&argv).expect("argv parses");
+            assert_eq!(
+                invocation_name(cli.command.as_ref()),
+                expected,
+                "{argv:?} should report itself as {expected}"
+            );
+        }
+    }
+
+    /// The bug in issue #67 was that a read-only command claimed a lifecycle event, so the two
+    /// must not be able to produce the same line.
+    ///
+    /// A bare `captastic` runs the daemon and is expected to match `daemon` exactly; every other
+    /// pair has to differ, which is what stops a future subcommand from being given a neighbour's
+    /// name by a careless copy.
+    #[test]
+    fn a_read_only_command_cannot_report_itself_as_the_daemon() {
+        let named = [
+            "daemon",
+            "status",
+            "stop",
+            "displays",
+            "capture",
+            "benchmark",
+            "version",
+            "doctor",
+            "startup",
+            "config",
+        ];
+        for (index, name) in named.iter().enumerate() {
+            for other in &named[index + 1..] {
+                assert_ne!(
+                    name, other,
+                    "two subcommands share the name {name}, so their exit lines are               indistinguishable"
+                );
+            }
+        }
+        let bare = Cli::try_parse_from(["captastic"]).expect("argv parses");
+        let status = Cli::try_parse_from(["captastic", "status"]).expect("argv parses");
+        assert_ne!(
+            invocation_name(bare.command.as_ref()),
+            invocation_name(status.command.as_ref()),
+            "`captastic status` still reports the same thing a daemon run does"
+        );
+    }
+
+    #[cfg(windows)]
+    fn pointer_error(kind: captastic_core::CaptureErrorKind) -> captastic_core::CaptureError {
+        captastic_core::CaptureError {
+            kind,
+            backend: "dxgi-manager",
+            operation: "resolve_pointer_display",
+            message: "pointer position (0, 1646) is on no attached display".to_owned(),
+            retryable: false,
+            native_code: None,
+        }
+    }
+
+    /// The pointer resting in the gap of an L-shaped desktop must not cost the user a screenshot.
+    #[cfg(windows)]
+    #[test]
+    fn a_pointer_on_no_display_captures_the_primary_display() {
+        let resolved = pointer_source_or_primary(Err(pointer_error(
+            captastic_core::CaptureErrorKind::PointerOutsideDisplays,
+        )))
+        .expect("a pointer on no display still yields a capture source");
+
+        assert_eq!(
+            resolved,
+            CaptureSource::Display(DisplayId::primary()),
+            "the fallback must name the primary display"
+        );
+    }
+
+    /// The fallback is for one condition only. A cursor query that was denied is a permissions
+    /// problem the user has to see; quietly photographing a different screen would hide it.
+    ///
+    /// `DesktopUnavailable` is the same denial once the session has explained it, and it must not
+    /// be swallowed either — there is nothing on the primary display to photograph while the
+    /// workstation is locked, and the message naming the lock is the only useful part of it.
+    #[cfg(windows)]
+    #[test]
+    fn other_pointer_failures_are_not_swallowed_by_the_fallback() {
+        for kind in [
+            captastic_core::CaptureErrorKind::PermissionDenied,
+            captastic_core::CaptureErrorKind::DesktopUnavailable,
+            captastic_core::CaptureErrorKind::NativeFailure,
+        ] {
+            let resolved = pointer_source_or_primary(Err(pointer_error(kind)));
+            assert!(
+                matches!(resolved, Err(error) if error.kind == kind),
+                "{kind:?} should still fail"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_resolved_pointer_display_is_used_as_it_is() {
+        let display = DisplayId("windows-monitor-abc".to_owned());
+        assert_eq!(
+            pointer_source_or_primary(Ok(display.clone())).expect("a resolved display"),
+            CaptureSource::Display(display)
+        );
+    }
+
+    fn cli(command: Option<Command>) -> Cli {
+        Cli {
+            log_file: None,
+            log_level: None,
+            log_format: None,
+            command,
+        }
+    }
+
+    #[test]
+    fn only_operational_commands_persist_logs_by_default() {
+        assert!(uses_persistent_logging(&cli(None)));
+        assert!(uses_persistent_logging(&cli(Some(Command::Daemon(
+            cli::DaemonArgs::default()
+        )))));
+        assert!(!uses_persistent_logging(&cli(Some(Command::Doctor {
+            json: true
+        }))));
+        let capture = Cli::try_parse_from(["captastic", "capture"]).expect("capture CLI");
+        assert!(uses_persistent_logging(&capture));
+        let benchmark = Cli::try_parse_from(["captastic", "benchmark"]).expect("benchmark CLI");
+        assert!(uses_persistent_logging(&benchmark));
+
+        let mut explicit = cli(Some(Command::Doctor { json: true }));
+        explicit.log_file = Some("doctor.log".into());
+        assert!(uses_persistent_logging(&explicit));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn one_shot_selection_ignores_unreadable_remembered_ui_state() {
+        let directory =
+            std::env::temp_dir().join(format!("captastic-one-shot-ui-load-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("create directory at config path");
+        let store = captastic_config::UiStateStore::at(&directory);
+
+        assert_eq!(
+            load_optional_one_shot_ui_state(&store, "display-1"),
+            captastic_config::DisplayUiState::default()
+        );
+
+        fs::remove_dir_all(directory).expect("remove directory at config path");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn one_shot_ui_state_persistence_failure_does_not_abort_the_capture() {
+        let directory = std::env::temp_dir().join(format!(
+            "captastic-one-shot-ui-finish-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("create directory at config path");
+        let store = captastic_config::UiStateStore::at(&directory);
+        let worker = selection::OneShotUiStateWorker::start(store).expect("start one-shot worker");
+        worker
+            .controller()
+            .submit_ui_update(captastic_windows::OverlayUiUpdate::ToolbarCenter {
+                display_id: "display-1".to_owned(),
+                center_x: 0.25,
+                center_y: 0.75,
+            });
+
+        // The capture is the product; retiring the worker reports the failed preference write
+        // instead of propagating it, so the surrounding capture path cannot exit with an error.
+        finish_one_shot_ui_state(Some(worker));
+
+        fs::remove_dir_all(directory).expect("remove directory at config path");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn one_shot_ui_state_warning_matches_the_daemon_phrasing() {
+        let warning = one_shot_ui_state_warning(&AppError::BackendUnavailable(
+            "failed to persist UI state: access is denied".to_owned(),
+        ));
+        assert!(warning.starts_with("Captastic could not save selection preferences."));
+        assert!(warning.contains("failed to persist UI state"));
+    }
+
+    #[test]
+    fn display_policy_resolves_pointer_primary_virtual_desktop_and_fixed_ids() {
+        assert_eq!(
+            resolve_display_policy("pointer").expect("pointer"),
+            DisplayPolicy::Pointer
+        );
+        assert_eq!(
+            resolve_display_policy("primary").expect("primary"),
+            DisplayPolicy::Primary
+        );
+        assert_eq!(
+            resolve_display_policy("virtual_desktop").expect("virtual desktop"),
+            DisplayPolicy::VirtualDesktop
+        );
+        assert_eq!(
+            resolve_display_policy("display:windows-monitor-0123456789abcdef")
+                .expect("fixed display"),
+            DisplayPolicy::Fixed(DisplayId("windows-monitor-0123456789abcdef".to_owned()))
+        );
+    }
+
+    #[test]
+    fn unresolved_display_policies_fail_before_backend_initialization() {
+        for value in ["display:", "unexpected"] {
+            assert!(matches!(
+                resolve_display_policy(value),
+                Err(AppError::InvalidArgument(_))
+            ));
+        }
+    }
+}
