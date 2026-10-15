@@ -555,6 +555,8 @@ fn capture(args: cli::CaptureArgs) -> Result<(), AppError> {
                     // ADR 0010's second slice.
                     pin_available: false,
                     edit_available: false,
+                    // A recording outlives the overlay; only a daemon can run one.
+                    record_format: None,
                 },
                 &mut overlay_resources,
             )?;

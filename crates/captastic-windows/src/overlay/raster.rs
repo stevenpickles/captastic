@@ -972,6 +972,34 @@ pub(super) fn draw_pin_icon(device: HDC, bounds: UiRect, color: COLORREF, metric
     );
 }
 
+/// A record button: a ring with a dot inside, the dot red while the action is offered. `color` is
+/// the action button's foreground, bright when enabled and grey when not.
+pub(super) fn draw_record_icon(device: HDC, bounds: UiRect, color: COLORREF, metrics: UiMetrics) {
+    let tokens = metrics.toolbar_tokens();
+    let size = tokens.icon_size;
+    let left = (bounds.left + bounds.right - size) / 2;
+    let top = (bounds.top + bounds.bottom - size) / 2;
+    draw_ellipse(
+        device,
+        left,
+        top,
+        left + size,
+        top + size,
+        color,
+        tokens.icon_stroke,
+    );
+    let enabled = color == rgb(245, 245, 247);
+    let inset = size / 4;
+    draw_filled_ellipse(
+        device,
+        left + inset,
+        top + inset,
+        left + size - inset,
+        top + size - inset,
+        if enabled { rgb(232, 64, 56) } else { color },
+    );
+}
+
 /// A pencil: a slanted body with a pointed tip at the lower left.
 pub(super) fn draw_edit_icon(device: HDC, bounds: UiRect, color: COLORREF, metrics: UiMetrics) {
     let tokens = metrics.toolbar_tokens();

@@ -257,6 +257,9 @@ pub(super) struct OverlayModel {
     pub(super) pin_available: bool,
     /// Whether **Edit** may end this run; see `OverlayDestinations::edit_available`.
     pub(super) edit_available: bool,
+    /// What **Record** records into, or `None` when this run cannot record; see
+    /// `OverlayDestinations::record_format`.
+    pub(super) record_format: Option<captastic_config::RecordingFormat>,
     pub(super) hovered_control: Option<ToolbarControl>,
     pub(super) pointer_local: Option<POINT>,
     /// The window-chooser candidate under the pointer. The shell owns the thumbnail
@@ -464,6 +467,10 @@ pub(super) enum OverlayEffect {
     /// Ask the daemon to turn file output on or off. Not a persistence effect: the daemon starts
     /// or stops the file worker and records `output.enabled` itself, exactly as it does for the
     /// notification-area item, so the two places cannot disagree about what the setting means.
+    /// The user chose, from the Options menu, what **Record** records into.
+    RequestRecordingFormat {
+        format: captastic_config::RecordingFormat,
+    },
     RequestFileOutput {
         enabled: bool,
     },
@@ -786,6 +793,7 @@ fn toolbar_control_pressed(
         ToolbarControl::Capture => return confirm_or_capture(model, confirm_intent(modifiers)),
         ToolbarControl::Pin => return confirm(model, ConfirmIntent::Pin),
         ToolbarControl::Edit => return confirm(model, ConfirmIntent::Edit),
+        ToolbarControl::Record => return confirm(model, ConfirmIntent::Record),
         ToolbarControl::DimBackground => {
             model.dim_background = !model.dim_background;
         }
@@ -827,6 +835,22 @@ fn toolbar_control_pressed(
                 effects.push(OverlayEffect::RequestFileOutput {
                     enabled: model.file_output_enabled,
                 });
+            }
+        }
+        ToolbarControl::RecordFormat => {
+            // The same optimism as the disk row: the label changes at the click, and the daemon
+            // records the choice for this and later recordings.
+            if let Some(format) = model.record_format {
+                let next = match format {
+                    captastic_config::RecordingFormat::Gif => {
+                        captastic_config::RecordingFormat::Mp4
+                    }
+                    captastic_config::RecordingFormat::Mp4 => {
+                        captastic_config::RecordingFormat::Gif
+                    }
+                };
+                model.record_format = Some(next);
+                effects.push(OverlayEffect::RequestRecordingFormat { format: next });
             }
         }
         ToolbarControl::Cancel => return cancel(model),
@@ -1291,6 +1315,7 @@ fn confirm(model: &mut OverlayModel, intent: ConfirmIntent) -> Vec<OverlayEffect
         ConfirmIntent::Capture => true,
         ConfirmIntent::Pin => model.pin_available,
         ConfirmIntent::Edit => model.edit_available,
+        ConfirmIntent::Record => model.record_format.is_some(),
     };
     if !available {
         return Vec::new();
@@ -1743,6 +1768,7 @@ mod tests {
             file_output_switchable: true,
             pin_available: true,
             edit_available: false,
+            record_format: None,
             hovered_control: None,
             pointer_local: None,
             hovered: None,
@@ -2706,6 +2732,73 @@ mod tests {
             Some(CloseOutcome::Confirmed { intent, .. }) => Some(intent),
             _ => None,
         }
+    }
+
+    #[test]
+    fn record_confirms_with_its_intent_only_when_the_run_can_record() {
+        let layout = layout_for(&region_model_with_selection());
+        let press = |at: POINT| OverlayInput::PointerDown {
+            point: at,
+            window_slot: None,
+            time_ms: 0,
+            modifiers: Modifiers::default(),
+        };
+        let mut model = region_model_with_selection();
+        model.record_format = Some(captastic_config::RecordingFormat::Gif);
+        let effects = transition(&mut model, press(center(layout.record)));
+        assert_eq!(confirmed_intent(&effects), Some(ConfirmIntent::Record));
+
+        // A run with nothing behind it to keep a recording going does not record.
+        let mut model = region_model_with_selection();
+        model.record_format = None;
+        let effects = transition(&mut model, press(center(layout.record)));
+        assert_eq!(confirmed_intent(&effects), None);
+    }
+
+    #[test]
+    fn the_record_as_row_switches_format_and_tells_the_daemon() {
+        let mut model = region_model_with_selection();
+        model.record_format = Some(captastic_config::RecordingFormat::Gif);
+        model.options_open = true;
+        let layout = layout_for(&model);
+        let row = OverlayInput::PointerDown {
+            point: center(layout.record_format),
+            window_slot: None,
+            time_ms: 0,
+            modifiers: Modifiers::default(),
+        };
+        let effects = transition(&mut model, row.clone());
+        assert_eq!(
+            model.record_format,
+            Some(captastic_config::RecordingFormat::Mp4)
+        );
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            OverlayEffect::RequestRecordingFormat {
+                format: captastic_config::RecordingFormat::Mp4
+            }
+        )));
+        transition(&mut model, row);
+        assert_eq!(
+            model.record_format,
+            Some(captastic_config::RecordingFormat::Gif)
+        );
+        // Greyed in a run that cannot record: the row does nothing.
+        let mut model = region_model_with_selection();
+        model.record_format = None;
+        model.options_open = true;
+        let effects = transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point: center(layout.record_format),
+                window_slot: None,
+                time_ms: 0,
+                modifiers: Modifiers::default(),
+            },
+        );
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, OverlayEffect::RequestRecordingFormat { .. })));
     }
 
     #[test]
