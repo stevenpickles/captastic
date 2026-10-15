@@ -61,10 +61,11 @@ unambiguous. After publishing a release, advance the workspace version to the ne
 before accepting further development; otherwise a prerelease would sort before the version that was
 just published.
 
-Use `captastic --version` for the compact identity or `captastic version --json` for the release
-version, full commit, revision count, channel, dirty state, target, profile, and CI provenance.
-Windows builds carry the same version and commit in their executable properties, and daemon startup
-logs and benchmark reports include the embedded identity.
+Use `captastic-dev --version` for the compact identity or `captastic-dev version --json` for the
+release version, full commit, revision count, channel, dirty state, target, profile, and CI
+provenance. Windows builds carry the same version and commit in their executable properties, the
+shipped `captastic.exe --version` shows the compact identity in a dialog, and daemon startup logs
+and benchmark reports include the embedded identity.
 
 ## Benchmark evidence
 
@@ -75,10 +76,10 @@ driver update or a hundred commits between two runs moves a latency figure witho
 the numbers say, so a mismatch stops the comparison and names every differing field instead of
 producing a percentage that reads like a regression.
 
-`captastic benchmark --repeat 3 --output-dir <dir>` writes the artifacts a claim rests on: a full
+`captastic-dev benchmark --repeat 3 --output-dir <dir>` writes the artifacts a claim rests on: a full
 report per run, the raw per-capture event stream per run with `--raw-events`, and a `repeated.json`
-carrying every stage's spread at p50, p95, and p99. `captastic benchmark compare <baseline>
-<candidate>` holds a later run against a committed one and prints the per-stage deltas with a
+carrying every stage's spread at p50, p95, and p99. `captastic-dev benchmark compare
+<baseline> <candidate>` holds a later run against a committed one and prints the per-stage deltas with a
 `within_noise`/`slower`/`faster` verdict. The operator procedure for turning those into a
 publishable number — console session, AC power, a repainting display, the acceptance criteria, and
 where accepted sets are committed — is [benchmarks/README.md](benchmarks/README.md).
@@ -92,6 +93,11 @@ artifact from the workflow run and open `index.html` to inspect line, function, 
 Interactive desktop and clipboard tests remain ignored in hosted CI because they require a live user session.
 
 ## Useful commands
+
+Captastic builds two executables. `captastic.exe` is the one that ships: the notification-area
+application, built for the Windows subsystem so it never opens a console. `captastic-dev.exe` is
+the developer command line used below and by the scripts under `scripts/` and `benchmarks/`; it is
+built from this repository and never packaged. `cargo run -p captastic-app` runs `captastic-dev`.
 
 ```powershell
 cargo run -p captastic-app -- doctor
@@ -112,17 +118,21 @@ cargo run -p captastic-app -- capture --backend dxgi --mode fresh --cpu-frame tr
 cargo run --release -p captastic-app -- benchmark --backend dxgi --mode fresh --cpu-frame true --iterations 100 --json
 ```
 
-Run the resident foreground daemon and press `Ctrl+Shift+F9`:
+Run the resident daemon and press `Ctrl+Shift+F9`, either as the shipped application or in the
+foreground from the developer command line, where its log is also printed to the console:
 
 ```powershell
-cargo run --release -p captastic-app
+cargo run --release -p captastic-app --bin captastic
 cargo run --release -p captastic-app -- daemon --backend dxgi --mode latest --cpu-frame true
 cargo run --release -p captastic-app -- daemon --config captastic.example.toml
 ```
 
-Running Captastic without a subcommand starts the resident desktop capture daemon with the default
-configuration. The explicit `daemon` form remains available for scripts, diagnostics, and CLI
-overrides. A named per-session control event prevents more than one daemon instance from running.
+`captastic.exe` accepts the daemon's options (`--config`, `--backend`, `--display` and the rest of
+`captastic-dev daemon --help`) and the logging flags, and nothing else. It has no console, so
+`--help`, `--version`, an invalid argument, or a daemon that cannot start is reported in a dialog.
+Running `captastic-dev` without a subcommand also starts the daemon. A named per-session control
+event prevents more than one daemon instance from running, and starting `captastic.exe` while one
+is running does nothing.
 While the daemon is active, Captastic places an icon in the Windows notification area. Double-click
 the icon to capture, or right-click it to capture, turn **Save Captures to Disk** on or off,
 open the most recent capture, show it in its folder, or prune the capture history (**Open Last
@@ -131,16 +141,20 @@ Capture**, **Show in Folder**, and **Prune Capture History**), pause/resume the 
 Windows Explorer restarts, Captastic restores its notification icon automatically. Tray
 initialization failures are logged and do not disable the capture daemon.
 
-Release builds also contain `captastic-desktop.exe`, a console-free launcher intended for shortcuts
-and login startup. It starts the sibling `captastic.exe` daemon without creating a terminal window
-and exits immediately; launching it while the daemon is already running is a no-op. Launch at login
-can also be managed explicitly:
+Launch at login is the notification area's **Start with Windows**, and registers `captastic.exe`
+under the current user's `Run` key. The developer command line manages the same entry, and always
+registers the `captastic.exe` beside it rather than itself:
 
 ```powershell
-captastic startup enable
-captastic startup status --json
-captastic startup disable
+captastic-dev startup enable
+captastic-dev startup status --json
+captastic-dev startup disable
 ```
+
+Versions up to 0.2 shipped a second executable, `captastic-desktop.exe`, whose only job was to start
+the console program without a window. A login entry naming it is moved onto `captastic.exe` by the
+installers and again by `captastic.exe` itself when it starts, provided the entry names the launcher
+in its own directory.
 
 ## Install and release packages
 
@@ -149,7 +163,7 @@ Tagged releases and manually dispatched release workflows produce a
 `captastic.<version>.nupkg` Chocolatey package. The repository's canonical local build command is
 `./scripts/build-packages.ps1`; it also writes `dist/artifacts.json` with the package version,
 embedded build identity, source provenance, filenames, and hashes used by CI and releases. The
-packager verifies that both executables came from the current commit before consuming a skipped
+packager verifies that the executable came from the current commit before consuming a skipped
 build. Chocolatey output is currently x86_64-only, while
 the portable package builder also supports ARM64. Extract the portable archive and run its
 current-user installer from PowerShell:
@@ -171,7 +185,7 @@ Current releases are not Authenticode-signed, so Windows marks the download and 
 look like, and how to verify a download against its published SHA-256 checksum and `artifacts.json`
 hashes.
 
-The installer copies the CLI and console-free desktop launcher to
+The installer copies `captastic.exe` to
 `%LOCALAPPDATA%\Programs\Captastic`, creates a per-user Start Menu shortcut, and starts the tray
 application; pass `-NoLaunch` to install without starting it.
 It does not require administrator privileges. Run the installed `uninstall.ps1` to stop Captastic,
@@ -186,7 +200,7 @@ choco install captastic
 choco upgrade captastic
 ```
 
-The Chocolatey package adds `captastic` and the console-free `captastic-desktop` launcher to `PATH`
+The Chocolatey package adds `captastic` to `PATH`, which starts the notification-area application,
 and creates a Start Menu shortcut without launching the desktop application during first install. It
 preserves `~/.captastic` on upgrades and uninstall. See
 [Chocolatey packaging](docs/chocolatey.md) for local package testing, portable-install migration
@@ -216,7 +230,7 @@ profile's remembered state; the default profile is not read or written. The daem
 and remembered UI settings at startup, so hand edits take effect after a restart. Background saves
 rewrite `state.toml` alone, so they cannot disturb a configuration you are editing, and the one
 setting the notification area does write back — `output.enabled` — is edited in place, preserving
-every other value and comment. The one-shot `captastic capture --selection true` command uses the
+every other value and comment. The one-shot `captastic-dev capture --selection true` command uses the
 default profile unless `--config <path>` names another, and flushes its UI updates before exiting.
 
 ## Configurable hotkeys
@@ -307,7 +321,7 @@ the two window tokens expand to nothing for a display or region capture, and the
 them collapse rather than leaving gaps behind. Values that come from a window are sanitized —
 forbidden characters, control characters, parent hops, reserved device names, and length — and a
 name can never place a capture outside the output directory.
-`captastic config validate --path <file>` rejects an unknown token, a path separator, or a template
+`captastic-dev config validate --path <file>` rejects an unknown token, a path separator, or a template
 with no token at all, which is the same check the daemon makes at startup. A window title is
 content; see [ADR 0008](docs/adr/0008-what-a-capture-reveals-by-default.md) for why the default
 names it anyway.
@@ -338,7 +352,7 @@ Captastic remembers recent captures under `[history]` (`max_items`, `max_age_day
 **Open Last Capture**, **Show in Folder**, and **Prune Capture History**, each greyed until there
 is something to open.
 
-One-shot captures write to disk from the same configuration: `captastic capture --backend dxgi`
+One-shot captures write to disk from the same configuration: `captastic-dev capture --backend dxgi`
 honours `[output]`, and `--config <file>` points it at a configuration other than the default.
 
 JPEG encoding uses the [`jpeg-encoder`](https://crates.io/crates/jpeg-encoder) crate, which is
@@ -389,7 +403,7 @@ wins. Multi-adapter virtual desktops return an explicit unsupported-topology err
 to one physical monitor, list the attached displays without creating a capture session:
 
 ```powershell
-captastic displays --backend dxgi --json
+captastic-dev displays --backend dxgi --json
 ```
 
 Copy the desired persistent ID into `captastic.toml` as
@@ -426,7 +440,7 @@ cargo run -p captastic-app -- daemon --backend dxgi --mode latest --cpu-frame tr
 
 `latest` is the product-behavior mode and should also work on a static desktop. A `fresh` DXGI capture needs the desktop image itself to change after the trigger. A static desktop can legitimately time out; pointer-only updates do not count as a fresh desktop image.
 
-Ctrl+C or `captastic stop` requests an orderly shutdown, stops admitting capture triggers, and gives the daemon three seconds to drain before overdue workers are detached. Windows close, logoff, and shutdown notifications request the same bounded teardown; the native handler waits up to four seconds for its completion signal, while a canceled shutdown query leaves the daemon running. Configuration recovery, persistence failures, clipboard failures, and Open Config errors detected during normal operation are reported through context-specific notification-area messages. The persistent log is authoritative for failures and timeouts detected during final teardown because the notification icon is being removed. `captastic status` reports whether the per-session daemon is running on Windows and reports `unsupported` on platforms without a native daemon. DXGI access/device loss drops the abandoned session before replacement construction and retries the same capture up to three times with bounded backoff. If those attempts fail, background reinitialization continues without acquiring another frame until the next capture.
+Ctrl+C on a foreground daemon, **Exit** in the notification-area menu, or `captastic-dev stop` requests an orderly shutdown, stops admitting capture triggers, and gives the daemon three seconds to drain before overdue workers are detached. Windows close, logoff, and shutdown notifications request the same bounded teardown; the native handler waits up to four seconds for its completion signal, while a canceled shutdown query leaves the daemon running. Configuration recovery, persistence failures, clipboard failures, and Open Config errors detected during normal operation are reported through context-specific notification-area messages. The persistent log is authoritative for failures and timeouts detected during final teardown because the notification icon is being removed. `captastic-dev status` reports whether the per-session daemon is running on Windows and reports `unsupported` on platforms without a native daemon. DXGI access/device loss drops the abandoned session before replacement construction and retries the same capture up to three times with bounded backoff. If those attempts fail, background reinitialization continues without acquiring another frame until the next capture.
 
 ## Known limitations
 

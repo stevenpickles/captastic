@@ -2,12 +2,12 @@
 #
 # These are claims about hardware, not about correctness, which is why they live here rather than
 # in the test suite. Hosted CI runs on a software adapter and would breach every GPU figure below
-# on every run; a check that always fails is a check nobody reads, so `captastic benchmark
+# on every run; a check that always fails is a check nobody reads, so `captastic-dev benchmark
 # --budgets` skips a budget whose host does not match the run and says so rather than passing it.
 #
 # Reproducing a run these apply to:
 #
-#   captastic benchmark --backend dxgi --cursor exclude --repeat 3 --iterations 200 \
+#   captastic-dev benchmark --backend dxgi --cursor exclude --repeat 3 --iterations 200 \
 #       --budgets benchmarks/budgets.toml
 #
 # from a *console* session. A Remote Desktop session composes onto a virtual display adapter that

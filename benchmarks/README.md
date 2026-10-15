@@ -14,7 +14,7 @@ because some version of that already happened.
 ## What the pieces are
 
 **A budget** (`budgets.toml`) is a claim about hardware, not about correctness — which is why it
-lives here rather than in the test suite. `captastic benchmark --budgets benchmarks/budgets.toml`
+lives here rather than in the test suite. `captastic-dev benchmark --budgets benchmarks/budgets.toml`
 judges a run against it, and a budget *names the host it describes*: a run anywhere else is skipped
 **loudly**, with every mismatch named and the measurements still reported, because a GPU timing
 budget evaluated on a hosted CI runner fails every time and a check that always fails is one nobody
@@ -39,7 +39,7 @@ Anything in that list differing between two runs stops a comparison. That is the
 
 **An artifact set** is what `--output-dir` writes: `run-1.json … run-N.json` (a whole report each),
 `run-N.events.jsonl` per run when `--raw-events` is given, and `repeated.json` holding the set, its
-compatibility, its per-stage agreement, and the budget verdict. `captastic benchmark compare` reads
+compatibility, its per-stage agreement, and the budget verdict. `captastic-dev benchmark compare` reads
 either shape back.
 
 ## The operator procedure
@@ -61,7 +61,7 @@ Every step is a precondition for the claim, not a suggestion.
 
 ```powershell
 cargo build --release -p captastic-app
-captastic doctor --json
+captastic-dev doctor --json
 ```
 
 In the `environment` block, all four must hold:
@@ -81,7 +81,7 @@ built again that produced them.
 Two cursor modes × the capture modes being claimed. For each:
 
 ```powershell
-captastic benchmark --backend dxgi --cpu-frame true --repeat 3 --iterations 200 --warmup 20 `
+captastic-dev benchmark --backend dxgi --cpu-frame true --repeat 3 --iterations 200 --warmup 20 `
     --budgets benchmarks\budgets.toml --output-dir benchmarks\runs\<date>\<mode>-<cursor>
 ```
 
@@ -147,7 +147,7 @@ A latency figure without the host and the spread is a number with no way to be w
 ### 8. Before publishing a later claim, compare
 
 ```powershell
-captastic benchmark compare benchmarks\baselines\<host-slug>\v0.2.0\<cell>\repeated.json `
+captastic-dev benchmark compare benchmarks\baselines\<host-slug>\v0.2.0\<cell>\repeated.json `
     benchmarks\runs\<date>\<cell>\repeated.json
 ```
 

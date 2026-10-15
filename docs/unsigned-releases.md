@@ -110,7 +110,8 @@ foreach ($artifact in $manifest.artifacts) {
 
 The manifest also records the exact Git commit, revision count, source tag, and build channel the
 package was produced from, and `publishable` is true only for a build made from a matching clean tag.
-`captastic version --json` reports the same identity from the installed executable, so a downloaded
+The installed executable's file properties (`(Get-Item captastic.exe).VersionInfo`) and
+`captastic.exe --version` report the same identity, so a downloaded
 package can be checked against what it claims to be after installation as well as before it.
 
 Be clear about what this establishes and what it does not. Matching hashes prove that the bytes on
@@ -129,8 +130,8 @@ archive's contents in the package, so the binaries a Chocolatey install places o
 covered by the archive hash above.
 
 `VERIFICATION.txt`, inside the package under `tools`, records the direct tagged GitHub release
-archive URL, the archive's SHA-256 hash, and the SHA-256 hashes of `captastic.exe` and
-`captastic-desktop.exe`, with instructions to download the archive, hash it with `Get-FileHash`,
+archive URL, the archive's SHA-256 hash, and the SHA-256 hash of `captastic.exe`, with
+instructions to download the archive, hash it with `Get-FileHash`,
 extract it, and compare. That file exists for Chocolatey's moderators, who verify that an embedded
 binary matches an upstream release before a package is approved, and it is equally usable by anyone
 who has the package. A tagged package build fails if it is given an indirect or non-release URL.
