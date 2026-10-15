@@ -360,6 +360,13 @@ fn capture(args: cli::CaptureArgs) -> Result<(), AppError> {
                 worker.controller(),
                 captastic_windows::InitialSelectionTool::Remembered,
                 Some(remembered_ui),
+                captastic_windows::OverlayDestinations {
+                    clipboard: args.clipboard,
+                    file_output: config.output.enabled,
+                    // A one-shot run has no daemon to start a file worker for it: the row states
+                    // what this capture will do and does not offer to change it.
+                    file_output_switchable: false,
+                },
                 &mut overlay_resources,
             )?;
             let selection = match selection {

@@ -276,11 +276,17 @@ impl SelectionWorker {
                         initial_view(job.preview_mode),
                         job.preview_mode == PreviewMode::Live,
                     );
+                    // Read at the moment the overlay opens rather than carried on the job: the
+                    // set can have changed between the press and the run, and the row states
+                    // where the confirmation will go, which is decided by the set at the
+                    // confirmation.
+                    let destinations = overlay_destinations(&destinations.names());
                     captastic_windows::select_from_preview_source_with_initial_tool_and_ui(
                         preview_source,
                         &worker_controller,
                         job.initial_tool,
                         Some(remembered_ui),
+                        destinations,
                         &mut overlay_resources,
                     )
                 };
@@ -1072,6 +1078,17 @@ fn remember_confirmed_region(
     });
 }
 
+/// Where the overlay says a capture goes, from the destination set's names.
+///
+/// Not yet switchable: nothing hands the overlay's request to the daemon.
+fn overlay_destinations(names: &[&'static str]) -> captastic_windows::OverlayDestinations {
+    captastic_windows::OverlayDestinations {
+        clipboard: names.contains(&crate::clipboard::DESTINATION_NAME),
+        file_output: names.contains(&crate::file_output::DESTINATION_NAME),
+        file_output_switchable: false,
+    }
+}
+
 fn persist_ui_state(
     receiver: mpsc::Receiver<captastic_windows::OverlayUiUpdate>,
     store: captastic_config::UiStateStore,
@@ -1094,6 +1111,10 @@ fn persist_ui_state(
                 // the last toggle in a burst is the one the user left the menu on.
                 captastic_windows::OverlayUiUpdate::SnapToWindows { .. } => (String::new(), 3),
                 captastic_windows::OverlayUiUpdate::RegionZoom { .. } => (String::new(), 4),
+                // Not persisted here at all, but coalesced for the same reason: the daemon is
+                // asked for where the row ended up, and two clicks that put it back where it
+                // started become a request it can see is already satisfied.
+                captastic_windows::OverlayUiUpdate::FileOutput { .. } => (String::new(), 5),
             };
             coalesce_ui_update(&mut latest, key, update);
         }
@@ -1121,6 +1142,8 @@ fn persist_ui_state(
                 captastic_windows::OverlayUiUpdate::RegionZoom { mode } => {
                     store.save_region_zoom(mode)
                 }
+                // Never sent: every run is told its row is not switchable.
+                captastic_windows::OverlayUiUpdate::FileOutput { .. } => Ok(()),
             };
             if let Err(error) = result {
                 let message = format!("failed to persist UI state: {error}");
@@ -1505,6 +1528,25 @@ mod tests {
         };
 
         assert_eq!(worker.stop(), vec!["scripted shutdown failure".to_owned()]);
+    }
+
+    #[test]
+    fn the_overlay_is_told_the_destinations_by_name() {
+        let both = overlay_destinations(&[
+            crate::clipboard::DESTINATION_NAME,
+            crate::file_output::DESTINATION_NAME,
+        ]);
+        assert!(both.clipboard);
+        assert!(both.file_output);
+        let clipboard_only = overlay_destinations(&[crate::clipboard::DESTINATION_NAME]);
+        assert!(clipboard_only.clipboard);
+        assert!(!clipboard_only.file_output);
+        let nothing = overlay_destinations(&[]);
+        assert!(!nothing.clipboard);
+        assert!(!nothing.file_output);
+        for destinations in [both, clipboard_only, nothing] {
+            assert!(!destinations.file_output_switchable);
+        }
     }
 
     #[test]
