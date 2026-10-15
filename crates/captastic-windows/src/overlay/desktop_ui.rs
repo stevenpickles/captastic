@@ -1,8 +1,8 @@
 //! The `captastic-desktop-ui` thread: the one thread that hosts every window that outlives an
 //! overlay run (ADR 0010).
 //!
-//! It is started by the first request and not before, so a daemon that never pins never creates
-//! it. The thread pumps messages for a hidden message-only host window and for the windows it
+//! It is started by the first request and not before, so a daemon that never pins or edits never
+//! creates it. The thread pumps messages for a hidden message-only host window and for the windows it
 //! hosts. Requests reach it as messages posted to that host window rather than to the thread: a
 //! thread message is discarded by any modal loop running on the thread, and dragging a window or
 //! opening a menu runs one.
@@ -18,13 +18,15 @@ use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    GetWindowLongPtrW, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW,
-    SetWindowLongPtrW, TranslateMessage, UnregisterClassW, CREATESTRUCTW, GWLP_USERDATA, HCURSOR,
-    HWND_MESSAGE, IDC_SIZEALL, MSG, WINDOW_EX_STYLE, WM_APP, WM_NCCREATE, WM_NCDESTROY, WNDCLASSW,
+    GetWindowLongPtrW, LoadCursorW, LoadIconW, PostMessageW, PostQuitMessage, RegisterClassW,
+    SetWindowLongPtrW, TranslateMessage, UnregisterClassW, CREATESTRUCTW, GWLP_USERDATA,
+    HWND_MESSAGE, IDC_ARROW, IDC_SIZEALL, MSG, WINDOW_EX_STYLE, WM_APP, WM_NCCREATE, WM_NCDESTROY,
+    WNDCLASSW,
 };
 
+use super::editor::{create_editor, editor_window_proc, EditFinished, EDITOR_CLASS_NAME};
 use super::pin::{create_pin, pin_window_proc, set_click_through, PIN_CLASS_NAME};
-use super::shell::ThreadDpiContext;
+use super::shell::{PrivateFontResource, ThreadDpiContext};
 
 const HOST_CLASS_NAME: PCWSTR = w!("CaptasticDesktopUiHost-v1");
 
@@ -35,11 +37,23 @@ const HOST_STOP: u32 = WM_APP + 2;
 /// Posted to the host window by a pin's own menu: close every pin, and keep the thread.
 pub(super) const HOST_CLOSE_PINS: u32 = WM_APP + 3;
 
+/// The icon every Captastic executable embeds, which an editor shows in its title bar and the
+/// taskbar.
+const APPLICATION_ICON_RESOURCE_ID: usize = 1;
+
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 const STOP_POLL: Duration = Duration::from_millis(5);
 
 enum UiCommand {
-    Pin { frame: Box<CpuFrame>, at: Rect },
+    Pin {
+        frame: Box<CpuFrame>,
+        at: Rect,
+    },
+    Edit {
+        frame: Box<CpuFrame>,
+        at: Rect,
+        on_finish: EditFinished,
+    },
     ClosePins,
     MakePinsClickable,
 }
@@ -85,6 +99,23 @@ impl DesktopUi {
         self.request(UiCommand::Pin {
             frame: Box::new(frame),
             at,
+        })
+    }
+
+    /// Opens an editor on `frame`, on the display where the capture was taken. The frame should
+    /// already be [`CpuFrame::detached`]. `on_finish` is called on the desktop UI thread exactly
+    /// once, however the editor ends, unless this returns an error: then the request never
+    /// reached the thread and `on_finish` has been dropped uncalled.
+    pub fn edit(
+        &self,
+        frame: CpuFrame,
+        at: Rect,
+        on_finish: impl FnOnce(super::EditOutcome) + Send + 'static,
+    ) -> Result<(), CaptureError> {
+        self.request(UiCommand::Edit {
+            frame: Box::new(frame),
+            at,
+            on_finish: Box::new(on_finish),
         })
     }
 
@@ -161,6 +192,10 @@ struct HostState {
     commands: mpsc::Receiver<UiCommand>,
     instance: HINSTANCE,
     pins: Vec<HWND>,
+    editors: Vec<HWND>,
+    /// The overlay's typeface, which editors draw their toolbar in. Each overlay run registers
+    /// and removes its own, so this thread holds one for as long as it has windows to draw.
+    _font: PrivateFontResource,
 }
 
 fn run_host(
@@ -173,14 +208,41 @@ fn run_host(
         let module = unsafe { GetModuleHandleW(None) }
             .map_err(|error| desktop_error("get_module_handle", error.to_string()))?;
         let instance = HINSTANCE(module.0);
-        register_class(HOST_CLASS_NAME, instance, host_window_proc, None)?;
-        // SAFETY: IDC_SIZEALL is a valid system cursor resource.
-        let cursor = unsafe { LoadCursorW(None, IDC_SIZEALL) }.ok();
-        register_class(PIN_CLASS_NAME, instance, pin_window_proc, cursor)?;
+        let font = PrivateFontResource::register()?;
+        register_class(WNDCLASSW {
+            lpfnWndProc: Some(host_window_proc),
+            hInstance: instance,
+            lpszClassName: HOST_CLASS_NAME,
+            ..Default::default()
+        })?;
+        register_class(WNDCLASSW {
+            lpfnWndProc: Some(pin_window_proc),
+            hInstance: instance,
+            // SAFETY: IDC_SIZEALL is a valid system cursor resource.
+            hCursor: unsafe { LoadCursorW(None, IDC_SIZEALL) }.unwrap_or_default(),
+            lpszClassName: PIN_CLASS_NAME,
+            ..Default::default()
+        })?;
+        register_class(WNDCLASSW {
+            lpfnWndProc: Some(editor_window_proc),
+            hInstance: instance,
+            // SAFETY: Resource ID 1 is embedded into each Captastic executable at build time; a
+            // test binary has none, and the window class then uses the default icon.
+            hIcon: unsafe {
+                LoadIconW(instance, PCWSTR(APPLICATION_ICON_RESOURCE_ID as *const u16))
+            }
+            .unwrap_or_default(),
+            // SAFETY: IDC_ARROW is a valid system cursor resource.
+            hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
+            lpszClassName: EDITOR_CLASS_NAME,
+            ..Default::default()
+        })?;
         let state = Box::new(HostState {
             commands,
             instance,
             pins: Vec::new(),
+            editors: Vec::new(),
+            _font: font,
         });
         let state_pointer = Box::into_raw(state);
         // SAFETY: A message-only window of a class registered above; the state pointer is handed
@@ -233,25 +295,13 @@ fn run_host(
     HOST_WINDOW.with(|cell| cell.set(0));
     // Every window of every class is gone, so a later host can register them afresh. Failure
     // changes nothing: `register_class` accepts a class that is still registered.
-    for class in [PIN_CLASS_NAME, HOST_CLASS_NAME] {
+    for class in [EDITOR_CLASS_NAME, PIN_CLASS_NAME, HOST_CLASS_NAME] {
         // SAFETY: Unregisters a class registered by this thread, after its last window.
         let _ = unsafe { UnregisterClassW(class, instance) };
     }
 }
 
-fn register_class(
-    name: PCWSTR,
-    instance: HINSTANCE,
-    procedure: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
-    cursor: Option<HCURSOR>,
-) -> Result<(), CaptureError> {
-    let class = WNDCLASSW {
-        lpfnWndProc: Some(procedure),
-        hInstance: instance,
-        hCursor: cursor.unwrap_or_default(),
-        lpszClassName: name,
-        ..Default::default()
-    };
+fn register_class(class: WNDCLASSW) -> Result<(), CaptureError> {
     // SAFETY: class is fully initialized and its name is a static wide string.
     if unsafe { RegisterClassW(&class) } == 0 {
         let error = windows::core::Error::from_win32();
@@ -317,8 +367,12 @@ unsafe extern "system" fn host_window_proc(
             LRESULT(0)
         }
         HOST_STOP if !state_pointer.is_null() => {
-            // SAFETY: As above.
-            unsafe { close_pins(state_pointer) };
+            // SAFETY: As above. An editor closed here reports that it was discarded: shutdown
+            // never waits on a person (ADR 0010).
+            unsafe {
+                close_pins(state_pointer);
+                close_editors(state_pointer);
+            }
             // SAFETY: hwnd is this thread's live host window.
             let _ = unsafe { DestroyWindow(hwnd) };
             LRESULT(0)
@@ -347,6 +401,18 @@ unsafe fn apply(state: *mut HostState, command: UiCommand) {
                 Err(error) => log::warn!("could not pin the capture: {error}"),
             }
         }
+        UiCommand::Edit {
+            frame,
+            at,
+            on_finish,
+        } => {
+            // SAFETY: Per this function's contract; the borrow ends before create_editor runs.
+            let instance = unsafe { (*state).instance };
+            if let Some(editor) = create_editor(instance, *frame, at, on_finish) {
+                // SAFETY: As above.
+                unsafe { (*state).editors.push(editor) };
+            }
+        }
         // SAFETY: As above.
         UiCommand::ClosePins => unsafe { close_pins(state) },
         UiCommand::MakePinsClickable => {
@@ -372,6 +438,17 @@ unsafe fn close_pins(state: *mut HostState) {
     }
 }
 
+/// # Safety
+/// `state` must be the host window's live state, used only on its thread.
+unsafe fn close_editors(state: *mut HostState) {
+    // SAFETY: Per this function's contract, and taken for the same reason as the pins.
+    let editors = std::mem::take(unsafe { &mut (*state).editors });
+    for editor in editors {
+        // SAFETY: Each handle is an editor window created on this thread.
+        let _ = unsafe { DestroyWindow(editor) };
+    }
+}
+
 /// Removes a hosted window that is being destroyed from the host's lists. A window closed by the
 /// host is already out of them, since the host takes a list before closing what is in it.
 pub(super) fn forget_window(hwnd: HWND) {
@@ -383,7 +460,10 @@ pub(super) fn forget_window(hwnd: HWND) {
     }
     // SAFETY: The host state lives until the host's WM_NCDESTROY on this thread, and nothing else
     // holds a borrow of it while a hosted window is being destroyed.
-    unsafe { (*state).pins.retain(|pin| *pin != hwnd) };
+    unsafe {
+        (*state).pins.retain(|pin| *pin != hwnd);
+        (*state).editors.retain(|editor| *editor != hwnd);
+    }
 }
 
 pub(super) fn desktop_error(operation: &'static str, message: String) -> CaptureError {

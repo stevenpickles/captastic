@@ -9,6 +9,7 @@ use std::thread;
 use std::time::Instant;
 
 mod desktop_ui;
+mod editor;
 mod layout;
 mod machine;
 mod pin;
@@ -119,6 +120,7 @@ const UI_FONT_HEIGHT: i32 = 21;
 /// "Snap to Window Edges" would be plainer but measures 200 px against the 192 px a menu row has
 /// for text at 96 DPI, and widening the menu for one row is a worse trade than the shorter name.
 pub use desktop_ui::DesktopUi;
+pub use editor::EditOutcome;
 
 const SNAP_TO_WINDOWS_LABEL: &str = "Snap to Edges";
 /// The Options row for file output. Shorter than the notification area's "Save Captures to Disk"
@@ -4115,7 +4117,7 @@ fn draw_hover_tooltip(device: HDC, state: &OverlayState, layout: ToolbarLayout) 
         }
         Some(ToolbarControl::Edit) => {
             let value = if !state.model.edit_available {
-                "Editing is not available yet"
+                "Editing needs Captastic running in the notification area"
             } else if state.model.selection.is_some() {
                 "Edit before copying (Ctrl+Enter)"
             } else {
