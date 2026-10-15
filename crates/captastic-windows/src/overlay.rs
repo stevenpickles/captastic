@@ -1673,7 +1673,14 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                 let state = unsafe { &*state_pointer };
                 screen_point(state.model.source, lparam)
             };
-            run_machine(hwnd, state_pointer, OverlayInput::DoubleClicked { point })
+            run_machine(
+                hwnd,
+                state_pointer,
+                OverlayInput::DoubleClicked {
+                    point,
+                    modifiers: modifiers(),
+                },
+            )
         }
         WM_KEYDOWN if wparam.0 == usize::from(VK_RETURN.0) => {
             let intent = confirm_intent(modifiers());

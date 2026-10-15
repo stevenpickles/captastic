@@ -316,8 +316,9 @@ pub(super) enum OverlayInput {
     /// button-up point: without them a drag made with Ctrl held would snap at the last instant,
     /// and the rectangle the user let go of would not be the one they got.
     PointerUp { point: POINT, modifiers: Modifiers },
-    /// Primary button double-clicked anywhere.
-    DoubleClicked { point: POINT },
+    /// Primary button double-clicked anywhere. Off the toolbar it confirms, and Shift and Ctrl
+    /// ask for Pin and Edit as they do on Enter.
+    DoubleClicked { point: POINT, modifiers: Modifiers },
     /// Pointer capture was taken by another window. Self-initiated releases are consumed by the
     /// shell's protocol flag and never reach the machine.
     PointerCaptureLost,
@@ -495,7 +496,7 @@ pub(super) fn transition(model: &mut OverlayModel, input: OverlayInput) -> Vec<O
             Vec::new()
         }
         OverlayInput::PointerUp { point, modifiers } => pointer_up(model, point, modifiers),
-        OverlayInput::DoubleClicked { point } => double_clicked(model, point),
+        OverlayInput::DoubleClicked { point, modifiers } => double_clicked(model, point, modifiers),
         OverlayInput::PointerCaptureLost => pointer_capture_lost(model),
         OverlayInput::LoupeKeyChanged { held } => loupe_key_changed(model, held),
         OverlayInput::Tick { time_ms } => loupe_tick(model, time_ms),
@@ -1220,13 +1221,17 @@ fn window_preview_resolved(
     }
 }
 
-fn double_clicked(model: &mut OverlayModel, point: POINT) -> Vec<OverlayEffect> {
+fn double_clicked(
+    model: &mut OverlayModel,
+    point: POINT,
+    modifiers: Modifiers,
+) -> Vec<OverlayEffect> {
     let local = local_point(model.source, point);
     let layout = ToolbarLayout::new(model.display_environment, model.toolbar_position);
     if layout.hit_test(local, model.options_open).is_some() {
         return Vec::new();
     }
-    confirm(model, ConfirmIntent::Capture)
+    confirm_or_capture(model, confirm_intent(modifiers))
 }
 
 fn pointer_capture_lost(model: &mut OverlayModel) -> Vec<OverlayEffect> {
@@ -2324,7 +2329,10 @@ mod tests {
         };
         assert!(transition(
             &mut model,
-            OverlayInput::DoubleClicked { point: on_toolbar }
+            OverlayInput::DoubleClicked {
+                point: on_toolbar,
+                modifiers: Modifiers::default(),
+            }
         )
         .is_empty());
 
@@ -2332,12 +2340,31 @@ mod tests {
             &mut model,
             OverlayInput::DoubleClicked {
                 point: point(20, 20),
+                modifiers: Modifiers::default(),
             },
         );
-        assert!(matches!(
-            close_outcome(&effects),
-            Some(CloseOutcome::Confirmed { .. })
-        ));
+        assert_eq!(confirmed_intent(&effects), Some(ConfirmIntent::Capture));
+    }
+
+    #[test]
+    fn shift_and_ctrl_on_a_double_click_ask_for_pin_and_edit_as_they_do_on_enter() {
+        let double_click = |ctrl: bool, shift: bool| OverlayInput::DoubleClicked {
+            point: point(20, 20),
+            modifiers: Modifiers { ctrl, shift },
+        };
+        let mut model = region_model_with_selection();
+        model.edit_available = true;
+        let effects = transition(&mut model, double_click(true, false));
+        assert_eq!(confirmed_intent(&effects), Some(ConfirmIntent::Edit));
+
+        let mut model = region_model_with_selection();
+        let effects = transition(&mut model, double_click(false, true));
+        assert_eq!(confirmed_intent(&effects), Some(ConfirmIntent::Pin));
+
+        let mut model = region_model_with_selection();
+        model.edit_available = false;
+        let effects = transition(&mut model, double_click(true, false));
+        assert_eq!(confirmed_intent(&effects), Some(ConfirmIntent::Capture));
     }
 
     fn center(rect: super::super::layout::UiRect) -> POINT {
@@ -4871,6 +4898,7 @@ mod tests {
             OverlayInput::DisplayConfigurationInvalidated { reason: "test" },
             OverlayInput::DoubleClicked {
                 point: point(20, 20),
+                modifiers: Modifiers::default(),
             },
         ];
         for input in inputs {
