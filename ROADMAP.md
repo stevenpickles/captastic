@@ -94,10 +94,9 @@ Milestone 5's criterion vacuously and on purpose.
 **Status:** planning on `dev` (workspace version 0.4.0). Decided on 2026-10-15:
 
 - **Theme: recording.** 0.4.0 adds recording a region, window or display as an **animated GIF**,
-  with recording to video as the same feature's second output; see
-  [Milestone 9](#milestone-9--screen-recording-and-animated-gif). Its design comes first, as an
-  ADR, because it opens questions pinning and editing never had to answer: how a recording is
-  started, seen and stopped, what bounds its length and memory, and where the file goes.
+  and as MP4 video; see [Milestone 9](#milestone-9--screen-recording-and-animated-gif) and
+  [ADR 0011](docs/adr/0011-screen-recording.md), which settles how a recording is started, seen and
+  stopped, what bounds its length and memory, and where the file goes.
 - **The editor keeps improving alongside it.** Antialiased pen, marker, highlighter and swatch
   icons are the first 0.4.0 change; arrows and text (Milestone 6 slices 3 and 4) follow, and may
   ship in 0.4.0 or a 0.4.x on their own schedule.
@@ -106,10 +105,10 @@ Milestone 5's criterion vacuously and on purpose.
 
 ### Gates — before the tag
 
-- **Milestone 9's first slices merged and their exit criteria met**: at minimum recording a region
-  to an animated GIF on disk, started from the overlay and stopped from the notification area or a
-  hotkey, with a visible indicator for the whole recording. Video may follow in 0.4.x; a recording
-  that cannot be seen to be running, or cannot be stopped, may not ship.
+- **Milestone 9 merged and its exit criteria met**: recording a region, window or display to an
+  animated GIF and to MP4 on disk, started from the overlay's **Record** button and stopped by its
+  **Stop** bar or the time limit, with the indicator visible for the whole recording and absent from
+  it. A recording that cannot be seen to be running, or cannot be stopped, may not ship.
 - **A manual desktop checklist for every slice that changes overlay or desktop behaviour**, run
   before merge.
 - **The disposable-VM checklist** in [docs/chocolatey.md](docs/chocolatey.md), this time before the
@@ -716,39 +715,36 @@ Windows Graphics Capture for windows. Recording reuses those sources at a steady
 a streaming encoder, so a recording's memory is bounded by the encoder's window rather than its
 length.
 
-### Questions for its ADR (0011)
+### Decisions (ADR 0011)
 
-- **Entry point.** A **Record** action on the overlay toolbar beside Capture, Pin and Edit, a
-  dedicated hotkey that opens the overlay in a recording mode, or both.
-- **Seeing and stopping it.** A border around the recorded area that is excluded from the recording
-  itself, a notification-area state, and how it stops: the hotkey again, a stop button, the tray, a
-  time limit. A recording must never be running unseen.
-- **Formats.** GIF first, which needs palette quantization (per frame or shared), optional
-  dithering, and frame differencing to stay small; then MP4/H.264 through Windows Media Foundation,
-  which encodes in hardware where it can and adds no dependency. The GIF quantizer's licence matters:
-  `imagequant` is GPL, so the candidate is a permissively licensed one such as `color_quant`.
-- **Limits.** Frame rate (10–15 fps is ample for GIF), a maximum duration and output size, and what
-  happens at the limit.
-- **Contents.** The pointer is composited, as it is for stills, with click highlighting an option to
-  decide; audio is out of scope.
-- **Destination.** A file in the output directory and capture history, whether or not still-capture
-  file output is on, with the clipboard given the file (`CF_HDROP`) rather than pixels.
-- **Editing.** Whether a recording can be trimmed before it is saved, which would be the editor's
-  first non-still use.
+[ADR 0011](docs/adr/0011-screen-recording.md) settles them; the user-facing choices were made on
+2026-10-15.
+
+- **Start:** a **Record** button on the overlay toolbar, for every tool, and no recording hotkey.
+- **Seen and stopped:** a red border around the area with a **Stop** bar outside it, both excluded
+  from the recording; a recording stops at **Stop** or at `recording.max_seconds` (60 by default),
+  and every other ending (exit, display change, the window closing) finalizes what was recorded.
+- **Formats:** GIF and MP4 both in 0.4.0, chosen by an Options row, **Record As**. GIF at 15 fps,
+  at most 1280 px on its longer side, NeuQuant palettes and transparent unchanged pixels; MP4 at
+  30 fps and native size through Media Foundation's H.264 encoder.
+- **Destination:** a file in the output directory and history, always; the clipboard is untouched,
+  and a balloon names the file.
+- **Memory:** frames stream through a bounded queue to an encoder thread; a slow encoder drops the
+  oldest unencoded frame rather than grow.
+- **Not in 0.4.0:** audio, trimming, and still captures while a recording runs.
 
 ### Proposed slices
 
-1. **ADR 0011**, settling the questions above.
-2. **The recording engine.** Frames from the existing sources at a steady rate into a bounded queue,
-   a recording state the daemon owns, and a stop path that always finalizes a valid file.
-3. **Animated GIF output.** Quantization, frame differencing and streaming encode on a worker, with
-   size and duration limits.
-4. **Starting, seeing and stopping a recording.** The overlay entry, the excluded border, the
-   notification-area state, and the stop controls, with the result saved and reported.
-5. **Video output.** MP4 through Media Foundation, offered beside GIF.
-6. **Trim before saving**, if the ADR decides it belongs in 0.4.
+1. **The recording engine.** Frames from the existing sources at a steady rate into a bounded queue,
+   a recording state the daemon owns, still captures refused while it runs, and a stop path that
+   always finalizes a valid file.
+2. **Animated GIF output.** NeuQuant quantization, transparent unchanged pixels and streaming encode
+   on a worker, with the dimension and duration limits.
+3. **Starting, seeing and stopping a recording.** The **Record** button, the **Record As** row, the
+   excluded border and its **Stop** bar, the time limit, and the saved-file balloon.
+4. **MP4 output** through Media Foundation's sink writer.
 
-Slices 1–4 gate the 0.4.0 tag; 5 and 6 may follow in 0.4.x.
+All four gate the 0.4.0 tag.
 
 ### Exit criteria
 
@@ -852,8 +848,8 @@ The order below reflects what remains.
 
 1. See the first Chocolatey community submission through validation and moderation, and run the
    disposable-VM checklist that v0.3.0 shipped without; a defect it finds is a 0.3.x patch.
-2. 0.4.0's theme, recording ([Milestone 9](#milestone-9--screen-recording-and-animated-gif)):
-   ADR 0011 first, then the engine, GIF output, and the controls to start, see and stop it.
+2. 0.4.0's theme, recording ([Milestone 9](#milestone-9--screen-recording-and-animated-gif)), as
+   ADR 0011 settles it: the engine, GIF output, the controls to start, see and stop it, and MP4.
 3. Milestone 6's remaining slices beside it: arrows and text on the editor model, then reopening a
    capture from history in the editor.
 4. Finish Milestone 5's evidence work, which is now measurement rather than code: the operator
@@ -884,9 +880,11 @@ not reproduced on demand, is in
 
 ## Recommended next branch
 
-`docs/adr-0011-recording`: ADR 0011, settling Milestone 9's questions (entry point, the indicator
-and stopping, formats, limits, contents, destination, trimming) before any recording code. The
-antialiased editor icons (`feature/71/editor-icons`) are the first 0.4.0 change, already built.
+`feature/72/recording-engine`: Milestone 9 slice 1 as [ADR 0011](docs/adr/0011-screen-recording.md)
+describes it — frames from the existing sources at a steady rate into a bounded queue of detached
+copies, a recording state the daemon owns, still captures refused while it runs, and a stop path
+that always finalizes. The antialiased editor icons (`feature/71/editor-icons`) are the first 0.4.0
+change, already built.
 Alongside: the disposable-VM checklist in [docs/chocolatey.md](docs/chocolatey.md) that v0.3.0
 shipped without, whatever the Chocolatey moderators ask of the first submission, and Milestone 6's
 arrow tool when it fits.
