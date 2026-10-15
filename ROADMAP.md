@@ -99,8 +99,9 @@ Milestone 5's criterion vacuously and on purpose.
 - **The Chocolatey community push waits for 0.3.0** rather than catching up v0.1.0 or v0.2.0.
 
 Already on `dev`: PR #99 (a host-independent compare test), #100 (the overlay's Save to Disk row and
-an honest clipboard row) and #101. Next to land: relaunching Captastic after a Chocolatey upgrade
-that stopped it (`feature/67/relaunch-after-upgrade`).
+an honest clipboard row), #101, #102 (this plan) and #103 (relaunching Captastic after a Chocolatey
+upgrade that stopped it, merged with its desktop check still to run). Milestone 6's design is
+settled in [ADR 0010](docs/adr/0010-pinning-and-annotation.md).
 
 ### Gates — before the tag
 
@@ -520,36 +521,34 @@ capture-engine identity.
 - Keep annotation resources lazy and absent from direct clipboard/file hotkeys.
 - Define whether editing is modal or concurrent before adding capture-history integration.
 
-### Decisions to settle first
+### Decisions (ADR 0010)
 
-One ADR, written before the first slice, because each answer shapes every slice after it:
+Settled with Steven on 2026-10-15 and recorded in
+[ADR 0010](docs/adr/0010-pinning-and-annotation.md):
 
-- **Where the tools are reached.** Candidates: actions on the overlay toolbar beside **Capture**
-  (for example **Pin** and **Edit**), a post-capture affordance, and notification-area items for the
-  last capture. The overlay is where the user already is when they decide; the tray is where they
-  are afterwards.
-- **Modal or concurrent.** Whether an editor or a pinned window may stay open while the hotkey
-  starts another overlay run, and what owns the screen when both exist.
-- **Where an edited result goes.** Whether it replaces the clipboard and writes a new file through
-  the destination set, never overwriting the capture it started from.
-- **Whether pinned windows appear in captures.** The exit criterion says a pinned window is never a
-  capture *candidate* (the window chooser, edge snapping) unless asked for; whether one shows in a
-  display or region capture, as anything else on screen does, is a separate choice.
-- **Frame ownership.** A pinned window or an editor must copy its pixels out of the CPU readback
-  pool rather than hold a pooled frame: the pool has three slots, and v0.2.0's soak showed that a
-  destination holding a lease for long is what produces `BufferExhausted` refusals.
+- **Entry points:** **Pin** and **Edit** buttons beside **Capture** on a widened overlay toolbar,
+  with **Shift+Enter** and **Ctrl+Enter**; greyed in a run with no daemon behind it.
+- **Concurrency:** pins and editors stay open, any number of each, while the hotkey keeps working.
+  They live on one lazily started UI thread, `captastic-desktop-ui`.
+- **Output:** **Pin** publishes the capture as usual and also pins it. **Edit** publishes nothing
+  until **Done**, then only the edited image; cancelling publishes nothing.
+- **Pins in captures:** visible in display and region captures and to other applications' screen
+  sharing, never offered by the window chooser or snapped to.
+- **Frame ownership:** pins and editors deep-copy the confirmed frame and never hold a CPU readback
+  slot.
 
 ### Proposed slices
 
 Each lands as its own pull request with a manual desktop checklist.
 
-1. **Pin a capture.** An always-on-top window showing a confirmed capture at its physical size, with
-   move, close, opacity and click-through, and excluded from the window chooser and edge snapping.
-   First because it is the smallest end-to-end path through the new frame ownership and the window
-   shell, with no editing model yet.
+1. **Pin a capture.** The `captastic-desktop-ui` thread, the frame copy, the widened toolbar and the
+   shortcuts, and an always-on-top window showing a confirmed capture at its physical size, with
+   move, close, opacity and click-through, plus **Close All Pins** and **Make Pins Clickable** in the
+   notification area. First because it is the smallest end-to-end path through the new thread, frame
+   ownership and window shell, with no editing model yet.
 2. **Editor shell, crop and redaction.** The editor window and model, crop adjustment, and
-   destructive redaction (pixels overwritten in the exported frame, never a reversible layer), with
-   the result published through the destination set.
+   destructive redaction (an opaque fill over the exported pixels, never a blur or a reversible
+   layer), with the capture withheld until **Done** and then published through the destination set.
 3. **Shapes and highlights.** Arrows, rectangles and highlights on the editor model.
 4. **Text.** Text annotations, with DPI-correct font rendering in the exported pixels.
 5. **History integration.** Opening a recent capture in the editor, once modal versus concurrent is
@@ -756,11 +755,11 @@ disposition are recorded in
 [docs/investigations.md](docs/investigations.md#the-2026-08-code-architecture-and-roadmap-review).
 The order below reflects what remains.
 
-1. Land the relaunch after a Chocolatey upgrade (`feature/67/relaunch-after-upgrade`), the last
-   packaging change 0.3.0 needs before its theme work.
-2. Write the Milestone 6 ADR (the [decisions to settle first](#decisions-to-settle-first)), then
-   build slices 1 and 2 — pinning, then the editor with crop and redaction — each with its manual
-   checklist. They gate the 0.3.0 tag.
+1. Run #103's desktop check: two Chocolatey upgrades between builds that carry the relaunch, the
+   second with Captastic running, which should leave it running and unelevated.
+2. Build Milestone 6 slices 1 and 2 as [ADR 0010](docs/adr/0010-pinning-and-annotation.md) settles
+   them — pinning, then the editor with crop and redaction — each with its manual checklist. They
+   gate the 0.3.0 tag.
 3. Ship 0.3.0: the disposable-VM checklist (portable installer and upgrade relaunch included),
    release notes, the branch model, and the first Chocolatey community push. Milestone 6's
    remaining slices can follow as 0.3.x.
@@ -792,12 +791,17 @@ not reproduced on demand, is in
 
 ## Recommended next branch
 
-`feature/67/relaunch-after-upgrade` is open and needs only its desktop check: with Captastic running,
-a Chocolatey upgrade to a newer 0.3 prerelease should leave it running afterwards, unelevated.
+`feature/68/pin-a-capture`: Milestone 6 slice 1 as
+[ADR 0010](docs/adr/0010-pinning-and-annotation.md) describes it. In order: the
+`captastic-desktop-ui` thread and its registration with the worker registry; the deep copy of the
+confirmed frame; the pinned window itself; the widened toolbar with **Pin** and **Edit** (Edit
+greyed until slice 2) and **Shift+Enter**; the notification-area **Close All Pins** and **Make Pins
+Clickable**; and a test that pins the process-ID exclusion from the chooser and snapping. Its
+manual checklist covers 100 % and 200 % scaling, a pin surviving several further overlay runs, and a
+pin appearing in a display capture.
 
-After it, the Milestone 6 ADR: a short document, not a branch of code, that settles the entry points,
-modal versus concurrent editing, where an edited result goes, whether pinned windows appear in
-captures, and frame ownership. Then slice 1, pinning, as the first code branch of the theme.
+Alongside it, #103's desktop check needs two upgrades between relaunch-carrying builds; the packages
+are in `dist`.
 
 FakeBackend fidelity keeps its leverage and is worth extending as gaps appear: much of Milestone 4
 shipped with daemon-side behaviour verified only by unit tests, because a second daemon cannot start
