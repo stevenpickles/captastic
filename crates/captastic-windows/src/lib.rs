@@ -59,7 +59,8 @@ pub use overlay::{
     select_from_frozen_frame_with_initial_tool, select_from_frozen_frame_with_initial_tool_and_ui,
     select_from_preview_source_with_initial_tool_and_ui, InitialSelectionTool, NativeWindowHandle,
     OverlayController, OverlayDestinations, OverlayResources, OverlaySelection, OverlayUiUpdate,
-    PreviewView, SelectionKind, SelectionOutcome, SelectionPreviewSource, DISPLAY_CHANGE_MONITORS,
+    PinHost, PreviewView, SelectionKind, SelectionOutcome, SelectionPreviewSource,
+    DISPLAY_CHANGE_MONITORS,
 };
 #[cfg(windows)]
 pub use session::{desktop_state, DesktopState};

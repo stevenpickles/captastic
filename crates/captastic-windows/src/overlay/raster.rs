@@ -943,6 +943,61 @@ pub(super) fn draw_region_icon(device: HDC, bounds: UiRect, color: COLORREF, met
     }
 }
 
+/// A push pin: a round head on a short shaft, tilted the way a pin sits in a board.
+pub(super) fn draw_pin_icon(device: HDC, bounds: UiRect, color: COLORREF, metrics: UiMetrics) {
+    let tokens = metrics.toolbar_tokens();
+    let size = tokens.icon_size;
+    let left = (bounds.left + bounds.right - size) / 2;
+    let top = (bounds.top + bounds.bottom - size) / 2;
+    let head = size / 2;
+    // The head sits in the upper right, the point in the lower left.
+    let head_left = left + size - head;
+    draw_ellipse(
+        device,
+        head_left,
+        top,
+        head_left + head,
+        top + head,
+        color,
+        tokens.icon_stroke,
+    );
+    draw_lines(
+        device,
+        &[
+            (head_left + head / 4, top + head - head / 4),
+            (left, top + size),
+        ],
+        color,
+        tokens.icon_stroke,
+    );
+}
+
+/// A pencil: a slanted body with a pointed tip at the lower left.
+pub(super) fn draw_edit_icon(device: HDC, bounds: UiRect, color: COLORREF, metrics: UiMetrics) {
+    let tokens = metrics.toolbar_tokens();
+    let size = tokens.icon_size;
+    let left = (bounds.left + bounds.right - size) / 2;
+    let top = (bounds.top + bounds.bottom - size) / 2;
+    let width = (size / 4).max(2);
+    let tip = (left, top + size);
+    let body_start = (left + width, top + size - width);
+    let end = (left + size, top);
+    draw_lines(
+        device,
+        &[
+            tip,
+            (body_start.0 - width / 2, body_start.1 - width / 2),
+            (end.0 - width, end.1),
+            end,
+            (end.0, end.1 + width),
+            (body_start.0 + width / 2, body_start.1 + width / 2),
+            tip,
+        ],
+        color,
+        tokens.icon_stroke,
+    );
+}
+
 pub(super) fn draw_camera_icon(
     device: HDC,
     left: i32,

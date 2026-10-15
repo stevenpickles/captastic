@@ -1,6 +1,6 @@
 use windows::Win32::Foundation::POINT;
 
-const TOOLBAR_WIDTH: i32 = 418;
+const TOOLBAR_WIDTH: i32 = 514;
 const TOOLBAR_HEIGHT: i32 = 56;
 const TOOLBAR_BOTTOM_MARGIN: i32 = 24;
 const MENU_WIDTH: i32 = 248;
@@ -13,6 +13,8 @@ pub(super) enum ToolbarControl {
     Window,
     Region,
     Options,
+    Pin,
+    Edit,
     Capture,
     DimBackground,
     SnapToWindows,
@@ -457,6 +459,8 @@ pub(super) struct ToolbarLayout {
     pub(super) window: UiRect,
     pub(super) region: UiRect,
     pub(super) options: UiRect,
+    pub(super) pin: UiRect,
+    pub(super) edit: UiRect,
     pub(super) capture: UiRect,
     pub(super) menu: UiRect,
     pub(super) dim_background: UiRect,
@@ -541,10 +545,22 @@ impl ToolbarLayout {
             right: left + metrics.px(284),
             bottom: control_bottom,
         };
-        let capture = UiRect {
+        let pin = UiRect {
             left: left + metrics.px(292),
             top: control_top,
-            right: left + metrics.px(412),
+            right: left + metrics.px(336),
+            bottom: control_bottom,
+        };
+        let edit = UiRect {
+            left: left + metrics.px(336),
+            top: control_top,
+            right: left + metrics.px(380),
+            bottom: control_bottom,
+        };
+        let capture = UiRect {
+            left: left + metrics.px(388),
+            top: control_top,
+            right: left + metrics.px(508),
             bottom: control_bottom,
         };
 
@@ -589,6 +605,8 @@ impl ToolbarLayout {
             window,
             region,
             options,
+            pin,
+            edit,
             capture,
             dim_background: UiRect {
                 left: row_left,
@@ -672,6 +690,10 @@ impl ToolbarLayout {
             Some(ToolbarControl::Region)
         } else if self.options.contains(point) {
             Some(ToolbarControl::Options)
+        } else if self.pin.contains(point) {
+            Some(ToolbarControl::Pin)
+        } else if self.edit.contains(point) {
+            Some(ToolbarControl::Edit)
         } else if self.capture.contains(point) {
             Some(ToolbarControl::Capture)
         } else {
@@ -1052,10 +1074,10 @@ mod tests {
     #[test]
     fn compact_toolbar_scales_at_supported_dpi_levels() {
         for (dpi, expected_width, expected_height, expected_menu) in [
-            (96, 418, 56, (248, 292)),
-            (120, 523, 70, (310, 365)),
-            (144, 627, 84, (372, 438)),
-            (192, 836, 112, (496, 584)),
+            (96, 514, 56, (248, 292)),
+            (120, 643, 70, (310, 365)),
+            (144, 771, 84, (372, 438)),
+            (192, 1028, 112, (496, 584)),
         ] {
             let environment = DisplayEnvironment {
                 work_area: UiRect {

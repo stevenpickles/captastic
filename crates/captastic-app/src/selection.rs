@@ -1105,6 +1105,9 @@ fn overlay_destinations(names: &[&'static str]) -> captastic_windows::OverlayDes
         clipboard: names.contains(&crate::clipboard::DESTINATION_NAME),
         file_output: names.contains(&crate::file_output::DESTINATION_NAME),
         file_output_switchable: true,
+        // Not yet: nothing hosts a pinned window. The next commit gives the worker one.
+        pin_available: false,
+        edit_available: false,
     }
 }
 
