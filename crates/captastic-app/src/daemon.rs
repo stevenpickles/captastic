@@ -1321,6 +1321,25 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                         }
                     }
                 }
+                // The Options menu's Save to Disk row, acted on here because the worker registry
+                // and the destination set live on this thread. The request normally lands within
+                // a tick of the click, while the overlay is still open, so the confirmation that
+                // follows goes to the set as the user just left it; one confirmed inside that
+                // tick still goes to the set as it was.
+                if let Some(requested) = workers
+                    .selection()
+                    .and_then(crate::selection::SelectionWorker::take_file_output_request)
+                {
+                    set_file_output_enabled(
+                        &args,
+                        &mut workers,
+                        &destinations,
+                        tray.as_ref(),
+                        &mut last_persistence_notification,
+                        requested,
+                        "overlay",
+                    );
+                }
                 if let Some(worker) = workers.selection() {
                     while let Some(failure) = worker.try_recv_persistence_failure() {
                         if let Some(tray) = tray.as_ref() {
