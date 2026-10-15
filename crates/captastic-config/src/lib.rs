@@ -22,7 +22,7 @@ mod ui_state;
 use fsio::{maintain_config_artifacts, quarantine_config};
 
 pub use captastic_core::OutputFormat;
-pub use config_edit::set_output_enabled;
+pub use config_edit::{set_output_enabled, set_recording_format};
 pub use filename_template::{validate_template, TOKENS as FILENAME_TEMPLATE_TOKENS};
 pub use fsio::{atomic_write, finalize_new, replace_file};
 pub use history::{
