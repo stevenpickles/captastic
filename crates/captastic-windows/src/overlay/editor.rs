@@ -1,5 +1,5 @@
-//! The editor: a window that crops and redacts a capture before it is published (ADR 0010,
-//! Milestone 6 slice 2).
+//! The editor: a window that crops, redacts and marks up a capture before it is published
+//! (ADR 0010, Milestone 6 slices 2 and 3).
 //!
 //! Editors live on the `captastic-desktop-ui` thread beside the pins, any number at once. What
 //! they edit is a [`captastic_core::Edit`]; this module is the window around it. Nothing an editor
@@ -8,15 +8,22 @@
 //! Exactly one [`EditOutcome`] is reported for every editor, whichever way it ends.
 //!
 //! The capture is shown at its physical size when the window has room, and scaled down when it
-//! does not. Redactions are shown as the opaque fill they will be published as, so what is on
-//! screen is what will be sent.
+//! does not. Every mark - a redaction, a box, a pen, marker or highlighter stroke - is painted into
+//! the preview by the same code that paints the published image, so what is on screen is what will
+//! be sent. A mark being drawn is painted the same way as it grows, redrawing only the pixels it
+//! covers.
 
 use captastic_core::{
-    paint_mark, CaptureError, CpuFrame, Edit, FrameAlpha, Mark, PixelFormat, Rect,
+    paint_mark, CaptureError, Color, CpuFrame, Edit, FrameAlpha, Mark, PixelFormat, Rect,
+    StrokeStyle,
 };
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{BeginPaint, BitBlt, EndPaint, GdiFlush, PAINTSTRUCT, SRCCOPY};
+use windows::Win32::Foundation::{
+    BOOL, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+};
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, BitBlt, EndPaint, GdiFlush, HDC, PAINTSTRUCT, SRCCOPY,
+};
 use windows::Win32::UI::HiDpi::AdjustWindowRectExForDpi;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE, VK_RETURN,
@@ -34,7 +41,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use super::desktop_ui::{desktop_error, forget_window, release_window_state, window_state};
 use super::layout::{UiMetrics, UiRect};
 use super::raster::{
-    draw_outline_rect, draw_round_box, draw_surface_to_rect, draw_text, fill_device_rect, rgb,
+    draw_edit_icon, draw_ellipse, draw_filled_ellipse, draw_lines, draw_outline_rect,
+    draw_round_box, draw_surface_to_rect, draw_text, fill_device_rect, measure_ui_text, rgb,
     TextAlignment,
 };
 use super::shell::{
@@ -50,15 +58,24 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 const TOOLBAR_HEIGHT_DIP: i32 = 52;
 const TOOLBAR_PADDING_DIP: i32 = 8;
 const BUTTON_HEIGHT_DIP: i32 = 36;
+const ICON_BUTTON_WIDTH_DIP: i32 = 36;
+const ICON_BUTTON_GAP_DIP: i32 = 4;
+const SWATCH_WIDTH_DIP: i32 = 28;
+const SWATCH_DIAMETER_DIP: i32 = 18;
+const SWATCH_GAP_DIP: i32 = 2;
+const TEXT_BUTTON_WIDTH_DIP: i32 = 84;
 const BUTTON_GAP_DIP: i32 = 6;
-const GROUP_GAP_DIP: i32 = 16;
+const GROUP_GAP_DIP: i32 = 12;
 const CANVAS_PADDING_DIP: i32 = 16;
 /// How far from a crop edge a press still takes hold of it.
 const GRIP_TOLERANCE_DIP: i32 = 8;
 const HANDLE_SIZE_DIP: i32 = 8;
 /// How far the pointer must travel before a press becomes a drag, so a click draws nothing.
 const DRAG_THRESHOLD_DIP: i32 = 3;
-const MINIMUM_CLIENT_DIP: (i32, i32) = (560, 320);
+/// How far, in capture pixels, the pointer must move before a stroke takes another point.
+const STROKE_STEP: f32 = 0.75;
+/// Wide enough for every button and swatch at every scaling.
+const MINIMUM_CLIENT_DIP: (i32, i32) = (740, 320);
 /// The share of the display's work area a new editor may take.
 const MAXIMUM_WORK_AREA_SHARE: f64 = 0.9;
 
@@ -66,6 +83,18 @@ const MAXIMUM_WORK_AREA_SHARE: f64 = 0.9;
 const DIM_FIFTHS: u16 = 2;
 const CANVAS_RGB: (u8, u8, u8) = (24, 24, 27);
 const ACCENT_RGB: (u8, u8, u8) = (45, 125, 246);
+
+/// The colours a mark can be drawn in, with the name each swatch's tooltip gives.
+const PALETTE: [(&str, Color); 6] = [
+    ("Red", Color::rgb(229, 57, 53)),
+    ("Yellow", Color::rgb(253, 216, 53)),
+    ("Green", Color::rgb(67, 160, 71)),
+    ("Blue", Color::rgb(30, 136, 229)),
+    ("Black", Color::rgb(0, 0, 0)),
+    ("White", Color::rgb(255, 255, 255)),
+];
+const RED: usize = 0;
+const YELLOW: usize = 1;
 
 /// How an editor ended. Reported exactly once per editor.
 #[derive(Debug)]
@@ -88,12 +117,62 @@ pub type EditFinished = Box<dyn FnOnce(EditOutcome) + Send>;
 enum EditorTool {
     Crop,
     Redact,
+    Box,
+    Pen,
+    Marker,
+    Highlighter,
+}
+
+impl EditorTool {
+    const ALL: [Self; 6] = [
+        Self::Crop,
+        Self::Redact,
+        Self::Box,
+        Self::Pen,
+        Self::Marker,
+        Self::Highlighter,
+    ];
+
+    /// Which of the drawing tools' remembered colours this tool uses, if it draws in colour.
+    const fn colour_slot(self) -> Option<usize> {
+        match self {
+            Self::Crop | Self::Redact => None,
+            Self::Box => Some(0),
+            Self::Pen => Some(1),
+            Self::Marker => Some(2),
+            Self::Highlighter => Some(3),
+        }
+    }
+
+    /// How wide the tool draws, in device-independent pixels of the display the capture came
+    /// from, so a pen is the same weight on a capture from any scaling.
+    const fn width_dip(self) -> f32 {
+        match self {
+            Self::Pen => 3.0,
+            Self::Box => 4.0,
+            Self::Marker => 10.0,
+            Self::Highlighter => 22.0,
+            Self::Crop | Self::Redact => 0.0,
+        }
+    }
+
+    const fn tooltip(self) -> &'static str {
+        match self {
+            Self::Crop => "Crop (C)",
+            Self::Redact => "Redact (R)",
+            Self::Box => "Box (B)",
+            Self::Pen => "Pen (P)",
+            Self::Marker => "Marker (M)",
+            Self::Highlighter => "Highlighter (H)",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EditorButton {
-    Crop,
-    Redact,
+    Tool(EditorTool),
+    /// A colour in [`PALETTE`], by index.
+    Swatch(usize),
     Undo,
     Redo,
     Cancel,
@@ -101,33 +180,25 @@ enum EditorButton {
 }
 
 impl EditorButton {
-    const fn label(self) -> &'static str {
+    fn tooltip(self) -> Option<String> {
         match self {
-            Self::Crop => "Crop",
-            Self::Redact => "Redact",
-            Self::Undo => "Undo",
-            Self::Redo => "Redo",
-            Self::Cancel => "Cancel",
-            Self::Done => "Done",
-        }
-    }
-
-    const fn width_dip(self) -> i32 {
-        match self {
-            Self::Crop | Self::Undo | Self::Redo => 64,
-            Self::Redact => 76,
-            Self::Cancel | Self::Done => 84,
+            Self::Tool(tool) => Some(tool.tooltip().to_owned()),
+            Self::Swatch(index) => Some(format!("{} ({})", PALETTE[index].0, index + 1)),
+            Self::Undo => Some("Undo (Ctrl+Z)".to_owned()),
+            Self::Redo => Some("Redo (Ctrl+Y)".to_owned()),
+            Self::Cancel | Self::Done => None,
         }
     }
 }
 
 /// Where everything in an editor's client area is, for one client size and DPI.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct EditorLayout {
     client: UiRect,
     toolbar: UiRect,
-    buttons: [(EditorButton, UiRect); 6],
-    /// Between the editing buttons and Cancel, for the size of the crop.
+    /// Left to right.
+    buttons: Vec<(EditorButton, UiRect)>,
+    /// Between Redo and Cancel, for the size of the crop; empty when there is no room.
     size_label: UiRect,
     canvas: UiRect,
     /// Where the capture is drawn.
@@ -147,44 +218,67 @@ impl EditorLayout {
         let button_height = metrics.px(BUTTON_HEIGHT_DIP);
         let top = toolbar.top + (toolbar.bottom - toolbar.top - button_height) / 2;
         let bottom = top + button_height;
-        let gap = metrics.px(BUTTON_GAP_DIP);
+        let mut buttons = Vec::with_capacity(16);
         let mut x = client.left + metrics.px(TOOLBAR_PADDING_DIP);
-        let mut place_left = |button: EditorButton, extra_gap: i32| {
-            x += extra_gap;
-            let left = x;
-            x += metrics.px(button.width_dip());
+        let mut place = |button: EditorButton, width_dip: i32, gap_dip: i32| {
             let rect = UiRect {
-                left,
+                left: x,
                 top,
-                right: x,
+                right: x + metrics.px(width_dip),
                 bottom,
             };
-            x += gap;
-            (button, rect)
+            x = rect.right + metrics.px(gap_dip);
+            buttons.push((button, rect));
         };
-        let crop = place_left(EditorButton::Crop, 0);
-        let redact = place_left(EditorButton::Redact, 0);
-        let undo = place_left(EditorButton::Undo, metrics.px(GROUP_GAP_DIP) - gap);
-        let redo = place_left(EditorButton::Redo, 0);
-        let left_end = redo.1.right;
-        let mut right = client.right - metrics.px(TOOLBAR_PADDING_DIP);
-        let mut place_right = |button: EditorButton| {
-            let rect = UiRect {
-                left: right - metrics.px(button.width_dip()),
-                top,
-                right,
-                bottom,
-            };
-            right = rect.left - gap;
-            (button, rect)
-        };
-        let done = place_right(EditorButton::Done);
-        let cancel = place_right(EditorButton::Cancel);
+        // Each group ends with the gap to the next, so the closure is the only thing moving `x`.
+        for (index, tool) in EditorTool::ALL.into_iter().enumerate() {
+            let last = index + 1 == EditorTool::ALL.len();
+            place(
+                EditorButton::Tool(tool),
+                ICON_BUTTON_WIDTH_DIP,
+                if last {
+                    GROUP_GAP_DIP
+                } else {
+                    ICON_BUTTON_GAP_DIP
+                },
+            );
+        }
+        for index in 0..PALETTE.len() {
+            let last = index + 1 == PALETTE.len();
+            place(
+                EditorButton::Swatch(index),
+                SWATCH_WIDTH_DIP,
+                if last { GROUP_GAP_DIP } else { SWATCH_GAP_DIP },
+            );
+        }
+        place(
+            EditorButton::Undo,
+            ICON_BUTTON_WIDTH_DIP,
+            ICON_BUTTON_GAP_DIP,
+        );
+        place(EditorButton::Redo, ICON_BUTTON_WIDTH_DIP, 0);
+        let left_end = x;
+        let done_left = client.right - metrics.px(TOOLBAR_PADDING_DIP + TEXT_BUTTON_WIDTH_DIP);
+        let cancel_left = done_left - metrics.px(BUTTON_GAP_DIP + TEXT_BUTTON_WIDTH_DIP);
+        for (button, left) in [
+            (EditorButton::Cancel, cancel_left),
+            (EditorButton::Done, done_left),
+        ] {
+            buttons.push((
+                button,
+                UiRect {
+                    left,
+                    top,
+                    right: left + metrics.px(TEXT_BUTTON_WIDTH_DIP),
+                    bottom,
+                },
+            ));
+        }
+        let label_left = left_end + metrics.px(GROUP_GAP_DIP);
         let size_label = UiRect {
-            left: left_end + metrics.px(GROUP_GAP_DIP),
+            left: label_left,
             top,
-            right: (cancel.1.left - metrics.px(GROUP_GAP_DIP))
-                .max(left_end + metrics.px(GROUP_GAP_DIP)),
+            right: (cancel_left - metrics.px(GROUP_GAP_DIP)).max(label_left),
             bottom,
         };
         let canvas = UiRect {
@@ -206,7 +300,7 @@ impl EditorLayout {
         Self {
             client,
             toolbar,
-            buttons: [crop, redact, undo, redo, cancel, done],
+            buttons,
             size_label,
             canvas,
             image: UiRect {
@@ -224,6 +318,13 @@ impl EditorLayout {
             .iter()
             .find(|(_, rect)| rect.contains(point))
             .map(|(button, _)| *button)
+    }
+
+    fn button_rect(&self, wanted: EditorButton) -> Option<UiRect> {
+        self.buttons
+            .iter()
+            .find(|(button, _)| *button == wanted)
+            .map(|(_, rect)| *rect)
     }
 
     /// The capture pixel position under a client point, unclamped and fractional.
@@ -406,9 +507,9 @@ fn compose_preview(source: &CpuFrame, marks: &[Mark]) -> Vec<u8> {
 }
 
 /// A press on the canvas, and what it is doing.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum Drag {
-    /// Drawing a redaction, or a crop from scratch.
+    /// Drawing a rectangle between two points: a redaction, a box, or a crop from scratch.
     Draw {
         tool: EditorTool,
         anchor: POINT,
@@ -422,6 +523,11 @@ enum Drag {
         anchor: POINT,
         current: POINT,
     },
+    /// A freehand stroke with the pen, marker or highlighter, in capture pixels.
+    Stroke {
+        tool: EditorTool,
+        points: Vec<(f32, f32)>,
+    },
 }
 
 /// One editor's state, owned by its window.
@@ -429,9 +535,20 @@ struct EditorState {
     edit: Edit,
     metrics: UiMetrics,
     layout: EditorLayout,
+    /// The capture with every committed mark, as shown; the preview is this plus the mark being
+    /// drawn.
+    committed: Vec<u8>,
     preview: FrozenSurface,
+    /// The part of the preview the mark being drawn has changed, to restore from `committed`.
+    pending_dirty: Option<Rect>,
     back_buffer: Option<FrozenSurface>,
     tool: EditorTool,
+    /// The drawing tool a swatch applies to while Crop or Redact is chosen.
+    last_drawing_tool: EditorTool,
+    /// The palette index each drawing tool draws in, by [`EditorTool::colour_slot`].
+    colours: [usize; 4],
+    /// Capture pixels per device-independent pixel on the display the capture came from.
+    stroke_unit: f32,
     drag: Option<Drag>,
     pressed: Option<EditorButton>,
     hovered: Option<EditorButton>,
@@ -440,26 +557,20 @@ struct EditorState {
 }
 
 impl EditorState {
-    /// What a drag in progress would make, if it ended here: a rectangle and the tool it is for.
-    fn pending(&self) -> Option<(EditorTool, Rect)> {
+    /// The crop a drag in progress would make, if it ended here.
+    fn pending_crop(&self) -> Option<Rect> {
         let bounds = self.edit.bounds();
-        match self.drag? {
+        match self.drag.as_ref()? {
             Drag::Draw {
-                tool,
+                tool: EditorTool::Crop,
                 anchor,
                 current,
-                moved,
-            } => {
-                if !moved {
-                    return None;
-                }
-                let rect = rect_between(
-                    self.layout.image_point(anchor),
-                    self.layout.image_point(current),
-                )?
-                .intersection(bounds)?;
-                Some((tool, rect))
-            }
+                moved: true,
+            } => rect_between(
+                self.layout.image_point(*anchor),
+                self.layout.image_point(*current),
+            )?
+            .intersection(bounds),
             Drag::Crop {
                 grip,
                 start,
@@ -468,8 +579,64 @@ impl EditorState {
             } => {
                 let dx = (f64::from(current.x - anchor.x) / self.layout.scale).round() as i64;
                 let dy = (f64::from(current.y - anchor.y) / self.layout.scale).round() as i64;
-                Some((EditorTool::Crop, adjust_crop(start, grip, dx, dy, bounds)))
+                Some(adjust_crop(*start, *grip, dx, dy, bounds))
             }
+            _ => None,
+        }
+    }
+
+    /// The mark a drag in progress would make, if it ended here.
+    fn pending_mark(&self) -> Option<Mark> {
+        match self.drag.as_ref()? {
+            Drag::Draw {
+                tool,
+                anchor,
+                current,
+                moved: true,
+            } => {
+                let rect = rect_between(
+                    self.layout.image_point(*anchor),
+                    self.layout.image_point(*current),
+                )?;
+                match tool {
+                    EditorTool::Redact => Some(Mark::Redaction(rect)),
+                    EditorTool::Box => Some(Mark::Rectangle {
+                        rect,
+                        color: self.colour(*tool),
+                        width: self.width(*tool).round().max(1.0) as u32,
+                    }),
+                    _ => None,
+                }
+            }
+            Drag::Stroke { tool, points } => Some(Mark::Stroke {
+                points: points.clone(),
+                color: self.colour(*tool),
+                width: self.width(*tool),
+                style: if *tool == EditorTool::Highlighter {
+                    StrokeStyle::Highlighter
+                } else {
+                    StrokeStyle::Ink
+                },
+            }),
+            _ => None,
+        }
+    }
+
+    fn colour(&self, tool: EditorTool) -> Color {
+        let slot = tool.colour_slot().unwrap_or(0);
+        PALETTE[self.colours[slot]].1
+    }
+
+    fn width(&self, tool: EditorTool) -> f32 {
+        (tool.width_dip() * self.stroke_unit).max(1.0)
+    }
+
+    /// The drawing tool whose colour the swatches show and set.
+    fn colour_tool(&self) -> EditorTool {
+        if self.tool.colour_slot().is_some() {
+            self.tool
+        } else {
+            self.last_drawing_tool
         }
     }
 
@@ -478,6 +645,23 @@ impl EditorState {
             EditorButton::Undo => self.edit.can_undo(),
             EditorButton::Redo => self.edit.can_redo(),
             _ => true,
+        }
+    }
+
+    fn choose_tool(&mut self, tool: EditorTool) {
+        self.tool = tool;
+        if tool.colour_slot().is_some() {
+            self.last_drawing_tool = tool;
+        }
+    }
+
+    /// A swatch sets the colour of the drawing tool in hand, or picks up the last one used, since
+    /// choosing a colour means meaning to draw.
+    fn choose_colour(&mut self, index: usize) {
+        let tool = self.colour_tool();
+        self.choose_tool(tool);
+        if let Some(slot) = tool.colour_slot() {
+            self.colours[slot] = index;
         }
     }
 }
@@ -526,7 +710,8 @@ fn open_editor(
         bottom: environment.work_area.bottom + at.y,
     };
     let (width, height) = (frame.width(), frame.height());
-    let preview = FrozenSurface::new(width, height, &compose_preview(&frame, &[]))?;
+    let committed = compose_preview(&frame, &[]);
+    let preview = FrozenSurface::new(width, height, &committed)?;
     let padding = metrics.px(CANVAS_PADDING_DIP) * 2;
     let maximum_width = (f64::from(work.right - work.left) * MAXIMUM_WORK_AREA_SHARE) as i32;
     let maximum_height = (f64::from(work.bottom - work.top) * MAXIMUM_WORK_AREA_SHARE) as i32;
@@ -567,9 +752,15 @@ fn open_editor(
         layout: EditorLayout::new(client, metrics, width, height),
         edit: Edit::new(frame),
         metrics,
+        committed,
         preview,
+        pending_dirty: None,
         back_buffer: None,
         tool: EditorTool::Crop,
+        last_drawing_tool: EditorTool::Pen,
+        // Red ink for the box, pen and marker; a highlighter is yellow.
+        colours: [RED, RED, RED, YELLOW],
+        stroke_unit: metrics.dpi as f32 / UiMetrics::BASE_DPI as f32,
         drag: None,
         pressed: None,
         hovered: None,
@@ -702,7 +893,9 @@ pub(super) unsafe extern "system" fn editor_window_proc(
         WM_CAPTURECHANGED => {
             // SAFETY: As above. Losing the pointer mid-drag abandons the drag.
             let state = unsafe { &mut *state_pointer };
-            if state.drag.take().is_some() || state.pressed.take().is_some() {
+            let dropped = state.drag.take().is_some();
+            if dropped || state.pressed.take().is_some() {
+                show_pending(state);
                 invalidate(hwnd);
             }
             LRESULT(0)
@@ -776,14 +969,10 @@ fn set_cursor(hwnd: HWND, state: &EditorState) {
     let cursor = if !located || !state.layout.canvas.contains(point) {
         IDC_ARROW
     } else {
-        match state.drag.map(|drag| match drag {
-            Drag::Crop { grip, .. } => Some(grip),
-            Drag::Draw { .. } => None,
-        }) {
-            Some(Some(grip)) => grip_cursor(grip),
-            Some(None) => IDC_CROSS,
+        match &state.drag {
+            Some(Drag::Crop { grip, .. }) => grip_cursor(*grip),
+            Some(_) => IDC_CROSS,
             None => match state.tool {
-                EditorTool::Redact => IDC_CROSS,
                 EditorTool::Crop => grip_at(
                     state.layout.client_rect(state.edit.crop()),
                     point,
@@ -791,6 +980,7 @@ fn set_cursor(hwnd: HWND, state: &EditorState) {
                     state.edit.crop() != state.edit.bounds(),
                 )
                 .map_or(IDC_CROSS, grip_cursor),
+                _ => IDC_CROSS,
             },
         }
     };
@@ -833,6 +1023,7 @@ fn pointer_moved(hwnd: HWND, state: &mut EditorState, point: POINT) {
     let mut changed = hovered != state.hovered;
     state.hovered = hovered;
     let threshold = state.metrics.px(DRAG_THRESHOLD_DIP);
+    let image_point = state.layout.image_point(point);
     match state.drag.as_mut() {
         Some(Drag::Draw {
             anchor,
@@ -849,9 +1040,22 @@ fn pointer_moved(hwnd: HWND, state: &mut EditorState, point: POINT) {
             *current = point;
             changed = true;
         }
+        Some(Drag::Stroke { points, .. }) => {
+            let next = (image_point.0 as f32, image_point.1 as f32);
+            let far_enough = points.last().is_none_or(|last| {
+                (next.0 - last.0).abs() >= STROKE_STEP || (next.1 - last.1).abs() >= STROKE_STEP
+            });
+            if far_enough {
+                points.push(next);
+                changed = true;
+            }
+        }
         None => {}
     }
     if changed {
+        if state.drag.is_some() {
+            show_pending(state);
+        }
         invalidate(hwnd);
     }
 }
@@ -867,13 +1071,21 @@ fn pointer_pressed(hwnd: HWND, state: &mut EditorState, point: POINT) {
     if !state.layout.canvas.contains(point) {
         return;
     }
+    let draw = |tool| Drag::Draw {
+        tool,
+        anchor: point,
+        current: point,
+        moved: false,
+    };
     let drag = match state.tool {
-        EditorTool::Redact => Drag::Draw {
-            tool: EditorTool::Redact,
-            anchor: point,
-            current: point,
-            moved: false,
-        },
+        EditorTool::Redact | EditorTool::Box => draw(state.tool),
+        EditorTool::Pen | EditorTool::Marker | EditorTool::Highlighter => {
+            let (x, y) = state.layout.image_point(point);
+            Drag::Stroke {
+                tool: state.tool,
+                points: vec![(x as f32, y as f32)],
+            }
+        }
         EditorTool::Crop => {
             let crop = state.edit.crop();
             match grip_at(
@@ -888,39 +1100,33 @@ fn pointer_pressed(hwnd: HWND, state: &mut EditorState, point: POINT) {
                     anchor: point,
                     current: point,
                 },
-                None => Drag::Draw {
-                    tool: EditorTool::Crop,
-                    anchor: point,
-                    current: point,
-                    moved: false,
-                },
+                None => draw(EditorTool::Crop),
             }
         }
     };
     state.drag = Some(drag);
+    show_pending(state);
     capture_pointer(hwnd);
+    invalidate(hwnd);
 }
 
 /// Ends a press. Returns the toolbar button to act on, if the press was one and was released over
 /// it; a drag is committed here.
 fn pointer_released(hwnd: HWND, state: &mut EditorState, point: POINT) -> Option<EditorButton> {
-    let pending = state.pending();
+    let crop = state.pending_crop();
+    let mark = state.pending_mark();
     let drag = state.drag.take();
     let pressed = state.pressed.take();
     // Taken before releasing: the release sends WM_CAPTURECHANGED, which would abandon both.
     release_pointer_capture();
     if drag.is_some() {
-        match pending {
-            Some((EditorTool::Redact, rect)) => {
-                if state.edit.redact(rect) {
-                    refresh_preview(state);
-                }
-            }
-            Some((EditorTool::Crop, rect)) => {
-                state.edit.set_crop(rect);
-            }
-            None => {}
+        if let Some(crop) = crop {
+            state.edit.set_crop(crop);
         }
+        if let Some(mark) = mark {
+            commit_mark(state, mark);
+        }
+        show_pending(state);
         invalidate(hwnd);
     }
     pressed.filter(|button| state.layout.button_at(point) == Some(*button))
@@ -932,8 +1138,8 @@ fn press_button(hwnd: HWND, state_pointer: *mut EditorState, button: EditorButto
         // before anything below can end the editor.
         let state = unsafe { &mut *state_pointer };
         match button {
-            EditorButton::Crop => state.tool = EditorTool::Crop,
-            EditorButton::Redact => state.tool = EditorTool::Redact,
+            EditorButton::Tool(tool) => state.choose_tool(tool),
+            EditorButton::Swatch(index) => state.choose_colour(index),
             EditorButton::Undo => {
                 if state.edit.undo() {
                     refresh_preview(state);
@@ -954,14 +1160,36 @@ fn press_button(hwnd: HWND, state_pointer: *mut EditorState, button: EditorButto
     }
 }
 
+/// The toolbar button a key stands for, without Ctrl unless it says so.
+fn key_button(key: u16, ctrl: bool, shift: bool) -> Option<EditorButton> {
+    let tool = |tool| Some(EditorButton::Tool(tool));
+    match (key, ctrl) {
+        _ if key == VK_RETURN.0 => Some(EditorButton::Done),
+        (0x5A, true) if shift => Some(EditorButton::Redo),
+        (0x5A, true) => Some(EditorButton::Undo),
+        (0x59, true) => Some(EditorButton::Redo),
+        (0x43, false) => tool(EditorTool::Crop),
+        (0x52, false) => tool(EditorTool::Redact),
+        (0x42, false) => tool(EditorTool::Box),
+        (0x50, false) => tool(EditorTool::Pen),
+        (0x4D, false) => tool(EditorTool::Marker),
+        (0x48, false) => tool(EditorTool::Highlighter),
+        // 1 to 6 on the main row or the number pad.
+        (0x31..=0x36, false) => Some(EditorButton::Swatch(usize::from(key - 0x31))),
+        (0x61..=0x66, false) => Some(EditorButton::Swatch(usize::from(key - 0x61))),
+        _ => None,
+    }
+}
+
 fn key_pressed(hwnd: HWND, state_pointer: *mut EditorState, key: u16) {
     let held = modifiers();
     if key == VK_ESCAPE.0 {
         // SAFETY: The editor's state lives until WM_NCDESTROY on this thread; the borrow ends
         // before the cancel below.
-        let dragging = unsafe { (*state_pointer).drag.take().is_some() };
-        if dragging {
+        let state = unsafe { &mut *state_pointer };
+        if state.drag.take().is_some() {
             // Escape mid-drag drops the drag, not the edit.
+            show_pending(state);
             release_pointer_capture();
             invalidate(hwnd);
         } else {
@@ -969,16 +1197,7 @@ fn key_pressed(hwnd: HWND, state_pointer: *mut EditorState, key: u16) {
         }
         return;
     }
-    let button = match key {
-        _ if key == VK_RETURN.0 => Some(EditorButton::Done),
-        0x5A if held.ctrl && held.shift => Some(EditorButton::Redo),
-        0x5A if held.ctrl => Some(EditorButton::Undo),
-        0x59 if held.ctrl => Some(EditorButton::Redo),
-        0x43 if !held.ctrl => Some(EditorButton::Crop),
-        0x52 if !held.ctrl => Some(EditorButton::Redact),
-        _ => None,
-    };
-    if let Some(button) = button {
+    if let Some(button) = key_button(key, held.ctrl, held.shift) {
         // SAFETY: As above.
         let dragging = unsafe { (*state_pointer).drag.is_some() };
         if !dragging {
@@ -987,10 +1206,84 @@ fn key_pressed(hwnd: HWND, state_pointer: *mut EditorState, key: u16) {
     }
 }
 
+/// The capture's whole area, which the preview buffers cover.
+fn preview_area(state: &EditorState) -> Rect {
+    state.edit.bounds()
+}
+
+/// Rebuilds the preview from every committed mark, after an undo or redo.
 fn refresh_preview(state: &mut EditorState) {
-    let pixels = compose_preview(state.edit.source(), state.edit.marks());
-    if let Err(error) = state.preview.write_pixels(&pixels) {
+    state.committed = compose_preview(state.edit.source(), state.edit.marks());
+    state.pending_dirty = None;
+    // SAFETY: Completes any queued GDI read of the preview before its pixels are replaced.
+    let _ = unsafe { GdiFlush() };
+    if let Err(error) = state.preview.write_pixels(&state.committed) {
         log::warn!("could not redraw the editor's preview: {error}");
+    }
+}
+
+/// Adds a finished mark to the edit, and to the committed preview by painting just that mark.
+fn commit_mark(state: &mut EditorState, mark: Mark) {
+    if !state.edit.add(mark.clone()) {
+        return;
+    }
+    let area = preview_area(state);
+    paint_mark(
+        &mark,
+        &mut state.committed,
+        area.width as usize * 4,
+        area,
+        PixelFormat::Bgra8Unorm,
+        FrameAlpha::Opaque,
+    );
+    // Marked for the next show_pending to copy from `committed`, together with whatever was
+    // already waiting, so the preview shows the mark exactly whether or not it was drawn as a
+    // pending mark first.
+    let reach = mark.bounds().and_then(|bounds| bounds.intersection(area));
+    state.pending_dirty = match (state.pending_dirty, reach) {
+        (Some(dirty), Some(reach)) => Some(union(dirty, reach)),
+        (dirty, reach) => dirty.or(reach),
+    };
+}
+
+/// The smallest rectangle holding both.
+fn union(a: Rect, b: Rect) -> Rect {
+    Rect::from_edges(
+        i64::from(a.x.min(b.x)),
+        i64::from(a.y.min(b.y)),
+        a.right().max(b.right()),
+        a.bottom().max(b.bottom()),
+    )
+    .unwrap_or(a)
+}
+
+/// Makes the preview show the committed marks plus the mark being drawn, if any, touching only the
+/// pixels the last pending mark and this one cover.
+fn show_pending(state: &mut EditorState) {
+    let area = preview_area(state);
+    let stride = area.width as usize * 4;
+    // SAFETY: Completes any queued GDI read of the preview before its pixels change.
+    let _ = unsafe { GdiFlush() };
+    // SAFETY: The preview's DIB holds exactly byte_length writable bytes, owned by this thread.
+    let pixels =
+        unsafe { std::slice::from_raw_parts_mut(state.preview.bits, state.preview.byte_length) };
+    if let Some(dirty) = state.pending_dirty.take() {
+        for row in dirty.y..(dirty.bottom() as i32) {
+            let start = row as usize * stride + dirty.x as usize * 4;
+            let end = start + dirty.width as usize * 4;
+            pixels[start..end].copy_from_slice(&state.committed[start..end]);
+        }
+    }
+    if let Some(mark) = state.pending_mark() {
+        paint_mark(
+            &mark,
+            pixels,
+            stride,
+            area,
+            PixelFormat::Bgra8Unorm,
+            FrameAlpha::Opaque,
+        );
+        state.pending_dirty = mark.bounds().and_then(|bounds| bounds.intersection(area));
     }
 }
 
@@ -1080,18 +1373,14 @@ fn paint(hwnd: HWND, state: &mut EditorState) {
 
 fn compose(state: &EditorState, surface: &FrozenSurface) {
     let device = surface.device;
-    let layout = state.layout;
+    let layout = &state.layout;
     let metrics = state.metrics;
     let canvas = rgb(CANVAS_RGB.0, CANVAS_RGB.1, CANVAS_RGB.2);
     let accent = rgb(ACCENT_RGB.0, ACCENT_RGB.1, ACCENT_RGB.2);
     fill_device_rect(device, native(layout.client), canvas);
     draw_surface_to_rect(device, &state.preview, layout.image);
 
-    let pending = state.pending();
-    let crop = match pending {
-        Some((EditorTool::Crop, rect)) => rect,
-        _ => state.edit.crop(),
-    };
+    let crop = state.pending_crop().unwrap_or_else(|| state.edit.crop());
     let crop_on_screen = layout.client_rect(crop);
     // SAFETY: Completes every queued GDI draw before the pixels are touched directly.
     let _ = unsafe { GdiFlush() };
@@ -1099,19 +1388,6 @@ fn compose(state: &EditorState, surface: &FrozenSurface) {
     let pixels = unsafe { std::slice::from_raw_parts_mut(surface.bits, surface.byte_length) };
     dim_outside(pixels, surface.width as usize, layout.image, crop_on_screen);
 
-    if let Some((EditorTool::Redact, rect)) = pending {
-        let on_screen = layout.client_rect(rect);
-        fill_device_rect(device, native(on_screen), rgb(0, 0, 0));
-        draw_outline_rect(
-            device,
-            on_screen.left,
-            on_screen.top,
-            on_screen.right,
-            on_screen.bottom,
-            accent,
-            1,
-        );
-    }
     let stroke = metrics.px(2).max(1);
     draw_outline_rect(
         device,
@@ -1126,14 +1402,10 @@ fn compose(state: &EditorState, surface: &FrozenSurface) {
         draw_crop_handles(device, crop_on_screen, metrics, accent);
     }
     draw_toolbar(device, state, crop);
+    draw_tooltip(device, state);
 }
 
-fn draw_crop_handles(
-    device: windows::Win32::Graphics::Gdi::HDC,
-    crop: UiRect,
-    metrics: UiMetrics,
-    accent: windows::Win32::Foundation::COLORREF,
-) {
+fn draw_crop_handles(device: HDC, crop: UiRect, metrics: UiMetrics, accent: COLORREF) {
     let half = metrics.px(HANDLE_SIZE_DIP) / 2;
     let border = metrics.px(1).max(1);
     let middle_x = (crop.left + crop.right) / 2;
@@ -1165,9 +1437,10 @@ fn draw_crop_handles(
     }
 }
 
-fn draw_toolbar(device: windows::Win32::Graphics::Gdi::HDC, state: &EditorState, crop: Rect) {
-    let layout = state.layout;
-    let tokens = state.metrics.toolbar_tokens();
+fn draw_toolbar(device: HDC, state: &EditorState, crop: Rect) {
+    let layout = &state.layout;
+    let metrics = state.metrics;
+    let tokens = metrics.toolbar_tokens();
     fill_device_rect(device, native(layout.toolbar), rgb(38, 38, 41));
     fill_device_rect(
         device,
@@ -1177,13 +1450,27 @@ fn draw_toolbar(device: windows::Win32::Graphics::Gdi::HDC, state: &EditorState,
         }),
         rgb(60, 60, 65),
     );
-    for (button, bounds) in layout.buttons {
+    let colour_tool = state.colour_tool();
+    let current_colour = colour_tool
+        .colour_slot()
+        .map(|slot| state.colours[slot])
+        .unwrap_or(RED);
+    for (button, bounds) in &layout.buttons {
+        let (button, bounds) = (*button, *bounds);
         let enabled = state.button_enabled(button);
         let hovered = enabled && state.hovered == Some(button);
-        let selected = matches!(
-            (button, state.tool),
-            (EditorButton::Crop, EditorTool::Crop) | (EditorButton::Redact, EditorTool::Redact)
-        );
+        if let EditorButton::Swatch(index) = button {
+            draw_swatch(
+                device,
+                bounds,
+                index,
+                index == current_colour,
+                hovered,
+                metrics,
+            );
+            continue;
+        }
+        let selected = button == EditorButton::Tool(state.tool);
         let fill = match button {
             EditorButton::Done if hovered => Some(rgb(68, 145, 255)),
             EditorButton::Done => Some(rgb(ACCENT_RGB.0, ACCENT_RGB.1, ACCENT_RGB.2)),
@@ -1194,25 +1481,272 @@ fn draw_toolbar(device: windows::Win32::Graphics::Gdi::HDC, state: &EditorState,
         if let Some(fill) = fill {
             draw_round_box(device, bounds, fill, fill, tokens.control_corner_radius);
         }
-        let text = if enabled {
+        let ink = if enabled {
             rgb(245, 245, 247)
         } else {
             rgb(110, 110, 116)
         };
+        match button {
+            EditorButton::Tool(tool) => draw_tool_icon(device, bounds, tool, ink, metrics),
+            EditorButton::Undo => draw_history_icon(device, bounds, false, ink, metrics),
+            EditorButton::Redo => draw_history_icon(device, bounds, true, ink, metrics),
+            EditorButton::Cancel | EditorButton::Done => draw_text(
+                device,
+                bounds,
+                if button == EditorButton::Done {
+                    "Done"
+                } else {
+                    "Cancel"
+                },
+                ink,
+                TextAlignment::Center,
+                tokens.font_height,
+            ),
+            EditorButton::Swatch(_) => {}
+        }
+    }
+    if layout.size_label.right - layout.size_label.left >= metrics.px(72) {
         draw_text(
             device,
-            bounds,
-            button.label(),
-            text,
+            layout.size_label,
+            &format!("{} \u{00d7} {}", crop.width, crop.height),
+            rgb(170, 170, 176),
             TextAlignment::Center,
             tokens.font_height,
         );
     }
+}
+
+fn draw_swatch(
+    device: HDC,
+    bounds: UiRect,
+    index: usize,
+    chosen: bool,
+    hovered: bool,
+    metrics: UiMetrics,
+) {
+    let colour = PALETTE[index].1;
+    let radius = metrics.px(SWATCH_DIAMETER_DIP) / 2;
+    let (x, y) = (
+        (bounds.left + bounds.right) / 2,
+        (bounds.top + bounds.bottom) / 2,
+    );
+    draw_filled_ellipse(
+        device,
+        x - radius,
+        y - radius,
+        x + radius,
+        y + radius,
+        rgb(colour.red, colour.green, colour.blue),
+    );
+    // A thin rim so black reads against the toolbar and white against nothing at all.
+    draw_ellipse(
+        device,
+        x - radius,
+        y - radius,
+        x + radius,
+        y + radius,
+        rgb(120, 120, 126),
+        1,
+    );
+    if chosen || hovered {
+        let ring = radius + metrics.px(3);
+        draw_ellipse(
+            device,
+            x - ring,
+            y - ring,
+            x + ring,
+            y + ring,
+            if chosen {
+                rgb(245, 245, 247)
+            } else {
+                rgb(140, 140, 146)
+            },
+            metrics.px(2).max(1),
+        );
+    }
+}
+
+fn icon_box(bounds: UiRect, metrics: UiMetrics) -> (i32, i32, i32) {
+    let size = metrics.toolbar_tokens().icon_size;
+    (
+        (bounds.left + bounds.right - size) / 2,
+        (bounds.top + bounds.bottom - size) / 2,
+        size,
+    )
+}
+
+fn draw_tool_icon(
+    device: HDC,
+    bounds: UiRect,
+    tool: EditorTool,
+    ink: COLORREF,
+    metrics: UiMetrics,
+) {
+    let stroke = metrics.toolbar_tokens().icon_stroke;
+    let (left, top, size) = icon_box(bounds, metrics);
+    let (right, bottom) = (left + size, top + size);
+    let quarter = size / 4;
+    match tool {
+        EditorTool::Crop => {
+            draw_lines(
+                device,
+                &[
+                    (left + quarter, top),
+                    (left + quarter, bottom - quarter),
+                    (right, bottom - quarter),
+                ],
+                ink,
+                stroke,
+            );
+            draw_lines(
+                device,
+                &[
+                    (left, top + quarter),
+                    (right - quarter, top + quarter),
+                    (right - quarter, bottom),
+                ],
+                ink,
+                stroke,
+            );
+        }
+        EditorTool::Redact => {
+            draw_outline_rect(
+                device,
+                left,
+                top + quarter / 2,
+                right,
+                bottom - quarter / 2,
+                ink,
+                stroke,
+            );
+            fill_device_rect(
+                device,
+                RECT {
+                    left: left + stroke * 2,
+                    top: top + size / 2 - stroke,
+                    right: right - stroke * 2,
+                    bottom: top + size / 2 + stroke * 2,
+                },
+                ink,
+            );
+        }
+        EditorTool::Box => {
+            draw_outline_rect(
+                device,
+                left,
+                top + quarter / 2,
+                right,
+                bottom - quarter / 2,
+                ink,
+                stroke,
+            );
+        }
+        EditorTool::Pen => draw_edit_icon(device, bounds, ink, metrics),
+        EditorTool::Marker => {
+            draw_lines(
+                device,
+                &[
+                    (left + quarter / 2, bottom - quarter / 2),
+                    (right - quarter / 2, top + quarter / 2),
+                ],
+                ink,
+                (stroke * 3).max(3),
+            );
+        }
+        EditorTool::Highlighter => {
+            let colour = PALETTE[YELLOW].1;
+            fill_device_rect(
+                device,
+                RECT {
+                    left,
+                    top: top + size / 2 - quarter / 2,
+                    right,
+                    bottom: top + size / 2 + quarter,
+                },
+                rgb(colour.red, colour.green, colour.blue),
+            );
+            draw_lines(
+                device,
+                &[(left, top + quarter), (right, top + quarter)],
+                ink,
+                stroke,
+            );
+            draw_lines(device, &[(left, bottom), (right, bottom)], ink, stroke);
+        }
+    }
+}
+
+/// A hooked arrow: back for Undo, forward for Redo.
+fn draw_history_icon(
+    device: HDC,
+    bounds: UiRect,
+    forward: bool,
+    ink: COLORREF,
+    metrics: UiMetrics,
+) {
+    let stroke = metrics.toolbar_tokens().icon_stroke;
+    let (left, top, size) = icon_box(bounds, metrics);
+    let mirror = |x: i32| if forward { left + size - (x - left) } else { x };
+    let middle = top + size * 2 / 5;
+    let head = size / 4;
+    draw_lines(
+        device,
+        &[
+            (mirror(left + size), top + size - 1),
+            (mirror(left + size), middle),
+            (mirror(left), middle),
+        ],
+        ink,
+        stroke,
+    );
+    draw_lines(
+        device,
+        &[
+            (mirror(left + head), middle - head),
+            (mirror(left), middle),
+            (mirror(left + head), middle + head),
+        ],
+        ink,
+        stroke,
+    );
+}
+
+/// The hovered icon button's name and key, below the toolbar.
+fn draw_tooltip(device: HDC, state: &EditorState) {
+    let Some(button) = state.hovered else { return };
+    let (Some(text), Some(target)) = (button.tooltip(), state.layout.button_rect(button)) else {
+        return;
+    };
+    let metrics = state.metrics;
+    let tokens = metrics.toolbar_tokens();
+    let measured = measure_ui_text(device, &text, tokens.font_height);
+    let width = measured.cx + tokens.tooltip_padding_x * 2;
+    let height = (measured.cy + tokens.tooltip_padding_y * 2).max(metrics.px(28));
+    let client = state.layout.client;
+    let left = ((target.left + target.right - width) / 2).clamp(
+        client.left + metrics.px(4),
+        (client.right - width - metrics.px(4)).max(0),
+    );
+    let top = state.layout.toolbar.bottom + metrics.px(6);
+    let bounds = UiRect {
+        left,
+        top,
+        right: left + width,
+        bottom: top + height,
+    };
+    draw_round_box(
+        device,
+        bounds,
+        rgb(31, 31, 34),
+        rgb(104, 104, 110),
+        tokens.tooltip_corner_radius,
+    );
     draw_text(
         device,
-        layout.size_label,
-        &format!("{} \u{00d7} {}", crop.width, crop.height),
-        rgb(170, 170, 176),
+        bounds,
+        &text,
+        rgb(248, 248, 250),
         TextAlignment::Center,
         tokens.font_height,
     );
@@ -1310,6 +1844,10 @@ mod tests {
                 .expect("post to the editor");
         };
         let at = |x: i32, y: i32| ((y as u32 as isize) << 16) | (x as u16 as isize);
+        // Read the editor's geometry in its own terms: a thread that is not per-monitor aware is
+        // handed coordinates scaled for it, which miss a four-pixel capture entirely.
+        let _dpi = super::super::shell::ThreadDpiContext::enter_per_monitor_v2()
+            .expect("per-monitor DPI awareness for the test thread");
         let host = DesktopUi::start().expect("the desktop UI thread starts");
         let frame = small_frame();
         let (sender, outcomes) = mpsc::channel();
@@ -1370,6 +1908,50 @@ mod tests {
 
         // The first editor answered before destroying itself; wait for it to go, so the next lookup
         // cannot find it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // SAFETY: IsWindow accepts any handle, live or not.
+        while unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(editor) }.as_bool() {
+            assert!(
+                Instant::now() < deadline,
+                "the finished editor never closed"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // A pen stroke across the middle, then Done: the stroke is in the published image, in
+        // the pen's colour.
+        let report = sender.clone();
+        host.edit(
+            frame.detached(),
+            frame.metadata.source_rect,
+            move |outcome| {
+                let _ = report.send(outcome);
+            },
+        )
+        .expect("the edit request is accepted");
+        let editor = find_editor();
+        let middle_y = (canvas_top + client.bottom) / 2;
+        post(editor, WM_KEYDOWN, usize::from(b'P'), 0);
+        post(editor, WM_LBUTTONDOWN, 1, at(1, middle_y));
+        post(editor, WM_MOUSEMOVE, 1, at(client.right / 2, middle_y));
+        post(editor, WM_MOUSEMOVE, 1, at(client.right - 2, middle_y));
+        post(editor, WM_LBUTTONUP, 0, at(client.right - 2, middle_y));
+        post(editor, WM_KEYDOWN, usize::from(VK_RETURN.0), 0);
+        match outcomes
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the editor answered")
+        {
+            EditOutcome::Done(edited) => {
+                let red = PALETTE[RED].1;
+                let ink = [red.blue, red.green, red.red, 255];
+                assert!(
+                    edited.pixels().chunks_exact(4).any(|pixel| pixel == ink),
+                    "no pixel was inked: {:?}",
+                    edited.pixels()
+                );
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
         let deadline = Instant::now() + Duration::from_secs(5);
         // SAFETY: IsWindow accepts any handle, live or not.
         while unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(editor) }.as_bool() {
@@ -1471,16 +2053,72 @@ mod tests {
                     pair[1].0
                 );
             }
-            assert!(layout.buttons[5].1.right <= layout.client.right);
+            let (last, done) = *layout.buttons.last().expect("buttons");
+            assert_eq!(last, EditorButton::Done);
+            assert!(done.right <= layout.client.right);
             assert!(layout.size_label.left <= layout.size_label.right);
             assert_eq!(
                 layout.button_at(POINT {
-                    x: layout.buttons[5].1.left + 1,
-                    y: layout.buttons[5].1.top + 1,
+                    x: done.left + 1,
+                    y: done.top + 1,
                 }),
                 Some(EditorButton::Done)
             );
+            // Every tool and every colour has a button.
+            for tool in EditorTool::ALL {
+                assert!(layout.button_rect(EditorButton::Tool(tool)).is_some());
+            }
+            for index in 0..PALETTE.len() {
+                assert!(layout.button_rect(EditorButton::Swatch(index)).is_some());
+            }
         }
+    }
+
+    #[test]
+    fn keys_choose_tools_and_colours_and_ctrl_keeps_them_for_undo_and_redo() {
+        assert_eq!(
+            key_button(u16::from(b'P'), false, false),
+            Some(EditorButton::Tool(EditorTool::Pen))
+        );
+        assert_eq!(
+            key_button(u16::from(b'H'), false, false),
+            Some(EditorButton::Tool(EditorTool::Highlighter))
+        );
+        assert_eq!(
+            key_button(u16::from(b'B'), false, false),
+            Some(EditorButton::Tool(EditorTool::Box))
+        );
+        assert_eq!(
+            key_button(u16::from(b'M'), false, false),
+            Some(EditorButton::Tool(EditorTool::Marker))
+        );
+        assert_eq!(
+            key_button(u16::from(b'1'), false, false),
+            Some(EditorButton::Swatch(0))
+        );
+        assert_eq!(
+            key_button(u16::from(b'6'), false, false),
+            Some(EditorButton::Swatch(5))
+        );
+        assert_eq!(
+            key_button(0x61, false, false),
+            Some(EditorButton::Swatch(0))
+        );
+        assert_eq!(key_button(u16::from(b'7'), false, false), None);
+        assert_eq!(
+            key_button(u16::from(b'Z'), true, false),
+            Some(EditorButton::Undo)
+        );
+        assert_eq!(
+            key_button(u16::from(b'Z'), true, true),
+            Some(EditorButton::Redo)
+        );
+        assert_eq!(
+            key_button(u16::from(b'Y'), true, false),
+            Some(EditorButton::Redo)
+        );
+        // Ctrl with a tool key is not that tool: Ctrl+C must not switch to cropping.
+        assert_eq!(key_button(u16::from(b'C'), true, false), None);
     }
 
     #[test]
