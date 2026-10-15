@@ -595,78 +595,52 @@ impl SelectionWorker {
                         let cpu_ready_offset_ns = job
                             .cpu_ready_offset_ns
                             .unwrap_or_else(|| duration_ns(job.triggered_at.elapsed()));
-                        // Pin publishes exactly as Capture does and also keeps the capture on
-                        // screen (ADR 0010). The share taken here is only held until the pin has
-                        // made its own copy below, after the destinations have their jobs, so
-                        // pinning adds nothing to the time a capture takes to reach the clipboard.
-                        let pin_frame = match selection.intent {
-                            captastic_windows::ConfirmIntent::Pin => Some(selected_frame.clone()),
-                            captastic_windows::ConfirmIntent::Capture => None,
-                            captastic_windows::ConfirmIntent::Edit => {
-                                // The overlay is never offered Edit until the editor exists, so
-                                // this cannot be reached; if it is, capturing is the safe reading.
-                                log::warn!(
-                                    "capture {} asked for an editor that does not exist yet; delivering it as a capture",
-                                    job.capture_id.0
-                                );
-                                None
-                            }
+                        let publication = Publication {
+                            capture_id: job.capture_id,
+                            triggered_at: job.triggered_at,
+                            action: job.action,
+                            chord: job.chord,
+                            cpu_ready_offset_ns,
+                            source: job.source,
+                            recorder: job.recorder,
+                            window_title: selection.window_title.clone(),
+                            window_application: selection.window_application.clone(),
                         };
-                        // Read per confirmation for the same reason the capture worker reads
-                        // it per capture: the set can have changed while the overlay was open.
-                        let output_sinks = destinations.current();
-                        if output_sinks.is_empty() {
-                            // A selection with no destination configured. Previously impossible to
-                            // express: the worker held a clipboard sender and a `.expect` in the
-                            // daemon asserted one existed, restating at runtime a rule the
-                            // configuration validator had already enforced.
-                            report_clipboard_rejection(
-                                crate::output::OutputJob {
-                                    capture_id: job.capture_id,
-                                    triggered_at: job.triggered_at,
-                                    action: job.action,
-                                    chord: job.chord,
-                                    cpu_ready_offset_ns,
-                                    source: job.source,
-                                    frame: selected_frame,
-                                    recorder: job.recorder,
-                                    window_title: None,
-                                    window_application: None,
-                                },
-                                "no_destination",
-                                json_output,
-                            );
-                        } else {
-                            // Every destination, not just the first: a selection is a capture like
-                            // any other, and a region chosen in the overlay belongs on disk too if
-                            // the user asked for file output.
-                            for sink in output_sinks.iter() {
-                                let destination_job = crate::output::OutputJob {
-                                    capture_id: job.capture_id,
-                                    triggered_at: job.triggered_at,
-                                    action: job.action,
-                                    chord: job.chord,
-                                    cpu_ready_offset_ns,
-                                    source: job.source,
-                                    frame: selected_frame.clone(),
-                                    // Forked per destination: they run concurrently and their
-                                    // events cannot be ordered against each other (ADR 0002).
-                                    recorder: job.recorder.clone(),
-                                    window_title: selection.window_title.clone(),
-                                    window_application: selection.window_application.clone(),
-                                };
-                                if let Err(rejection) = sink.submit(destination_job) {
-                                    let status = rejection.status();
-                                    report_clipboard_rejection(
-                                        *rejection.into_job(),
-                                        status,
+                        match selection.intent {
+                            captastic_windows::ConfirmIntent::Edit => {
+                                // Edit withholds the capture until the editor's Done, and then
+                                // publishes only what it made (ADR 0010): a secret that has
+                                // reached the clipboard is not redacted by anything afterwards.
+                                edit_capture(
+                                    &worker_desktop_ui,
+                                    EditContext {
+                                        publication,
+                                        destinations: destinations.clone(),
+                                        notices: notices.clone(),
                                         json_output,
+                                    },
+                                    &selected_frame,
+                                    selection.rect,
+                                );
+                            }
+                            intent => {
+                                // Pin publishes exactly as Capture does and also keeps the
+                                // capture on screen (ADR 0010). The share taken here is only held
+                                // until the pin has made its own copy below, after the
+                                // destinations have their jobs, so pinning adds nothing to the
+                                // time a capture takes to reach the clipboard.
+                                let pin_frame = matches!(intent, captastic_windows::ConfirmIntent::Pin)
+                                    .then(|| selected_frame.clone());
+                                publication.publish(&destinations, selected_frame, json_output);
+                                if let Some(frame) = pin_frame {
+                                    pin_capture(
+                                        &worker_desktop_ui,
+                                        job.capture_id,
+                                        &frame,
+                                        selection.rect,
                                     );
                                 }
                             }
-                        }
-                        if let Some(frame) = pin_frame {
-                            pin_capture(&worker_desktop_ui, job.capture_id, &frame, selection.rect);
                         }
                     }
                     Ok(captastic_windows::SelectionOutcome::Cancelled) => {
@@ -1160,11 +1134,189 @@ fn overlay_destinations(names: &[&'static str]) -> captastic_windows::OverlayDes
         clipboard: names.contains(&crate::clipboard::DESTINATION_NAME),
         file_output: names.contains(&crate::file_output::DESTINATION_NAME),
         file_output_switchable: true,
-        // The worker starts the desktop UI thread on the first Pin, so a daemon run can
-        // always offer it.
+        // The worker starts the desktop UI thread on the first Pin or Edit, so a daemon run can
+        // always offer both.
         pin_available: true,
-        edit_available: false,
+        edit_available: true,
     }
+}
+
+/// Everything a capture is published with, apart from its pixels.
+///
+/// Separate from the pixels because an edited capture is published later, from the editor's
+/// thread, with pixels the editor made; everything else about it is the capture it came from.
+struct Publication {
+    capture_id: CaptureId,
+    triggered_at: Instant,
+    action: HotkeyAction,
+    chord: Option<HotkeyChord>,
+    cpu_ready_offset_ns: u64,
+    source: &'static str,
+    recorder: EventRecorder,
+    window_title: Option<String>,
+    window_application: Option<String>,
+}
+
+impl Publication {
+    fn job(&self, frame: CpuFrame, recorder: EventRecorder) -> crate::output::OutputJob {
+        crate::output::OutputJob {
+            capture_id: self.capture_id,
+            triggered_at: self.triggered_at,
+            action: self.action,
+            chord: self.chord,
+            cpu_ready_offset_ns: self.cpu_ready_offset_ns,
+            source: self.source,
+            frame,
+            recorder,
+            window_title: self.window_title.clone(),
+            window_application: self.window_application.clone(),
+        }
+    }
+
+    /// Offers `frame` to every destination in the set as it stands now.
+    fn publish(
+        self,
+        destinations: &crate::output::OutputDestinations,
+        frame: CpuFrame,
+        json_output: bool,
+    ) {
+        // Read per confirmation for the same reason the capture worker reads it per capture: the
+        // set can have changed while the overlay, or the editor, was open.
+        let output_sinks = destinations.current();
+        if output_sinks.is_empty() {
+            // A selection with no destination configured. Previously impossible to express: the
+            // worker held a clipboard sender and a `.expect` in the daemon asserted one existed,
+            // restating at runtime a rule the configuration validator had already enforced.
+            let job = self.job(frame, self.recorder.clone());
+            report_clipboard_rejection(job, "no_destination", json_output);
+            return;
+        }
+        // Every destination, not just the first: a selection is a capture like any other, and a
+        // region chosen in the overlay belongs on disk too if the user asked for file output.
+        for sink in output_sinks.iter() {
+            // The recorder is forked per destination: they run concurrently and their events
+            // cannot be ordered against each other (ADR 0002).
+            let destination_job = self.job(frame.clone(), self.recorder.clone());
+            if let Err(rejection) = sink.submit(destination_job) {
+                let status = rejection.status();
+                report_clipboard_rejection(*rejection.into_job(), status, json_output);
+            }
+        }
+    }
+}
+
+/// What an editor needs to publish its result when it is done, on the desktop UI thread.
+struct EditContext {
+    publication: Publication,
+    destinations: crate::output::OutputDestinations,
+    notices: mpsc::SyncSender<crate::daemon::DaemonNotice>,
+    json_output: bool,
+}
+
+const EDITOR_UNAVAILABLE_REASON: &str = "the editor could not be opened";
+const EDITOR_FAILED_REASON: &str = "the editor could not make the edited image";
+
+/// Opens a confirmed capture in an editor, starting the desktop UI thread if this is the first.
+///
+/// Nothing is published here. Done in the editor publishes the edited image; any other ending
+/// publishes nothing, and an editor that cannot be opened says so in the notification area, since
+/// the user is otherwise left waiting for a window that will not appear.
+fn edit_capture(
+    desktop_ui: &Mutex<Option<captastic_windows::DesktopUi>>,
+    context: EditContext,
+    frame: &CpuFrame,
+    at: captastic_core::Rect,
+) {
+    let capture_id = context.publication.capture_id;
+    let notices = context.notices.clone();
+    let unavailable = |error: &dyn std::fmt::Display| {
+        crate::logging::warn(format_args!(
+            "capture {} could not be opened in the editor and was not published: {error}",
+            capture_id.0
+        ));
+        notify_dropped_selection(&notices, capture_id, EDITOR_UNAVAILABLE_REASON);
+    };
+    let mut host = lock_desktop_ui(desktop_ui);
+    let host = match started_desktop_ui(&mut host) {
+        Ok(host) => host,
+        Err(error) => return unavailable(&error),
+    };
+    let (width, height) = (frame.width(), frame.height());
+    // Detached: an editor stays open as long as the person takes, and must never hold one of the
+    // readback pool's slots while it does (ADR 0010).
+    match host.edit(frame.detached(), at, move |outcome| {
+        finish_edit(outcome, context)
+    }) {
+        Ok(()) => log::info!(
+            "capture {} opened in the editor ({width}x{height}); nothing is published until Done",
+            capture_id.0
+        ),
+        Err(error) => unavailable(&error),
+    }
+}
+
+/// Publishes, or does not, what an editor ended with. Runs on the desktop UI thread.
+fn finish_edit(outcome: captastic_windows::EditOutcome, context: EditContext) {
+    let capture_id = context.publication.capture_id;
+    let label = match outcome {
+        captastic_windows::EditOutcome::Done(frame) => {
+            log::info!(
+                "capture {} edited to {}x{}; publishing the edited image only",
+                capture_id.0,
+                frame.width(),
+                frame.height()
+            );
+            context
+                .publication
+                .publish(&context.destinations, *frame, context.json_output);
+            "done"
+        }
+        captastic_windows::EditOutcome::Cancelled => {
+            log::info!(
+                "capture {}: editing was cancelled; nothing was published",
+                capture_id.0
+            );
+            "cancelled"
+        }
+        captastic_windows::EditOutcome::Discarded => {
+            log::info!(
+                "capture {}: the editor closed with Captastic; nothing was published",
+                capture_id.0
+            );
+            "discarded"
+        }
+        captastic_windows::EditOutcome::Failed(message) => {
+            crate::logging::warn(format_args!(
+                "capture {}: the editor failed and nothing was published: {message}",
+                capture_id.0
+            ));
+            notify_dropped_selection(&context.notices, capture_id, EDITOR_FAILED_REASON);
+            "failed"
+        }
+    };
+    if context.json_output {
+        println!(
+            "{}",
+            json!({
+                "schema_version": 1,
+                "event": "edit_finished",
+                "capture_id": capture_id,
+                "outcome": label,
+            })
+        );
+    }
+}
+
+/// The desktop UI thread, started here if no Pin or Edit has started it yet.
+fn started_desktop_ui<'a>(
+    host: &'a mut std::sync::MutexGuard<'_, Option<captastic_windows::DesktopUi>>,
+) -> Result<&'a captastic_windows::DesktopUi, captastic_core::CaptureError> {
+    if host.is_none() {
+        **host = Some(captastic_windows::DesktopUi::start()?);
+    }
+    Ok(host
+        .as_ref()
+        .expect("the desktop UI thread was just started"))
 }
 
 fn lock_desktop_ui(
@@ -1188,19 +1340,16 @@ fn pin_capture(
     at: captastic_core::Rect,
 ) {
     let mut host = lock_desktop_ui(desktop_ui);
-    if host.is_none() {
-        match captastic_windows::DesktopUi::start() {
-            Ok(started) => *host = Some(started),
-            Err(error) => {
-                crate::logging::warn(format_args!(
-                    "capture {} was delivered but could not be pinned: {error}",
-                    capture_id.0
-                ));
-                return;
-            }
+    let host = match started_desktop_ui(&mut host) {
+        Ok(host) => host,
+        Err(error) => {
+            crate::logging::warn(format_args!(
+                "capture {} was delivered but could not be pinned: {error}",
+                capture_id.0
+            ));
+            return;
         }
-    }
-    let Some(host) = host.as_ref() else { return };
+    };
     // Detached: a pin stays open as long as the user wants it, and must never hold one of the
     // readback pool's slots while it does (ADR 0010).
     match host.pin(frame.detached(), at) {
@@ -1726,8 +1875,8 @@ mod tests {
                 "a daemon run can always pin, whatever the destinations"
             );
             assert!(
-                !destinations.edit_available,
-                "the editor is ADR 0010's second slice"
+                destinations.edit_available,
+                "a daemon run can always edit, whatever the destinations"
             );
         }
     }
