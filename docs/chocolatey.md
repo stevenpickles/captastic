@@ -13,8 +13,13 @@ the Start Menu, then turn on **Start with Windows** in the tray menu if it shoul
 Windows. When upgrading or uninstalling a running installation, the Chocolatey before-modify hook
 stops the daemon before touching its files, by signalling the session control event
 `Local\CaptasticDaemonControl-v1` and waiting for the daemon to release it. That needs no Captastic
-executable, so the same hook stops a 0.2 daemon and a 0.3 one. Reopen Captastic from the Start Menu
-after an upgrade. The package never starts an elevated tray process from Chocolatey. Uninstall
+executable, so the same hook stops a 0.2 daemon and a 0.3 one. The hook also leaves a marker
+in `%TEMP%` when it stopped a running daemon, and the new version's install reads it and starts
+Captastic again through `explorer.exe`, which hands the start to the signed-in user's desktop shell,
+so Captastic comes back at that user's normal integrity level. The package never starts an elevated
+tray process. A first install never launches, an upgrade of a Captastic that was not running does
+not either, and an upgrade from 0.2 does not relaunch because 0.2's hook predates the marker; start
+Captastic from the Start Menu in those cases. Uninstall
 removes the command shim, the login entry and the shortcut but preserves configuration and logs
 under `~/.captastic`.
 
