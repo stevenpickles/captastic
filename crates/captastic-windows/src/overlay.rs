@@ -8,6 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
+mod desktop_ui;
+mod editor;
 mod layout;
 mod machine;
 mod pin;
@@ -41,15 +43,15 @@ use shell::{
 use snap::{SnapAxis, SnapTarget, SnapTargetKind, SnapTargets, NO_SNAPS};
 use window_enumeration::{enumerate_visible_windows, WindowCandidate};
 
+use machine::{
+    confirm_intent, default_region_for_source, fit_region_to_source, initial_selection,
+    local_point, transition, CaptureTool, CloseOutcome, CursorIntent, OverlayEffect, OverlayInput,
+    OverlayModel, ResizeHandle,
+};
 #[cfg(test)]
 use machine::{
     contains, hit_test_resize_handle, latest_interaction_region, move_region, rect_from_points,
     resize_region,
-};
-use machine::{
-    default_region_for_source, fit_region_to_source, initial_selection, local_point, transition,
-    CaptureTool, CloseOutcome, CursorIntent, Modifiers, OverlayEffect, OverlayInput, OverlayModel,
-    ResizeHandle,
 };
 
 use crate::dwm_thumbnail::{fit_source_in_bounds, DwmThumbnail};
@@ -117,7 +119,8 @@ const UI_FONT_HEIGHT: i32 = 21;
 ///
 /// "Snap to Window Edges" would be plainer but measures 200 px against the 192 px a menu row has
 /// for text at 96 DPI, and widening the menu for one row is a worse trade than the shorter name.
-pub use pin::PinHost;
+pub use desktop_ui::DesktopUi;
+pub use editor::EditOutcome;
 
 const SNAP_TO_WINDOWS_LABEL: &str = "Snap to Edges";
 /// The Options row for file output. Shorter than the notification area's "Save Captures to Disk"
@@ -1644,6 +1647,7 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                     point,
                     window_slot,
                     time_ms: message_time_ms(),
+                    modifiers: modifiers(),
                 }
             };
             run_machine(hwnd, state_pointer, input)
@@ -1669,7 +1673,14 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
                 let state = unsafe { &*state_pointer };
                 screen_point(state.model.source, lparam)
             };
-            run_machine(hwnd, state_pointer, OverlayInput::DoubleClicked { point })
+            run_machine(
+                hwnd,
+                state_pointer,
+                OverlayInput::DoubleClicked {
+                    point,
+                    modifiers: modifiers(),
+                },
+            )
         }
         WM_KEYDOWN if wparam.0 == usize::from(VK_RETURN.0) => {
             let intent = confirm_intent(modifiers());
@@ -2124,20 +2135,6 @@ fn apply_overlay_effects(
                 return;
             }
         }
-    }
-}
-
-/// The intent a confirming key or click carries: Shift pins and Ctrl edits, as the plain key or
-/// click captures (ADR 0010). Ctrl wins when both are held: it is the one that withholds the
-/// capture, and an edit can still be abandoned, where a capture already delivered cannot be taken
-/// back.
-fn confirm_intent(held: Modifiers) -> ConfirmIntent {
-    if held.ctrl {
-        ConfirmIntent::Edit
-    } else if held.shift {
-        ConfirmIntent::Pin
-    } else {
-        ConfirmIntent::Capture
     }
 }
 
@@ -4114,7 +4111,7 @@ fn draw_hover_tooltip(device: HDC, state: &OverlayState, layout: ToolbarLayout) 
         }
         Some(ToolbarControl::Edit) => {
             let value = if !state.model.edit_available {
-                "Editing is not available yet"
+                "Editing needs Captastic running in the notification area"
             } else if state.model.selection.is_some() {
                 "Edit before copying (Ctrl+Enter)"
             } else {
@@ -4124,7 +4121,7 @@ fn draw_hover_tooltip(device: HDC, state: &OverlayState, layout: ToolbarLayout) 
         }
         Some(ToolbarControl::Capture) => {
             let value = if state.model.selection.is_some() {
-                "Copy selection to clipboard"
+                "Copy selection (Shift+click to pin, Ctrl+click to edit)"
             } else {
                 "Select something to capture"
             };
@@ -4619,7 +4616,7 @@ mod tests {
             metadata,
         )
         .expect("a valid four-pixel frame");
-        let host = PinHost::start().expect("the pinned-capture thread starts");
+        let host = DesktopUi::start().expect("the desktop UI thread starts");
         host.pin(frame.detached(), frame.metadata.source_rect)
             .expect("the pin request is accepted");
 
