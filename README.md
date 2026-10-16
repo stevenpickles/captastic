@@ -135,8 +135,9 @@ event prevents more than one daemon instance from running, and starting `captast
 is running does nothing.
 While the daemon is active, Captastic places an icon in the Windows notification area. Double-click
 the icon to capture, or right-click it to capture, turn **Save Captures to Disk** on or off,
-open the most recent capture, show it in its folder, or prune the capture history (**Open Last
-Capture**, **Show in Folder**, and **Prune Capture History**), close every pinned capture or make
+open the most recent capture, show it selected in its folder, open the folder captures are saved
+to, or prune the capture history (**Open Last Capture**, **Show in Folder**, **Open Captures
+Folder**, and **Prune Capture History**), close every pinned capture or make
 them clickable again (**Close All Pins**, **Make Pins Clickable**), pause/resume the global hotkey, open
 `captastic.toml`, open the persistent log, toggle **Start with Windows**, or exit cleanly. If
 Windows Explorer restarts, Captastic restores its notification icon automatically. Tray
@@ -352,7 +353,9 @@ directory, template) is read at startup as before, so changing those still means
 Captastic remembers recent captures under `[history]` (`max_items`, `max_age_days`,
 `max_total_bytes`; `max_items = 0` turns it off). The notification-area menu uses that history for
 **Open Last Capture**, **Show in Folder**, and **Prune Capture History**, each greyed until there
-is something to open.
+is something to open; a saved recording counts, whether or not still captures are being saved.
+**Open Captures Folder** is always available, and opens the output directory even before anything
+has been saved there.
 
 One-shot captures write to disk from the same configuration: `captastic-dev capture --backend dxgi`
 honours `[output]`, and `--config <file>` points it at a configuration other than the default.
@@ -488,7 +491,7 @@ way it is saved. **Options -> Record As** chooses the format, and the choice is 
 
 A recording is always saved to the output directory, named by the same template as stills and
 remembered in capture history, whether or not still captures are being saved; a notification names
-the file. It never goes to the clipboard. It records the pointer if `[capture] cursor` includes it
+the file, and clicking it shows the file selected in its folder. It never goes to the clipboard. It records the pointer if `[capture] cursor` includes it
 for stills, and never audio. One recording runs at a time, and the capture hotkey does nothing while
 it runs except say so. Captastic exiting finishes a recording rather than discarding it. Recording
 needs Captastic running in the notification area; the developer command line's one-shot capture

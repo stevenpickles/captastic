@@ -1,7 +1,7 @@
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
@@ -53,6 +53,10 @@ const COMMAND_EXIT: usize = 1_009;
 const COMMAND_FILE_OUTPUT: usize = 1_010;
 const COMMAND_CLOSE_PINS: usize = 1_011;
 const COMMAND_PINS_CLICKABLE: usize = 1_012;
+const COMMAND_OPEN_CAPTURES_FOLDER: usize = 1_013;
+/// Sent to the tray callback when the person clicks a notification. Defined by hand, as the
+/// shell's headers do: `WM_USER + 5`.
+const NIN_BALLOONUSERCLICK: u32 = 0x0405;
 const SESSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(4);
 const TRAY_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const TRAY_STOP_POLL: Duration = Duration::from_millis(5);
@@ -71,6 +75,8 @@ pub enum TrayEvent {
     OpenLastCapture,
     /// Reveal the most recently written capture in the file manager.
     ShowInFolder,
+    /// Open the folder captures and recordings are saved to.
+    OpenCapturesFolder,
     /// Apply retention now, rather than waiting for the next capture to do it.
     PruneHistory,
     /// Start or stop writing captures to disk, and remember which the user chose.
@@ -221,18 +227,39 @@ impl TrayIcon {
         self.notify(title.into(), message.into(), true)
     }
 
+    /// An information notification about a file, which shows that file in its folder when it
+    /// is clicked: a saved recording, for instance.
+    pub fn show_info_revealing(
+        &self,
+        title: impl Into<String>,
+        message: impl Into<String>,
+        file: PathBuf,
+    ) -> Result<(), CaptureError> {
+        self.send_notification(TrayNotification {
+            title: title.into(),
+            message: message.into(),
+            informational: true,
+            reveal: Some(file),
+        })
+    }
+
     fn notify(
         &self,
         title: String,
         message: String,
         informational: bool,
     ) -> Result<(), CaptureError> {
+        self.send_notification(TrayNotification {
+            title,
+            message,
+            informational,
+            reveal: None,
+        })
+    }
+
+    fn send_notification(&self, notification: TrayNotification) -> Result<(), CaptureError> {
         self.notification_sender
-            .try_send(TrayNotification {
-                title,
-                message,
-                informational,
-            })
+            .try_send(notification)
             .map_err(|error| tray_error("queue_tray_error", error.to_string()))?;
         // SAFETY: hwnd identifies the live hidden tray window owned by the tray thread.
         unsafe { PostMessageW(HWND(self.hwnd), TRAY_SHOW_ERROR, WPARAM(0), LPARAM(0)) }
@@ -305,6 +332,31 @@ pub fn open_path(path: &Path) -> Result<(), CaptureError> {
     Ok(())
 }
 
+/// Opens the file manager on the folder holding `file`, with the file selected.
+pub fn reveal_in_folder(file: &Path) -> Result<(), CaptureError> {
+    let parameters = format!("/select,\"{}\"", file.display());
+    let mut parameters: Vec<u16> = parameters.encode_utf16().collect();
+    parameters.push(0);
+    // SAFETY: Both strings are null-terminated for this call; the rest are deliberately null.
+    let result = unsafe {
+        ShellExecuteW(
+            HWND(0),
+            w!("open"),
+            w!("explorer.exe"),
+            PCWSTR(parameters.as_ptr()),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if result.0 <= 32 {
+        return Err(tray_error(
+            "reveal_in_folder",
+            format!("ShellExecuteW returned {} for {}", result.0, file.display()),
+        ));
+    }
+    Ok(())
+}
+
 pub fn show_error_dialog(message: &str) {
     show_dialog(message, MB_ICONERROR);
 }
@@ -368,6 +420,7 @@ fn run_tray(
         session_shutdown_requested,
         session_drain_completed,
         model: machine::TrayModel::new(startup_enabled, file_output_enabled),
+        last_reveal: None,
     });
     let state_pointer = Box::into_raw(state);
     // SAFETY: The registered class is live and state_pointer remains allocated through the loop.
@@ -492,6 +545,9 @@ struct TrayState {
     session_shutdown_requested: Arc<AtomicBool>,
     session_drain_completed: Arc<AtomicBool>,
     model: machine::TrayModel,
+    /// The file the most recent notification was about, which clicking it reveals. Every
+    /// notification replaces it, so clicking one about something else reveals nothing.
+    last_reveal: Option<PathBuf>,
 }
 
 /// The tray window's decision core: the window procedure translates each Win32 message into a
@@ -572,6 +628,7 @@ mod machine {
         FileOutputChanged(bool),
         HistoryAvailabilityChanged(bool),
         NotificationsPosted,
+        NotificationClicked,
         QueryEndSession,
         EndSession {
             committed: bool,
@@ -592,6 +649,7 @@ mod machine {
         OpenLogs,
         OpenLastCapture,
         ShowInFolder,
+        OpenCapturesFolder,
         PruneHistory,
         ToggleFileOutput,
         ClosePins,
@@ -626,6 +684,8 @@ mod machine {
         },
         /// Drain the queued notifications into balloons.
         DrainNotifications,
+        /// Show the file the last notification was about, if it was about one.
+        RevealNotifiedFile,
         SendEvent(TrayEvent),
         CreateShutdownBlockReason,
         DestroyShutdownBlockReason,
@@ -728,6 +788,11 @@ mod machine {
                 vec![TrayEffect::SendEvent(TrayEvent::ShowInFolder)],
                 Handled,
             ),
+            TrayInput::Menu(TrayMenuCommand::OpenCapturesFolder) => (
+                vec![TrayEffect::SendEvent(TrayEvent::OpenCapturesFolder)],
+                Handled,
+            ),
+            TrayInput::NotificationClicked => (vec![TrayEffect::RevealNotifiedFile], Handled),
             TrayInput::Menu(TrayMenuCommand::PruneHistory) => (
                 vec![TrayEffect::SendEvent(TrayEvent::PruneHistory)],
                 Handled,
@@ -914,6 +979,7 @@ fn translate_tray_message(
         TRAY_CALLBACK => match lparam.0 as u32 {
             WM_LBUTTONDBLCLK => TranslatedMessage::Input(TrayInput::IconDoubleClick),
             WM_RBUTTONUP | WM_CONTEXTMENU => TranslatedMessage::Input(TrayInput::IconContextMenu),
+            NIN_BALLOONUSERCLICK => TranslatedMessage::Input(TrayInput::NotificationClicked),
             _ => TranslatedMessage::Consumed,
         },
         WM_COMMAND => match wparam.0 & 0xffff {
@@ -928,6 +994,9 @@ fn translate_tray_message(
             }
             COMMAND_SHOW_IN_FOLDER => {
                 TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::ShowInFolder))
+            }
+            COMMAND_OPEN_CAPTURES_FOLDER => {
+                TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::OpenCapturesFolder))
             }
             COMMAND_PRUNE_HISTORY => {
                 TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::PruneHistory))
@@ -1039,10 +1108,23 @@ fn apply_tray_effect(hwnd: HWND, state_pointer: *mut TrayState, effect: machine:
                 unsafe { (*state_pointer).notification_receiver.try_recv() }
             };
             let Ok(message) = message else { break };
+            // SAFETY: A short write to this thread's state; nothing else runs meanwhile.
+            unsafe { (*state_pointer).last_reveal = message.reveal.clone() };
             if let Err(error) = show_error_notification(hwnd, &message) {
                 log::warn!("failed to show tray error notification: {error}");
             }
         },
+        TrayEffect::RevealNotifiedFile => {
+            let file = {
+                // SAFETY: A short read of this thread's state, ended before the shell is called.
+                unsafe { (*state_pointer).last_reveal.clone() }
+            };
+            if let Some(file) = file {
+                if let Err(error) = reveal_in_folder(&file) {
+                    log::warn!("failed to show a notified file in its folder: {error}");
+                }
+            }
+        }
         TrayEffect::SendEvent(event) => send_tray_event(state_pointer, event),
         TrayEffect::CreateShutdownBlockReason => {
             // SAFETY: hwnd is this live top-level window and the reason is static UTF-16.
@@ -1199,6 +1281,8 @@ struct TrayNotification {
     message: String,
     /// The information icon rather than the error one.
     informational: bool,
+    /// The file clicking the notification shows in its folder.
+    reveal: Option<PathBuf>,
 }
 
 fn show_error_notification(
@@ -1331,6 +1415,17 @@ fn show_context_menu(
             )
         }
         .map_err(|error| native_error("append_show_in_folder_menu", error))?;
+        // Always usable: the folder is there to open whether or not anything is remembered.
+        // SAFETY: menu and static labels are live for each call.
+        unsafe {
+            AppendMenuW(
+                menu,
+                MF_STRING,
+                COMMAND_OPEN_CAPTURES_FOLDER,
+                w!("Open Captures Folder"),
+            )
+        }
+        .map_err(|error| native_error("append_open_captures_folder_menu", error))?;
         // SAFETY: menu and static labels are live for each call.
         unsafe {
             AppendMenuW(
@@ -1695,6 +1790,18 @@ mod tests {
                 WM_CONTEXTMENU as isize,
                 TranslatedMessage::Input(TrayInput::IconContextMenu),
             ),
+            (
+                TRAY_CALLBACK,
+                0,
+                NIN_BALLOONUSERCLICK as isize,
+                TranslatedMessage::Input(TrayInput::NotificationClicked),
+            ),
+            (
+                WM_COMMAND,
+                COMMAND_OPEN_CAPTURES_FOLDER,
+                0,
+                TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::OpenCapturesFolder)),
+            ),
             // Hover and move notifications are acknowledged without a product decision.
             (TRAY_CALLBACK, 0, 0x0200, TranslatedMessage::Consumed),
             (
@@ -1943,6 +2050,10 @@ mod tests {
         for (command, expected) in [
             (TrayMenuCommand::OpenLastCapture, TrayEvent::OpenLastCapture),
             (TrayMenuCommand::ShowInFolder, TrayEvent::ShowInFolder),
+            (
+                TrayMenuCommand::OpenCapturesFolder,
+                TrayEvent::OpenCapturesFolder,
+            ),
             (TrayMenuCommand::PruneHistory, TrayEvent::PruneHistory),
         ] {
             let (effects, handled) = transition(&mut model, TrayInput::Menu(command));

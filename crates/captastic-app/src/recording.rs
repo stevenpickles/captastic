@@ -771,6 +771,7 @@ impl RecordingHost {
                             .file_name()
                             .map(|name| name.to_string_lossy().into_owned())
                             .unwrap_or_default(),
+                        path: report.path.clone(),
                         ended: report.ended,
                     });
             }
