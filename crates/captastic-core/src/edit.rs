@@ -120,10 +120,12 @@ pub enum Mark {
         width: f32,
     },
     /// Text, as `mask` laid with its top-left pixel at `at` and coloured `color`. `text` is what
-    /// was typed, kept so an edit can say what it holds; only the mask is painted.
+    /// was typed and `size` the pixels to the em it was rasterized at, kept so the text can be
+    /// laid out again and edited; only the mask is painted.
     Text {
         at: (i32, i32),
         text: String,
+        size: u32,
         color: Color,
         mask: GlyphMask,
     },
@@ -189,8 +191,17 @@ impl Mark {
 /// One undoable operation.
 #[derive(Clone, Debug, PartialEq)]
 enum Step {
-    Crop { before: Rect, after: Rect },
+    Crop {
+        before: Rect,
+        after: Rect,
+    },
     Mark(Mark),
+    /// The mark at `index` changed to `after`, or removed when there is no `after`.
+    Replace {
+        index: usize,
+        before: Mark,
+        after: Option<Mark>,
+    },
 }
 
 /// A capture being edited.
@@ -266,12 +277,41 @@ impl Edit {
     /// drawn, and only offered to a capture of eight-bit pixels, since nothing paints a colour
     /// into a wider one yet.
     pub fn add(&mut self, mark: Mark) -> bool {
+        let Some(mark) = self.accept(mark) else {
+            return false;
+        };
+        self.record(Step::Mark(mark));
+        true
+    }
+
+    /// Changes the mark at `index` to `mark`, keeping its place in the painting order, or removes
+    /// it when `mark` is `None`. Returns whether anything changed: a replacement [`Edit::add`]
+    /// would refuse, one the same as the mark it replaces, or an index with no mark, is not an
+    /// operation.
+    pub fn replace(&mut self, index: usize, mark: Option<Mark>) -> bool {
+        let Some(before) = self.marks.get(index).cloned() else {
+            return false;
+        };
+        let after = match mark {
+            Some(mark) => match self.accept(mark) {
+                Some(mark) if mark != before => Some(mark),
+                _ => return false,
+            },
+            None => None,
+        };
+        self.record(Step::Replace {
+            index,
+            before,
+            after,
+        });
+        true
+    }
+
+    /// The mark as it would be kept, or nothing if it is not one to keep.
+    fn accept(&self, mark: Mark) -> Option<Mark> {
         let bounds = self.bounds();
         let mark = match mark {
-            Mark::Redaction(rect) => match rect.intersection(bounds) {
-                Some(rect) => Mark::Redaction(rect),
-                None => return false,
-            },
+            Mark::Redaction(rect) => Mark::Redaction(rect.intersection(bounds)?),
             drawn => {
                 let eight_bit = matches!(
                     self.source.format().encoding(),
@@ -290,13 +330,12 @@ impl Edit {
                     Mark::Redaction(_) => true,
                 };
                 if !eight_bit || !visible || !drawable {
-                    return false;
+                    return None;
                 }
                 drawn
             }
         };
-        self.record(Step::Mark(mark));
-        true
+        Some(mark)
     }
 
     pub fn can_undo(&self) -> bool {
@@ -321,6 +360,17 @@ impl Edit {
             Step::Crop { before, .. } => self.crop = *before,
             Step::Mark(_) => {
                 self.marks.pop();
+            }
+            Step::Replace {
+                index,
+                before,
+                after,
+            } => {
+                if after.is_some() {
+                    self.marks[*index] = before.clone();
+                } else {
+                    self.marks.insert(*index, before.clone());
+                }
             }
         }
         self.redo.push(step);
@@ -348,6 +398,12 @@ impl Edit {
         match step {
             Step::Crop { after, .. } => self.crop = after,
             Step::Mark(mark) => self.marks.push(mark),
+            Step::Replace { index, after, .. } => match after {
+                Some(mark) => self.marks[index] = mark,
+                None => {
+                    self.marks.remove(index);
+                }
+            },
         }
     }
 
@@ -1206,6 +1262,7 @@ mod tests {
         assert!(edit.add(Mark::Text {
             at: (3, 2),
             text: "x".to_owned(),
+            size: 12,
             color: RED,
             mask,
         }));
@@ -1229,6 +1286,7 @@ mod tests {
         assert!(edit.add(Mark::Text {
             at: (-1, 2),
             text: "x".to_owned(),
+            size: 12,
             color: RED,
             mask,
         }));
@@ -1238,10 +1296,41 @@ mod tests {
         assert!(!edit.add(Mark::Text {
             at: (0, 0),
             text: "  ".to_owned(),
+            size: 12,
             color: RED,
             mask: GlyphMask::new(2, 1, vec![0, 0]).expect("mask"),
         }));
         assert!(GlyphMask::new(2, 2, vec![0; 3]).is_none());
+    }
+
+    #[test]
+    fn a_mark_replaced_keeps_its_place_and_undo_puts_it_back() {
+        let mut edit = Edit::new(white(40, 40));
+        let arrow = |to: (f32, f32)| Mark::Arrow {
+            from: (2.0, 2.0),
+            to,
+            color: RED,
+            width: 2.0,
+        };
+        edit.add(arrow((20.0, 20.0)));
+        edit.redact(rect(0, 0, 4, 4));
+        assert!(edit.replace(0, Some(arrow((30.0, 10.0)))));
+        assert_eq!(edit.marks()[0], arrow((30.0, 10.0)));
+        assert_eq!(edit.marks()[1], Mark::Redaction(rect(0, 0, 4, 4)));
+        // The same mark again, one that would be refused, and no mark at all are not operations.
+        assert!(!edit.replace(0, Some(arrow((30.0, 10.0)))));
+        assert!(!edit.replace(0, Some(arrow((2.0, 2.0)))));
+        assert!(!edit.replace(5, None));
+        assert!(edit.undo());
+        assert_eq!(edit.marks()[0], arrow((20.0, 20.0)));
+        assert!(edit.redo());
+        assert_eq!(edit.marks()[0], arrow((30.0, 10.0)));
+        // Removing one, and undoing that, restores it where it was.
+        assert!(edit.replace(0, None));
+        assert_eq!(edit.marks(), [Mark::Redaction(rect(0, 0, 4, 4))]);
+        assert!(edit.undo());
+        assert_eq!(edit.marks()[0], arrow((30.0, 10.0)));
+        assert_eq!(edit.marks().len(), 2);
     }
 
     #[test]
