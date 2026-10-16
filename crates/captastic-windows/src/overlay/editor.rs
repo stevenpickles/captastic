@@ -8,7 +8,7 @@
 //! Exactly one [`EditOutcome`] is reported for every editor, whichever way it ends.
 //!
 //! The capture is shown at its physical size when the window has room, and scaled down when it
-//! does not. Every mark - a redaction, a box, a pen, marker or highlighter stroke - is painted into
+//! does not. Every mark - a redaction, a box, an arrow, a pen, marker or highlighter stroke - is painted into
 //! the preview by the same code that paints the published image, so what is on screen is what will
 //! be sent. A mark being drawn is painted the same way as it grows, redrawing only the pixels it
 //! covers.
@@ -75,7 +75,7 @@ const DRAG_THRESHOLD_DIP: i32 = 3;
 /// How far, in capture pixels, the pointer must move before a stroke takes another point.
 const STROKE_STEP: f32 = 0.75;
 /// Wide enough for every button and swatch at every scaling.
-const MINIMUM_CLIENT_DIP: (i32, i32) = (760, 320);
+const MINIMUM_CLIENT_DIP: (i32, i32) = (800, 320);
 /// How far a box's corners are rounded: enough to soften them, not enough to read as a pill.
 const BOX_RADIUS_DIP: f32 = 6.0;
 /// The share of the display's work area a new editor may take.
@@ -121,16 +121,18 @@ enum EditorTool {
     Crop,
     Redact,
     Box,
+    Arrow,
     Pen,
     Marker,
     Highlighter,
 }
 
 impl EditorTool {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Crop,
         Self::Redact,
         Self::Box,
+        Self::Arrow,
         Self::Pen,
         Self::Marker,
         Self::Highlighter,
@@ -144,6 +146,7 @@ impl EditorTool {
             Self::Pen => Some(1),
             Self::Marker => Some(2),
             Self::Highlighter => Some(3),
+            Self::Arrow => Some(4),
         }
     }
 
@@ -152,7 +155,7 @@ impl EditorTool {
     const fn width_dip(self) -> f32 {
         match self {
             Self::Pen => 3.0,
-            Self::Box => 4.0,
+            Self::Box | Self::Arrow => 4.0,
             Self::Marker => 10.0,
             Self::Highlighter => 22.0,
             Self::Crop | Self::Redact => 0.0,
@@ -164,6 +167,7 @@ impl EditorTool {
             Self::Crop => "Crop (C)",
             Self::Redact => "Redact (R)",
             Self::Box => "Box (B)",
+            Self::Arrow => "Arrow (A)",
             Self::Pen => "Pen (P)",
             Self::Marker => "Marker (M)",
             Self::Highlighter => "Highlighter (H)",
@@ -512,7 +516,7 @@ fn compose_preview(source: &CpuFrame, marks: &[Mark]) -> Vec<u8> {
 /// A press on the canvas, and what it is doing.
 #[derive(Clone, Debug)]
 enum Drag {
-    /// Drawing a rectangle between two points: a redaction, a box, or a crop from scratch.
+    /// Drawing between two points: a redaction, a box, an arrow, or a crop from scratch.
     Draw {
         tool: EditorTool,
         anchor: POINT,
@@ -549,7 +553,7 @@ struct EditorState {
     /// The drawing tool a swatch applies to while Crop or Redact is chosen.
     last_drawing_tool: EditorTool,
     /// The palette index each drawing tool draws in, by [`EditorTool::colour_slot`].
-    colours: [usize; 4],
+    colours: [usize; 5],
     /// Capture pixels per device-independent pixel on the display the capture came from.
     stroke_unit: f32,
     drag: Option<Drag>,
@@ -597,10 +601,19 @@ impl EditorState {
                 current,
                 moved: true,
             } => {
-                let rect = rect_between(
+                let (from, to) = (
                     self.layout.image_point(*anchor),
                     self.layout.image_point(*current),
-                )?;
+                );
+                if *tool == EditorTool::Arrow {
+                    return Some(Mark::Arrow {
+                        from: (from.0 as f32, from.1 as f32),
+                        to: (to.0 as f32, to.1 as f32),
+                        color: self.colour(*tool),
+                        width: self.width(*tool),
+                    });
+                }
+                let rect = rect_between(from, to)?;
                 match tool {
                     EditorTool::Redact => Some(Mark::Redaction(rect)),
                     EditorTool::Box => Some(Mark::Rectangle {
@@ -762,8 +775,8 @@ fn open_editor(
         back_buffer: None,
         tool: EditorTool::Crop,
         last_drawing_tool: EditorTool::Pen,
-        // Red ink for the box, pen and marker; a highlighter is yellow.
-        colours: [RED, RED, RED, YELLOW],
+        // Red ink for the box, pen, marker and arrow; a highlighter is yellow.
+        colours: [RED, RED, RED, YELLOW, RED],
         stroke_unit: metrics.dpi as f32 / UiMetrics::BASE_DPI as f32,
         drag: None,
         pressed: None,
@@ -1082,7 +1095,7 @@ fn pointer_pressed(hwnd: HWND, state: &mut EditorState, point: POINT) {
         moved: false,
     };
     let drag = match state.tool {
-        EditorTool::Redact | EditorTool::Box => draw(state.tool),
+        EditorTool::Redact | EditorTool::Box | EditorTool::Arrow => draw(state.tool),
         EditorTool::Pen | EditorTool::Marker | EditorTool::Highlighter => {
             let (x, y) = state.layout.image_point(point);
             Drag::Stroke {
@@ -1175,6 +1188,7 @@ fn key_button(key: u16, ctrl: bool, shift: bool) -> Option<EditorButton> {
         (0x43, false) => tool(EditorTool::Crop),
         (0x52, false) => tool(EditorTool::Redact),
         (0x42, false) => tool(EditorTool::Box),
+        (0x41, false) => tool(EditorTool::Arrow),
         (0x50, false) => tool(EditorTool::Pen),
         (0x4D, false) => tool(EditorTool::Marker),
         (0x48, false) => tool(EditorTool::Highlighter),
@@ -1557,6 +1571,9 @@ fn paint_icons(state: &EditorState, surface: &FrozenSurface) {
                 colour_bgr(state.colour(EditorTool::Highlighter)),
                 metrics,
             ),
+            EditorButton::Tool(EditorTool::Arrow) => {
+                paint_arrow(&mut painter, *bounds, ink, metrics)
+            }
             _ => {}
         }
     }
@@ -1680,6 +1697,32 @@ fn paint_highlighter(
     painter.capsule(pen.at(0.76, 0.0), pen.at(0.80, 0.0), half * size, ink, 1.0);
 }
 
+/// An arrow on the diagonal, pointing up and to the right.
+fn paint_arrow(painter: &mut Painter, bounds: UiRect, ink: Bgr, metrics: UiMetrics) {
+    let (left, top, size) = icon_frame(bounds, metrics);
+    let line = metrics.toolbar_tokens().icon_stroke as f32;
+    let tip = (left + size * 0.9, top + size * 0.1);
+    let base = (left + size * 0.58, top + size * 0.42);
+    painter.capsule(
+        (left + size * 0.12, top + size * 0.88),
+        base,
+        line * 0.75,
+        ink,
+        1.0,
+    );
+    // The head: its point at the tip, its base square to the shaft.
+    let spread = size * 0.2 * std::f32::consts::FRAC_1_SQRT_2;
+    painter.polygon(
+        &[
+            tip,
+            (base.0 - spread, base.1 - spread),
+            (base.0 + spread, base.1 + spread),
+        ],
+        ink,
+        1.0,
+    );
+}
+
 /// A colour swatch: a disc with a quiet rim, so black and white both read on the toolbar, and a
 /// ring when it is the colour in use or under the pointer.
 fn paint_swatch(
@@ -1784,8 +1827,8 @@ fn draw_tool_icon(
                 stroke,
             );
         }
-        // Painted antialiased after GDI is done, in the colour each draws in: see paint_icons.
-        EditorTool::Pen | EditorTool::Marker | EditorTool::Highlighter => {}
+        // Painted antialiased after GDI is done: see paint_icons.
+        EditorTool::Arrow | EditorTool::Pen | EditorTool::Marker | EditorTool::Highlighter => {}
     }
 }
 
@@ -2074,6 +2117,47 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
+        // An arrow dragged across the middle, then Done: its shaft crosses the capture.
+        let report = sender.clone();
+        host.edit(
+            frame.detached(),
+            frame.metadata.source_rect,
+            move |outcome| {
+                let _ = report.send(outcome);
+            },
+        )
+        .expect("the edit request is accepted");
+        let editor = find_editor();
+        post(editor, WM_KEYDOWN, usize::from(b'A'), 0);
+        post(editor, WM_LBUTTONDOWN, 1, at(1, middle_y));
+        post(editor, WM_MOUSEMOVE, 1, at(client.right - 2, middle_y));
+        post(editor, WM_LBUTTONUP, 0, at(client.right - 2, middle_y));
+        post(editor, WM_KEYDOWN, usize::from(VK_RETURN.0), 0);
+        match outcomes
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the editor answered")
+        {
+            EditOutcome::Done(edited) => {
+                let red = PALETTE[RED].1;
+                let ink = [red.blue, red.green, red.red, 255];
+                assert!(
+                    edited.pixels().chunks_exact(4).any(|pixel| pixel == ink),
+                    "no pixel was inked: {:?}",
+                    edited.pixels()
+                );
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // SAFETY: IsWindow accepts any handle, live or not.
+        while unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(editor) }.as_bool() {
+            assert!(
+                Instant::now() < deadline,
+                "the finished editor never closed"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
         // Escape on an unedited capture cancels without asking.
         let report = sender.clone();
         host.edit(
@@ -2199,6 +2283,10 @@ mod tests {
         assert_eq!(
             key_button(u16::from(b'B'), false, false),
             Some(EditorButton::Tool(EditorTool::Box))
+        );
+        assert_eq!(
+            key_button(u16::from(b'A'), false, false),
+            Some(EditorButton::Tool(EditorTool::Arrow))
         );
         assert_eq!(
             key_button(u16::from(b'M'), false, false),

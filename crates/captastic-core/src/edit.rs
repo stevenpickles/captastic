@@ -1,7 +1,8 @@
 //! What an editor does to a capture, independent of any window that shows it (ADR 0010).
 //!
 //! An [`Edit`] holds a capture and the operations made on it so far: one crop and any number of
-//! [`Mark`]s - redactions, box outlines and pen, marker and highlighter strokes - each undoable.
+//! [`Mark`]s - redactions, box outlines, arrows and pen, marker and highlighter strokes - each
+//! undoable.
 //! Nothing touches the capture's pixels until [`Edit::render`], which makes the image that will be
 //! published, painting the marks in the order they were made.
 //!
@@ -69,6 +70,14 @@ pub enum Mark {
         width: f32,
         style: StrokeStyle,
     },
+    /// A straight arrow from `from` to `to`: a shaft `width` pixels across with a round tail, and
+    /// a filled head whose point is exactly `to`.
+    Arrow {
+        from: (f32, f32),
+        to: (f32, f32),
+        color: Color,
+        width: f32,
+    },
 }
 
 impl Mark {
@@ -77,6 +86,26 @@ impl Mark {
         match self {
             Self::Redaction(rect) | Self::Rectangle { rect, .. } => {
                 (rect.width > 0 && rect.height > 0).then_some(*rect)
+            }
+            Self::Arrow {
+                from, to, width, ..
+            } => {
+                let shape = ArrowShape::new(*from, *to, *width)?;
+                let reach = width / 2.0 + 1.0;
+                let (mut left, mut top) = (from.0.min(to.0), from.1.min(to.1));
+                let (mut right, mut bottom) = (from.0.max(to.0), from.1.max(to.1));
+                for (x, y) in shape.head {
+                    left = left.min(x);
+                    top = top.min(y);
+                    right = right.max(x);
+                    bottom = bottom.max(y);
+                }
+                Rect::from_edges(
+                    (left - reach).floor() as i64,
+                    (top - reach).floor() as i64,
+                    (right + reach).ceil() as i64,
+                    (bottom + reach).ceil() as i64,
+                )
             }
             Self::Stroke { points, width, .. } => {
                 let reach = width / 2.0 + 1.0;
@@ -200,6 +229,8 @@ impl Edit {
                 let drawable = match &drawn {
                     Mark::Rectangle { width, .. } => *width > 0,
                     Mark::Stroke { width, .. } => *width > 0.0,
+                    // Bounds already refuse an arrow with no length or no width.
+                    Mark::Arrow { .. } => true,
                     Mark::Redaction(_) => true,
                 };
                 if !eight_bit || !visible || !drawable {
@@ -392,6 +423,95 @@ pub fn paint_mark(
                 }
             }
         }
+        Mark::Arrow {
+            from,
+            to,
+            color,
+            width,
+        } => {
+            let Some(shape) = ArrowShape::new(*from, *to, *width) else {
+                return;
+            };
+            let ink = ordered(*color, blue_first);
+            for y in reach.y..(reach.bottom() as i32) {
+                for x in reach.x..(reach.right() as i32) {
+                    let cover = shape.coverage((x as f32 + 0.5, y as f32 + 0.5));
+                    if cover > 0.0 {
+                        let at = offset(x, y);
+                        blend_over(&mut pixels[at..at + 4], &ink, cover, alpha);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// An arrow's outline: a shaft from the tail to the base of its head, and the head, a triangle.
+struct ArrowShape {
+    tail: (f32, f32),
+    /// Where the shaft meets the head, at the middle of the head's base.
+    base: (f32, f32),
+    radius: f32,
+    /// The point, then the two corners of the base.
+    head: [(f32, f32); 3],
+}
+
+impl ArrowShape {
+    /// The shape of an arrow `width` pixels across, or nothing if it has no length or no width.
+    ///
+    /// The head is long in proportion to the width, so a heavier arrow has a larger head, and
+    /// never more than three fifths of the arrow, so a short one is still mostly arrow.
+    fn new(from: (f32, f32), to: (f32, f32), width: f32) -> Option<Self> {
+        let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+        let length = (dx * dx + dy * dy).sqrt();
+        if !(length >= 1.0 && width > 0.0) {
+            return None;
+        }
+        let direction = (dx / length, dy / length);
+        let across = (-direction.1, direction.0);
+        let head_length = (width * 3.5 + 6.0).min(length * 0.6);
+        let half = (head_length * 0.55).max(width);
+        let base = (
+            to.0 - direction.0 * head_length,
+            to.1 - direction.1 * head_length,
+        );
+        Some(Self {
+            tail: from,
+            base,
+            radius: width / 2.0,
+            head: [
+                to,
+                (base.0 + across.0 * half, base.1 + across.1 * half),
+                (base.0 - across.0 * half, base.1 - across.1 * half),
+            ],
+        })
+    }
+
+    /// How much of the pixel centred at `point` the arrow covers, from 0 to 1.
+    fn coverage(&self, point: (f32, f32)) -> f32 {
+        let shaft =
+            (self.radius + 0.5 - distance_to_segment(point, self.tail, self.base)).clamp(0.0, 1.0);
+        // The head's distance is the largest of its distances outside each edge, which is exact
+        // along the edges and slightly sharpens the corners, as an arrowhead should be.
+        let centre = (
+            (self.head[0].0 + self.head[1].0 + self.head[2].0) / 3.0,
+            (self.head[0].1 + self.head[1].1 + self.head[2].1) / 3.0,
+        );
+        let mut outside = f32::MIN;
+        for index in 0..3 {
+            let start = self.head[index];
+            let end = self.head[(index + 1) % 3];
+            let (ex, ey) = (end.0 - start.0, end.1 - start.1);
+            let length = (ex * ex + ey * ey).sqrt().max(f32::EPSILON);
+            let mut normal = (ey / length, -ex / length);
+            // Point the normal away from the middle, whichever way round the corners run.
+            if (centre.0 - start.0) * normal.0 + (centre.1 - start.1) * normal.1 > 0.0 {
+                normal = (-normal.0, -normal.1);
+            }
+            outside = outside.max((point.0 - start.0) * normal.0 + (point.1 - start.1) * normal.1);
+        }
+        let head = (0.5 - outside).clamp(0.0, 1.0);
+        shaft.max(head)
     }
 }
 
@@ -957,6 +1077,55 @@ mod tests {
     }
 
     #[test]
+    fn an_arrow_has_a_shaft_and_a_head_whose_point_is_where_it_ends() {
+        let mut edit = Edit::new(white(40, 21));
+        assert!(edit.add(Mark::Arrow {
+            from: (2.0, 10.5),
+            to: (38.0, 10.5),
+            color: RED,
+            width: 2.0,
+        }));
+        let rendered = edit.render().expect("render");
+        let red = [RED.blue, RED.green, RED.red, 255];
+        // The shaft: solid along its middle, clear a little above it.
+        assert_eq!(pixel(&rendered, 10, 10), red);
+        assert_eq!(pixel(&rendered, 10, 7), [255; 4]);
+        // The head is wider than the shaft: solid above and below the line near its base.
+        assert_eq!(pixel(&rendered, 28, 7), red);
+        assert_eq!(pixel(&rendered, 28, 13), red);
+        // It narrows to its point, which reaches the end and goes no further.
+        assert_ne!(pixel(&rendered, 37, 10), [255; 4]);
+        assert_eq!(pixel(&rendered, 39, 10), [255; 4]);
+        assert_eq!(pixel(&rendered, 37, 6), [255; 4]);
+        // Nothing behind the tail.
+        assert_eq!(pixel(&rendered, 0, 10), [255; 4]);
+    }
+
+    #[test]
+    fn an_arrow_points_whichever_way_it_was_drawn() {
+        let mut down = Edit::new(white(21, 40));
+        down.add(Mark::Arrow {
+            from: (10.5, 2.0),
+            to: (10.5, 38.0),
+            color: RED,
+            width: 2.0,
+        });
+        let mut up = Edit::new(white(21, 40));
+        up.add(Mark::Arrow {
+            from: (10.5, 38.0),
+            to: (10.5, 2.0),
+            color: RED,
+            width: 2.0,
+        });
+        let (down, up) = (down.render().expect("down"), up.render().expect("up"));
+        // The wide part is near the end each points to.
+        assert_ne!(pixel(&down, 7, 28), [255; 4]);
+        assert_eq!(pixel(&down, 7, 10), [255; 4]);
+        assert_ne!(pixel(&up, 7, 11), [255; 4]);
+        assert_eq!(pixel(&up, 7, 29), [255; 4]);
+    }
+
+    #[test]
     fn a_mark_that_misses_the_capture_or_has_no_width_is_refused() {
         let mut edit = Edit::new(white(4, 4));
         assert!(!edit.add(Mark::Rectangle {
@@ -976,6 +1145,13 @@ mod tests {
             color: RED,
             width: 2.0,
             style: StrokeStyle::Ink,
+        }));
+        // An arrow with no length has no direction to point in.
+        assert!(!edit.add(Mark::Arrow {
+            from: (2.0, 2.0),
+            to: (2.2, 2.0),
+            color: RED,
+            width: 2.0,
         }));
         assert!(!edit.can_undo());
     }
