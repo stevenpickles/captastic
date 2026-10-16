@@ -440,7 +440,8 @@ one-shot capture greys it. See [ADR 0010](docs/adr/0010-pinning-and-annotation.m
 pixel size where there is room and scaled down where there is not. **Crop** (C) draws the part to
 keep, and its edges, corners and handles move and resize it; what falls outside is dimmed. **Redact**
 (R) draws opaque black boxes over anything that must not be shared. To point things out, **Box**
-(B) draws a coloured outline with slightly rounded corners, **Pen** (P) a thin freehand line, **Marker** (M) a thick one,
+(B) draws a coloured outline with slightly rounded corners, **Arrow** (A) a straight arrow pointing
+to where the drag ends, **Pen** (P) a thin freehand line, **Marker** (M) a thick one,
 and **Highlighter** (H) a wide translucent stroke that tints what is under it without hiding it. The
 seven swatches (1-7: red, yellow, green, blue, magenta, black, white) set the colour of the drawing tool in
 hand, and each tool remembers its own, so the highlighter starts yellow and the rest red. Marks are

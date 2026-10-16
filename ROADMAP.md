@@ -588,8 +588,8 @@ Each lands as its own pull request with a manual desktop checklist.
    destructive redaction (an opaque fill over the exported pixels, never a blur or a reversible
    layer), with the capture withheld until **Done** and then published through the destination set.
 3. **Shapes and highlights** (`feature/70/editor-shapes-and-pens`, built on slice 2). Box outlines,
-   pen, marker and highlighter strokes in a six-colour palette, painted in order with redaction.
-   Arrows are still to come.
+   pen, marker and highlighter strokes in a seven-colour palette, painted in order with redaction.
+   Arrows followed in 0.4.0 (`feature/76/editor-arrows`).
 4. **Text.** Text annotations, with DPI-correct font rendering in the exported pixels.
 5. **History integration.** Opening a recent capture in the editor, once modal versus concurrent is
    settled and proven by the slices above.
