@@ -1442,7 +1442,12 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                     }
                     last_notice_message = Some(message.clone());
                     if let Some(tray) = tray.as_ref() {
-                        let shown = if notice.is_informational() {
+                        let shown = if let DaemonNotice::RecordingSaved { path, .. } = &notice {
+                            // The recording is in history now, which the tray's history entries
+                            // need to know even when still captures are not being saved.
+                            refresh_tray_history(&args.history_store, tray);
+                            tray.show_info_revealing(notice.title(), message, path.clone())
+                        } else if notice.is_informational() {
                             tray.show_info_with_title(notice.title(), message)
                         } else {
                             tray.show_error_with_title(notice.title(), message)
@@ -1499,6 +1504,9 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                             }
                             captastic_windows::TrayEvent::ShowInFolder => {
                                 show_last_capture_in_folder(&args.history_store, tray);
+                            }
+                            captastic_windows::TrayEvent::OpenCapturesFolder => {
+                                open_captures_folder(&args.output_directory, tray);
                             }
                             captastic_windows::TrayEvent::PruneHistory => {
                                 prune_history_from_tray(
@@ -1710,11 +1718,7 @@ fn show_last_capture_in_folder(
 ) {
     match latest_capture(store) {
         Ok(Some(path)) => {
-            let Some(directory) = path.parent() else {
-                notify_history_problem(tray, "The remembered capture has no folder.".to_owned());
-                return;
-            };
-            if let Err(error) = captastic_windows::open_path(directory) {
+            if let Err(error) = captastic_windows::reveal_in_folder(&path) {
                 notify_history_problem(
                     tray,
                     format!("Captastic could not open the folder: {error}"),
@@ -1730,6 +1734,26 @@ fn show_last_capture_in_folder(
             tray,
             format!("Captastic could not read its capture history: {error}"),
         ),
+    }
+}
+
+/// Opens the folder captures and recordings are saved to, making it first if nothing has been
+/// saved there yet, so the menu entry always leads somewhere.
+#[cfg(windows)]
+fn open_captures_folder(directory: &std::path::Path, tray: &captastic_windows::TrayIcon) {
+    let opened = std::fs::create_dir_all(directory)
+        .map_err(|error| error.to_string())
+        .and_then(|()| captastic_windows::open_path(directory).map_err(|error| error.to_string()));
+    if let Err(error) = opened {
+        crate::logging::warn(format_args!("could not open the captures folder: {error}"));
+        if let Err(error) = tray.show_error_with_title(
+            "Captastic could not open the captures folder",
+            format!("{}: {error}", directory.display()),
+        ) {
+            crate::logging::warn(format_args!(
+                "failed to surface a captures-folder problem in the notification area: {error}"
+            ));
+        }
     }
 }
 
@@ -3191,6 +3215,8 @@ pub(crate) enum DaemonNotice {
     /// A recording was saved to the output directory.
     RecordingSaved {
         file_name: String,
+        /// Where it was saved, which clicking the notification shows.
+        path: std::path::PathBuf,
         ended: crate::recording::RecordingEnd,
     },
     /// A recording failed, and nothing was saved.
@@ -3235,11 +3261,16 @@ impl DaemonNotice {
             Self::RecordingInProgress => {
                 "Stop the recording with its Stop button before capturing again.".to_owned()
             }
-            Self::RecordingSaved { file_name, ended } => match ended {
-                crate::recording::RecordingEnd::TimeLimit => {
-                    format!("{file_name} was saved when the recording reached its time limit.")
+            Self::RecordingSaved {
+                file_name, ended, ..
+            } => match ended {
+                crate::recording::RecordingEnd::TimeLimit => format!(
+                    "{file_name} was saved when the recording reached its time limit. Click to \
+                     show it in its folder."
+                ),
+                crate::recording::RecordingEnd::Stopped => {
+                    format!("{file_name} was saved. Click to show it in its folder.")
                 }
-                crate::recording::RecordingEnd::Stopped => format!("{file_name} was saved."),
             },
             Self::RecordingFailed { message } => format!("Nothing was saved: {message}."),
         }
