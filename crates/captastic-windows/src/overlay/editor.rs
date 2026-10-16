@@ -105,7 +105,6 @@ const PALETTE: [(&str, Color); 7] = [
     ("White", Color::rgb(255, 255, 255)),
 ];
 const RED: usize = 0;
-const YELLOW: usize = 1;
 
 /// How an editor ended. Reported exactly once per editor.
 #[derive(Debug)]
@@ -148,17 +147,9 @@ impl EditorTool {
         Self::Highlighter,
     ];
 
-    /// Which of the drawing tools' remembered colours this tool uses, if it draws in colour.
-    const fn colour_slot(self) -> Option<usize> {
-        match self {
-            Self::Crop | Self::Redact => None,
-            Self::Box => Some(0),
-            Self::Pen => Some(1),
-            Self::Marker => Some(2),
-            Self::Highlighter => Some(3),
-            Self::Arrow => Some(4),
-            Self::Text => Some(5),
-        }
+    /// Whether the tool draws in the colour in hand.
+    const fn draws(self) -> bool {
+        !matches!(self, Self::Crop | Self::Redact)
     }
 
     /// How wide the tool draws, in device-independent pixels of the display the capture came
@@ -547,6 +538,13 @@ enum Drag {
         tool: EditorTool,
         points: Vec<(f32, f32)>,
     },
+    /// Moving one end of the arrow at `index` among the edit's marks.
+    ArrowEnd {
+        index: usize,
+        /// The point, rather than the tail.
+        tip: bool,
+        current: POINT,
+    },
 }
 
 /// Text being typed, not yet a mark: it is shown as the mark it would be, and becomes one on
@@ -560,6 +558,11 @@ struct TextEntry {
     /// waiting for its second.
     high_surrogate: Option<u16>,
     layout: TextLayout,
+    /// Pixels to the em, in the capture.
+    size: i32,
+    color: Color,
+    /// The text mark this was opened from, which it replaces when finished.
+    replacing: Option<usize>,
 }
 
 impl TextEntry {
@@ -571,13 +574,14 @@ impl TextEntry {
         )
     }
 
-    fn mark(&self, color: Color) -> Option<Mark> {
+    fn mark(&self) -> Option<Mark> {
         let mask = self.layout.mask.clone()?;
         let (x, y) = self.origin();
         Some(Mark::Text {
             at: (x + self.layout.mask_offset.0, y + self.layout.mask_offset.1),
             text: self.text.clone(),
-            color,
+            size: self.size.max(1) as u32,
+            color: self.color,
             mask,
         })
     }
@@ -608,10 +612,10 @@ struct EditorState {
     pending_dirty: Option<Rect>,
     back_buffer: Option<FrozenSurface>,
     tool: EditorTool,
-    /// The drawing tool a swatch applies to while Crop or Redact is chosen.
+    /// The drawing tool a swatch picks up while Crop or Redact is chosen.
     last_drawing_tool: EditorTool,
-    /// The palette index each drawing tool draws in, by [`EditorTool::colour_slot`].
-    colours: [usize; 6],
+    /// The palette index every drawing tool draws in.
+    colour_index: usize,
     /// The text being typed, if any.
     typing: Option<TextEntry>,
     /// The size text is typed at, as an index into [`TEXT_SIZES_DIP`].
@@ -657,10 +661,7 @@ impl EditorState {
     /// The mark a drag in progress would make, if it ended here, or the text being typed.
     fn pending_mark(&self) -> Option<Mark> {
         let Some(drag) = self.drag.as_ref() else {
-            return self
-                .typing
-                .as_ref()
-                .and_then(|entry| entry.mark(self.colour(EditorTool::Text)));
+            return self.typing.as_ref().and_then(TextEntry::mark);
         };
         match drag {
             Drag::Draw {
@@ -677,7 +678,7 @@ impl EditorState {
                     return Some(Mark::Arrow {
                         from: (from.0 as f32, from.1 as f32),
                         to: (to.0 as f32, to.1 as f32),
-                        color: self.colour(*tool),
+                        color: self.colour(),
                         width: self.width(*tool),
                     });
                 }
@@ -686,16 +687,39 @@ impl EditorState {
                     EditorTool::Redact => Some(Mark::Redaction(rect)),
                     EditorTool::Box => Some(Mark::Rectangle {
                         rect,
-                        color: self.colour(*tool),
+                        color: self.colour(),
                         width: self.width(*tool).round().max(1.0) as u32,
                         radius: BOX_RADIUS_DIP * self.stroke_unit,
                     }),
                     _ => None,
                 }
             }
+            Drag::ArrowEnd {
+                index,
+                tip,
+                current,
+            } => {
+                let Some(Mark::Arrow {
+                    from,
+                    to,
+                    color,
+                    width,
+                }) = self.edit.marks().get(*index)
+                else {
+                    return None;
+                };
+                let (x, y) = self.layout.image_point(*current);
+                let moved = (x as f32, y as f32);
+                Some(Mark::Arrow {
+                    from: if *tip { *from } else { moved },
+                    to: if *tip { moved } else { *to },
+                    color: *color,
+                    width: *width,
+                })
+            }
             Drag::Stroke { tool, points } => Some(Mark::Stroke {
                 points: points.clone(),
-                color: self.colour(*tool),
+                color: self.colour(),
                 width: self.width(*tool),
                 style: if *tool == EditorTool::Highlighter {
                     StrokeStyle::Highlighter
@@ -707,9 +731,8 @@ impl EditorState {
         }
     }
 
-    fn colour(&self, tool: EditorTool) -> Color {
-        let slot = tool.colour_slot().unwrap_or(0);
-        PALETTE[self.colours[slot]].1
+    fn colour(&self) -> Color {
+        PALETTE[self.colour_index].1
     }
 
     fn width(&self, tool: EditorTool) -> f32 {
@@ -730,15 +753,6 @@ impl EditorState {
                 .is_some_and(|entry| !entry.text.is_empty())
     }
 
-    /// The drawing tool whose colour the swatches show and set.
-    fn colour_tool(&self) -> EditorTool {
-        if self.tool.colour_slot().is_some() {
-            self.tool
-        } else {
-            self.last_drawing_tool
-        }
-    }
-
     fn button_enabled(&self, button: EditorButton) -> bool {
         match button {
             EditorButton::Undo => self.edit.can_undo(),
@@ -749,19 +763,63 @@ impl EditorState {
 
     fn choose_tool(&mut self, tool: EditorTool) {
         self.tool = tool;
-        if tool.colour_slot().is_some() {
+        if tool.draws() {
             self.last_drawing_tool = tool;
         }
     }
 
-    /// A swatch sets the colour of the drawing tool in hand, or picks up the last one used, since
-    /// choosing a colour means meaning to draw.
+    /// A swatch sets the colour every drawing tool draws in, and recolours text being typed. With
+    /// Crop or Redact in hand it picks up the last drawing tool, since choosing a colour means
+    /// meaning to draw.
     fn choose_colour(&mut self, index: usize) {
-        let tool = self.colour_tool();
-        self.choose_tool(tool);
-        if let Some(slot) = tool.colour_slot() {
-            self.colours[slot] = index;
+        if !self.tool.draws() {
+            self.choose_tool(self.last_drawing_tool);
         }
+        self.colour_index = index;
+        if let Some(entry) = self.typing.as_mut() {
+            entry.color = PALETTE[index].1;
+        }
+    }
+
+    /// The end of an arrow under a client point, topmost first, and whether it is the point.
+    fn arrow_end_at(&self, point: POINT) -> Option<(usize, bool)> {
+        let reach = f64::from(self.metrics.px(GRIP_TOLERANCE_DIP));
+        let near = |end: (f32, f32)| {
+            let x = f64::from(self.layout.image.left) + f64::from(end.0) * self.layout.scale;
+            let y = f64::from(self.layout.image.top) + f64::from(end.1) * self.layout.scale;
+            (x - f64::from(point.x)).hypot(y - f64::from(point.y)) <= reach
+        };
+        self.edit
+            .marks()
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, mark)| match mark {
+                Mark::Arrow { to, .. } if near(*to) => Some((index, true)),
+                Mark::Arrow { from, .. } if near(*from) => Some((index, false)),
+                _ => None,
+            })
+    }
+
+    /// The text mark under a capture pixel, topmost first.
+    fn text_at(&self, at: (f64, f64)) -> Option<usize> {
+        let (x, y) = (at.0.floor() as i64, at.1.floor() as i64);
+        self.edit
+            .marks()
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, mark)| {
+                let bounds = match mark {
+                    Mark::Text { .. } => mark.bounds()?,
+                    _ => return None,
+                };
+                let inside = x >= i64::from(bounds.x)
+                    && x < bounds.right()
+                    && y >= i64::from(bounds.y)
+                    && y < bounds.bottom();
+                inside.then_some(index)
+            })
     }
 }
 
@@ -858,7 +916,7 @@ fn open_editor(
         tool: EditorTool::Crop,
         last_drawing_tool: EditorTool::Pen,
         // Red ink for the box, pen, marker and arrow; a highlighter is yellow.
-        colours: [RED, RED, RED, YELLOW, RED, RED],
+        colour_index: RED,
         typing: None,
         text_size: DEFAULT_TEXT_SIZE,
         stroke_unit: metrics.dpi as f32 / UiMetrics::BASE_DPI as f32,
@@ -994,7 +1052,7 @@ pub(super) unsafe extern "system" fn editor_window_proc(
         WM_CAPTURECHANGED => {
             // SAFETY: As above. Losing the pointer mid-drag abandons the drag.
             let state = unsafe { &mut *state_pointer };
-            let dropped = state.drag.take().is_some();
+            let dropped = abandon_drag(state);
             if dropped || state.pressed.take().is_some() {
                 show_pending(state);
                 invalidate(hwnd);
@@ -1077,6 +1135,7 @@ fn set_cursor(hwnd: HWND, state: &EditorState) {
     } else {
         match &state.drag {
             Some(Drag::Crop { grip, .. }) => grip_cursor(*grip),
+            Some(Drag::ArrowEnd { .. }) => IDC_SIZEALL,
             Some(_) => IDC_CROSS,
             None => match state.tool {
                 EditorTool::Crop => grip_at(
@@ -1087,6 +1146,7 @@ fn set_cursor(hwnd: HWND, state: &EditorState) {
                 )
                 .map_or(IDC_CROSS, grip_cursor),
                 EditorTool::Text => IDC_IBEAM,
+                EditorTool::Arrow if state.arrow_end_at(point).is_some() => IDC_SIZEALL,
                 _ => IDC_CROSS,
             },
         }
@@ -1143,7 +1203,7 @@ fn pointer_moved(hwnd: HWND, state: &mut EditorState, point: POINT) {
                 (point.x - anchor.x).abs() >= threshold || (point.y - anchor.y).abs() >= threshold;
             changed = true;
         }
-        Some(Drag::Crop { current, .. }) => {
+        Some(Drag::Crop { current, .. } | Drag::ArrowEnd { current, .. }) => {
             *current = point;
             changed = true;
         }
@@ -1189,6 +1249,20 @@ fn pointer_pressed(hwnd: HWND, state: &mut EditorState, point: POINT) {
         current: point,
         moved: false,
     };
+    if state.tool == EditorTool::Arrow {
+        if let Some((index, tip)) = state.arrow_end_at(point) {
+            state.drag = Some(Drag::ArrowEnd {
+                index,
+                tip,
+                current: point,
+            });
+            leave_out_of_preview(state, index);
+            show_pending(state);
+            capture_pointer(hwnd);
+            invalidate(hwnd);
+            return;
+        }
+    }
     let drag = match state.tool {
         EditorTool::Text => {
             start_typing(state, state.layout.image_point(point));
@@ -1236,7 +1310,13 @@ fn pointer_released(hwnd: HWND, state: &mut EditorState, point: POINT) -> Option
     let pressed = state.pressed.take();
     // Taken before releasing: the release sends WM_CAPTURECHANGED, which would abandon both.
     release_pointer_capture();
-    if drag.is_some() {
+    if let Some(Drag::ArrowEnd { index, .. }) = drag {
+        if let Some(mark) = mark {
+            state.edit.replace(index, Some(mark));
+        }
+        refresh_preview(state);
+        invalidate(hwnd);
+    } else if drag.is_some() {
         if let Some(crop) = crop {
             state.edit.set_crop(crop);
         }
@@ -1323,6 +1403,10 @@ fn key_pressed(hwnd: HWND, state_pointer: *mut EditorState, key: u16) {
             if state.tool == EditorTool::Text {
                 let largest = TEXT_SIZES_DIP.len() as i32 - 1;
                 state.text_size = (state.text_size as i32 + step).clamp(0, largest) as usize;
+                let size = state.text_pixels();
+                if let Some(entry) = state.typing.as_mut() {
+                    entry.size = size;
+                }
                 retype(state);
                 invalidate(hwnd);
                 return;
@@ -1331,8 +1415,7 @@ fn key_pressed(hwnd: HWND, state_pointer: *mut EditorState, key: u16) {
         if state.typing.is_some() {
             // Keys type while text is open: none of them is a tool, a colour or a shortcut.
             if key == VK_ESCAPE.0 {
-                state.typing = None;
-                show_pending(state);
+                discard_typing(state);
             } else if key == VK_RETURN.0 && held.shift {
                 type_text(state, "\n");
             } else if key == VK_RETURN.0 {
@@ -1346,7 +1429,7 @@ fn key_pressed(hwnd: HWND, state_pointer: *mut EditorState, key: u16) {
         // SAFETY: The editor's state lives until WM_NCDESTROY on this thread; the borrow ends
         // before the cancel below.
         let state = unsafe { &mut *state_pointer };
-        if state.drag.take().is_some() {
+        if abandon_drag(state) {
             // Escape mid-drag drops the drag, not the edit.
             show_pending(state);
             release_pointer_capture();
@@ -1447,37 +1530,130 @@ fn show_pending(state: &mut EditorState) {
 }
 
 /// Opens text at `at`, a capture pixel, finishing any text already open.
+///
+/// A click on text already there opens that text instead, with the caret at its end, to be
+/// edited where it is, in its own size and colour.
 fn start_typing(state: &mut EditorState, at: (f64, f64)) {
     commit_typing(state);
-    match layout_text("", state.text_pixels()) {
+    if let Some(index) = state.text_at(at) {
+        if let Some(Mark::Text {
+            at,
+            text,
+            size,
+            color,
+            ..
+        }) = state.edit.marks().get(index).cloned()
+        {
+            match layout_text(&text, size as i32) {
+                Ok(layout) => {
+                    // The inverse of TextEntry::origin and TextEntry::mark.
+                    let origin = (at.0 - layout.mask_offset.0, at.1 - layout.mask_offset.1);
+                    state.typing = Some(TextEntry {
+                        anchor: (
+                            f64::from(origin.0),
+                            f64::from(origin.1) + f64::from(layout.line_height) / 2.0,
+                        ),
+                        text,
+                        high_surrogate: None,
+                        layout,
+                        size: size as i32,
+                        color,
+                        replacing: Some(index),
+                    });
+                    leave_out_of_preview(state, index);
+                    show_pending(state);
+                }
+                Err(error) => log::warn!("could not reopen text in the editor: {error}"),
+            }
+            return;
+        }
+    }
+    let size = state.text_pixels();
+    match layout_text("", size) {
         Ok(layout) => {
             state.typing = Some(TextEntry {
                 anchor: at,
                 text: String::new(),
                 high_surrogate: None,
                 layout,
+                size,
+                color: state.colour(),
+                replacing: None,
             });
         }
         Err(error) => log::warn!("could not start typing in the editor: {error}"),
     }
 }
 
-/// Makes the text being typed a mark, if it shows anything.
+/// Makes the text being typed a mark, if it shows anything. Reopened text replaces the mark it
+/// came from, and text emptied out removes it.
 fn commit_typing(state: &mut EditorState) {
     let Some(entry) = state.typing.take() else {
         return;
     };
-    if let Some(mark) = entry.mark(state.colour(EditorTool::Text)) {
-        commit_mark(state, mark);
+    let mark = entry.mark();
+    match entry.replacing {
+        Some(index) => {
+            state.edit.replace(index, mark);
+            refresh_preview(state);
+        }
+        None => {
+            if let Some(mark) = mark {
+                commit_mark(state, mark);
+            }
+            show_pending(state);
+        }
     }
-    show_pending(state);
+}
+
+/// Throws away the text being typed; reopened text goes back to how it was.
+fn discard_typing(state: &mut EditorState) {
+    if let Some(entry) = state.typing.take() {
+        if entry.replacing.is_some() {
+            refresh_preview(state);
+        } else {
+            show_pending(state);
+        }
+    }
+}
+
+/// Drops the drag in progress, if any, putting back a mark it had taken out of the preview.
+/// Returns whether there was one.
+fn abandon_drag(state: &mut EditorState) -> bool {
+    match state.drag.take() {
+        Some(Drag::ArrowEnd { .. }) => {
+            refresh_preview(state);
+            true
+        }
+        Some(_) => true,
+        None => false,
+    }
+}
+
+/// Shows every committed mark but the one at `index`, which is being changed and is drawn as the
+/// pending mark meanwhile, over the others.
+fn leave_out_of_preview(state: &mut EditorState, index: usize) {
+    let others: Vec<Mark> = state
+        .edit
+        .marks()
+        .iter()
+        .enumerate()
+        .filter(|(at, _)| *at != index)
+        .map(|(_, mark)| mark.clone())
+        .collect();
+    state.committed = compose_preview(state.edit.source(), &others);
+    state.pending_dirty = None;
+    // SAFETY: Completes any queued GDI read of the preview before its pixels are replaced.
+    let _ = unsafe { GdiFlush() };
+    if let Err(error) = state.preview.write_pixels(&state.committed) {
+        log::warn!("could not redraw the editor's preview: {error}");
+    }
 }
 
 /// Lays the text being typed out again, after it or its size changed, and shows it.
 fn retype(state: &mut EditorState) {
-    let size = state.text_pixels();
     if let Some(entry) = state.typing.as_mut() {
-        match layout_text(&entry.text, size) {
+        match layout_text(&entry.text, entry.size) {
             Ok(layout) => entry.layout = layout,
             Err(error) => log::warn!("could not lay out the editor's text: {error}"),
         }
@@ -1645,9 +1821,12 @@ fn compose(state: &EditorState, surface: &FrozenSurface) {
     if state.tool == EditorTool::Crop {
         draw_crop_handles(device, crop_on_screen, metrics, accent);
     }
+    if state.tool == EditorTool::Arrow {
+        draw_arrow_handles(device, state, accent);
+    }
     if let Some(entry) = &state.typing {
         let caret = layout.client_rect(entry.caret());
-        let colour = state.colour(EditorTool::Text);
+        let colour = entry.color;
         fill_device_rect(
             device,
             native(UiRect {
@@ -1661,6 +1840,49 @@ fn compose(state: &EditorState, surface: &FrozenSurface) {
     draw_toolbar(device, state, crop);
     paint_icons(state, surface);
     draw_tooltip(device, state);
+}
+
+/// A handle on each end of every arrow, so it is plain they can be taken hold of. The arrow
+/// being changed shows its ends where they are going.
+fn draw_arrow_handles(device: HDC, state: &EditorState, accent: COLORREF) {
+    let metrics = state.metrics;
+    let layout = &state.layout;
+    let half = metrics.px(HANDLE_SIZE_DIP) / 2;
+    let border = metrics.px(1).max(1);
+    let moving = match &state.drag {
+        Some(Drag::ArrowEnd { index, .. }) => Some(*index),
+        _ => None,
+    };
+    let pending = moving.and_then(|_| state.pending_mark());
+    let marks = state.edit.marks().iter().enumerate();
+    for (index, mark) in marks {
+        let shown = if moving == Some(index) {
+            pending.as_ref()
+        } else {
+            Some(mark)
+        };
+        let Some(Mark::Arrow { from, to, .. }) = shown else {
+            continue;
+        };
+        for end in [*from, *to] {
+            let x = layout.image.left + (f64::from(end.0) * layout.scale).round() as i32;
+            let y = layout.image.top + (f64::from(end.1) * layout.scale).round() as i32;
+            let outer = UiRect {
+                left: x - half,
+                top: y - half,
+                right: x + half,
+                bottom: y + half,
+            };
+            fill_device_rect(device, native(outer), accent);
+            let inner = UiRect {
+                left: outer.left + border,
+                top: outer.top + border,
+                right: outer.right - border,
+                bottom: outer.bottom - border,
+            };
+            fill_device_rect(device, native(inner), rgb(255, 255, 255));
+        }
+    }
 }
 
 fn draw_crop_handles(device: HDC, crop: UiRect, metrics: UiMetrics, accent: COLORREF) {
@@ -1773,10 +1995,7 @@ fn paint_icons(state: &EditorState, surface: &FrozenSurface) {
     let pixels = unsafe { std::slice::from_raw_parts_mut(surface.bits, surface.byte_length) };
     let mut painter = Painter::new(pixels, surface.width as usize);
     let metrics = state.metrics;
-    let chosen_colour = state
-        .colour_tool()
-        .colour_slot()
-        .map(|slot| state.colours[slot]);
+    let chosen_colour = Some(state.colour_index);
     let ink = bgr(245, 245, 247);
     for (button, bounds) in &state.layout.buttons {
         let hovered = state.hovered == Some(*button);
@@ -1793,21 +2012,21 @@ fn paint_icons(state: &EditorState, surface: &FrozenSurface) {
                 &mut painter,
                 *bounds,
                 ink,
-                colour_bgr(state.colour(EditorTool::Pen)),
+                colour_bgr(state.colour()),
                 metrics,
             ),
             EditorButton::Tool(EditorTool::Marker) => paint_marker(
                 &mut painter,
                 *bounds,
                 ink,
-                colour_bgr(state.colour(EditorTool::Marker)),
+                colour_bgr(state.colour()),
                 metrics,
             ),
             EditorButton::Tool(EditorTool::Highlighter) => paint_highlighter(
                 &mut painter,
                 *bounds,
                 ink,
-                colour_bgr(state.colour(EditorTool::Highlighter)),
+                colour_bgr(state.colour()),
                 metrics,
             ),
             EditorButton::Tool(EditorTool::Arrow) => {
@@ -2392,7 +2611,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        // An arrow dragged across the middle, then Done: its shaft crosses the capture.
+        // Blue chosen, then the pen, then the arrow: the colour stays blue. An arrow dragged across
+        // the middle, then its point dragged elsewhere, then Done: it is blue in the image.
         let report = sender.clone();
         host.edit(
             frame.detached(),
@@ -2403,18 +2623,28 @@ mod tests {
         )
         .expect("the edit request is accepted");
         let editor = find_editor();
+        post(editor, WM_KEYDOWN, usize::from(b'4'), 0);
+        post(editor, WM_KEYDOWN, usize::from(b'P'), 0);
         post(editor, WM_KEYDOWN, usize::from(b'A'), 0);
         post(editor, WM_LBUTTONDOWN, 1, at(1, middle_y));
         post(editor, WM_MOUSEMOVE, 1, at(client.right - 2, middle_y));
         post(editor, WM_LBUTTONUP, 0, at(client.right - 2, middle_y));
+        post(
+            editor,
+            WM_LBUTTONDOWN,
+            1,
+            at(client.right - 3, middle_y + 1),
+        );
+        post(editor, WM_MOUSEMOVE, 1, at(client.right - 3, middle_y + 9));
+        post(editor, WM_LBUTTONUP, 0, at(client.right - 3, middle_y + 9));
         post(editor, WM_KEYDOWN, usize::from(VK_RETURN.0), 0);
         match outcomes
             .recv_timeout(Duration::from_secs(5))
             .expect("the editor answered")
         {
             EditOutcome::Done(edited) => {
-                let red = PALETTE[RED].1;
-                let ink = [red.blue, red.green, red.red, 255];
+                let blue = PALETTE[3].1;
+                let ink = [blue.blue, blue.green, blue.red, 255];
                 assert!(
                     edited.pixels().chunks_exact(4).any(|pixel| pixel == ink),
                     "no pixel was inked: {:?}",
@@ -2475,6 +2705,45 @@ mod tests {
             }
             other => panic!("expected Done, got {other:?}"),
         }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // SAFETY: IsWindow accepts any handle, live or not.
+        while unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(editor) }.as_bool() {
+            assert!(
+                Instant::now() < deadline,
+                "the finished editor never closed"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Text typed and finished, then clicked again, emptied and finished: the text is gone, so
+        // nothing is left to lose and Escape cancels without asking.
+        let report = sender.clone();
+        host.edit(
+            frame.detached(),
+            frame.metadata.source_rect,
+            move |outcome| {
+                let _ = report.send(outcome);
+            },
+        )
+        .expect("the edit request is accepted");
+        let editor = find_editor();
+        let spot = at(client.right / 2 - 6, middle_y);
+        post(editor, WM_KEYDOWN, usize::from(b'T'), 0);
+        post(editor, WM_LBUTTONDOWN, 1, spot);
+        post(editor, WM_LBUTTONUP, 0, spot);
+        post(editor, WM_CHAR, usize::from(b'M'), 0);
+        post(editor, WM_CHAR, usize::from(b'M'), 0);
+        post(editor, WM_KEYDOWN, usize::from(VK_RETURN.0), 0);
+        post(editor, WM_LBUTTONDOWN, 1, spot);
+        post(editor, WM_LBUTTONUP, 0, spot);
+        post(editor, WM_CHAR, 0x08, 0);
+        post(editor, WM_CHAR, 0x08, 0);
+        post(editor, WM_KEYDOWN, usize::from(VK_RETURN.0), 0);
+        post(editor, WM_KEYDOWN, usize::from(VK_ESCAPE.0), 0);
+        assert!(matches!(
+            outcomes.recv_timeout(Duration::from_secs(5)),
+            Ok(EditOutcome::Cancelled)
+        ));
         let deadline = Instant::now() + Duration::from_secs(5);
         // SAFETY: IsWindow accepts any handle, live or not.
         while unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(editor) }.as_bool() {
