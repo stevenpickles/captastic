@@ -17,6 +17,7 @@ mod raster;
 mod recording_frame;
 mod shell;
 mod snap;
+mod text_mark;
 mod vector;
 mod window_enumeration;
 

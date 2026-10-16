@@ -441,13 +441,17 @@ pixel size where there is room and scaled down where there is not. **Crop** (C) 
 keep, and its edges, corners and handles move and resize it; what falls outside is dimmed. **Redact**
 (R) draws opaque black boxes over anything that must not be shared. To point things out, **Box**
 (B) draws a coloured outline with slightly rounded corners, **Arrow** (A) a straight arrow pointing
-to where the drag ends, **Pen** (P) a thin freehand line, **Marker** (M) a thick one,
+to where the drag ends, **Text** (T) types where you click, **Pen** (P) a thin freehand line, **Marker** (M) a thick one,
 and **Highlighter** (H) a wide translucent stroke that tints what is under it without hiding it. The
 seven swatches (1-7: red, yellow, green, blue, magenta, black, white) set the colour of the drawing tool in
 hand, and each tool remembers its own, so the highlighter starts yellow and the rest red. Marks are
 laid down in the order you draw them, so one drawn over a redaction sits on top of the black and
 never uncovers what is beneath it. Line widths follow the scaling of the display the capture came
-from. **Undo** and **Redo** (Ctrl+Z, and Ctrl+Y or Ctrl+Shift+Z) step through every crop and mark.
+from. Text shows as you type it, centred on the line you clicked: **Enter** finishes it,
+**Shift+Enter** starts a new line, **Escape** throws it away, and **Ctrl+Plus** and **Ctrl+Minus**
+make it larger or smaller. While text is open every key types, so the tool and colour keys wait
+until it is finished; a swatch recolours it, and clicking elsewhere or any other button finishes it.
+**Undo** and **Redo** (Ctrl+Z, and Ctrl+Y or Ctrl+Shift+Z) step through every crop and mark.
 **Done** (Enter) copies the edited image to the
 clipboard, and to disk if file output is on; **Cancel** (Escape) or closing the window discards it,
 asking first if you had made changes.

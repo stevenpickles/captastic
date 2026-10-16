@@ -1,8 +1,8 @@
 //! What an editor does to a capture, independent of any window that shows it (ADR 0010).
 //!
 //! An [`Edit`] holds a capture and the operations made on it so far: one crop and any number of
-//! [`Mark`]s - redactions, box outlines, arrows and pen, marker and highlighter strokes - each
-//! undoable.
+//! [`Mark`]s - redactions, box outlines, arrows, pen, marker and highlighter strokes, and text -
+//! each undoable.
 //! Nothing touches the capture's pixels until [`Edit::render`], which makes the image that will be
 //! published, painting the marks in the order they were made.
 //!
@@ -37,6 +37,47 @@ pub struct Color {
 impl Color {
     pub const fn rgb(red: u8, green: u8, blue: u8) -> Self {
         Self { red, green, blue }
+    }
+}
+
+/// Rasterized text: how much of each pixel the letters cover, from 0 to 255, row by row.
+///
+/// Whoever lays text out also rasterizes it, with the platform's fonts; an edit only paints the
+/// result. That keeps fonts out of the model, and means the published pixels are exactly the
+/// pixels that were shown while typing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GlyphMask {
+    width: u32,
+    height: u32,
+    coverage: Arc<[u8]>,
+}
+
+impl GlyphMask {
+    /// A mask `width` by `height`, or nothing if `coverage` is not exactly one byte per pixel.
+    pub fn new(width: u32, height: u32, coverage: Vec<u8>) -> Option<Self> {
+        let expected = (width as usize).checked_mul(height as usize)?;
+        (coverage.len() == expected).then(|| Self {
+            width,
+            height,
+            coverage: Arc::from(coverage),
+        })
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn coverage(&self) -> &[u8] {
+        &self.coverage
+    }
+
+    /// Whether any pixel is covered at all: blank text, spaces alone, covers none.
+    pub fn is_blank(&self) -> bool {
+        self.coverage.iter().all(|value| *value == 0)
     }
 }
 
@@ -78,6 +119,14 @@ pub enum Mark {
         color: Color,
         width: f32,
     },
+    /// Text, as `mask` laid with its top-left pixel at `at` and coloured `color`. `text` is what
+    /// was typed, kept so an edit can say what it holds; only the mask is painted.
+    Text {
+        at: (i32, i32),
+        text: String,
+        color: Color,
+        mask: GlyphMask,
+    },
 }
 
 impl Mark {
@@ -87,6 +136,12 @@ impl Mark {
             Self::Redaction(rect) | Self::Rectangle { rect, .. } => {
                 (rect.width > 0 && rect.height > 0).then_some(*rect)
             }
+            Self::Text { at, mask, .. } => (mask.width > 0 && mask.height > 0).then_some(Rect {
+                x: at.0,
+                y: at.1,
+                width: mask.width,
+                height: mask.height,
+            }),
             Self::Arrow {
                 from, to, width, ..
             } => {
@@ -231,6 +286,7 @@ impl Edit {
                     Mark::Stroke { width, .. } => *width > 0.0,
                     // Bounds already refuse an arrow with no length or no width.
                     Mark::Arrow { .. } => true,
+                    Mark::Text { mask, .. } => !mask.is_blank(),
                     Mark::Redaction(_) => true,
                 };
                 if !eight_bit || !visible || !drawable {
@@ -419,6 +475,23 @@ pub fn paint_mark(
                     match style {
                         StrokeStyle::Ink => blend_over(pixel, &ink, cover, alpha),
                         StrokeStyle::Highlighter => tint(pixel, &ink, cover * HIGHLIGHTER_STRENGTH),
+                    }
+                }
+            }
+        }
+        Mark::Text {
+            at, color, mask, ..
+        } => {
+            let ink = ordered(*color, blue_first);
+            let mask_width = mask.width as usize;
+            for y in reach.y..(reach.bottom() as i32) {
+                let row = (y - at.1) as usize * mask_width;
+                for x in reach.x..(reach.right() as i32) {
+                    let value = mask.coverage[row + (x - at.0) as usize];
+                    if value > 0 {
+                        let at = offset(x, y);
+                        let cover = f32::from(value) / 255.0;
+                        blend_over(&mut pixels[at..at + 4], &ink, cover, alpha);
                     }
                 }
             }
@@ -1123,6 +1196,52 @@ mod tests {
         assert_eq!(pixel(&down, 7, 10), [255; 4]);
         assert_ne!(pixel(&up, 7, 11), [255; 4]);
         assert_eq!(pixel(&up, 7, 29), [255; 4]);
+    }
+
+    #[test]
+    fn text_paints_its_mask_in_its_colour_where_it_was_placed() {
+        let mut edit = Edit::new(white(6, 5));
+        // A two-by-two mask: full, half, nothing, full.
+        let mask = GlyphMask::new(2, 2, vec![255, 128, 0, 255]).expect("mask");
+        assert!(edit.add(Mark::Text {
+            at: (3, 2),
+            text: "x".to_owned(),
+            color: RED,
+            mask,
+        }));
+        let rendered = edit.render().expect("render");
+        let red = [RED.blue, RED.green, RED.red, 255];
+        assert_eq!(pixel(&rendered, 3, 2), red);
+        assert_eq!(pixel(&rendered, 4, 3), red);
+        assert_eq!(pixel(&rendered, 3, 3), [255; 4]);
+        // Half covered is half way from white to the colour.
+        let half = pixel(&rendered, 4, 2);
+        assert!(half[2] > 230 && (130..=150).contains(&half[1]), "{half:?}");
+        // Nothing outside the mask.
+        assert_eq!(pixel(&rendered, 2, 2), [255; 4]);
+        assert_eq!(pixel(&rendered, 5, 4), [255; 4]);
+    }
+
+    #[test]
+    fn text_hanging_off_the_capture_is_clipped_and_blank_text_is_refused() {
+        let mut edit = Edit::new(white(4, 4));
+        let mask = GlyphMask::new(3, 3, vec![255; 9]).expect("mask");
+        assert!(edit.add(Mark::Text {
+            at: (-1, 2),
+            text: "x".to_owned(),
+            color: RED,
+            mask,
+        }));
+        let rendered = edit.render().expect("render");
+        assert_eq!(pixel(&rendered, 0, 3), [RED.blue, RED.green, RED.red, 255]);
+        assert_eq!(pixel(&rendered, 2, 3), [255; 4]);
+        assert!(!edit.add(Mark::Text {
+            at: (0, 0),
+            text: "  ".to_owned(),
+            color: RED,
+            mask: GlyphMask::new(2, 1, vec![0, 0]).expect("mask"),
+        }));
+        assert!(GlyphMask::new(2, 2, vec![0; 3]).is_none());
     }
 
     #[test]
