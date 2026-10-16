@@ -13,6 +13,8 @@
 //! be sent. A mark being drawn is painted the same way as it grows, redrawing only the pixels it
 //! covers, and so is text as it is typed.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use captastic_core::{
     paint_mark, CaptureError, Color, CpuFrame, Edit, FrameAlpha, Mark, PixelFormat, Rect,
     StrokeStyle,
@@ -77,13 +79,22 @@ const DRAG_THRESHOLD_DIP: i32 = 3;
 /// How far, in capture pixels, the pointer must move before a stroke takes another point.
 const STROKE_STEP: f32 = 0.75;
 /// Wide enough for every button and swatch at every scaling.
-const MINIMUM_CLIENT_DIP: (i32, i32) = (840, 320);
+const MINIMUM_CLIENT_DIP: (i32, i32) = (928, 320);
 /// How far a box's corners are rounded: enough to soften them, not enough to read as a pill.
 const BOX_RADIUS_DIP: f32 = 6.0;
 /// The sizes text can be, in device-independent pixels to the em, smallest first.
 const TEXT_SIZES_DIP: [i32; 5] = [14, 18, 24, 32, 48];
 /// Where in [`TEXT_SIZES_DIP`] text starts: large enough to stand out from what it annotates.
 const DEFAULT_TEXT_SIZE: usize = 2;
+/// The widths an arrow can be, in device-independent pixels, thinnest first.
+const ARROW_SIZES_DIP: [f32; 6] = [2.0, 3.0, 4.0, 6.0, 8.0, 12.0];
+const DEFAULT_ARROW_SIZE: usize = 2;
+/// What the last editor was left with, for the next one Captastic opens: the colour, as an index
+/// into [`PALETTE`], and the arrow and text sizes, as indexes into theirs. Editors all live on the
+/// one desktop UI thread; atomics only make the statics safe to share.
+static REMEMBERED_COLOUR: AtomicUsize = AtomicUsize::new(RED);
+static REMEMBERED_ARROW_SIZE: AtomicUsize = AtomicUsize::new(DEFAULT_ARROW_SIZE);
+static REMEMBERED_TEXT_SIZE: AtomicUsize = AtomicUsize::new(DEFAULT_TEXT_SIZE);
 /// The most one piece of text holds, in bytes, so a held key cannot grow it without end.
 const MAXIMUM_TEXT_BYTES: usize = 4096;
 /// The share of the display's work area a new editor may take.
@@ -183,6 +194,10 @@ enum EditorButton {
     Tool(EditorTool),
     /// A colour in [`PALETTE`], by index.
     Swatch(usize),
+    /// Thinner arrows or smaller text.
+    Smaller,
+    /// Thicker arrows or larger text.
+    Larger,
     Undo,
     Redo,
     Cancel,
@@ -194,6 +209,8 @@ impl EditorButton {
         match self {
             Self::Tool(tool) => Some(tool.tooltip().to_owned()),
             Self::Swatch(index) => Some(format!("{} ({})", PALETTE[index].0, index + 1)),
+            Self::Smaller => Some("Smaller arrow or text (Ctrl+Minus)".to_owned()),
+            Self::Larger => Some("Larger arrow or text (Ctrl+Plus)".to_owned()),
             Self::Undo => Some("Undo (Ctrl+Z)".to_owned()),
             Self::Redo => Some("Redo (Ctrl+Y)".to_owned()),
             Self::Cancel | Self::Done => None,
@@ -261,6 +278,12 @@ impl EditorLayout {
                 if last { GROUP_GAP_DIP } else { SWATCH_GAP_DIP },
             );
         }
+        place(
+            EditorButton::Smaller,
+            ICON_BUTTON_WIDTH_DIP,
+            ICON_BUTTON_GAP_DIP,
+        );
+        place(EditorButton::Larger, ICON_BUTTON_WIDTH_DIP, GROUP_GAP_DIP);
         place(
             EditorButton::Undo,
             ICON_BUTTON_WIDTH_DIP,
@@ -620,6 +643,8 @@ struct EditorState {
     typing: Option<TextEntry>,
     /// The size text is typed at, as an index into [`TEXT_SIZES_DIP`].
     text_size: usize,
+    /// The width arrows are drawn at, as an index into [`ARROW_SIZES_DIP`].
+    arrow_size: usize,
     /// Capture pixels per device-independent pixel on the display the capture came from.
     stroke_unit: f32,
     drag: Option<Drag>,
@@ -736,7 +761,24 @@ impl EditorState {
     }
 
     fn width(&self, tool: EditorTool) -> f32 {
-        (tool.width_dip() * self.stroke_unit).max(1.0)
+        let dip = if tool == EditorTool::Arrow {
+            ARROW_SIZES_DIP[self.arrow_size]
+        } else {
+            tool.width_dip()
+        };
+        (dip * self.stroke_unit).max(1.0)
+    }
+
+    /// Where a step of `step` would take the size of the tool in hand, if it has a size and the
+    /// step stays within its range.
+    fn stepped_size(&self, step: i32) -> Option<usize> {
+        let (current, count) = match self.tool {
+            EditorTool::Arrow => (self.arrow_size, ARROW_SIZES_DIP.len()),
+            EditorTool::Text => (self.text_size, TEXT_SIZES_DIP.len()),
+            _ => return None,
+        };
+        let next = current as i32 + step;
+        (0..count as i32).contains(&next).then_some(next as usize)
     }
 
     /// The size text is typed at, in capture pixels to the em.
@@ -755,6 +797,8 @@ impl EditorState {
 
     fn button_enabled(&self, button: EditorButton) -> bool {
         match button {
+            EditorButton::Smaller => self.stepped_size(-1).is_some(),
+            EditorButton::Larger => self.stepped_size(1).is_some(),
             EditorButton::Undo => self.edit.can_undo(),
             EditorButton::Redo => self.edit.can_redo(),
             _ => true,
@@ -776,6 +820,7 @@ impl EditorState {
             self.choose_tool(self.last_drawing_tool);
         }
         self.colour_index = index;
+        REMEMBERED_COLOUR.store(index, Ordering::Relaxed);
         if let Some(entry) = self.typing.as_mut() {
             entry.color = PALETTE[index].1;
         }
@@ -916,9 +961,16 @@ fn open_editor(
         tool: EditorTool::Crop,
         last_drawing_tool: EditorTool::Pen,
         // Red ink for the box, pen, marker and arrow; a highlighter is yellow.
-        colour_index: RED,
+        colour_index: REMEMBERED_COLOUR
+            .load(Ordering::Relaxed)
+            .min(PALETTE.len() - 1),
+        arrow_size: REMEMBERED_ARROW_SIZE
+            .load(Ordering::Relaxed)
+            .min(ARROW_SIZES_DIP.len() - 1),
         typing: None,
-        text_size: DEFAULT_TEXT_SIZE,
+        text_size: REMEMBERED_TEXT_SIZE
+            .load(Ordering::Relaxed)
+            .min(TEXT_SIZES_DIP.len() - 1),
         stroke_unit: metrics.dpi as f32 / UiMetrics::BASE_DPI as f32,
         drag: None,
         pressed: None,
@@ -1347,6 +1399,8 @@ fn press_button(hwnd: HWND, state_pointer: *mut EditorState, button: EditorButto
                     refresh_preview(state);
                 }
             }
+            EditorButton::Smaller => resize(state, -1),
+            EditorButton::Larger => resize(state, 1),
             EditorButton::Cancel | EditorButton::Done => {}
         }
     }
@@ -1400,17 +1454,11 @@ fn key_pressed(hwnd: HWND, state_pointer: *mut EditorState, key: u16) {
         // with this block.
         let state = unsafe { &mut *state_pointer };
         if let Some(step) = text_size_step(key, held.ctrl) {
-            if state.tool == EditorTool::Text {
-                let largest = TEXT_SIZES_DIP.len() as i32 - 1;
-                state.text_size = (state.text_size as i32 + step).clamp(0, largest) as usize;
-                let size = state.text_pixels();
-                if let Some(entry) = state.typing.as_mut() {
-                    entry.size = size;
-                }
-                retype(state);
+            if state.drag.is_none() {
+                resize(state, step);
                 invalidate(hwnd);
-                return;
             }
+            return;
         }
         if state.typing.is_some() {
             // Keys type while text is open: none of them is a tool, a colour or a shortcut.
@@ -1526,6 +1574,50 @@ fn show_pending(state: &mut EditorState) {
             FrameAlpha::Opaque,
         );
         state.pending_dirty = mark.bounds().and_then(|bounds| bounds.intersection(area));
+    }
+}
+
+/// Makes the tool in hand a step larger or smaller. Text being typed takes the new size, and so
+/// does an arrow when the last thing done was drawing or moving it, so what was just drawn can be
+/// adjusted without drawing it again.
+fn resize(state: &mut EditorState, step: i32) {
+    let Some(size) = state.stepped_size(step) else {
+        return;
+    };
+    match state.tool {
+        EditorTool::Text => {
+            state.text_size = size;
+            REMEMBERED_TEXT_SIZE.store(size, Ordering::Relaxed);
+            let pixels = state.text_pixels();
+            if let Some(entry) = state.typing.as_mut() {
+                entry.size = pixels;
+            }
+            retype(state);
+        }
+        EditorTool::Arrow => {
+            state.arrow_size = size;
+            REMEMBERED_ARROW_SIZE.store(size, Ordering::Relaxed);
+            let width = state.width(EditorTool::Arrow);
+            let last = state.edit.last_changed();
+            if let Some((
+                index,
+                Some(Mark::Arrow {
+                    from, to, color, ..
+                }),
+            )) = last.map(|index| (index, state.edit.marks().get(index).cloned()))
+            {
+                let thicker = Mark::Arrow {
+                    from,
+                    to,
+                    color,
+                    width,
+                };
+                if state.edit.replace(index, Some(thicker)) {
+                    refresh_preview(state);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1825,7 +1917,34 @@ fn compose(state: &EditorState, surface: &FrozenSurface) {
         draw_arrow_handles(device, state, accent);
     }
     if let Some(entry) = &state.typing {
-        let caret = layout.client_rect(entry.caret());
+        // A frame around the text being typed, so it is plain which text is open.
+        let caret = entry.caret();
+        let extent = entry
+            .mark()
+            .and_then(|mark| mark.bounds())
+            .map_or(caret, |bounds| union(bounds, caret));
+        let frame = layout.client_rect(extent);
+        let margin = metrics.px(4);
+        draw_outline_rect(
+            device,
+            frame.left - margin,
+            frame.top - margin,
+            frame.right + margin,
+            frame.bottom + margin,
+            accent,
+            metrics.px(1).max(1),
+        );
+        draw_typing_hint(
+            device,
+            state,
+            UiRect {
+                left: frame.left - margin,
+                top: frame.top - margin,
+                right: frame.right + margin,
+                bottom: frame.bottom + margin,
+            },
+        );
+        let caret = layout.client_rect(caret);
         let colour = entry.color;
         fill_device_rect(
             device,
@@ -1958,6 +2077,8 @@ fn draw_toolbar(device: HDC, state: &EditorState, crop: Rect) {
             EditorButton::Tool(tool) => draw_tool_icon(device, bounds, tool, ink, metrics),
             EditorButton::Undo => draw_history_icon(device, bounds, false, ink, metrics),
             EditorButton::Redo => draw_history_icon(device, bounds, true, ink, metrics),
+            EditorButton::Smaller => draw_size_icon(device, bounds, false, ink, metrics),
+            EditorButton::Larger => draw_size_icon(device, bounds, true, ink, metrics),
             EditorButton::Cancel | EditorButton::Done => draw_text(
                 device,
                 bounds,
@@ -2326,6 +2447,28 @@ fn draw_tool_icon(
     }
 }
 
+/// A minus for Smaller, a plus for Larger.
+fn draw_size_icon(device: HDC, bounds: UiRect, larger: bool, ink: COLORREF, metrics: UiMetrics) {
+    let stroke = metrics.toolbar_tokens().icon_stroke;
+    let (left, top, size) = icon_box(bounds, metrics);
+    let inset = size / 5;
+    let middle = (left + size / 2, top + size / 2);
+    draw_lines(
+        device,
+        &[(left + inset, middle.1), (left + size - inset, middle.1)],
+        ink,
+        stroke,
+    );
+    if larger {
+        draw_lines(
+            device,
+            &[(middle.0, top + inset), (middle.0, top + size - inset)],
+            ink,
+            stroke,
+        );
+    }
+}
+
 /// A hooked arrow: back for Undo, forward for Redo.
 fn draw_history_icon(
     device: HDC,
@@ -2358,6 +2501,48 @@ fn draw_history_icon(
         ],
         ink,
         stroke,
+    );
+}
+
+/// How to finish the text being typed, in a label just below its frame, or above it when the
+/// frame is near the bottom of the canvas.
+fn draw_typing_hint(device: HDC, state: &EditorState, frame: UiRect) {
+    let metrics = state.metrics;
+    let tokens = metrics.toolbar_tokens();
+    let text = "Enter to finish \u{00b7} Shift+Enter new line \u{00b7} Esc to discard";
+    let measured = measure_ui_text(device, text, tokens.font_height);
+    let width = measured.cx + tokens.tooltip_padding_x * 2;
+    let height = (measured.cy + tokens.tooltip_padding_y * 2).max(metrics.px(28));
+    let canvas = state.layout.canvas;
+    let gap = metrics.px(6);
+    let top = if frame.bottom + gap + height <= canvas.bottom {
+        frame.bottom + gap
+    } else {
+        (frame.top - gap - height).max(canvas.top)
+    };
+    let left = frame
+        .left
+        .clamp(canvas.left, (canvas.right - width).max(canvas.left));
+    let bounds = UiRect {
+        left,
+        top,
+        right: left + width,
+        bottom: top + height,
+    };
+    draw_round_box(
+        device,
+        bounds,
+        rgb(31, 31, 34),
+        rgb(ACCENT_RGB.0, ACCENT_RGB.1, ACCENT_RGB.2),
+        tokens.tooltip_corner_radius,
+    );
+    draw_text(
+        device,
+        bounds,
+        text,
+        rgb(248, 248, 250),
+        TextAlignment::Center,
+        tokens.font_height,
     );
 }
 
@@ -2693,12 +2878,13 @@ mod tests {
             .expect("the editor answered")
         {
             EditOutcome::Done(edited) => {
-                // The capture is mid-grey; red text pulls some pixel well toward red.
+                // The capture is mid-grey. The blue chosen in the editor before this one is
+                // remembered, so the text pulls some pixel well toward blue.
                 assert!(
                     edited
                         .pixels()
                         .chunks_exact(4)
-                        .any(|pixel| pixel[2] > pixel[1].saturating_add(60)),
+                        .any(|pixel| pixel[0] > pixel[1].saturating_add(40)),
                     "no pixel was inked: {:?}",
                     edited.pixels()
                 );

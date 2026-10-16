@@ -338,6 +338,20 @@ impl Edit {
         Some(mark)
     }
 
+    /// The mark the last operation made or changed, if the last operation was one that left a
+    /// mark: so an editor can adjust what was just drawn.
+    pub fn last_changed(&self) -> Option<usize> {
+        match self.undo.last()? {
+            Step::Mark(_) => self.marks.len().checked_sub(1),
+            Step::Replace {
+                index,
+                after: Some(_),
+                ..
+            } => Some(*index),
+            _ => None,
+        }
+    }
+
     pub fn can_undo(&self) -> bool {
         !self.undo.is_empty()
     }
@@ -1314,6 +1328,7 @@ mod tests {
         };
         edit.add(arrow((20.0, 20.0)));
         edit.redact(rect(0, 0, 4, 4));
+        assert_eq!(edit.last_changed(), Some(1));
         assert!(edit.replace(0, Some(arrow((30.0, 10.0)))));
         assert_eq!(edit.marks()[0], arrow((30.0, 10.0)));
         assert_eq!(edit.marks()[1], Mark::Redaction(rect(0, 0, 4, 4)));
@@ -1325,9 +1340,11 @@ mod tests {
         assert_eq!(edit.marks()[0], arrow((20.0, 20.0)));
         assert!(edit.redo());
         assert_eq!(edit.marks()[0], arrow((30.0, 10.0)));
+        assert_eq!(edit.last_changed(), Some(0));
         // Removing one, and undoing that, restores it where it was.
         assert!(edit.replace(0, None));
         assert_eq!(edit.marks(), [Mark::Redaction(rect(0, 0, 4, 4))]);
+        assert_eq!(edit.last_changed(), None);
         assert!(edit.undo());
         assert_eq!(edit.marks()[0], arrow((30.0, 10.0)));
         assert_eq!(edit.marks().len(), 2);
