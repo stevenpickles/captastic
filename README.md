@@ -481,7 +481,9 @@ once: a region, a window's area on screen, or a whole display. While it runs, a 
 the recorded area and a bar beside it shows the elapsed time and a **Stop** button; neither ever
 appears in the recording, and the bar never takes focus from what you are working in. A recording
 ends at **Stop** or when it reaches `recording.max_seconds` (60 by default, at most 600), and either
-way it is saved. **Options -> Record As** chooses the format, and the choice is kept:
+way it is saved. Under the Window tool, clicking a window captures it at once, so press **Record**
+first: it stays held down, and the next window you click is recorded (press it again to go back to
+capturing). **Options -> Record As** chooses the format, and the choice is kept:
 
 - **GIF**, the default: 15 frames a second, scaled down so its longer side is at most
   `recording.gif_max_dimension` (1280 by default), and small because only what changes between

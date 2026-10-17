@@ -794,6 +794,7 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
             pin_available: destinations.pin_available,
             edit_available: destinations.edit_available,
             record_format: destinations.record_format,
+            record_armed: false,
             hovered_control: None,
             pointer_local: None,
             hovered: None,
@@ -4011,6 +4012,17 @@ fn draw_toolbar(state: &OverlayState) {
         state,
         draw_edit_icon,
     );
+    if state.model.record_armed {
+        // Held down, as a chosen tool is, while it waits for a window to be clicked.
+        let color = rgb(76, 76, 82);
+        draw_round_box(
+            device,
+            layout.record,
+            color,
+            color,
+            tokens.control_corner_radius,
+        );
+    }
     draw_action_button(
         device,
         layout.record,
@@ -4077,8 +4089,14 @@ fn draw_action_button(
 ) {
     let metrics = state.model.display_environment.metrics;
     let tokens = metrics.toolbar_tokens();
-    let enabled = available && state.model.selection.is_some();
-    if enabled && state.model.hovered_control == Some(control) {
+    // Record can also be pressed before a window is chosen, to record the next one clicked.
+    let enabled = available
+        && (state.model.selection.is_some()
+            || (control == ToolbarControl::Record && state.model.tool == CaptureTool::Window));
+    if enabled
+        && state.model.hovered_control == Some(control)
+        && !(control == ToolbarControl::Record && state.model.record_armed)
+    {
         let color = rgb(58, 58, 63);
         draw_round_box(device, bounds, color, color, tokens.control_corner_radius);
     }
@@ -4153,6 +4171,15 @@ fn draw_hover_tooltip(device: HDC, state: &OverlayState, layout: ToolbarLayout) 
         Some(ToolbarControl::Record) => {
             let value = match state.model.record_format {
                 None => "Recording needs Captastic running in the notification area",
+                Some(_) if state.model.record_armed => {
+                    "Click a window to record it (press Record again to cancel)"
+                }
+                Some(_)
+                    if state.model.selection.is_none()
+                        && state.model.tool == CaptureTool::Window =>
+                {
+                    "Press, then click a window to record it"
+                }
                 Some(_) if state.model.selection.is_none() => "Select something to record",
                 Some(captastic_config::RecordingFormat::Gif) => "Record as an animated GIF",
                 Some(captastic_config::RecordingFormat::Mp4) => "Record as an MP4 video",
