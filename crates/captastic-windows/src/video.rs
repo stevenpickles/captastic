@@ -20,8 +20,8 @@ use windows::Win32::Media::MediaFoundation::{
     MFStartup, MFTranscodeContainerType_MPEG4, MFVideoFormat_H264, MFVideoFormat_RGB32,
     MFVideoInterlace_Progressive, MFSTARTUP_FULL, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE,
     MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS,
-    MF_TRANSCODE_CONTAINERTYPE, MF_VERSION,
+    MF_MT_MAX_KEYFRAME_SPACING, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
+    MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_TRANSCODE_CONTAINERTYPE, MF_VERSION,
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 
@@ -57,12 +57,12 @@ pub struct VideoSummary {
 }
 
 /// Media Foundation and COM, started for this thread and stopped when dropped.
-struct MediaFoundation {
+pub(crate) struct MediaFoundation {
     uninitialize_com: bool,
 }
 
 impl MediaFoundation {
-    fn start() -> Result<Self, CaptureError> {
+    pub(crate) fn start() -> Result<Self, CaptureError> {
         // SAFETY: Initializes COM for this thread; a thread already in another apartment answers
         // RPC_E_CHANGED_MODE, which still leaves COM usable and must not be balanced.
         let uninitialize_com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
@@ -158,6 +158,11 @@ impl Mp4Writer {
             output
                 .SetUINT32(&MF_MT_AVG_BITRATE, bitrate)
                 .map_err(|error| video_error("set_bitrate", error))?;
+            // A key frame at least every second of written frames, so a review seeking in the
+            // file decodes at most that much to reach any frame (ADR 0012).
+            output
+                .SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, frame_rate.max(1))
+                .map_err(|error| video_error("set_keyframe_spacing", error))?;
             let stream = writer
                 .AddStream(&output)
                 .map_err(|error| video_error("add_video_stream", error))?;

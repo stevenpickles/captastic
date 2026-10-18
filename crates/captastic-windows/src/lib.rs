@@ -29,6 +29,8 @@ mod tray;
 #[cfg(windows)]
 mod video;
 #[cfg(windows)]
+mod video_reader;
+#[cfg(windows)]
 mod window_capture;
 #[cfg(windows)]
 mod window_capture_wgc;
@@ -74,5 +76,7 @@ pub use tray::{
 };
 #[cfg(windows)]
 pub use video::{mp4_frame_size, Mp4Writer, VideoSummary, MP4_MAXIMUM_SIZE};
+#[cfg(windows)]
+pub use video_reader::Mp4Reader;
 #[cfg(windows)]
 pub use window_capture::{captured_window_frame, materialize_selection};

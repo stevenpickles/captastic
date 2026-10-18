@@ -12,6 +12,7 @@ mod fake;
 mod frame;
 mod jpeg;
 mod metrics;
+mod playback;
 mod png;
 #[cfg(test)]
 mod test_frames;
@@ -37,4 +38,7 @@ pub use frame::{
     PixelEncoding, PixelFormat, TimingProvenance,
 };
 pub use metrics::{validate_event_order, EventRecorder, LatencySummary, PerfEvent, PerfEventKind};
+pub use playback::{
+    GifReader, KeptFrame, PixelRect, PlaybackError, RecordingEdit, RecordingFrames, Timeline,
+};
 pub use png::{encode_frame, PngEffort, PngError};
