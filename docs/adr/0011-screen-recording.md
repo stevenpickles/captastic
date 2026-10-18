@@ -3,6 +3,7 @@
 ## Status
 
 Accepted for the Windows prototype, 2026-10-15. Governs Milestone 9, the 0.4.0 theme.
+Trimming, ruled out of 0.4.0 below, was brought into it by [ADR 0012](0012-recording-review.md).
 
 ## Context
 
