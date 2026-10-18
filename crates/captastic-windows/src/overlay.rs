@@ -15,6 +15,7 @@ mod machine;
 mod pin;
 mod raster;
 mod recording_frame;
+mod review;
 mod shell;
 mod snap;
 mod text_mark;
@@ -124,6 +125,7 @@ const UI_FONT_HEIGHT: i32 = 21;
 /// for text at 96 DPI, and widening the menu for one row is a worse trade than the shorter name.
 pub use desktop_ui::DesktopUi;
 pub use editor::EditOutcome;
+pub use review::ReviewOutcome;
 
 const SNAP_TO_WINDOWS_LABEL: &str = "Snap to Edges";
 /// The Options row for file output. Shorter than the notification area's "Save Captures to Disk"
