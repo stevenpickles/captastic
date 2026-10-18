@@ -87,6 +87,20 @@ pub fn set_recording_format(path: &Path, format: RecordingFormat) -> Result<(), 
     )
 }
 
+/// Sets `recording.review` in the configuration at `path`, preserving everything else in the
+/// file, as the notification area's **Review Recordings** switch is flipped.
+pub fn set_recording_review(path: &Path, review: bool) -> Result<(), ConfigError> {
+    set_setting(
+        path,
+        &Setting {
+            section: "recording",
+            key: "review",
+            value: Value::from(review),
+            created_when: "\"Review Recordings\" was switched from the\n# notification area",
+        },
+    )
+}
+
 fn set_setting(path: &Path, setting: &Setting) -> Result<(), ConfigError> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -223,6 +237,28 @@ mod tests {
         let config: crate::AppConfig = toml::from_str(&text).expect("valid");
         assert_eq!(config.recording.format, RecordingFormat::Mp4);
         assert!(text.contains("Record As"), "{text}");
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn the_review_switch_is_written_beside_the_recording_format() {
+        let directory = temporary_directory("recording-review");
+        let path = directory.join("captastic.toml");
+        fs::write(
+            &path,
+            "schema_version = 1\n\n[recording]\nformat = \"mp4\"\n",
+        )
+        .expect("seed");
+        set_recording_review(&path, false).expect("turn review off");
+        let config: crate::AppConfig =
+            toml::from_str(&fs::read_to_string(&path).expect("read")).expect("valid");
+        assert!(!config.recording.review);
+        assert_eq!(config.recording.format, RecordingFormat::Mp4);
+        let fresh = directory.join("fresh.toml");
+        set_recording_review(&fresh, false).expect("create");
+        let config: crate::AppConfig =
+            toml::from_str(&fs::read_to_string(&fresh).expect("read")).expect("valid");
+        assert!(!config.recording.review);
         let _ = fs::remove_dir_all(&directory);
     }
 

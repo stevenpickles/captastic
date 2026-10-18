@@ -12,6 +12,11 @@
 //! finished: the encoder writes what it has and closes the file. A recording that fails - the
 //! source gone, the encoder refusing, the disk full - removes its file, so it leaves a valid
 //! recording or nothing.
+//!
+//! The daemon's recordings are reviewed before they are saved, unless `recording.review` is off
+//! (ADR 0012): [`RecordingHost`] records into a hidden drafts folder in the output directory, opens
+//! the draft in the review window, and acts on the answer - moving the draft into the output
+//! directory as it is, encoding the span and rectangle kept into a new file, or deleting it.
 
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
@@ -23,7 +28,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use captastic_config::RecordingFormat;
-use captastic_core::{CaptureError, CpuFrame, PixelEncoding, Rect};
+use captastic_core::{
+    CaptureError, CaptureId, CpuFrame, GifReader, PixelEncoding, PixelRect, RecordingEdit,
+    RecordingFrames, Rect,
+};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -46,6 +54,9 @@ const STOP_POLL: Duration = Duration::from_millis(15);
 const SOURCE_FAILURES_TOLERATED: u32 = 5;
 /// How many names a recording tries before giving up on finding an unused one.
 const MAX_NAME_ATTEMPTS: u32 = 100;
+/// Where recordings wait for their review, inside the output directory so that saving one is a
+/// rename on the same volume.
+pub const DRAFTS_FOLDER: &str = ".captastic-drafts";
 
 /// Where a recording's frames come from.
 pub trait FrameSource {
@@ -576,6 +587,33 @@ struct HostInner {
     /// Where `recording.format` is written back when **Record As** changes it.
     config_path: Option<PathBuf>,
     json_output: bool,
+    /// Whether a recording started now is reviewed before it is saved.
+    review: AtomicBool,
+    drafts_directory: PathBuf,
+    /// The review open, if any, and the drafts waiting for it to end.
+    reviews: Mutex<ReviewQueue>,
+    /// Threads encoding an edited recording, which exit waits for.
+    savers: Mutex<Vec<thread::JoinHandle<()>>>,
+    /// Set as Captastic exits: a recording that finishes then is saved, not reviewed.
+    exiting: AtomicBool,
+}
+
+/// One review at a time: a recording finished while another is in review waits its turn.
+#[derive(Default)]
+struct ReviewQueue {
+    open: bool,
+    waiting: VecDeque<Draft>,
+}
+
+/// A finished recording in the drafts folder, waiting for its review or in it.
+struct Draft {
+    /// As recorded; its path is the draft's.
+    report: RecordingReport,
+    /// What the saved file is named, before its extension.
+    stem: String,
+    capture_id: CaptureId,
+    display: String,
+    area: Rect,
 }
 
 impl RecordingHost {
@@ -590,8 +628,15 @@ impl RecordingHost {
         config_path: Option<PathBuf>,
         json_output: bool,
     ) -> Self {
+        let review = AtomicBool::new(config.review);
+        let drafts_directory = output_directory.join(DRAFTS_FOLDER);
         Self {
             inner: Arc::new(HostInner {
+                review,
+                drafts_directory,
+                reviews: Mutex::new(ReviewQueue::default()),
+                savers: Mutex::new(Vec::new()),
+                exiting: AtomicBool::new(false),
                 active: Arc::new(AtomicBool::new(false)),
                 stop: Mutex::new(None),
                 join: Mutex::new(None),
@@ -632,6 +677,34 @@ impl RecordingHost {
         }
     }
 
+    /// Whether recordings are reviewed before they are saved.
+    pub fn review_enabled(&self) -> bool {
+        self.inner.review.load(Ordering::Acquire)
+    }
+
+    /// Applies the notification area's **Review Recordings** switch to later recordings, and
+    /// writes it back to the configuration as `recording.review`.
+    pub fn set_review(&self, enabled: bool) {
+        self.inner.review.store(enabled, Ordering::Release);
+        lock(&self.inner.config).review = enabled;
+        log::info!(
+            "recordings will be {}",
+            if enabled {
+                "reviewed before they are saved"
+            } else {
+                "saved as soon as they end"
+            }
+        );
+        if let Some(path) = self.inner.config_path.as_deref() {
+            if let Err(error) = captastic_config::set_recording_review(path, enabled) {
+                crate::logging::warn(format_args!(
+                    "the review setting could not be saved to {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
     /// Starts recording `request`'s area: shows the indicator through `desktop_ui` and records on
     /// a thread of its own until **Stop** or the time limit. Refused, with a notice, while another
     /// recording runs.
@@ -663,7 +736,15 @@ impl RecordingHost {
                 title: request.window_title.as_deref(),
             },
         );
-        let path = match reserve_path(&inner.output_directory, &stem, settings.format.extension()) {
+        // A recording to be reviewed is recorded as a draft and saved once the review is done.
+        let reviewing = inner.review.load(Ordering::Acquire);
+        let directory = if reviewing {
+            prepare_drafts_directory(&inner.drafts_directory);
+            &inner.drafts_directory
+        } else {
+            &inner.output_directory
+        };
+        let path = match reserve_path(directory, &stem, settings.format.extension()) {
             Ok(path) => path,
             Err(error) => {
                 inner.active.store(false, Ordering::Release);
@@ -700,7 +781,16 @@ impl RecordingHost {
         let thread_desktop_ui = desktop_ui.clone();
         let spawned = thread::Builder::new()
             .name("captastic-recording".to_owned())
-            .spawn(move || host.run(request, settings, path, stop, thread_desktop_ui));
+            .spawn(move || {
+                host.run(
+                    request,
+                    settings,
+                    path,
+                    stop,
+                    thread_desktop_ui,
+                    reviewing.then_some(stem),
+                );
+            });
         match spawned {
             Ok(join) => *lock(&inner.join) = Some(join),
             Err(error) => {
@@ -713,7 +803,8 @@ impl RecordingHost {
         }
     }
 
-    /// The recording thread: records, takes the indicator down, and says how it went.
+    /// The recording thread: records, takes the indicator down, and says how it went - or, with
+    /// `review_stem`, hands the draft to the review, to be saved under that name.
     fn run(
         &self,
         request: RecordingRequest,
@@ -721,6 +812,7 @@ impl RecordingHost {
         path: PathBuf,
         stop: Arc<AtomicBool>,
         desktop_ui: Arc<Mutex<Option<captastic_windows::DesktopUi>>>,
+        review_stem: Option<String>,
     ) {
         let inner = &self.inner;
         let mut frames = CaptureThreadFrames {
@@ -738,7 +830,7 @@ impl RecordingHost {
         match result {
             Ok(report) => {
                 log::info!(
-                    "recording {} saved: {} s, {}x{}, {} bytes, {} frames captured, {} written, {} dropped, ended by {:?}",
+                    "recording {} finished: {} s, {}x{}, {} bytes, {} frames captured, {} written, {} dropped, ended by {:?}",
                     request.capture_id.0,
                     report.duration.as_secs_f64(),
                     report.width,
@@ -749,33 +841,362 @@ impl RecordingHost {
                     report.frames_dropped,
                     report.ended
                 );
-                inner
-                    .history
-                    .record_recording(&report, &request.display_id.0);
-                if inner.json_output {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "schema_version": 1,
-                            "event": "recording_complete",
-                            "capture_id": request.capture_id,
-                            "report": report,
-                        })
-                    );
+                match review_stem {
+                    Some(stem) => {
+                        let draft = Draft {
+                            report,
+                            stem,
+                            capture_id: request.capture_id,
+                            display: request.display_id.0.clone(),
+                            area: request.area,
+                        };
+                        if inner.exiting.load(Ordering::Acquire) {
+                            // Stopped because Captastic is exiting: there is no one to review it.
+                            self.save_unchanged(draft);
+                        } else {
+                            self.queue_review(draft, &desktop_ui);
+                        }
+                    }
+                    None => {
+                        let ended = Some(report.ended);
+                        self.announce_saved(
+                            request.capture_id,
+                            &request.display_id.0,
+                            &report,
+                            ended,
+                        );
+                    }
                 }
-                let _ = inner
-                    .notices
-                    .try_send(crate::daemon::DaemonNotice::RecordingSaved {
-                        file_name: report
-                            .path
-                            .file_name()
-                            .map(|name| name.to_string_lossy().into_owned())
-                            .unwrap_or_default(),
-                        path: report.path.clone(),
-                        ended: report.ended,
-                    });
             }
             Err(error) => self.report_failure(request.capture_id, &error),
+        }
+    }
+
+    /// Records a saved recording in history and says so. `ended` is how the recording ended, for
+    /// one saved straight away; a reviewed recording's ending is old news by the time it is saved.
+    fn announce_saved(
+        &self,
+        capture_id: CaptureId,
+        display: &str,
+        report: &RecordingReport,
+        ended: Option<RecordingEnd>,
+    ) {
+        let inner = &self.inner;
+        log::info!(
+            "recording {} saved: {} s, {}x{}, {} bytes",
+            capture_id.0,
+            report.duration.as_secs_f64(),
+            report.width,
+            report.height,
+            report.bytes
+        );
+        inner.history.record_recording(report, display);
+        if inner.json_output {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "schema_version": 1,
+                    "event": "recording_complete",
+                    "capture_id": capture_id,
+                    "report": report,
+                })
+            );
+        }
+        let _ = inner
+            .notices
+            .try_send(crate::daemon::DaemonNotice::RecordingSaved {
+                file_name: file_name(&report.path),
+                path: report.path.clone(),
+                ended,
+            });
+    }
+
+    /// Opens `draft`'s review, or queues it behind the one open.
+    fn queue_review(
+        &self,
+        draft: Draft,
+        desktop_ui: &Arc<Mutex<Option<captastic_windows::DesktopUi>>>,
+    ) {
+        {
+            let mut reviews = lock(&self.inner.reviews);
+            if reviews.open {
+                log::info!(
+                    "recording {} waits for the review already open",
+                    draft.capture_id.0
+                );
+                reviews.waiting.push_back(draft);
+                return;
+            }
+            reviews.open = true;
+        }
+        self.open_review(draft, desktop_ui);
+    }
+
+    fn open_review(
+        &self,
+        draft: Draft,
+        desktop_ui: &Arc<Mutex<Option<captastic_windows::DesktopUi>>>,
+    ) {
+        // Shared between the request and its answer, since a request the thread never receives
+        // drops the answer uncalled and the draft has to be saved here instead.
+        let shared = Arc::new(Mutex::new(Some(draft)));
+        let requested = {
+            let host = lock(desktop_ui);
+            let Some(ui) = host.as_ref() else {
+                drop(host);
+                if let Some(draft) = lock(&shared).take() {
+                    self.conclude_review(
+                        draft,
+                        captastic_windows::ReviewOutcome::Closed,
+                        desktop_ui,
+                    );
+                }
+                return;
+            };
+            let (path, format, area) = {
+                let draft = lock(&shared);
+                let draft = draft
+                    .as_ref()
+                    .expect("the draft is here until the review answers");
+                (draft.report.path.clone(), draft.report.format, draft.area)
+            };
+            let host = self.clone();
+            let answer_draft = shared.clone();
+            let answer_ui = desktop_ui.clone();
+            ui.review(path, format, area, move |outcome| {
+                if let Some(draft) = lock(&answer_draft).take() {
+                    host.conclude_review(draft, outcome, &answer_ui);
+                }
+            })
+        };
+        if let Err(error) = requested {
+            crate::logging::warn(format_args!(
+                "the review could not be opened, so the recording is saved as it is: {error}"
+            ));
+            if let Some(draft) = lock(&shared).take() {
+                self.conclude_review(draft, captastic_windows::ReviewOutcome::Closed, desktop_ui);
+            }
+        }
+    }
+
+    /// Acts on a review's answer, then opens the next review waiting, if any.
+    fn conclude_review(
+        &self,
+        draft: Draft,
+        outcome: captastic_windows::ReviewOutcome,
+        desktop_ui: &Arc<Mutex<Option<captastic_windows::DesktopUi>>>,
+    ) {
+        use captastic_windows::ReviewOutcome;
+        let shutting_down = matches!(outcome, ReviewOutcome::Closed);
+        match outcome {
+            ReviewOutcome::Save(edit)
+                if !edit.changes_nothing(&timeline_of(&draft.report), size_of(&draft.report)) =>
+            {
+                let host = self.clone();
+                let spawned = thread::Builder::new()
+                    .name("captastic-recording-save".to_owned())
+                    .spawn(move || host.save_edited(draft, edit));
+                match spawned {
+                    Ok(join) => {
+                        let mut savers = lock(&self.inner.savers);
+                        savers.retain(|saver| !saver.is_finished());
+                        savers.push(join);
+                    }
+                    Err(error) => crate::logging::warn(format_args!(
+                        "the edited recording could not be saved, and its draft is kept: {error}"
+                    )),
+                }
+            }
+            ReviewOutcome::Save(_) | ReviewOutcome::Closed => self.save_unchanged(draft),
+            ReviewOutcome::Failed(message) => {
+                crate::logging::warn(format_args!(
+                    "recording {} could not be reviewed, so it is saved as it is: {message}",
+                    draft.capture_id.0
+                ));
+                self.save_unchanged(draft);
+            }
+            ReviewOutcome::Discard => self.discard(draft),
+        }
+        let next = {
+            let mut reviews = lock(&self.inner.reviews);
+            let next = reviews.waiting.pop_front();
+            reviews.open = next.is_some();
+            next
+        };
+        if let Some(next) = next {
+            if shutting_down {
+                // Captastic is exiting: what waited is saved as it is, like the review it followed.
+                self.conclude_review(next, ReviewOutcome::Closed, desktop_ui);
+            } else {
+                self.open_review(next, desktop_ui);
+            }
+        }
+    }
+
+    /// Moves a draft into the output directory as it is.
+    fn save_unchanged(&self, draft: Draft) {
+        let extension = draft.report.format.extension();
+        match move_into(
+            &draft.report.path,
+            &self.inner.output_directory,
+            &draft.stem,
+            extension,
+        ) {
+            Ok(path) => {
+                let report = RecordingReport {
+                    path,
+                    ..draft.report
+                };
+                self.announce_saved(draft.capture_id, &draft.display, &report, None);
+            }
+            Err(error) => {
+                crate::logging::warn(format_args!(
+                    "recording {} could not be moved into the output directory, and stays at {}: {error}",
+                    draft.capture_id.0,
+                    draft.report.path.display()
+                ));
+                let _ = self
+                    .inner
+                    .notices
+                    .try_send(crate::daemon::DaemonNotice::RecordingFailed {
+                        message: format!("it is still at {}: {error}", draft.report.path.display()),
+                    });
+            }
+        }
+    }
+
+    /// Encodes the span and rectangle `edit` keeps into a new file in the output directory, and
+    /// removes the draft. If that fails, the draft is saved as it was recorded instead.
+    fn save_edited(&self, draft: Draft, edit: RecordingEdit) {
+        let extension = draft.report.format.extension();
+        let target = match reserve_path(&self.inner.output_directory, &draft.stem, extension) {
+            Ok(target) => target,
+            Err(error) => {
+                self.edit_failed(draft, &error.to_string());
+                return;
+            }
+        };
+        match encode_edited(&draft.report.path, draft.report.format, edit, &target) {
+            Ok(summary) => {
+                if let Err(error) = std::fs::remove_file(&draft.report.path) {
+                    log::warn!(
+                        "the draft of recording {} could not be removed: {error}",
+                        draft.capture_id.0
+                    );
+                }
+                let bytes = std::fs::metadata(&target).map_or(0, |metadata| metadata.len());
+                let report = RecordingReport {
+                    path: target,
+                    bytes,
+                    width: summary.width,
+                    height: summary.height,
+                    duration: edit.length(),
+                    frames_written: summary.frames_written,
+                    ..draft.report
+                };
+                self.announce_saved(draft.capture_id, &draft.display, &report, None);
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&target);
+                self.edit_failed(draft, &error.to_string());
+            }
+        }
+    }
+
+    fn edit_failed(&self, draft: Draft, message: &str) {
+        crate::logging::warn(format_args!(
+            "recording {} could not be trimmed or cropped, so it is saved as recorded: {message}",
+            draft.capture_id.0
+        ));
+        let extension = draft.report.format.extension();
+        match move_into(
+            &draft.report.path,
+            &self.inner.output_directory,
+            &draft.stem,
+            extension,
+        ) {
+            Ok(path) => {
+                let report = RecordingReport {
+                    path,
+                    ..draft.report
+                };
+                self.inner.history.record_recording(&report, &draft.display);
+                let _ =
+                    self.inner
+                        .notices
+                        .try_send(crate::daemon::DaemonNotice::RecordingEditFailed {
+                            file_name: file_name(&report.path),
+                            path: report.path.clone(),
+                            message: message.to_owned(),
+                        });
+            }
+            Err(error) => {
+                let _ = self
+                    .inner
+                    .notices
+                    .try_send(crate::daemon::DaemonNotice::RecordingFailed {
+                        message: format!("it is still at {}: {error}", draft.report.path.display()),
+                    });
+            }
+        }
+    }
+
+    fn discard(&self, draft: Draft) {
+        match std::fs::remove_file(&draft.report.path) {
+            Ok(()) => log::info!("recording {} discarded", draft.capture_id.0),
+            Err(error) => crate::logging::warn(format_args!(
+                "recording {} was discarded but its draft could not be deleted: {error}",
+                draft.capture_id.0
+            )),
+        }
+        if self.inner.json_output {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "schema_version": 1,
+                    "event": "recording_discarded",
+                    "capture_id": draft.capture_id,
+                })
+            );
+        }
+    }
+
+    /// Saves every draft a Captastic that ended without the chance to - a crash, a power cut -
+    /// left behind, into the output directory, and says so. Empty drafts, from a recording that
+    /// never wrote a frame, are removed.
+    pub fn recover_drafts(&self) {
+        let Ok(entries) = std::fs::read_dir(&self.inner.drafts_directory) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let extension = path.extension().and_then(|value| value.to_str());
+            let Some(extension) = extension.filter(|value| matches!(*value, "gif" | "mp4")) else {
+                continue;
+            };
+            if std::fs::metadata(&path).map_or(0, |metadata| metadata.len()) == 0 {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            let stem = path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "recording".to_owned());
+            match move_into(&path, &self.inner.output_directory, &stem, extension) {
+                Ok(saved) => {
+                    log::info!("a recording left unsaved was recovered into the output directory");
+                    let _ = self.inner.notices.try_send(
+                        crate::daemon::DaemonNotice::RecordingRecovered {
+                            file_name: file_name(&saved),
+                            path: saved,
+                        },
+                    );
+                }
+                Err(error) => crate::logging::warn(format_args!(
+                    "a recording left in {} could not be recovered: {error}",
+                    self.inner.drafts_directory.display()
+                )),
+            }
         }
     }
 
@@ -806,21 +1227,194 @@ impl RecordingHost {
     /// Stops a running recording and waits until `deadline` for its file to be finished.
     /// Captastic exiting finishes a recording rather than discarding it.
     pub fn stop_before(&self, deadline: Instant) {
+        self.inner.exiting.store(true, Ordering::Release);
         if let Some(stop) = lock(&self.inner.stop).as_ref() {
             stop.store(true, Ordering::Release);
         }
-        let Some(join) = lock(&self.inner.join).take() else {
-            return;
-        };
-        while !join.is_finished() {
-            if Instant::now() >= deadline {
+        let recording = lock(&self.inner.join).take();
+        if let Some(join) = recording {
+            if !join_before(join, deadline) {
                 log::warn!("the recording did not finish before the shutdown deadline");
                 return;
             }
-            thread::sleep(Duration::from_millis(10));
         }
-        let _ = join.join();
+        // And an edited recording still being encoded is given until the deadline to finish; one
+        // that does not is left as its draft, which the next start recovers.
+        let savers = std::mem::take(&mut *lock(&self.inner.savers));
+        for saver in savers {
+            if !join_before(saver, deadline) {
+                log::warn!("an edited recording was still being saved at shutdown");
+                return;
+            }
+        }
     }
+}
+
+/// Waits for `handle`'s thread until `deadline`; whether it ended in time.
+fn join_before(handle: thread::JoinHandle<()>, deadline: Instant) -> bool {
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let _ = handle.join();
+    true
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// The timeline a review shows a report's recording on, for asking whether an edit keeps all of
+/// it: only its duration matters for that.
+fn timeline_of(report: &RecordingReport) -> captastic_core::Timeline {
+    captastic_core::Timeline::new(
+        vec![Duration::ZERO],
+        report.duration.max(Duration::from_millis(1)),
+    )
+    .expect("a one-frame timeline that ends after it starts")
+}
+
+fn size_of(report: &RecordingReport) -> (u32, u32) {
+    (report.width, report.height)
+}
+
+/// Makes the drafts folder, hidden, if it is not there already.
+fn prepare_drafts_directory(directory: &Path) {
+    if directory.is_dir() {
+        return;
+    }
+    if let Err(error) = std::fs::create_dir_all(directory) {
+        log::warn!("the recording drafts folder could not be made: {error}");
+        return;
+    }
+    if let Err(error) = captastic_windows::hide_path(directory) {
+        log::debug!("the recording drafts folder could not be hidden: {error}");
+    }
+}
+
+/// Moves `from` into `directory` as `stem.extension`, or the next unused name like it, and returns
+/// where it went. A rename where it can be, and a copy where it cannot.
+fn move_into(
+    from: &Path,
+    directory: &Path,
+    stem: &str,
+    extension: &str,
+) -> Result<PathBuf, RecordingError> {
+    let target = reserve_path(directory, stem, extension)?;
+    if std::fs::rename(from, &target).is_ok() {
+        return Ok(target);
+    }
+    match std::fs::copy(from, &target) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(from);
+            Ok(target)
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&target);
+            Err(RecordingError::Io(format!("{}: {error}", target.display())))
+        }
+    }
+}
+
+/// What an edited recording came out as.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EditedRecording {
+    pub width: u32,
+    pub height: u32,
+    pub frames_written: u64,
+}
+
+/// Encodes what `edit` keeps of the recording at `source` into `target`, in the same format.
+pub fn encode_edited(
+    source: &Path,
+    format: RecordingFormat,
+    edit: RecordingEdit,
+    target: &Path,
+) -> Result<EditedRecording, RecordingError> {
+    let playback = |error: captastic_core::PlaybackError| RecordingError::Encode(error.0);
+    let mut reader: Box<dyn RecordingFrames> = match format {
+        RecordingFormat::Gif => {
+            let bytes = std::fs::read(source)
+                .map_err(|error| RecordingError::Io(format!("{}: {error}", source.display())))?;
+            Box::new(GifReader::new(&bytes).map_err(playback)?)
+        }
+        RecordingFormat::Mp4 => {
+            Box::new(captastic_windows::Mp4Reader::open(source).map_err(playback)?)
+        }
+    };
+    let size = reader.size();
+    let mut edit = edit;
+    if format == RecordingFormat::Mp4 {
+        // H.264 needs even sides; a crop that is not loses its last column or row.
+        let crop = edit.crop.unwrap_or(PixelRect {
+            x: 0,
+            y: 0,
+            width: size.0,
+            height: size.1,
+        });
+        let (width, height) = captastic_windows::mp4_frame_size(crop.width, crop.height);
+        edit.crop = Some(PixelRect {
+            width: width.min(crop.width),
+            height: height.min(crop.height),
+            ..crop
+        });
+    }
+    let (width, height) = edit.output_size(size);
+    let timeline = reader.timeline().clone();
+    let kept = edit.kept_frames(&timeline);
+    if kept.is_empty() {
+        return Err(RecordingError::Encode("the span kept is empty".to_owned()));
+    }
+    let frames_written = match format {
+        RecordingFormat::Gif => {
+            let file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(target)
+                .map_err(|error| RecordingError::Io(format!("{}: {error}", target.display())))?;
+            let mut writer = captastic_core::GifWriter::new(BufWriter::new(file), width, height)
+                .map_err(|error| RecordingError::Encode(error.to_string()))?;
+            for frame in &kept {
+                let pixels = reader.frame(frame.index).map_err(playback)?;
+                writer
+                    .push(&edit.crop_pixels(pixels, size.0), frame.at)
+                    .map_err(|error| RecordingError::Encode(error.to_string()))?;
+            }
+            let (file, summary) = writer
+                .finish(edit.length())
+                .map_err(|error| RecordingError::Encode(error.to_string()))?;
+            file.into_inner()
+                .map_err(|error| RecordingError::Io(error.to_string()))?
+                .sync_all()
+                .map_err(|error| RecordingError::Io(error.to_string()))?;
+            summary.frames_written
+        }
+        RecordingFormat::Mp4 => {
+            let mut writer =
+                captastic_windows::Mp4Writer::create(target, width, height, format.frame_rate())
+                    .map_err(|error| RecordingError::Encode(error.to_string()))?;
+            for frame in &kept {
+                let pixels = reader.frame(frame.index).map_err(playback)?;
+                writer
+                    .push(&edit.crop_pixels(pixels, size.0), frame.at)
+                    .map_err(|error| RecordingError::Encode(error.to_string()))?;
+            }
+            writer
+                .finish(edit.length())
+                .map_err(|error| RecordingError::Encode(error.to_string()))?
+                .frames_written
+        }
+    };
+    Ok(EditedRecording {
+        width,
+        height,
+        frames_written,
+    })
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1110,6 +1704,7 @@ mod tests {
                 format: RecordingFormat::Gif,
                 max_seconds: 30,
                 gif_max_dimension: 1280,
+                review: false,
             },
             directory.join("captures"),
             "{timestamp}".to_owned(),
@@ -1197,5 +1792,250 @@ mod tests {
             output_size(settings(RecordingFormat::Gif, 1.0), 640, 320),
             (64, 32)
         );
+    }
+
+    /// A GIF of `frames` frames, 100 ms apart, 40 by 30, whose frame `n` has its first `n + 1`
+    /// pixels of the top row white, so each frame says which it is.
+    fn counting_gif(path: &Path, frames: u32) {
+        let (width, height) = (40_u32, 30_u32);
+        let mut writer = captastic_core::GifWriter::new(Vec::new(), width, height).expect("writer");
+        let mut pixels = vec![80_u8; (width * height * 4) as usize];
+        for n in 0..frames {
+            let at = (n * 4) as usize;
+            pixels[at..at + 4].copy_from_slice(&[255, 255, 255, 255]);
+            writer
+                .push(&pixels, Duration::from_millis(u64::from(n) * 100))
+                .expect("push");
+        }
+        let (bytes, _) = writer
+            .finish(Duration::from_millis(u64::from(frames) * 100))
+            .expect("finish");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("directory");
+        std::fs::write(path, bytes).expect("write");
+    }
+
+    fn white_count(pixels: &[u8]) -> usize {
+        pixels
+            .chunks_exact(4)
+            .take(40)
+            .filter(|pixel| pixel[0] > 200)
+            .count()
+    }
+
+    #[test]
+    fn an_edit_encodes_only_the_span_and_rectangle_kept() {
+        let directory = directory("edit");
+        let source = directory.join("source.gif");
+        counting_gif(&source, 20);
+        let target = directory.join("edited.gif");
+        let edit = RecordingEdit {
+            start: Duration::from_millis(550),
+            end: Duration::from_millis(1_250),
+            crop: Some(PixelRect {
+                x: 2,
+                y: 0,
+                width: 20,
+                height: 10,
+            }),
+        };
+        let edited = encode_edited(&source, RecordingFormat::Gif, edit, &target).expect("encode");
+        assert_eq!((edited.width, edited.height), (20, 10));
+        let mut reader = GifReader::new(&std::fs::read(&target).expect("read")).expect("reader");
+        assert_eq!(reader.size(), (20, 10));
+        let timeline = reader.timeline().clone();
+        assert_eq!(timeline.duration(), Duration::from_millis(700));
+        // Frame 5 was on screen at 550 ms, so it opens the result; frame 12 started at 1200 ms
+        // and is the last. Cropping two columns away leaves frame n with n - 1 white pixels.
+        assert_eq!(white_count(reader.frame(0).expect("first")), 4);
+        let last = timeline.len() - 1;
+        assert_eq!(white_count(reader.frame(last).expect("last")), 11);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A host that reviews, with its notices, and the history it remembers into.
+    fn reviewing_host(
+        directory: &Path,
+    ) -> (
+        RecordingHost,
+        std::sync::mpsc::Receiver<crate::daemon::DaemonNotice>,
+        captastic_config::HistoryStore,
+    ) {
+        let (capture_sender, _capture_receiver) = std::sync::mpsc::sync_channel(1);
+        let (notice_sender, notices) = std::sync::mpsc::sync_channel(16);
+        let history = captastic_config::HistoryStore::at(directory.join("history.toml"));
+        let host = RecordingHost::new(
+            captastic_config::RecordingConfig::default(),
+            directory.join("captures"),
+            "{timestamp}".to_owned(),
+            crate::file_output::HistoryRecorder::new(
+                history.clone(),
+                captastic_config::HistoryConfig::default().retention(),
+            ),
+            notice_sender,
+            capture_sender,
+            None,
+            false,
+        );
+        (host, notices, history)
+    }
+
+    /// A draft of a two-second counting GIF in the host's drafts folder.
+    fn draft(host: &RecordingHost, name: &str) -> Draft {
+        let path = host.inner.drafts_directory.join(format!("{name}.gif"));
+        counting_gif(&path, 20);
+        Draft {
+            report: RecordingReport {
+                bytes: std::fs::metadata(&path).expect("draft").len(),
+                path,
+                format: RecordingFormat::Gif,
+                width: 40,
+                height: 30,
+                duration: Duration::from_secs(2),
+                frames_captured: 20,
+                frames_written: 20,
+                frames_dropped: 0,
+                ended: RecordingEnd::Stopped,
+            },
+            stem: name.to_owned(),
+            capture_id: CaptureId(3),
+            display: "primary".to_owned(),
+            area: rect(0, 0, 40, 30),
+        }
+    }
+
+    fn saved(directory: &Path) -> Vec<PathBuf> {
+        let mut saved: Vec<PathBuf> = std::fs::read_dir(directory.join("captures"))
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| path.is_file())
+                    .collect()
+            })
+            .unwrap_or_default();
+        saved.sort();
+        saved
+    }
+
+    #[test]
+    fn a_review_saves_unchanged_by_moving_saves_an_edit_by_encoding_and_discards_by_deleting() {
+        use crate::daemon::DaemonNotice;
+        use captastic_windows::ReviewOutcome;
+
+        let directory = directory("review");
+        let (host, notices, history) = reviewing_host(&directory);
+        let no_ui = Arc::new(Mutex::new(None));
+
+        // Saved as it is: the draft itself moves, and the notice is not about how it ended.
+        let unchanged = draft(&host, "unchanged");
+        let bytes = unchanged.report.bytes;
+        host.conclude_review(
+            unchanged,
+            ReviewOutcome::Save(RecordingEdit::none(Duration::from_secs(2))),
+            &no_ui,
+        );
+        let files = saved(&directory);
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].file_name().and_then(|n| n.to_str()),
+            Some("unchanged.gif")
+        );
+        assert_eq!(std::fs::metadata(&files[0]).expect("saved").len(), bytes);
+        assert!(matches!(
+            notices.try_recv(),
+            Ok(DaemonNotice::RecordingSaved { ended: None, .. })
+        ));
+
+        // Trimmed: encoded into a new file, on a thread exit waits for, and the draft removed.
+        let trimmed = draft(&host, "trimmed");
+        let draft_path = trimmed.report.path.clone();
+        host.conclude_review(
+            trimmed,
+            ReviewOutcome::Save(RecordingEdit {
+                start: Duration::from_millis(500),
+                end: Duration::from_secs(2),
+                crop: None,
+            }),
+            &no_ui,
+        );
+        host.stop_before(Instant::now() + Duration::from_secs(10));
+        assert!(!draft_path.exists());
+        let trimmed = directory.join("captures").join("trimmed.gif");
+        let reader = GifReader::new(&std::fs::read(&trimmed).expect("trimmed")).expect("reader");
+        assert_eq!(reader.timeline().duration(), Duration::from_millis(1_500));
+        assert!(matches!(
+            notices.try_recv(),
+            Ok(DaemonNotice::RecordingSaved { .. })
+        ));
+
+        // Discarded: gone, and nothing more saved or said.
+        let discarded = draft(&host, "discarded");
+        let draft_path = discarded.report.path.clone();
+        host.conclude_review(discarded, ReviewOutcome::Discard, &no_ui);
+        assert!(!draft_path.exists());
+        assert_eq!(saved(&directory).len(), 2);
+        assert!(notices.try_recv().is_err());
+
+        // Both saved recordings are remembered, the trimmed one at its new length's size.
+        let remembered = history.load().expect("history");
+        assert_eq!(remembered.entries.len(), 2);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn with_no_window_to_review_in_a_recording_is_saved_and_waiting_ones_follow() {
+        use crate::daemon::DaemonNotice;
+
+        let directory = directory("review-queue");
+        let (host, notices, _history) = reviewing_host(&directory);
+        let no_ui = Arc::new(Mutex::new(None));
+        // One review is open, so the next waits; when the open one closes, Captastic exiting,
+        // the waiting one is saved too rather than reviewed.
+        lock(&host.inner.reviews).open = true;
+        host.queue_review(draft(&host, "second"), &no_ui);
+        assert_eq!(lock(&host.inner.reviews).waiting.len(), 1);
+        host.conclude_review(
+            draft(&host, "first"),
+            captastic_windows::ReviewOutcome::Closed,
+            &no_ui,
+        );
+        assert_eq!(saved(&directory).len(), 2);
+        assert!(!lock(&host.inner.reviews).open);
+        // And with no desktop UI at all, a review cannot open, so the recording is saved.
+        host.queue_review(draft(&host, "third"), &no_ui);
+        assert_eq!(saved(&directory).len(), 3);
+        assert_eq!(
+            notices
+                .try_iter()
+                .filter(|notice| matches!(notice, DaemonNotice::RecordingSaved { .. }))
+                .count(),
+            3
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn drafts_left_behind_are_saved_at_startup_and_empty_ones_removed() {
+        use crate::daemon::DaemonNotice;
+
+        let directory = directory("recover");
+        let (host, notices, _history) = reviewing_host(&directory);
+        let left = draft(&host, "left-behind");
+        let empty = host.inner.drafts_directory.join("empty.mp4");
+        std::fs::write(&empty, b"").expect("empty draft");
+        host.recover_drafts();
+        assert!(!left.report.path.exists());
+        assert!(!empty.exists());
+        let files = saved(&directory);
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].file_name().and_then(|n| n.to_str()),
+            Some("left-behind.gif")
+        );
+        assert!(matches!(
+            notices.try_recv(),
+            Ok(DaemonNotice::RecordingRecovered { .. })
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }

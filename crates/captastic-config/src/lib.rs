@@ -22,7 +22,7 @@ mod ui_state;
 use fsio::{maintain_config_artifacts, quarantine_config};
 
 pub use captastic_core::OutputFormat;
-pub use config_edit::{set_output_enabled, set_recording_format};
+pub use config_edit::{set_output_enabled, set_recording_format, set_recording_review};
 pub use filename_template::{validate_template, TOKENS as FILENAME_TEMPLATE_TOKENS};
 pub use fsio::{atomic_write, finalize_new, replace_file};
 pub use history::{
@@ -1145,6 +1145,9 @@ pub struct RecordingConfig {
     /// A GIF is scaled down so its longer side is at most this many pixels. Between 64 and 4096.
     /// MP4 is not: it keeps the recorded size, up to its encoder's own limit.
     pub gif_max_dimension: u32,
+    /// Whether a finished recording opens in the review window, to be trimmed and cropped, before
+    /// it is saved (ADR 0012). Off, it is saved as soon as it ends.
+    pub review: bool,
 }
 
 impl RecordingConfig {
@@ -1178,6 +1181,7 @@ impl Default for RecordingConfig {
             format: RecordingFormat::Gif,
             max_seconds: 60,
             gif_max_dimension: 1280,
+            review: true,
         }
     }
 }
@@ -1942,6 +1946,7 @@ mod tests {
         assert_eq!(config.recording.format, RecordingFormat::Gif);
         assert_eq!(config.recording.max_duration(), Duration::from_secs(60));
         assert_eq!(config.recording.gif_max_dimension, 1280);
+        assert!(config.recording.review);
         for seconds in [0, 601] {
             let mut config = AppConfig::default();
             config.recording.max_seconds = seconds;

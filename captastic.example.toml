@@ -121,6 +121,10 @@ max_seconds = 60
 # recorded size. Recordings are always saved to the [output] directory, whether or not still
 # captures are, and never to the clipboard.
 gif_max_dimension = 1280
+# A finished recording opens in a review window, where it can be trimmed and cropped before it is
+# saved. false saves it as soon as it ends. The notification area's Review Recordings switch
+# changes it too.
+review = true
 
 [metrics]
 enabled = true
