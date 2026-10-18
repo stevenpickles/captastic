@@ -115,6 +115,8 @@ Milestone 5's criterion vacuously and on purpose.
   tag.
 - **Release notes** that say plainly what a recording contains (the region and the pointer, never
   audio) and that the indicator itself is never recorded.
+- **Recording review** (ADR 0012, Milestone 9 slices 5 to 8) merged and checked on the desktop,
+  added to 0.4.0 on 2026-10-17.
 
 ## Release readiness — v0.3.0
 
@@ -734,7 +736,10 @@ length.
   and a balloon names the file.
 - **Memory:** frames stream through a bounded queue to an encoder thread; a slow encoder drops the
   oldest unencoded frame rather than grow.
-- **Not in 0.4.0:** audio, trimming, and still captures while a recording runs.
+- **Review before saving (ADR 0012):** a finished recording opens in a review window, by default,
+  to be trimmed to the millisecond and cropped before it is saved; Save unchanged costs no encode,
+  and discarding always asks first.
+- **Not in 0.4.0:** audio, marks drawn on recordings, and still captures while a recording runs.
 
 ### Proposed slices
 
@@ -747,8 +752,17 @@ length.
    button, the **Record As** row, the excluded border and its **Stop** bar, the time limit, and the
    saved-file balloon.
 4. **MP4 output** (#116) through Media Foundation's sink writer.
+5. **Reading recordings back** ([ADR 0012](docs/adr/0012-recording-review.md)): a GIF reader that
+   keeps frames compressed and decodes them on demand, and an MP4 reader on Media Foundation's
+   source reader, each tested against its writer.
+6. **Drafts, saving and recovery**: recordings encoded into a hidden drafts folder, saved unchanged
+   by a move or edited by a re-encode, `recording.review` and the **Review Recordings** tray switch,
+   and drafts recovered at startup.
+7. **The review window with trim**: playback, a timeline with start and end handles, frame, second
+   and change stepping, **I** and **O**, millisecond readouts, Save, and Discard that asks first.
+8. **Crop** in the review window.
 
-All four gate the 0.4.0 tag.
+All eight gate the 0.4.0 tag.
 
 ### Exit criteria
 
