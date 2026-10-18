@@ -1211,6 +1211,11 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     };
     if let Some(tray) = tray.as_ref() {
         refresh_tray_history(&args.history_store, tray);
+        if let Err(error) = tray.set_review_enabled(recordings.review_enabled()) {
+            crate::logging::warn(format_args!(
+                "failed to show the review setting in the notification area: {error}"
+            ));
+        }
         for warning in &args.startup_warnings {
             if let Err(error) =
                 tray.show_error_with_title("Captastic configuration recovered", warning.clone())
@@ -1221,6 +1226,10 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             }
         }
     }
+
+    // A recording left in review by a Captastic that could not finish it is saved now, and the
+    // notice reaches the notification area with the others (ADR 0012).
+    recordings.recover_drafts();
 
     let active_hotkeys = args
         .hotkey_bindings
@@ -1442,11 +1451,17 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                     }
                     last_notice_message = Some(message.clone());
                     if let Some(tray) = tray.as_ref() {
-                        let shown = if let DaemonNotice::RecordingSaved { path, .. } = &notice {
+                        let revealing = match &notice {
+                            DaemonNotice::RecordingSaved { path, .. }
+                            | DaemonNotice::RecordingEditFailed { path, .. }
+                            | DaemonNotice::RecordingRecovered { path, .. } => Some(path.clone()),
+                            _ => None,
+                        };
+                        let shown = if let Some(path) = revealing {
                             // The recording is in history now, which the tray's history entries
                             // need to know even when still captures are not being saved.
                             refresh_tray_history(&args.history_store, tray);
-                            tray.show_info_revealing(notice.title(), message, path.clone())
+                            tray.show_info_revealing(notice.title(), message, path)
                         } else if notice.is_informational() {
                             tray.show_info_with_title(notice.title(), message)
                         } else {
@@ -1526,6 +1541,15 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                     requested,
                                     "notification area",
                                 );
+                            }
+                            captastic_windows::TrayEvent::ToggleReview => {
+                                let enabled = !recordings.review_enabled();
+                                recordings.set_review(enabled);
+                                if let Err(error) = tray.set_review_enabled(enabled) {
+                                    crate::logging::warn(format_args!(
+                                        "failed to update the review setting in the notification area: {error}"
+                                    ));
+                                }
                             }
                             captastic_windows::TrayEvent::ClosePins => {
                                 if let Some(worker) = workers.selection() {
@@ -3217,10 +3241,23 @@ pub(crate) enum DaemonNotice {
         file_name: String,
         /// Where it was saved, which clicking the notification shows.
         path: std::path::PathBuf,
-        ended: crate::recording::RecordingEnd,
+        /// How it ended, for a recording saved as soon as it ended; `None` once it has been
+        /// reviewed, when that is no longer news.
+        ended: Option<crate::recording::RecordingEnd>,
     },
     /// A recording failed, and nothing was saved.
     RecordingFailed { message: String },
+    /// A reviewed recording could not be trimmed or cropped, so it was saved as recorded.
+    RecordingEditFailed {
+        file_name: String,
+        path: std::path::PathBuf,
+        message: String,
+    },
+    /// A recording Captastic ended without saving - a crash, a power cut - was saved at startup.
+    RecordingRecovered {
+        file_name: String,
+        path: std::path::PathBuf,
+    },
 }
 
 #[cfg(windows)]
@@ -3233,6 +3270,8 @@ impl DaemonNotice {
             Self::RecordingInProgress => "Captastic is recording",
             Self::RecordingSaved { .. } => "Recording saved",
             Self::RecordingFailed { .. } => "Captastic could not save the recording",
+            Self::RecordingEditFailed { .. } => "Captastic could not trim the recording",
+            Self::RecordingRecovered { .. } => "Recording recovered",
         }
     }
 
@@ -3240,7 +3279,10 @@ impl DaemonNotice {
     fn is_informational(&self) -> bool {
         matches!(
             self,
-            Self::CaptureEngineRecovered | Self::RecordingSaved { .. } | Self::RecordingInProgress
+            Self::CaptureEngineRecovered
+                | Self::RecordingSaved { .. }
+                | Self::RecordingInProgress
+                | Self::RecordingRecovered { .. }
         )
     }
 
@@ -3264,15 +3306,25 @@ impl DaemonNotice {
             Self::RecordingSaved {
                 file_name, ended, ..
             } => match ended {
-                crate::recording::RecordingEnd::TimeLimit => format!(
+                Some(crate::recording::RecordingEnd::TimeLimit) => format!(
                     "{file_name} was saved when the recording reached its time limit. Click to \
                      show it in its folder."
                 ),
-                crate::recording::RecordingEnd::Stopped => {
+                Some(crate::recording::RecordingEnd::Stopped) | None => {
                     format!("{file_name} was saved. Click to show it in its folder.")
                 }
             },
             Self::RecordingFailed { message } => format!("Nothing was saved: {message}."),
+            Self::RecordingEditFailed {
+                file_name, message, ..
+            } => format!(
+                "{file_name} was saved as it was recorded instead: {message}. Click to show it in \
+                 its folder."
+            ),
+            Self::RecordingRecovered { file_name, .. } => format!(
+                "{file_name} was left unsaved when Captastic last stopped, and is saved now. Click \
+                 to show it in its folder."
+            ),
         }
     }
 }

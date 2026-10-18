@@ -138,7 +138,8 @@ the icon to capture, or right-click it to capture, turn **Save Captures to Disk*
 open the most recent capture, show it selected in its folder, open the folder captures are saved
 to, or prune the capture history (**Open Last Capture**, **Show in Folder**, **Open Captures
 Folder**, and **Prune Capture History**), close every pinned capture or make
-them clickable again (**Close All Pins**, **Make Pins Clickable**), pause/resume the global hotkey, open
+them clickable again (**Close All Pins**, **Make Pins Clickable**), turn reviewing recordings before
+they are saved on or off (**Review Recordings**), pause/resume the global hotkey, open
 `captastic.toml`, open the persistent log, toggle **Start with Windows**, or exit cleanly. If
 Windows Explorer restarts, Captastic restores its notification icon automatically. Tray
 initialization failures are logged and do not disable the capture daemon.
@@ -490,6 +491,19 @@ capturing). **Options -> Record As** chooses the format, and the choice is kept:
   frames is stored. What chats, issues and documents embed directly.
 - **MP4**: H.264 video at 30 frames a second and the recorded size, encoded by Windows on the GPU
   where it can be. Far smaller and smoother for anything long or large.
+
+When a recording ends it opens in a **review window** before it is saved (ADR 0012). It plays the
+recording back, and a timeline under the picture holds a handle for each end of the span to keep and
+a playhead: drag a handle to trim, and the picture shows the first or last frame kept. For finer
+control than a pointer, **Left** and **Right** move the playhead one frame, with **Shift** one second
+and with **Ctrl** to the previous or next change on screen; **I** and **O** put the start and the end
+of the span at the playhead, and the times read to the millisecond. **Space** plays the span kept,
+**Save** (Enter) saves it, and **Discard**, Escape or the close button ask before deleting the
+recording. Saved without trimming, the recording is kept exactly as recorded; trimmed, the span kept
+is encoded again. Until it is saved a recording waits in a hidden `.captastic-drafts` folder in the
+output directory; Captastic exiting during a review saves it as it is, and a recording left there by
+a crash is saved the next time Captastic starts. `recording.review = false`, or **Review Recordings**
+in the notification-area menu, saves recordings as soon as they end instead.
 
 A recording is always saved to the output directory, named by the same template as stills and
 remembered in capture history, whether or not still captures are being saved; a notification names

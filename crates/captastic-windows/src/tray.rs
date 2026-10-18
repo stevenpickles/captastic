@@ -9,8 +9,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use captastic_core::{CaptureError, CaptureErrorKind};
-use windows::core::{w, Error as WindowsError, PCWSTR};
+use windows::core::{w, Error as WindowsError, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Storage::FileSystem::{SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Shutdown::{ShutdownBlockReasonCreate, ShutdownBlockReasonDestroy};
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -38,6 +39,7 @@ const TRAY_CALLBACK: u32 = WM_APP + 1;
 const TRAY_SET_STARTUP: u32 = WM_APP + 2;
 const TRAY_SET_HAS_HISTORY: u32 = WM_APP + 5;
 const TRAY_SET_FILE_OUTPUT: u32 = WM_APP + 4;
+const TRAY_SET_REVIEW: u32 = WM_APP + 6;
 const TRAY_SHOW_ERROR: u32 = WM_APP + 3;
 const TRAY_ICON_ID: u32 = 1;
 const APPLICATION_ICON_RESOURCE_ID: usize = 1;
@@ -54,6 +56,7 @@ const COMMAND_FILE_OUTPUT: usize = 1_010;
 const COMMAND_CLOSE_PINS: usize = 1_011;
 const COMMAND_PINS_CLICKABLE: usize = 1_012;
 const COMMAND_OPEN_CAPTURES_FOLDER: usize = 1_013;
+const COMMAND_REVIEW: usize = 1_014;
 /// Sent to the tray callback when the person clicks a notification. Defined by hand, as the
 /// shell's headers do: `WM_USER + 5`.
 const NIN_BALLOONUSERCLICK: u32 = 0x0405;
@@ -81,6 +84,8 @@ pub enum TrayEvent {
     PruneHistory,
     /// Start or stop writing captures to disk, and remember which the user chose.
     ToggleFileOutput,
+    /// Turn reviewing recordings before they are saved on or off, and remember which.
+    ToggleReview,
     /// Close every pinned capture (ADR 0010).
     ClosePins,
     /// Make every pinned capture clickable again, the only way back for a click-through pin.
@@ -188,6 +193,21 @@ impl TrayIcon {
             )
         }
         .map_err(|error| native_error("update_file_output_menu", error))
+    }
+
+    /// Tells the tray whether recordings are reviewed before they are saved, which is what the
+    /// checkmark beside `Review Recordings` reports.
+    pub fn set_review_enabled(&self, enabled: bool) -> Result<(), CaptureError> {
+        // SAFETY: hwnd identifies the live hidden tray window owned by the tray thread.
+        unsafe {
+            PostMessageW(
+                HWND(self.hwnd),
+                TRAY_SET_REVIEW,
+                WPARAM(usize::from(enabled)),
+                LPARAM(0),
+            )
+        }
+        .map_err(|error| native_error("update_review_menu", error))
     }
 
     /// Tells the tray whether there is a remembered capture, which decides whether the history
@@ -355,6 +375,14 @@ pub fn reveal_in_folder(file: &Path) -> Result<(), CaptureError> {
         ));
     }
     Ok(())
+}
+
+/// Marks `path` hidden, as Windows hides folders of its own.
+pub fn hide_path(path: &Path) -> Result<(), CaptureError> {
+    let wide = HSTRING::from(path.as_os_str());
+    // SAFETY: The path is a null-terminated wide string that lives for the call.
+    unsafe { SetFileAttributesW(PCWSTR(wide.as_ptr()), FILE_ATTRIBUTE_HIDDEN) }
+        .map_err(|error| native_error("hide_path", error))
 }
 
 pub fn show_error_dialog(message: &str) {
@@ -569,6 +597,9 @@ mod machine {
         /// the only thing that knows whether the file worker actually started, and reported here
         /// through [`TrayInput::FileOutputChanged`].
         pub(super) file_output_enabled: bool,
+        /// Whether recordings are reviewed before they are saved, as the daemon last reported it
+        /// through [`TrayInput::ReviewChanged`].
+        pub(super) review_enabled: bool,
         pub(super) has_history: bool,
         pub(super) icon: IconState,
         pub(super) session: SessionPhase,
@@ -585,6 +616,8 @@ mod machine {
                 paused: false,
                 startup_enabled,
                 file_output_enabled,
+                // The default, until the daemon reports the configuration.
+                review_enabled: true,
                 // Nothing is known about history until the daemon reports it.
                 has_history: false,
                 icon: IconState::Absent,
@@ -626,6 +659,7 @@ mod machine {
         Menu(TrayMenuCommand),
         StartupStateChanged(bool),
         FileOutputChanged(bool),
+        ReviewChanged(bool),
         HistoryAvailabilityChanged(bool),
         NotificationsPosted,
         NotificationClicked,
@@ -652,6 +686,7 @@ mod machine {
         OpenCapturesFolder,
         PruneHistory,
         ToggleFileOutput,
+        ToggleReview,
         ClosePins,
         MakePinsClickable,
         ToggleStartup,
@@ -678,6 +713,8 @@ mod machine {
             /// Whether captures are being written to disk, which decides whether
             /// `Save Captures to Disk` is shown checked.
             file_output_enabled: bool,
+            /// Whether `Review Recordings` is shown checked.
+            review_enabled: bool,
             /// Whether there is a remembered capture to open, which decides whether the history
             /// entries are usable or greyed.
             has_history: bool,
@@ -753,6 +790,7 @@ mod machine {
                     paused: model.paused,
                     startup_enabled: model.startup_enabled,
                     file_output_enabled: model.file_output_enabled,
+                    review_enabled: model.review_enabled,
                     has_history: model.has_history,
                 }],
                 Handled,
@@ -811,6 +849,11 @@ mod machine {
                 vec![TrayEffect::SendEvent(TrayEvent::ToggleFileOutput)],
                 Handled,
             ),
+            TrayInput::Menu(TrayMenuCommand::ToggleReview) => (
+                // Reported like the disk switch: the daemon applies it and says so.
+                vec![TrayEffect::SendEvent(TrayEvent::ToggleReview)],
+                Handled,
+            ),
             TrayInput::Menu(TrayMenuCommand::ToggleStartup) => (
                 vec![TrayEffect::SendEvent(TrayEvent::ToggleStartup)],
                 Handled,
@@ -826,6 +869,10 @@ mod machine {
             TrayInput::FileOutputChanged(enabled) => {
                 // Like the history flag: read when the menu is next opened, so nothing redraws.
                 model.file_output_enabled = enabled;
+                (Vec::new(), Handled)
+            }
+            TrayInput::ReviewChanged(enabled) => {
+                model.review_enabled = enabled;
                 (Vec::new(), Handled)
             }
             TrayInput::HistoryAvailabilityChanged(has_history) => {
@@ -1004,6 +1051,9 @@ fn translate_tray_message(
             COMMAND_FILE_OUTPUT => {
                 TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::ToggleFileOutput))
             }
+            COMMAND_REVIEW => {
+                TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::ToggleReview))
+            }
             COMMAND_CLOSE_PINS => {
                 TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::ClosePins))
             }
@@ -1020,6 +1070,7 @@ fn translate_tray_message(
         TRAY_SET_FILE_OUTPUT => {
             TranslatedMessage::Input(TrayInput::FileOutputChanged(wparam.0 != 0))
         }
+        TRAY_SET_REVIEW => TranslatedMessage::Input(TrayInput::ReviewChanged(wparam.0 != 0)),
         TRAY_SET_HAS_HISTORY => {
             TranslatedMessage::Input(TrayInput::HistoryAvailabilityChanged(wparam.0 != 0))
         }
@@ -1090,6 +1141,7 @@ fn apply_tray_effect(hwnd: HWND, state_pointer: *mut TrayState, effect: machine:
             paused,
             startup_enabled,
             file_output_enabled,
+            review_enabled,
             has_history,
         } => {
             if let Err(error) = show_context_menu(
@@ -1097,6 +1149,7 @@ fn apply_tray_effect(hwnd: HWND, state_pointer: *mut TrayState, effect: machine:
                 paused,
                 startup_enabled,
                 file_output_enabled,
+                review_enabled,
                 has_history,
             ) {
                 log::warn!("failed to show tray menu: {error}");
@@ -1344,6 +1397,7 @@ fn show_context_menu(
     paused: bool,
     startup_enabled: bool,
     file_output_enabled: bool,
+    review_enabled: bool,
     has_history: bool,
 ) -> Result<(), CaptureError> {
     // SAFETY: Creates an empty popup menu owned by this function.
@@ -1452,6 +1506,14 @@ fn show_context_menu(
             )
         }
         .map_err(|error| native_error("append_pins_clickable_menu", error))?;
+        let review_flags = if review_enabled {
+            MF_STRING | MF_CHECKED
+        } else {
+            MF_STRING
+        };
+        // SAFETY: menu and static label are live for the call.
+        unsafe { AppendMenuW(menu, review_flags, COMMAND_REVIEW, w!("Review Recordings")) }
+            .map_err(|error| native_error("append_review_menu", error))?;
         let startup_flags = if startup_enabled {
             MF_STRING | MF_CHECKED
         } else {
@@ -1798,6 +1860,12 @@ mod tests {
             ),
             (
                 WM_COMMAND,
+                COMMAND_REVIEW,
+                0,
+                TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::ToggleReview)),
+            ),
+            (
+                WM_COMMAND,
                 COMMAND_OPEN_CAPTURES_FOLDER,
                 0,
                 TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::OpenCapturesFolder)),
@@ -2050,6 +2118,7 @@ mod tests {
         for (command, expected) in [
             (TrayMenuCommand::OpenLastCapture, TrayEvent::OpenLastCapture),
             (TrayMenuCommand::ShowInFolder, TrayEvent::ShowInFolder),
+            (TrayMenuCommand::ToggleReview, TrayEvent::ToggleReview),
             (
                 TrayMenuCommand::OpenCapturesFolder,
                 TrayEvent::OpenCapturesFolder,
@@ -2074,6 +2143,7 @@ mod tests {
                 paused: false,
                 startup_enabled: false,
                 file_output_enabled: false,
+                review_enabled: true,
                 has_history: false,
             }]
         );
@@ -2091,6 +2161,7 @@ mod tests {
                 paused: false,
                 startup_enabled: false,
                 file_output_enabled: false,
+                review_enabled: true,
                 has_history: true,
             }]
         );
@@ -2106,6 +2177,7 @@ mod tests {
                 paused: false,
                 startup_enabled: true,
                 file_output_enabled: false,
+                review_enabled: true,
                 has_history: false,
             }]
         );
@@ -2123,6 +2195,7 @@ mod tests {
                 paused: true,
                 startup_enabled: false,
                 file_output_enabled: false,
+                review_enabled: true,
                 has_history: true,
             }]
         );
@@ -2287,6 +2360,7 @@ mod tests {
                 paused: false,
                 startup_enabled: false,
                 file_output_enabled: false,
+                review_enabled: true,
                 has_history: false,
             }]
         );
@@ -2303,6 +2377,7 @@ mod tests {
                 paused: false,
                 startup_enabled: false,
                 file_output_enabled: true,
+                review_enabled: true,
                 has_history: false,
             }]
         );
@@ -2325,6 +2400,34 @@ mod tests {
     }
 
     #[test]
+    fn the_review_switch_is_reported_and_checked_once_the_daemon_says_so() {
+        let mut model = TrayModel::new(false, false);
+        assert!(model.review_enabled, "reviewing is the default");
+        let (effects, _) = transition(&mut model, TrayInput::Menu(TrayMenuCommand::ToggleReview));
+        assert_eq!(
+            effects,
+            vec![TrayEffect::SendEvent(TrayEvent::ToggleReview)]
+        );
+        assert!(
+            model.review_enabled,
+            "still on until the daemon says otherwise"
+        );
+        let (effects, _) = transition(&mut model, TrayInput::ReviewChanged(false));
+        assert!(effects.is_empty());
+        let (effects, _) = transition(&mut model, TrayInput::IconContextMenu);
+        assert_eq!(
+            effects,
+            vec![TrayEffect::ShowMenu {
+                paused: false,
+                startup_enabled: false,
+                file_output_enabled: false,
+                review_enabled: false,
+                has_history: false,
+            }]
+        );
+    }
+
+    #[test]
     fn a_daemon_that_starts_with_file_output_on_opens_the_menu_checked() {
         // `output.enabled = true` in the configuration: the first menu the user opens has to
         // agree with where their captures have been going since startup.
@@ -2336,6 +2439,7 @@ mod tests {
                 paused: false,
                 startup_enabled: false,
                 file_output_enabled: true,
+                review_enabled: true,
                 has_history: false,
             }]
         );
