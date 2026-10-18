@@ -497,10 +497,12 @@ recording back, and a timeline under the picture holds a handle for each end of 
 a playhead: drag a handle to trim, and the picture shows the first or last frame kept. For finer
 control than a pointer, **Left** and **Right** move the playhead one frame, with **Shift** one second
 and with **Ctrl** to the previous or next change on screen; **I** and **O** put the start and the end
-of the span at the playhead, and the times read to the millisecond. **Space** plays the span kept,
+of the span at the playhead, and the times read to the millisecond. Drag on the picture to crop it,
+then move the rectangle or pull its edges and corners as in the image editor; **Reset Crop** (R)
+keeps the whole picture again, and an MP4's crop keeps even sides, as H.264 needs. **Space** plays the span kept,
 **Save** (Enter) saves it, and **Discard**, Escape or the close button ask before deleting the
-recording. Saved without trimming, the recording is kept exactly as recorded; trimmed, the span kept
-is encoded again. Until it is saved a recording waits in a hidden `.captastic-drafts` folder in the
+recording. Saved without trimming or cropping, the recording is kept exactly as recorded; otherwise
+what is kept is encoded again. Until it is saved a recording waits in a hidden `.captastic-drafts` folder in the
 output directory; Captastic exiting during a review saves it as it is, and a recording left there by
 a crash is saved the next time Captastic starts. `recording.review = false`, or **Review Recordings**
 in the notification-area menu, saves recordings as soon as they end instead.

@@ -10,17 +10,22 @@
 //! Trimming is to the millisecond. The timeline under the picture has a handle for each end of
 //! the span kept and a playhead; the keyboard moves the playhead by a frame interval, a second,
 //! or to the next change on screen, and **I** and **O** put the start or the end where it is.
+//!
+//! Cropping is the image editor's: drag on the picture for the rectangle to keep, then move it or
+//! pull its edges and corners. An MP4's crop is kept to even sides, as H.264 needs, so what is
+//! shown is what is saved.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use captastic_config::RecordingFormat;
 use captastic_core::{
-    CaptureError, GifReader, PlaybackError, RecordingEdit, RecordingFrames, Rect, Timeline,
+    CaptureError, GifReader, PixelRect, PlaybackError, RecordingEdit, RecordingFrames, Rect,
+    Timeline,
 };
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{BeginPaint, BitBlt, EndPaint, PAINTSTRUCT, SRCCOPY};
+use windows::Win32::Graphics::Gdi::{BeginPaint, BitBlt, EndPaint, GdiFlush, PAINTSTRUCT, SRCCOPY};
 use windows::Win32::UI::HiDpi::AdjustWindowRectExForDpi;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RETURN,
@@ -29,17 +34,21 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, KillTimer, LoadCursorW,
     MessageBoxW, SetCursor, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, HTCLIENT,
-    IDC_ARROW, IDC_SIZEWE, IDOK, MB_ICONWARNING, MB_OKCANCEL, MINMAXINFO, SWP_NOACTIVATE,
-    SWP_NOZORDER, SW_SHOW, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
-    WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY,
-    WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_TIMER, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
+    IDC_ARROW, IDC_CROSS, IDC_SIZEWE, IDOK, MB_ICONWARNING, MB_OKCANCEL, MINMAXINFO,
+    SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
+    WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_TIMER, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
 };
 
 use super::desktop_ui::{desktop_error, forget_window, release_window_state, window_state};
+use super::editor::{
+    adjust_crop, dim_outside, draw_crop_handles, grip_at as crop_grip_at, grip_cursor,
+    rect_between, Grip,
+};
 use super::layout::{UiMetrics, UiRect};
 use super::raster::{
-    draw_round_box, draw_surface_to_rect, draw_text, fill_device_rect, measure_ui_text, rgb,
-    TextAlignment,
+    draw_outline_rect, draw_round_box, draw_surface_to_rect, draw_text, fill_device_rect,
+    measure_ui_text, rgb, TextAlignment,
 };
 use super::shell::{
     capture_pointer, modifiers, query_display_environment, release_pointer_capture, FrozenSurface,
@@ -54,6 +63,7 @@ const TOOLBAR_HEIGHT_DIP: i32 = 52;
 const TOOLBAR_PADDING_DIP: i32 = 8;
 const BUTTON_HEIGHT_DIP: i32 = 36;
 const TEXT_BUTTON_WIDTH_DIP: i32 = 84;
+const RESET_BUTTON_WIDTH_DIP: i32 = 104;
 const BUTTON_GAP_DIP: i32 = 6;
 const GROUP_GAP_DIP: i32 = 12;
 const TIME_LABEL_WIDTH_DIP: i32 = 190;
@@ -65,6 +75,8 @@ const TRACK_HEIGHT_DIP: i32 = 30;
 const HANDLE_WIDTH_DIP: i32 = 8;
 /// How far from a handle a press still takes hold of it.
 const GRIP_TOLERANCE_DIP: i32 = 8;
+/// How far the pointer must travel before a press on the picture starts a crop.
+const DRAG_THRESHOLD_DIP: i32 = 3;
 /// Ticks for the changes on screen closer together than this are left out.
 const TICK_SPACING_DIP: i32 = 3;
 const MINIMUM_CLIENT_DIP: (i32, i32) = (760, 420);
@@ -173,6 +185,7 @@ fn clock(at: Duration) -> String {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReviewButton {
     Play,
+    ResetCrop,
     Discard,
     Save,
 }
@@ -181,6 +194,7 @@ impl ReviewButton {
     const fn tooltip(self) -> &'static str {
         match self {
             Self::Play => "Play or pause (Space)",
+            Self::ResetCrop => "Keep the whole picture again (R)",
             Self::Discard => "Delete this recording (Esc)",
             Self::Save => "Save the span kept (Enter)",
         }
@@ -192,10 +206,12 @@ impl ReviewButton {
 struct ReviewLayout {
     client: UiRect,
     toolbar: UiRect,
-    buttons: [(ReviewButton, UiRect); 3],
+    buttons: [(ReviewButton, UiRect); 4],
     time_label: UiRect,
     span_label: UiRect,
     image: UiRect,
+    /// Client pixels per recording pixel; never more than one.
+    scale: f64,
     timeline: UiRect,
     track: UiRect,
     hint: UiRect,
@@ -219,6 +235,11 @@ impl ReviewLayout {
         let play = button(client.left + metrics.px(TOOLBAR_PADDING_DIP));
         let save = button(client.right - metrics.px(TOOLBAR_PADDING_DIP + TEXT_BUTTON_WIDTH_DIP));
         let discard = button(save.left - metrics.px(BUTTON_GAP_DIP + TEXT_BUTTON_WIDTH_DIP));
+        let reset_crop = UiRect {
+            left: discard.left - metrics.px(GROUP_GAP_DIP + RESET_BUTTON_WIDTH_DIP),
+            right: discard.left - metrics.px(GROUP_GAP_DIP),
+            ..discard
+        };
         let time_label = UiRect {
             left: play.right + metrics.px(GROUP_GAP_DIP),
             top,
@@ -228,7 +249,7 @@ impl ReviewLayout {
         let span_label = UiRect {
             left: time_label.right + metrics.px(GROUP_GAP_DIP),
             top,
-            right: (discard.left - metrics.px(GROUP_GAP_DIP))
+            right: (reset_crop.left - metrics.px(GROUP_GAP_DIP))
                 .max(time_label.right + metrics.px(GROUP_GAP_DIP)),
             bottom,
         };
@@ -270,6 +291,7 @@ impl ReviewLayout {
             toolbar,
             buttons: [
                 (ReviewButton::Play, play),
+                (ReviewButton::ResetCrop, reset_crop),
                 (ReviewButton::Discard, discard),
                 (ReviewButton::Save, save),
             ],
@@ -281,9 +303,29 @@ impl ReviewLayout {
                 right: left + width,
                 bottom: image_top + height,
             },
+            scale,
             timeline,
             track,
             hint,
+        }
+    }
+
+    /// The recording pixel under a client point, unclamped and fractional.
+    fn image_point(&self, point: POINT) -> (f64, f64) {
+        (
+            f64::from(point.x - self.image.left) / self.scale,
+            f64::from(point.y - self.image.top) / self.scale,
+        )
+    }
+
+    /// Where a rectangle of recording pixels is drawn.
+    fn client_rect(&self, rect: Rect) -> UiRect {
+        let at = |origin: i32, value: i64| origin + (value as f64 * self.scale).round() as i32;
+        UiRect {
+            left: at(self.image.left, i64::from(rect.x)),
+            top: at(self.image.top, i64::from(rect.y)),
+            right: at(self.image.left, rect.right()),
+            bottom: at(self.image.top, rect.bottom()),
         }
     }
 
@@ -346,6 +388,33 @@ fn grip_at(layout: &ReviewLayout, trim: &Trim, point: POINT, tolerance: i32) -> 
     }
 }
 
+/// A press on the picture, and what it is doing to the crop.
+#[derive(Clone, Copy, Debug)]
+enum CropDrag {
+    /// Drawing a new crop from where the press began.
+    Draw {
+        anchor: POINT,
+        current: POINT,
+        moved: bool,
+    },
+    /// Moving or resizing the crop there is.
+    Adjust {
+        grip: Grip,
+        start: Rect,
+        anchor: POINT,
+        current: POINT,
+    },
+}
+
+/// `crop` with its sides rounded down to even numbers, never below two.
+fn even(crop: Rect) -> Rect {
+    Rect {
+        width: (crop.width & !1).max(2),
+        height: (crop.height & !1).max(2),
+        ..crop
+    }
+}
+
 /// One review's state, owned by its window.
 struct ReviewState {
     /// Taken out and dropped before the answer is given, so the draft is free to move.
@@ -361,6 +430,11 @@ struct ReviewState {
     /// Since when, and from where, the recording is playing.
     playing: Option<(Instant, Duration)>,
     drag: Option<Drag>,
+    /// The rectangle kept, in recording pixels: the whole picture until it is cropped.
+    crop: Rect,
+    crop_drag: Option<CropDrag>,
+    /// Whether a crop is kept to even sides, as an MP4's must be.
+    even_crop: bool,
     pressed: Option<ReviewButton>,
     hovered: Option<ReviewButton>,
     tracking_leave: bool,
@@ -368,6 +442,59 @@ struct ReviewState {
 }
 
 impl ReviewState {
+    fn bounds(&self) -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            width: self.size.0,
+            height: self.size.1,
+        }
+    }
+
+    fn cropped(&self) -> bool {
+        self.crop != self.bounds()
+    }
+
+    /// The crop a drag in progress would make, if it ended here, kept to even sides for an MP4.
+    fn pending_crop(&self) -> Option<Rect> {
+        let bounds = self.bounds();
+        let crop = match self.crop_drag.as_ref()? {
+            CropDrag::Draw {
+                anchor,
+                current,
+                moved: true,
+            } => rect_between(
+                self.layout.image_point(*anchor),
+                self.layout.image_point(*current),
+            )?
+            .intersection(bounds)?,
+            CropDrag::Draw { .. } => return None,
+            CropDrag::Adjust {
+                grip,
+                start,
+                anchor,
+                current,
+            } => {
+                let dx = (f64::from(current.x - anchor.x) / self.layout.scale).round() as i64;
+                let dy = (f64::from(current.y - anchor.y) / self.layout.scale).round() as i64;
+                adjust_crop(*start, *grip, dx, dy, bounds)
+            }
+        };
+        Some(if self.even_crop { even(crop) } else { crop })
+    }
+
+    fn edit(&self) -> RecordingEdit {
+        RecordingEdit {
+            crop: self.cropped().then_some(PixelRect {
+                x: self.crop.x.max(0) as u32,
+                y: self.crop.y.max(0) as u32,
+                width: self.crop.width,
+                height: self.crop.height,
+            }),
+            ..self.trim.edit()
+        }
+    }
+
     /// Puts the frame on screen at the playhead into the picture, if it is not there already.
     fn show_playhead(&mut self) {
         let index = self.timeline.index_at(self.trim.playhead);
@@ -494,6 +621,14 @@ fn open_review(
         back_buffer: None,
         playing: None,
         drag: None,
+        crop: Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        },
+        crop_drag: None,
+        even_crop: format == RecordingFormat::Mp4,
         pressed: None,
         hovered: None,
         tracking_leave: false,
@@ -626,7 +761,8 @@ pub(super) unsafe extern "system" fn review_window_proc(
         WM_CAPTURECHANGED => {
             // SAFETY: As above. Losing the pointer mid-drag ends the drag where it is.
             let state = unsafe { &mut *state_pointer };
-            if state.drag.take().is_some() || state.pressed.take().is_some() {
+            let crop_dropped = state.crop_drag.take().is_some();
+            if state.drag.take().is_some() || state.pressed.take().is_some() || crop_dropped {
                 invalidate(hwnd);
             }
             LRESULT(0)
@@ -715,9 +851,28 @@ fn set_cursor(hwnd: HWND, state: &ReviewState) {
         ),
         None => None,
     };
-    let cursor = match grip {
-        Some(Drag::Start | Drag::End) => IDC_SIZEWE,
-        _ => IDC_ARROW,
+    let cursor = match (grip, state.crop_drag) {
+        (Some(Drag::Start | Drag::End), _) => IDC_SIZEWE,
+        (Some(Drag::Playhead), _) => IDC_ARROW,
+        (None, Some(CropDrag::Adjust { grip, .. })) => grip_cursor(grip),
+        (None, Some(CropDrag::Draw { .. })) => IDC_CROSS,
+        (None, None) if located => crop_grip_at(
+            state.layout.client_rect(state.crop),
+            point,
+            state.metrics.px(GRIP_TOLERANCE_DIP),
+            state.cropped(),
+        )
+        .map_or_else(
+            || {
+                if state.layout.image.contains(point) {
+                    IDC_CROSS
+                } else {
+                    IDC_ARROW
+                }
+            },
+            grip_cursor,
+        ),
+        (None, None) => IDC_ARROW,
     };
     // SAFETY: Each is a shared system cursor that needs no destruction.
     if let Ok(cursor) = unsafe { LoadCursorW(None, cursor) } {
@@ -743,6 +898,24 @@ fn pointer_moved(hwnd: HWND, state: &mut ReviewState, point: POINT) {
     if let Some(drag) = state.drag {
         drag_to(state, drag, point.x);
         changed = true;
+    }
+    let threshold = state.metrics.px(DRAG_THRESHOLD_DIP);
+    match state.crop_drag.as_mut() {
+        Some(CropDrag::Draw {
+            anchor,
+            current,
+            moved,
+        }) => {
+            *current = point;
+            *moved |=
+                (point.x - anchor.x).abs() >= threshold || (point.y - anchor.y).abs() >= threshold;
+            changed = true;
+        }
+        Some(CropDrag::Adjust { current, .. }) => {
+            *current = point;
+            changed = true;
+        }
+        None => {}
     }
     if changed {
         invalidate(hwnd);
@@ -782,7 +955,31 @@ fn pointer_pressed(hwnd: HWND, state: &mut ReviewState, point: POINT) {
         drag_to(state, drag, point.x);
         capture_pointer(hwnd);
         invalidate(hwnd);
+        return;
     }
+    // The picture: an edge or corner of the crop, its inside once there is one, or a new crop.
+    let crop_drag = match crop_grip_at(
+        state.layout.client_rect(state.crop),
+        point,
+        tolerance,
+        state.cropped(),
+    ) {
+        Some(grip) => CropDrag::Adjust {
+            grip,
+            start: state.crop,
+            anchor: point,
+            current: point,
+        },
+        None if state.layout.image.contains(point) => CropDrag::Draw {
+            anchor: point,
+            current: point,
+            moved: false,
+        },
+        None => return,
+    };
+    state.crop_drag = Some(crop_drag);
+    capture_pointer(hwnd);
+    invalidate(hwnd);
 }
 
 /// Ends a press. Returns the toolbar button to act on, if the press was one and was released over
@@ -790,6 +987,10 @@ fn pointer_pressed(hwnd: HWND, state: &mut ReviewState, point: POINT) {
 fn pointer_released(state: &mut ReviewState, point: POINT) -> Option<ReviewButton> {
     let pressed = state.pressed.take();
     state.drag = None;
+    if let Some(crop) = state.pending_crop() {
+        state.crop = crop;
+    }
+    state.crop_drag = None;
     // Taken before releasing: the release sends WM_CAPTURECHANGED.
     release_pointer_capture();
     pressed.filter(|button| state.layout.button_at(point) == Some(*button))
@@ -801,10 +1002,16 @@ fn press_button(hwnd: HWND, state_pointer: *mut ReviewState, button: ReviewButto
             // SAFETY: The review's state lives until WM_NCDESTROY on this thread.
             toggle_playing(hwnd, unsafe { &mut *state_pointer });
         }
+        ReviewButton::ResetCrop => {
+            // SAFETY: As above.
+            let state = unsafe { &mut *state_pointer };
+            state.crop = state.bounds();
+            invalidate(hwnd);
+        }
         ReviewButton::Discard => request_discard(hwnd, state_pointer),
         ReviewButton::Save => {
             // SAFETY: As above; read and released before the review ends.
-            let edit = unsafe { (*state_pointer).trim.edit() };
+            let edit = unsafe { (*state_pointer).edit() };
             finish(hwnd, state_pointer, ReviewOutcome::Save(edit));
         }
     }
@@ -853,7 +1060,11 @@ fn key_pressed(hwnd: HWND, state_pointer: *mut ReviewState, key: u16) {
     if key == VK_ESCAPE.0 {
         // SAFETY: The review's state lives until WM_NCDESTROY on this thread; the borrow ends
         // before the discard below.
-        let dragging = unsafe { (*state_pointer).drag.take().is_some() };
+        let dragging = unsafe {
+            let state = &mut *state_pointer;
+            let cropping = state.crop_drag.take().is_some();
+            state.drag.take().is_some() || cropping
+        };
         if dragging {
             release_pointer_capture();
             invalidate(hwnd);
@@ -868,7 +1079,11 @@ fn key_pressed(hwnd: HWND, state_pointer: *mut ReviewState, key: u16) {
     }
     // SAFETY: As above; nothing below ends the review.
     let state = unsafe { &mut *state_pointer };
-    if state.drag.is_some() {
+    if state.drag.is_some() || state.crop_drag.is_some() {
+        return;
+    }
+    if key == 0x52 {
+        press_button(hwnd, state_pointer, ReviewButton::ResetCrop);
         return;
     }
     let step = if held.ctrl {
@@ -990,8 +1205,46 @@ fn compose(state: &ReviewState, surface: &FrozenSurface) {
         rgb(CANVAS_RGB.0, CANVAS_RGB.1, CANVAS_RGB.2),
     );
     draw_surface_to_rect(device, &state.picture, layout.image);
+    let crop = state.pending_crop().unwrap_or(state.crop);
+    if crop != state.bounds() || state.crop_drag.is_some() {
+        let accent = rgb(ACCENT_RGB.0, ACCENT_RGB.1, ACCENT_RGB.2);
+        let on_screen = layout.client_rect(crop);
+        // SAFETY: Completes every queued GDI draw before the pixels are touched directly.
+        let _ = unsafe { GdiFlush() };
+        // SAFETY: The surface's DIB holds exactly byte_length writable bytes, owned by this
+        // thread.
+        let pixels = unsafe { std::slice::from_raw_parts_mut(surface.bits, surface.byte_length) };
+        dim_outside(pixels, surface.width as usize, layout.image, on_screen);
+        draw_outline_rect(
+            device,
+            on_screen.left,
+            on_screen.top,
+            on_screen.right,
+            on_screen.bottom,
+            accent,
+            metrics.px(2).max(1),
+        );
+        draw_crop_handles(device, on_screen, metrics, accent);
+    } else {
+        // Under the picture, while nothing is cropped, the one thing it does that nothing says.
+        let caption = UiRect {
+            top: layout.image.bottom + metrics.px(6),
+            bottom: layout.image.bottom + metrics.px(30),
+            ..layout.client
+        };
+        if caption.bottom <= layout.timeline.top {
+            draw_text(
+                device,
+                caption,
+                "Drag on the picture to crop it",
+                rgb(140, 140, 148),
+                TextAlignment::Center,
+                (tokens.font_height * 9 / 10).max(1),
+            );
+        }
+    }
 
-    // The toolbar: Play, the playhead's time, the span kept, Discard and Save.
+    // The toolbar: Play, the playhead's time, the span kept, Reset Crop, Discard and Save.
     fill_device_rect(device, native(layout.toolbar), rgb(38, 38, 41));
     fill_device_rect(
         device,
@@ -1002,7 +1255,8 @@ fn compose(state: &ReviewState, surface: &FrozenSurface) {
         rgb(60, 60, 65),
     );
     for (button, bounds) in &layout.buttons {
-        let hovered = state.hovered == Some(*button);
+        let enabled = *button != ReviewButton::ResetCrop || state.cropped();
+        let hovered = enabled && state.hovered == Some(*button);
         let fill = match button {
             ReviewButton::Save if hovered => Some(rgb(68, 145, 255)),
             ReviewButton::Save => Some(rgb(ACCENT_RGB.0, ACCENT_RGB.1, ACCENT_RGB.2)),
@@ -1016,6 +1270,7 @@ fn compose(state: &ReviewState, surface: &FrozenSurface) {
         let label = match button {
             ReviewButton::Play if state.playing.is_some() => "Pause",
             ReviewButton::Play => "Play",
+            ReviewButton::ResetCrop => "Reset Crop",
             ReviewButton::Discard => "Discard",
             ReviewButton::Save => "Save",
         };
@@ -1023,7 +1278,11 @@ fn compose(state: &ReviewState, surface: &FrozenSurface) {
             device,
             *bounds,
             label,
-            rgb(245, 245, 247),
+            if enabled {
+                rgb(245, 245, 247)
+            } else {
+                rgb(110, 110, 116)
+            },
             TextAlignment::Center,
             tokens.font_height,
         );
@@ -1040,7 +1299,17 @@ fn compose(state: &ReviewState, surface: &FrozenSurface) {
     // The span kept, as fully as there is room for.
     let length = format_seconds(trim.end - trim.start);
     let room = layout.span_label.right - layout.span_label.left;
+    let crop = if state.cropped() {
+        format!(", {} \u{00d7} {}", state.crop.width, state.crop.height)
+    } else {
+        String::new()
+    };
     let span = [
+        format!(
+            "Keep {} \u{2013} {} ({length} s{crop})",
+            clock(trim.start),
+            clock(trim.end)
+        ),
         format!(
             "Keep {} \u{2013} {} ({length} s)",
             clock(trim.start),
@@ -1146,10 +1415,16 @@ fn draw_timeline(device: windows::Win32::Graphics::Gdi::HDC, state: &ReviewState
         }),
         rgb(253, 216, 53),
     );
-    let hint =
-        "\u{2190} \u{2192} frame   Shift second   Ctrl change   I / O set start / end   Space play";
+    // What the keys and the picture do, as fully as there is room for.
     let font = (metrics.toolbar_tokens().font_height * 9 / 10).max(1);
-    if measure_ui_text(device, hint, font).cx <= layout.hint.right - layout.hint.left {
+    let room = layout.hint.right - layout.hint.left;
+    let hint = [
+        "\u{2190} \u{2192} frame   Shift second   Ctrl change   I / O set start / end   Space play",
+        "\u{2190} \u{2192} frame   I / O start / end   Space play",
+    ]
+    .into_iter()
+    .find(|hint| measure_ui_text(device, hint, font).cx <= room);
+    if let Some(hint) = hint {
         draw_text(
             device,
             layout.hint,
@@ -1250,6 +1525,25 @@ mod tests {
                 start: ms(1_234),
                 end: ms(4_000),
                 crop: None
+            }
+        );
+    }
+
+    #[test]
+    fn an_mp4_crop_keeps_even_sides() {
+        let crop = Rect {
+            x: 3,
+            y: 5,
+            width: 101,
+            height: 1,
+        };
+        assert_eq!(
+            even(crop),
+            Rect {
+                x: 3,
+                y: 5,
+                width: 100,
+                height: 2
             }
         );
     }
@@ -1399,6 +1693,37 @@ mod tests {
             post(review, WM_KEYDOWN, usize::from(VK_LEFT.0));
         }
         post(review, WM_KEYDOWN, 0x4F);
+        // And a crop dragged on the picture, from (40, 30) to (200, 150) in recording pixels.
+        let mut client = RECT::default();
+        // SAFETY: review is a live window and client is writable storage.
+        unsafe { GetClientRect(review, &mut client) }.expect("client size");
+        // SAFETY: review is a live window; the call has no other arguments.
+        let metrics = UiMetrics::new(unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(review) });
+        let layout = ReviewLayout::new(
+            UiRect {
+                left: 0,
+                top: 0,
+                right: client.right,
+                bottom: client.bottom,
+            },
+            metrics,
+            320,
+            180,
+        );
+        let on_picture = |x: f64, y: f64| {
+            let x = layout.image.left + (x * layout.scale).round() as i32;
+            let y = layout.image.top + (y * layout.scale).round() as i32;
+            ((y as u32 as isize) << 16) | (x as u16 as isize)
+        };
+        let post_at = |message: u32, wparam: usize, lparam: isize| {
+            // SAFETY: Posting to a live window owned by the desktop UI thread.
+            unsafe { PostMessageW(review, message, WPARAM(wparam), LPARAM(lparam)) }
+                .expect("post to the review");
+        };
+        post_at(WM_LBUTTONDOWN, 1, on_picture(40.0, 30.0));
+        post_at(WM_MOUSEMOVE, 1, on_picture(120.0, 90.0));
+        post_at(WM_MOUSEMOVE, 1, on_picture(200.0, 150.0));
+        post_at(WM_LBUTTONUP, 0, on_picture(200.0, 150.0));
         post(review, WM_KEYDOWN, usize::from(VK_RETURN.0));
         let interval = Duration::from_secs(1) / 15;
         match outcomes
@@ -1408,7 +1733,17 @@ mod tests {
             ReviewOutcome::Save(edit) => {
                 assert_eq!(edit.start, interval * 5);
                 assert_eq!(edit.end, Duration::from_secs(3) - interval * 3);
-                assert_eq!(edit.crop, None);
+                // At a scale of one the drag's ends are whole pixels; scaled down they may round
+                // by one.
+                let crop = edit.crop.expect("a crop");
+                assert!(
+                    crop.x.abs_diff(40) <= 1 && crop.y.abs_diff(30) <= 1,
+                    "{crop:?}"
+                );
+                assert!(
+                    crop.width.abs_diff(160) <= 2 && crop.height.abs_diff(120) <= 2,
+                    "{crop:?}"
+                );
             }
             other => panic!("expected Save, got {other:?}"),
         }
