@@ -382,7 +382,7 @@ impl EditorLayout {
 
 /// The capture pixels spanned by a drag between two fractional pixel positions: every pixel the
 /// drag touches, so a drag over a single pixel covers it.
-fn rect_between(a: (f64, f64), b: (f64, f64)) -> Option<Rect> {
+pub(super) fn rect_between(a: (f64, f64), b: (f64, f64)) -> Option<Rect> {
     Rect::from_edges(
         a.0.min(b.0).floor() as i64,
         a.1.min(b.1).floor() as i64,
@@ -393,7 +393,7 @@ fn rect_between(a: (f64, f64), b: (f64, f64)) -> Option<Rect> {
 
 /// What a press on the crop takes hold of.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Grip {
+pub(super) enum Grip {
     Move,
     Resize {
         left: bool,
@@ -406,7 +406,7 @@ enum Grip {
 /// The part of the crop, drawn at `crop`, under `point`. Edges and corners win over the inside,
 /// and an uncropped capture's inside is not offered for moving: dragging there draws a new crop,
 /// which is what someone starting to crop means.
-fn grip_at(crop: UiRect, point: POINT, tolerance: i32, cropped: bool) -> Option<Grip> {
+pub(super) fn grip_at(crop: UiRect, point: POINT, tolerance: i32, cropped: bool) -> Option<Grip> {
     let within_x = point.x >= crop.left - tolerance && point.x <= crop.right + tolerance;
     let within_y = point.y >= crop.top - tolerance && point.y <= crop.bottom + tolerance;
     if !within_x || !within_y {
@@ -437,7 +437,7 @@ fn grip_at(crop: UiRect, point: POINT, tolerance: i32, cropped: bool) -> Option<
 
 /// The crop `start` after its grip has been dragged by `(dx, dy)` capture pixels, kept within
 /// `bounds` and at least one pixel in each direction.
-fn adjust_crop(start: Rect, grip: Grip, dx: i64, dy: i64, bounds: Rect) -> Rect {
+pub(super) fn adjust_crop(start: Rect, grip: Grip, dx: i64, dy: i64, bounds: Rect) -> Rect {
     match grip {
         Grip::Move => Rect {
             x: (i64::from(start.x) + dx).clamp(0, i64::from(bounds.width) - i64::from(start.width))
@@ -477,7 +477,7 @@ fn adjust_crop(start: Rect, grip: Grip, dx: i64, dy: i64, bounds: Rect) -> Rect 
 
 /// Darkens every pixel of `area` outside `keep`, in a tightly packed BGRA buffer `width` pixels
 /// wide, so the crop reads as what will be kept.
-fn dim_outside(pixels: &mut [u8], width: usize, area: UiRect, keep: UiRect) {
+pub(super) fn dim_outside(pixels: &mut [u8], width: usize, area: UiRect, keep: UiRect) {
     let height = pixels.len() / (width * 4).max(1);
     let clamp_x = |value: i32| value.clamp(0, width as i32) as usize;
     let clamp_y = |value: i32| value.clamp(0, height as i32) as usize;
@@ -1210,7 +1210,7 @@ fn set_cursor(hwnd: HWND, state: &EditorState) {
     }
 }
 
-fn grip_cursor(grip: Grip) -> PCWSTR {
+pub(super) fn grip_cursor(grip: Grip) -> PCWSTR {
     match grip {
         Grip::Move => IDC_SIZEALL,
         Grip::Resize {
@@ -2004,7 +2004,7 @@ fn draw_arrow_handles(device: HDC, state: &EditorState, accent: COLORREF) {
     }
 }
 
-fn draw_crop_handles(device: HDC, crop: UiRect, metrics: UiMetrics, accent: COLORREF) {
+pub(super) fn draw_crop_handles(device: HDC, crop: UiRect, metrics: UiMetrics, accent: COLORREF) {
     let half = metrics.px(HANDLE_SIZE_DIP) / 2;
     let border = metrics.px(1).max(1);
     let middle_x = (crop.left + crop.right) / 2;
