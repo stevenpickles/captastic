@@ -49,8 +49,9 @@ long the recording is.
 **Save** writes the recording into the output directory, named as before, records it in capture
 history, and raises the "Recording saved" notification. Saved unchanged, the draft is moved there
 as it is, with no encoding. Saved trimmed or cropped, the kept frames are decoded, cropped and
-encoded again by the writers ADR 0011 uses, then the draft is removed. The window shows that the
-save is in progress and closes when it is done.
+encoded again by the writers ADR 0011 uses, then the draft is removed. The window closes at
+**Save**, and the "Recording saved" notification says when the file is ready; an edited save takes
+as long as encoding the span kept.
 
 **Discarding is always deliberate.** **Discard**, Escape and the window's close button all ask
 first: *"Discard this recording? It will be deleted."* Only **OK** deletes the draft. Captastic
