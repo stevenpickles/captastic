@@ -183,6 +183,13 @@ try {
     Assert-True ($nuspec.package.metadata.licenseUrl -eq `
         'https://github.com/stevenpickles/captastic/blob/v0.0.0-test-choco/LICENSE-MIT') `
         'Chocolatey license URL is not version-specific.'
+    # Chocolatey moderation (0.4.0) asks that projectSourceUrl point at the source code itself,
+    # not repeat projectUrl.
+    Assert-True ($nuspec.package.metadata.projectSourceUrl -eq `
+        'https://github.com/stevenpickles/captastic/tree/v0.0.0-test-choco') `
+        'Chocolatey project source URL is not the tagged source tree.'
+    Assert-True ($nuspec.package.metadata.projectSourceUrl -ne $nuspec.package.metadata.projectUrl) `
+        'Chocolatey project source URL repeats the project URL.'
     foreach ($urlProperty in @(
         'projectUrl',
         'packageSourceUrl',
