@@ -91,7 +91,10 @@ Milestone 5's criterion vacuously and on purpose.
 
 ## Release readiness — v0.4.0
 
-**Status:** planning on `dev` (workspace version 0.4.0). Decided on 2026-10-15:
+**Status:** every gate below met on 2026-10-21, ready to tag. The desktop checklists passed for
+every slice (#118-#131), the disposable-VM checklist passed, and the release notes are drafted in
+[docs/release-notes-v0.4.0.md](docs/release-notes-v0.4.0.md). The 0.3.0 Chocolatey submission
+was approved on 2026-10-19. Decided on 2026-10-15:
 
 - **Theme: recording.** 0.4.0 adds recording a region, window or display as an **animated GIF**,
   and as MP4 video; see [Milestone 9](#milestone-9--screen-recording-and-animated-gif) and
