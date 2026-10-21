@@ -28,7 +28,7 @@ use windows::Win32::System::WinRT::Direct3D11::{
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows::Win32::System::WinRT::{RoInitialize, RoUninitialize, RO_INIT_MULTITHREADED};
 
-const FIRST_FRAME_TIMEOUT: Duration = Duration::from_millis(300);
+pub(crate) const FIRST_FRAME_TIMEOUT: Duration = Duration::from_millis(300);
 const GPU_MAP_TIMEOUT: Duration = Duration::from_millis(250);
 const GPU_MAP_RETRY_DELAY: Duration = Duration::from_millis(1);
 /// Time held back from the caller's deadline before waiting for the first frame, covering the
@@ -164,7 +164,7 @@ pub(crate) fn capture_window(
 // and drop it before the apartment guard runs, so no factory outlives the apartment that
 // activated it. Do not replace these with the generated statics and do not cache the factories.
 
-fn wgc_session_is_supported() -> windows::core::Result<bool> {
+pub(crate) fn wgc_session_is_supported() -> windows::core::Result<bool> {
     let statics = factory::<GraphicsCaptureSession, IGraphicsCaptureSessionStatics>()?;
     // SAFETY: Mirrors the generated binding: statics is a live IGraphicsCaptureSessionStatics
     // whose IsSupported slot writes a bool into the initialized result__ storage.
@@ -175,7 +175,7 @@ fn wgc_session_is_supported() -> windows::core::Result<bool> {
     }
 }
 
-fn wgc_create_free_threaded_frame_pool(
+pub(crate) fn wgc_create_free_threaded_frame_pool(
     device: &IDirect3DDevice,
     pixel_format: DirectXPixelFormat,
     number_of_buffers: i32,
@@ -199,9 +199,9 @@ fn wgc_create_free_threaded_frame_pool(
     }
 }
 
-struct WgcCaptureResources {
-    pool: Direct3D11CaptureFramePool,
-    session: Option<GraphicsCaptureSession>,
+pub(crate) struct WgcCaptureResources {
+    pub(crate) pool: Direct3D11CaptureFramePool,
+    pub(crate) session: Option<GraphicsCaptureSession>,
 }
 
 impl Drop for WgcCaptureResources {
@@ -213,7 +213,8 @@ impl Drop for WgcCaptureResources {
     }
 }
 
-fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext, IDirect3DDevice), CaptureError> {
+pub(crate) fn create_device(
+) -> Result<(ID3D11Device, ID3D11DeviceContext, IDirect3DDevice), CaptureError> {
     let mut device = None;
     let mut context = None;
     // SAFETY: Output pointers reference initialized Option slots. A null adapter with HARDWARE
@@ -263,7 +264,7 @@ fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext, IDirect3DDevice
     Ok((device, context, winrt_device))
 }
 
-fn readback_frame(
+pub(crate) fn readback_frame(
     device: &ID3D11Device,
     context: &ID3D11DeviceContext,
     frame: &windows::Graphics::Capture::Direct3D11CaptureFrame,
@@ -492,10 +493,10 @@ impl Drop for MappedTexture<'_> {
     }
 }
 
-struct WinRtApartment;
+pub(crate) struct WinRtApartment;
 
 impl WinRtApartment {
-    fn initialize() -> Result<Self, CaptureError> {
+    pub(crate) fn initialize() -> Result<Self, CaptureError> {
         // SAFETY: Initializes WinRT only for this fresh, short-lived capture worker thread.
         unsafe { RoInitialize(RO_INIT_MULTITHREADED) }
             .map_err(|error| windows_error("initialize_winrt", error, false))?;
@@ -527,7 +528,11 @@ fn deadline_exhausted(operation: &'static str, deadline: RenderDeadline) -> Capt
     )
 }
 
-fn windows_error(operation: &'static str, error: WindowsError, retryable: bool) -> CaptureError {
+pub(crate) fn windows_error(
+    operation: &'static str,
+    error: WindowsError,
+    retryable: bool,
+) -> CaptureError {
     session_explained_error(operation, error, retryable, crate::session::desktop_state)
 }
 
@@ -573,7 +578,7 @@ fn session_explained_error(
 /// move when the explanation is added.
 const WGC_BACKEND: &str = "windows-graphics-capture";
 
-fn capture_error(
+pub(crate) fn capture_error(
     kind: CaptureErrorKind,
     operation: &'static str,
     message: impl Into<String>,
