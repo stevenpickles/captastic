@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed, 2026-10-21. Part of 0.5.0, asked for by the maintainer on 2026-10-21. Amends
+Accepted for the Windows prototype, 2026-10-21. Part of 0.5.0, asked for by the maintainer on 2026-10-21. Amends
 [ADR 0011](0011-screen-recording.md), which said a recording has no audio, and
 [ADR 0012](0012-recording-review.md), whose review window plays silently.
 

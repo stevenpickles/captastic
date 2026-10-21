@@ -4,7 +4,8 @@
 
 Accepted for the Windows prototype, 2026-10-17. Extends ADR 0011 within Milestone 9, for 0.4.0.
 Amended 2026-10-21: a recording in review is held in memory rather than in a drafts folder on disk,
-at the maintainer's request; see *Amendment* below.
+at the maintainer's request; see *Amendment* below. From 0.5.0 the review window plays an MP4's
+sound and a trimmed save keeps it, per [ADR 0015](0015-recording-system-audio.md).
 
 ## Context
 
