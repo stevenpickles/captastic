@@ -14,13 +14,13 @@
 //! recording or nothing.
 //!
 //! The daemon's recordings are reviewed before they are saved, unless `recording.review` is off
-//! (ADR 0012): [`RecordingHost`] records into a hidden drafts folder in the output directory, opens
-//! the draft in the review window, and acts on the answer - moving the draft into the output
-//! directory as it is, encoding the span and rectangle kept into a new file, or deleting it.
+//! (ADR 0012): [`RecordingHost`] records into memory, opens the recording in the review window,
+//! and acts on the answer - writing it into the output directory as it is, encoding the span and
+//! rectangle kept and writing that, or letting it go. Nothing reaches the disk before **Save**.
 
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -54,9 +54,6 @@ const STOP_POLL: Duration = Duration::from_millis(15);
 const SOURCE_FAILURES_TOLERATED: u32 = 5;
 /// How many names a recording tries before giving up on finding an unused one.
 const MAX_NAME_ATTEMPTS: u32 = 100;
-/// Where recordings wait for their review, inside the output directory so that saving one is a
-/// rename on the same volume.
-pub const DRAFTS_FOLDER: &str = ".captastic-drafts";
 
 /// Where a recording's frames come from.
 pub trait FrameSource {
@@ -92,6 +89,7 @@ pub enum RecordingEnd {
 /// A finished recording.
 #[derive(Clone, Debug, Serialize)]
 pub struct RecordingReport {
+    /// Where the recording is saved; empty for one held in memory until it is.
     pub path: PathBuf,
     pub format: RecordingFormat,
     pub bytes: u64,
@@ -139,20 +137,34 @@ pub fn record(
     path: &Path,
     stop: &AtomicBool,
 ) -> Result<RecordingReport, RecordingError> {
-    let result = record_into(source, area, settings, path, stop);
+    let result = record_into(source, area, settings, Some(path), stop);
     if result.is_err() {
         let _ = std::fs::remove_file(path);
     }
-    result
+    let (report, _) = result?;
+    Ok(report)
 }
 
+/// As [`record`], but encodes the recording into memory and returns its bytes with the report,
+/// whose path is empty. A recording to be reviewed is held like this until it is saved.
+pub fn record_in_memory(
+    source: &mut dyn FrameSource,
+    area: Rect,
+    settings: RecordingSettings,
+    stop: &AtomicBool,
+) -> Result<(RecordingReport, Vec<u8>), RecordingError> {
+    let (report, bytes) = record_into(source, area, settings, None, stop)?;
+    Ok((report, bytes.unwrap_or_default()))
+}
+
+/// Records into the file at `path`, or into memory without one, returning the bytes then.
 fn record_into(
     source: &mut dyn FrameSource,
     area: Rect,
     settings: RecordingSettings,
-    path: &Path,
+    path: Option<&Path>,
     stop: &AtomicBool,
-) -> Result<RecordingReport, RecordingError> {
+) -> Result<(RecordingReport, Option<Vec<u8>>), RecordingError> {
     let started = Instant::now();
     let interval = Duration::from_secs(1) / settings.format.frame_rate();
     let first = source.next_frame().map_err(RecordingError::Source)?;
@@ -163,11 +175,11 @@ fn record_into(
     )));
     let encoder = {
         let queue = queue.clone();
-        let path = path.to_owned();
+        let path = path.map(Path::to_owned);
         let format = settings.format;
         thread::Builder::new()
             .name("captastic-recording-encoder".to_owned())
-            .spawn(move || encode(&queue, format, &path, width, height))
+            .spawn(move || encode(&queue, format, path.as_deref(), width, height))
             .map_err(|error| RecordingError::Encode(error.to_string()))?
     };
     queue.push(frame_pixels(&first, area, width, height)?, Duration::ZERO);
@@ -224,14 +236,18 @@ fn record_into(
     };
     let duration = started.elapsed().min(settings.max_duration);
     queue.close(duration);
-    let written = encoder
+    let (written, data) = encoder
         .join()
         .map_err(|_| RecordingError::Encode("the encoder thread panicked".to_owned()))??;
-    let bytes = std::fs::metadata(path)
-        .map_err(|error| RecordingError::Io(error.to_string()))?
-        .len();
-    Ok(RecordingReport {
-        path: path.to_owned(),
+    let bytes = match (&data, path) {
+        (Some(data), _) => data.len() as u64,
+        (None, Some(path)) => std::fs::metadata(path)
+            .map_err(|error| RecordingError::Io(error.to_string()))?
+            .len(),
+        (None, None) => 0,
+    };
+    let report = RecordingReport {
+        path: path.map(Path::to_owned).unwrap_or_default(),
         format: settings.format,
         bytes,
         width,
@@ -241,7 +257,8 @@ fn record_into(
         frames_written: written,
         frames_dropped: queue.dropped(),
         ended,
-    })
+    };
+    Ok((report, data))
 }
 
 /// The part of `area` on the frame's display, in desktop coordinates.
@@ -319,15 +336,16 @@ fn frame_pixels(
     ))
 }
 
-/// The encoder thread: everything the queue hands it, into `path`, until the queue closes.
-/// Returns how many frames the file holds.
+/// The encoder thread: everything the queue hands it, into `path` or into memory without one,
+/// until the queue closes. Returns how many frames the recording holds, and its bytes when they
+/// are in memory.
 fn encode(
     queue: &FrameQueue,
     format: RecordingFormat,
-    path: &Path,
+    path: Option<&Path>,
     width: u32,
     height: u32,
-) -> Result<u64, RecordingError> {
+) -> Result<(u64, Option<Vec<u8>>), RecordingError> {
     let result = match format {
         RecordingFormat::Gif => encode_gif(queue, path, width, height),
         RecordingFormat::Mp4 => encode_mp4(queue, path, width, height),
@@ -338,62 +356,83 @@ fn encode(
     result
 }
 
+/// Hands `push` every frame the queue holds until it closes, and returns when it closed.
+fn queued_frames(
+    queue: &FrameQueue,
+    mut push: impl FnMut(&[u8], Duration) -> Result<(), String>,
+) -> Result<Duration, RecordingError> {
+    loop {
+        match queue.pop() {
+            Next::Frame(pixels, at) => push(&pixels, at).map_err(RecordingError::Encode)?,
+            Next::Closed(end) => return Ok(end),
+        }
+    }
+}
+
 fn encode_gif(
     queue: &FrameQueue,
-    path: &Path,
+    path: Option<&Path>,
     width: u32,
     height: u32,
-) -> Result<u64, RecordingError> {
+) -> Result<(u64, Option<Vec<u8>>), RecordingError> {
+    fn frames<W: Write>(
+        queue: &FrameQueue,
+        output: W,
+        width: u32,
+        height: u32,
+    ) -> Result<(W, u64), RecordingError> {
+        let mut writer = captastic_core::GifWriter::new(output, width, height)
+            .map_err(|error| RecordingError::Encode(error.to_string()))?;
+        let end = queued_frames(queue, |pixels, at| {
+            writer.push(pixels, at).map_err(|error| error.to_string())
+        })?;
+        let (output, summary) = writer
+            .finish(end)
+            .map_err(|error| RecordingError::Encode(error.to_string()))?;
+        Ok((output, summary.frames_written))
+    }
+    let Some(path) = path else {
+        let (bytes, written) = frames(queue, Vec::new(), width, height)?;
+        return Ok((written, Some(bytes)));
+    };
     let file = OpenOptions::new()
         .write(true)
         .truncate(true)
         .open(path)
         .map_err(|error| RecordingError::Io(format!("{}: {error}", path.display())))?;
-    let mut writer = captastic_core::GifWriter::new(BufWriter::new(file), width, height)
-        .map_err(|error| RecordingError::Encode(error.to_string()))?;
-    let end = loop {
-        match queue.pop() {
-            Next::Frame(pixels, at) => writer
-                .push(&pixels, at)
-                .map_err(|error| RecordingError::Encode(error.to_string()))?,
-            Next::Closed(end) => break end,
-        }
-    };
-    let (file, summary) = writer
-        .finish(end)
-        .map_err(|error| RecordingError::Encode(error.to_string()))?;
+    let (file, written) = frames(queue, BufWriter::new(file), width, height)?;
     file.into_inner()
         .map_err(|error| RecordingError::Io(error.to_string()))?
         .sync_all()
         .map_err(|error| RecordingError::Io(error.to_string()))?;
-    Ok(summary.frames_written)
+    Ok((written, None))
 }
 
 fn encode_mp4(
     queue: &FrameQueue,
-    path: &Path,
+    path: Option<&Path>,
     width: u32,
     height: u32,
-) -> Result<u64, RecordingError> {
-    let mut writer = captastic_windows::Mp4Writer::create(
-        path,
-        width,
-        height,
-        RecordingFormat::Mp4.frame_rate(),
-    )
+) -> Result<(u64, Option<Vec<u8>>), RecordingError> {
+    let rate = RecordingFormat::Mp4.frame_rate();
+    let mut writer = match path {
+        Some(path) => captastic_windows::Mp4Writer::create(path, width, height, rate),
+        None => captastic_windows::Mp4Writer::create_in_memory(width, height, rate),
+    }
     .map_err(|error| RecordingError::Encode(error.to_string()))?;
-    let end = loop {
-        match queue.pop() {
-            Next::Frame(pixels, at) => writer
-                .push(&pixels, at)
-                .map_err(|error| RecordingError::Encode(error.to_string()))?,
-            Next::Closed(end) => break end,
-        }
-    };
-    let summary = writer
-        .finish(end)
+    let end = queued_frames(queue, |pixels, at| {
+        writer.push(pixels, at).map_err(|error| error.to_string())
+    })?;
+    if path.is_some() {
+        let summary = writer
+            .finish(end)
+            .map_err(|error| RecordingError::Encode(error.to_string()))?;
+        return Ok((summary.frames_written, None));
+    }
+    let (bytes, summary) = writer
+        .finish_in_memory(end)
         .map_err(|error| RecordingError::Encode(error.to_string()))?;
-    Ok(summary.frames_written)
+    Ok((summary.frames_written, Some(bytes)))
 }
 
 /// Creates an empty file for a recording in `directory`, named `stem` with `extension` or, if
@@ -589,11 +628,10 @@ struct HostInner {
     json_output: bool,
     /// Whether a recording started now is reviewed before it is saved.
     review: AtomicBool,
-    drafts_directory: PathBuf,
     /// The review open, if any, and the drafts waiting for it to end.
     reviews: Mutex<ReviewQueue>,
-    /// Threads encoding an edited recording, which exit waits for.
-    savers: Mutex<Vec<thread::JoinHandle<()>>>,
+    /// Edited recordings being encoded, which exit waits for.
+    savers: Mutex<Vec<Saver>>,
     /// Set as Captastic exits: a recording that finishes then is saved, not reviewed.
     exiting: AtomicBool,
 }
@@ -605,15 +643,33 @@ struct ReviewQueue {
     waiting: VecDeque<Draft>,
 }
 
-/// A finished recording in the drafts folder, waiting for its review or in it.
+/// A finished recording held in memory, waiting for its review or in it.
 struct Draft {
-    /// As recorded; its path is the draft's.
+    /// As recorded; its path is empty, since it is not saved yet.
     report: RecordingReport,
+    /// The recording's file, as it would be saved unchanged.
+    recording: Arc<[u8]>,
     /// What the saved file is named, before its extension.
     stem: String,
     capture_id: CaptureId,
     display: String,
     area: Rect,
+}
+
+/// An edited recording being encoded on a thread of its own.
+struct Saver {
+    join: thread::JoinHandle<()>,
+    /// The draft, until the thread saves it, or exit saves it unchanged because the thread has not
+    /// finished in time: whichever takes it saves it.
+    unsaved: Arc<Mutex<Option<Draft>>>,
+}
+
+/// Where a recording goes as it is recorded.
+enum Destination {
+    /// Straight into this file.
+    File(PathBuf),
+    /// Into memory, for a review, then saved as `stem`.
+    Review { stem: String },
 }
 
 impl RecordingHost {
@@ -629,11 +685,9 @@ impl RecordingHost {
         json_output: bool,
     ) -> Self {
         let review = AtomicBool::new(config.review);
-        let drafts_directory = output_directory.join(DRAFTS_FOLDER);
         Self {
             inner: Arc::new(HostInner {
                 review,
-                drafts_directory,
                 reviews: Mutex::new(ReviewQueue::default()),
                 savers: Mutex::new(Vec::new()),
                 exiting: AtomicBool::new(false),
@@ -736,20 +790,17 @@ impl RecordingHost {
                 title: request.window_title.as_deref(),
             },
         );
-        // A recording to be reviewed is recorded as a draft and saved once the review is done.
-        let reviewing = inner.review.load(Ordering::Acquire);
-        let directory = if reviewing {
-            prepare_drafts_directory(&inner.drafts_directory);
-            &inner.drafts_directory
+        // A recording to be reviewed is held in memory and saved once the review is done.
+        let destination = if inner.review.load(Ordering::Acquire) {
+            Destination::Review { stem }
         } else {
-            &inner.output_directory
-        };
-        let path = match reserve_path(directory, &stem, settings.format.extension()) {
-            Ok(path) => path,
-            Err(error) => {
-                inner.active.store(false, Ordering::Release);
-                self.report_failure(request.capture_id, &error);
-                return;
+            match reserve_path(&inner.output_directory, &stem, settings.format.extension()) {
+                Ok(path) => Destination::File(path),
+                Err(error) => {
+                    inner.active.store(false, Ordering::Release);
+                    self.report_failure(request.capture_id, &error);
+                    return;
+                }
             }
         };
         let stop = Arc::new(AtomicBool::new(false));
@@ -782,14 +833,7 @@ impl RecordingHost {
         let spawned = thread::Builder::new()
             .name("captastic-recording".to_owned())
             .spawn(move || {
-                host.run(
-                    request,
-                    settings,
-                    path,
-                    stop,
-                    thread_desktop_ui,
-                    reviewing.then_some(stem),
-                );
+                host.run(request, settings, destination, stop, thread_desktop_ui);
             });
         match spawned {
             Ok(join) => *lock(&inner.join) = Some(join),
@@ -803,16 +847,15 @@ impl RecordingHost {
         }
     }
 
-    /// The recording thread: records, takes the indicator down, and says how it went - or, with
-    /// `review_stem`, hands the draft to the review, to be saved under that name.
+    /// The recording thread: records, takes the indicator down, and says how it went - or, for a
+    /// review, hands the recording to it.
     fn run(
         &self,
         request: RecordingRequest,
         settings: RecordingSettings,
-        path: PathBuf,
+        destination: Destination,
         stop: Arc<AtomicBool>,
         desktop_ui: Arc<Mutex<Option<captastic_windows::DesktopUi>>>,
-        review_stem: Option<String>,
     ) {
         let inner = &self.inner;
         let mut frames = CaptureThreadFrames {
@@ -823,12 +866,19 @@ impl RecordingHost {
                 captastic_core::CaptureSource::Display(request.display_id.clone())
             },
         };
-        let result = record(&mut frames, request.area, settings, &path, &stop);
+        let result = match destination {
+            Destination::File(path) => record(&mut frames, request.area, settings, &path, &stop)
+                .map(|report| (report, None)),
+            Destination::Review { stem } => {
+                record_in_memory(&mut frames, request.area, settings, &stop)
+                    .map(|(report, recording)| (report, Some((stem, recording))))
+            }
+        };
         hide_indicator(Some(&desktop_ui));
         *lock(&inner.stop) = None;
         inner.active.store(false, Ordering::Release);
         match result {
-            Ok(report) => {
+            Ok((report, review)) => {
                 log::info!(
                     "recording {} finished: {} s, {}x{}, {} bytes, {} frames captured, {} written, {} dropped, ended by {:?}",
                     request.capture_id.0,
@@ -841,10 +891,11 @@ impl RecordingHost {
                     report.frames_dropped,
                     report.ended
                 );
-                match review_stem {
-                    Some(stem) => {
+                match review {
+                    Some((stem, recording)) => {
                         let draft = Draft {
                             report,
+                            recording: recording.into(),
                             stem,
                             capture_id: request.capture_id,
                             display: request.display_id.0.clone(),
@@ -953,17 +1004,17 @@ impl RecordingHost {
                 }
                 return;
             };
-            let (path, format, area) = {
+            let (recording, format, area) = {
                 let draft = lock(&shared);
                 let draft = draft
                     .as_ref()
                     .expect("the draft is here until the review answers");
-                (draft.report.path.clone(), draft.report.format, draft.area)
+                (draft.recording.clone(), draft.report.format, draft.area)
             };
             let host = self.clone();
             let answer_draft = shared.clone();
             let answer_ui = desktop_ui.clone();
-            ui.review(path, format, area, move |outcome| {
+            ui.review(recording, format, area, move |outcome| {
                 if let Some(draft) = lock(&answer_draft).take() {
                     host.conclude_review(draft, outcome, &answer_ui);
                 }
@@ -993,18 +1044,22 @@ impl RecordingHost {
                 if !edit.changes_nothing(&timeline_of(&draft.report), size_of(&draft.report)) =>
             {
                 let host = self.clone();
+                let unsaved = Arc::new(Mutex::new(Some(draft)));
+                let saving = unsaved.clone();
                 let spawned = thread::Builder::new()
                     .name("captastic-recording-save".to_owned())
-                    .spawn(move || host.save_edited(draft, edit));
+                    .spawn(move || host.save_edited(&saving, edit));
                 match spawned {
                     Ok(join) => {
                         let mut savers = lock(&self.inner.savers);
-                        savers.retain(|saver| !saver.is_finished());
-                        savers.push(join);
+                        savers.retain(|saver| !saver.join.is_finished());
+                        savers.push(Saver { join, unsaved });
                     }
-                    Err(error) => crate::logging::warn(format_args!(
-                        "the edited recording could not be saved, and its draft is kept: {error}"
-                    )),
+                    Err(error) => {
+                        if let Some(draft) = lock(&unsaved).take() {
+                            self.edit_failed(draft, &error.to_string());
+                        }
+                    }
                 }
             }
             ReviewOutcome::Save(_) | ReviewOutcome::Closed => self.save_unchanged(draft),
@@ -1033,14 +1088,14 @@ impl RecordingHost {
         }
     }
 
-    /// Moves a draft into the output directory as it is.
+    /// Saves a draft into the output directory as it was recorded.
     fn save_unchanged(&self, draft: Draft) {
         let extension = draft.report.format.extension();
-        match move_into(
-            &draft.report.path,
+        match write_new(
             &self.inner.output_directory,
             &draft.stem,
             extension,
+            &draft.recording,
         ) {
             Ok(path) => {
                 let report = RecordingReport {
@@ -1049,45 +1104,39 @@ impl RecordingHost {
                 };
                 self.announce_saved(draft.capture_id, &draft.display, &report, None);
             }
-            Err(error) => {
-                crate::logging::warn(format_args!(
-                    "recording {} could not be moved into the output directory, and stays at {}: {error}",
-                    draft.capture_id.0,
-                    draft.report.path.display()
-                ));
-                let _ = self
-                    .inner
-                    .notices
-                    .try_send(crate::daemon::DaemonNotice::RecordingFailed {
-                        message: format!("it is still at {}: {error}", draft.report.path.display()),
-                    });
-            }
+            Err(error) => self.report_failure(draft.capture_id, &error),
         }
     }
 
-    /// Encodes the span and rectangle `edit` keeps into a new file in the output directory, and
-    /// removes the draft. If that fails, the draft is saved as it was recorded instead.
-    fn save_edited(&self, draft: Draft, edit: RecordingEdit) {
-        let extension = draft.report.format.extension();
-        let target = match reserve_path(&self.inner.output_directory, &draft.stem, extension) {
-            Ok(target) => target,
+    /// Encodes the span and rectangle `edit` keeps of the draft in `unsaved` and saves that into
+    /// the output directory. If that fails, the draft is saved as it was recorded instead; if exit
+    /// has taken the draft meanwhile, to save it unchanged, the edit is dropped.
+    fn save_edited(&self, unsaved: &Mutex<Option<Draft>>, edit: RecordingEdit) {
+        let (recording, format) = match lock(unsaved).as_ref() {
+            Some(draft) => (draft.recording.clone(), draft.report.format),
+            None => return,
+        };
+        let edited = encode_edited(&recording, format, edit);
+        let Some(draft) = lock(unsaved).take() else {
+            return;
+        };
+        let (bytes, summary) = match edited {
+            Ok(edited) => edited,
             Err(error) => {
                 self.edit_failed(draft, &error.to_string());
                 return;
             }
         };
-        match encode_edited(&draft.report.path, draft.report.format, edit, &target) {
-            Ok(summary) => {
-                if let Err(error) = std::fs::remove_file(&draft.report.path) {
-                    log::warn!(
-                        "the draft of recording {} could not be removed: {error}",
-                        draft.capture_id.0
-                    );
-                }
-                let bytes = std::fs::metadata(&target).map_or(0, |metadata| metadata.len());
+        match write_new(
+            &self.inner.output_directory,
+            &draft.stem,
+            format.extension(),
+            &bytes,
+        ) {
+            Ok(path) => {
                 let report = RecordingReport {
-                    path: target,
-                    bytes,
+                    path,
+                    bytes: bytes.len() as u64,
                     width: summary.width,
                     height: summary.height,
                     duration: edit.length(),
@@ -1096,10 +1145,7 @@ impl RecordingHost {
                 };
                 self.announce_saved(draft.capture_id, &draft.display, &report, None);
             }
-            Err(error) => {
-                let _ = std::fs::remove_file(&target);
-                self.edit_failed(draft, &error.to_string());
-            }
+            Err(error) => self.edit_failed(draft, &error.to_string()),
         }
     }
 
@@ -1109,11 +1155,11 @@ impl RecordingHost {
             draft.capture_id.0
         ));
         let extension = draft.report.format.extension();
-        match move_into(
-            &draft.report.path,
+        match write_new(
             &self.inner.output_directory,
             &draft.stem,
             extension,
+            &draft.recording,
         ) {
             Ok(path) => {
                 let report = RecordingReport {
@@ -1130,25 +1176,13 @@ impl RecordingHost {
                             message: message.to_owned(),
                         });
             }
-            Err(error) => {
-                let _ = self
-                    .inner
-                    .notices
-                    .try_send(crate::daemon::DaemonNotice::RecordingFailed {
-                        message: format!("it is still at {}: {error}", draft.report.path.display()),
-                    });
-            }
+            Err(error) => self.report_failure(draft.capture_id, &error),
         }
     }
 
+    /// Lets a draft go: it was never on disk, so there is nothing to delete.
     fn discard(&self, draft: Draft) {
-        match std::fs::remove_file(&draft.report.path) {
-            Ok(()) => log::info!("recording {} discarded", draft.capture_id.0),
-            Err(error) => crate::logging::warn(format_args!(
-                "recording {} was discarded but its draft could not be deleted: {error}",
-                draft.capture_id.0
-            )),
-        }
+        log::info!("recording {} discarded", draft.capture_id.0);
         if self.inner.json_output {
             println!(
                 "{}",
@@ -1158,45 +1192,6 @@ impl RecordingHost {
                     "capture_id": draft.capture_id,
                 })
             );
-        }
-    }
-
-    /// Saves every draft a Captastic that ended without the chance to - a crash, a power cut -
-    /// left behind, into the output directory, and says so. Empty drafts, from a recording that
-    /// never wrote a frame, are removed.
-    pub fn recover_drafts(&self) {
-        let Ok(entries) = std::fs::read_dir(&self.inner.drafts_directory) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let extension = path.extension().and_then(|value| value.to_str());
-            let Some(extension) = extension.filter(|value| matches!(*value, "gif" | "mp4")) else {
-                continue;
-            };
-            if std::fs::metadata(&path).map_or(0, |metadata| metadata.len()) == 0 {
-                let _ = std::fs::remove_file(&path);
-                continue;
-            }
-            let stem = path
-                .file_stem()
-                .map(|stem| stem.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "recording".to_owned());
-            match move_into(&path, &self.inner.output_directory, &stem, extension) {
-                Ok(saved) => {
-                    log::info!("a recording left unsaved was recovered into the output directory");
-                    let _ = self.inner.notices.try_send(
-                        crate::daemon::DaemonNotice::RecordingRecovered {
-                            file_name: file_name(&saved),
-                            path: saved,
-                        },
-                    );
-                }
-                Err(error) => crate::logging::warn(format_args!(
-                    "a recording left in {} could not be recovered: {error}",
-                    self.inner.drafts_directory.display()
-                )),
-            }
         }
     }
 
@@ -1239,12 +1234,17 @@ impl RecordingHost {
             }
         }
         // And an edited recording still being encoded is given until the deadline to finish; one
-        // that does not is left as its draft, which the next start recovers.
+        // that does not is saved as it was recorded instead, so exiting loses no recording.
         let savers = std::mem::take(&mut *lock(&self.inner.savers));
         for saver in savers {
-            if !join_before(saver, deadline) {
-                log::warn!("an edited recording was still being saved at shutdown");
-                return;
+            if !join_before(saver.join, deadline) {
+                if let Some(draft) = lock(&saver.unsaved).take() {
+                    log::warn!(
+                        "recording {} was still being trimmed or cropped at shutdown, so it is saved as recorded",
+                        draft.capture_id.0
+                    );
+                    self.save_unchanged(draft);
+                }
             }
         }
     }
@@ -1282,42 +1282,28 @@ fn size_of(report: &RecordingReport) -> (u32, u32) {
     (report.width, report.height)
 }
 
-/// Makes the drafts folder, hidden, if it is not there already.
-fn prepare_drafts_directory(directory: &Path) {
-    if directory.is_dir() {
-        return;
-    }
-    if let Err(error) = std::fs::create_dir_all(directory) {
-        log::warn!("the recording drafts folder could not be made: {error}");
-        return;
-    }
-    if let Err(error) = captastic_windows::hide_path(directory) {
-        log::debug!("the recording drafts folder could not be hidden: {error}");
-    }
-}
-
-/// Moves `from` into `directory` as `stem.extension`, or the next unused name like it, and returns
-/// where it went. A rename where it can be, and a copy where it cannot.
-fn move_into(
-    from: &Path,
+/// Writes `bytes` into `directory` as `stem.extension`, or the next unused name like it, and
+/// returns where they went. Leaves nothing behind if the write fails.
+fn write_new(
     directory: &Path,
     stem: &str,
     extension: &str,
+    bytes: &[u8],
 ) -> Result<PathBuf, RecordingError> {
-    let target = reserve_path(directory, stem, extension)?;
-    if std::fs::rename(from, &target).is_ok() {
-        return Ok(target);
+    let path = reserve_path(directory, stem, extension)?;
+    let written = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        });
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&path);
+        return Err(RecordingError::Io(format!("{}: {error}", path.display())));
     }
-    match std::fs::copy(from, &target) {
-        Ok(_) => {
-            let _ = std::fs::remove_file(from);
-            Ok(target)
-        }
-        Err(error) => {
-            let _ = std::fs::remove_file(&target);
-            Err(RecordingError::Io(format!("{}: {error}", target.display())))
-        }
-    }
+    Ok(path)
 }
 
 /// What an edited recording came out as.
@@ -1328,22 +1314,18 @@ pub struct EditedRecording {
     pub frames_written: u64,
 }
 
-/// Encodes what `edit` keeps of the recording at `source` into `target`, in the same format.
+/// Encodes what `edit` keeps of `recording`, a recording's file, into a new one in the same
+/// format, returned with what it holds.
 pub fn encode_edited(
-    source: &Path,
+    recording: &[u8],
     format: RecordingFormat,
     edit: RecordingEdit,
-    target: &Path,
-) -> Result<EditedRecording, RecordingError> {
+) -> Result<(Vec<u8>, EditedRecording), RecordingError> {
     let playback = |error: captastic_core::PlaybackError| RecordingError::Encode(error.0);
     let mut reader: Box<dyn RecordingFrames> = match format {
-        RecordingFormat::Gif => {
-            let bytes = std::fs::read(source)
-                .map_err(|error| RecordingError::Io(format!("{}: {error}", source.display())))?;
-            Box::new(GifReader::new(&bytes).map_err(playback)?)
-        }
+        RecordingFormat::Gif => Box::new(GifReader::new(recording).map_err(playback)?),
         RecordingFormat::Mp4 => {
-            Box::new(captastic_windows::Mp4Reader::open(source).map_err(playback)?)
+            Box::new(captastic_windows::Mp4Reader::from_bytes(recording).map_err(playback)?)
         }
     };
     let size = reader.size();
@@ -1369,52 +1351,46 @@ pub fn encode_edited(
     if kept.is_empty() {
         return Err(RecordingError::Encode("the span kept is empty".to_owned()));
     }
-    let frames_written = match format {
+    let encode = |error: String| RecordingError::Encode(error);
+    let (bytes, frames_written) = match format {
         RecordingFormat::Gif => {
-            let file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(target)
-                .map_err(|error| RecordingError::Io(format!("{}: {error}", target.display())))?;
-            let mut writer = captastic_core::GifWriter::new(BufWriter::new(file), width, height)
-                .map_err(|error| RecordingError::Encode(error.to_string()))?;
+            let mut writer = captastic_core::GifWriter::new(Vec::new(), width, height)
+                .map_err(|error| encode(error.to_string()))?;
             for frame in &kept {
                 let pixels = reader.frame(frame.index).map_err(playback)?;
                 writer
                     .push(&edit.crop_pixels(pixels, size.0), frame.at)
-                    .map_err(|error| RecordingError::Encode(error.to_string()))?;
+                    .map_err(|error| encode(error.to_string()))?;
             }
-            let (file, summary) = writer
+            let (bytes, summary) = writer
                 .finish(edit.length())
-                .map_err(|error| RecordingError::Encode(error.to_string()))?;
-            file.into_inner()
-                .map_err(|error| RecordingError::Io(error.to_string()))?
-                .sync_all()
-                .map_err(|error| RecordingError::Io(error.to_string()))?;
-            summary.frames_written
+                .map_err(|error| encode(error.to_string()))?;
+            (bytes, summary.frames_written)
         }
         RecordingFormat::Mp4 => {
             let mut writer =
-                captastic_windows::Mp4Writer::create(target, width, height, format.frame_rate())
-                    .map_err(|error| RecordingError::Encode(error.to_string()))?;
+                captastic_windows::Mp4Writer::create_in_memory(width, height, format.frame_rate())
+                    .map_err(|error| encode(error.to_string()))?;
             for frame in &kept {
                 let pixels = reader.frame(frame.index).map_err(playback)?;
                 writer
                     .push(&edit.crop_pixels(pixels, size.0), frame.at)
-                    .map_err(|error| RecordingError::Encode(error.to_string()))?;
+                    .map_err(|error| encode(error.to_string()))?;
             }
-            writer
-                .finish(edit.length())
-                .map_err(|error| RecordingError::Encode(error.to_string()))?
-                .frames_written
+            let (bytes, summary) = writer
+                .finish_in_memory(edit.length())
+                .map_err(|error| encode(error.to_string()))?;
+            (bytes, summary.frames_written)
         }
     };
-    Ok(EditedRecording {
-        width,
-        height,
-        frames_written,
-    })
+    Ok((
+        bytes,
+        EditedRecording {
+            width,
+            height,
+            frames_written,
+        },
+    ))
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1796,7 +1772,7 @@ mod tests {
 
     /// A GIF of `frames` frames, 100 ms apart, 40 by 30, whose frame `n` has its first `n + 1`
     /// pixels of the top row white, so each frame says which it is.
-    fn counting_gif(path: &Path, frames: u32) {
+    fn counting_gif(frames: u32) -> Vec<u8> {
         let (width, height) = (40_u32, 30_u32);
         let mut writer = captastic_core::GifWriter::new(Vec::new(), width, height).expect("writer");
         let mut pixels = vec![80_u8; (width * height * 4) as usize];
@@ -1810,8 +1786,7 @@ mod tests {
         let (bytes, _) = writer
             .finish(Duration::from_millis(u64::from(frames) * 100))
             .expect("finish");
-        std::fs::create_dir_all(path.parent().expect("parent")).expect("directory");
-        std::fs::write(path, bytes).expect("write");
+        bytes
     }
 
     fn white_count(pixels: &[u8]) -> usize {
@@ -1824,10 +1799,7 @@ mod tests {
 
     #[test]
     fn an_edit_encodes_only_the_span_and_rectangle_kept() {
-        let directory = directory("edit");
-        let source = directory.join("source.gif");
-        counting_gif(&source, 20);
-        let target = directory.join("edited.gif");
+        let source = counting_gif(20);
         let edit = RecordingEdit {
             start: Duration::from_millis(550),
             end: Duration::from_millis(1_250),
@@ -1838,9 +1810,9 @@ mod tests {
                 height: 10,
             }),
         };
-        let edited = encode_edited(&source, RecordingFormat::Gif, edit, &target).expect("encode");
+        let (bytes, edited) = encode_edited(&source, RecordingFormat::Gif, edit).expect("encode");
         assert_eq!((edited.width, edited.height), (20, 10));
-        let mut reader = GifReader::new(&std::fs::read(&target).expect("read")).expect("reader");
+        let mut reader = GifReader::new(&bytes).expect("reader");
         assert_eq!(reader.size(), (20, 10));
         let timeline = reader.timeline().clone();
         assert_eq!(timeline.duration(), Duration::from_millis(700));
@@ -1849,7 +1821,6 @@ mod tests {
         assert_eq!(white_count(reader.frame(0).expect("first")), 4);
         let last = timeline.len() - 1;
         assert_eq!(white_count(reader.frame(last).expect("last")), 11);
-        let _ = std::fs::remove_dir_all(&directory);
     }
 
     /// A host that reviews, with its notices, and the history it remembers into.
@@ -1879,14 +1850,13 @@ mod tests {
         (host, notices, history)
     }
 
-    /// A draft of a two-second counting GIF in the host's drafts folder.
-    fn draft(host: &RecordingHost, name: &str) -> Draft {
-        let path = host.inner.drafts_directory.join(format!("{name}.gif"));
-        counting_gif(&path, 20);
+    /// A draft of a two-second counting GIF, held in memory.
+    fn draft(name: &str) -> Draft {
+        let recording = counting_gif(20);
         Draft {
             report: RecordingReport {
-                bytes: std::fs::metadata(&path).expect("draft").len(),
-                path,
+                bytes: recording.len() as u64,
+                path: PathBuf::new(),
                 format: RecordingFormat::Gif,
                 width: 40,
                 height: 30,
@@ -1896,6 +1866,7 @@ mod tests {
                 frames_dropped: 0,
                 ended: RecordingEnd::Stopped,
             },
+            recording: recording.into(),
             stem: name.to_owned(),
             capture_id: CaptureId(3),
             display: "primary".to_owned(),
@@ -1918,7 +1889,8 @@ mod tests {
     }
 
     #[test]
-    fn a_review_saves_unchanged_by_moving_saves_an_edit_by_encoding_and_discards_by_deleting() {
+    fn a_review_saves_unchanged_as_recorded_saves_an_edit_by_encoding_and_discards_by_writing_nothing(
+    ) {
         use crate::daemon::DaemonNotice;
         use captastic_windows::ReviewOutcome;
 
@@ -1926,9 +1898,12 @@ mod tests {
         let (host, notices, history) = reviewing_host(&directory);
         let no_ui = Arc::new(Mutex::new(None));
 
-        // Saved as it is: the draft itself moves, and the notice is not about how it ended.
-        let unchanged = draft(&host, "unchanged");
-        let bytes = unchanged.report.bytes;
+        // Nothing is on disk until a review saves it.
+        assert!(saved(&directory).is_empty());
+
+        // Saved as it is: exactly the recorded bytes, and the notice is not about how it ended.
+        let unchanged = draft("unchanged");
+        let recorded = unchanged.recording.clone();
         host.conclude_review(
             unchanged,
             ReviewOutcome::Save(RecordingEdit::none(Duration::from_secs(2))),
@@ -1940,15 +1915,14 @@ mod tests {
             files[0].file_name().and_then(|n| n.to_str()),
             Some("unchanged.gif")
         );
-        assert_eq!(std::fs::metadata(&files[0]).expect("saved").len(), bytes);
+        assert_eq!(std::fs::read(&files[0]).expect("saved"), recorded.to_vec());
         assert!(matches!(
             notices.try_recv(),
             Ok(DaemonNotice::RecordingSaved { ended: None, .. })
         ));
 
-        // Trimmed: encoded into a new file, on a thread exit waits for, and the draft removed.
-        let trimmed = draft(&host, "trimmed");
-        let draft_path = trimmed.report.path.clone();
+        // Trimmed: encoded and saved on a thread exit waits for.
+        let trimmed = draft("trimmed");
         host.conclude_review(
             trimmed,
             ReviewOutcome::Save(RecordingEdit {
@@ -1959,7 +1933,6 @@ mod tests {
             &no_ui,
         );
         host.stop_before(Instant::now() + Duration::from_secs(10));
-        assert!(!draft_path.exists());
         let trimmed = directory.join("captures").join("trimmed.gif");
         let reader = GifReader::new(&std::fs::read(&trimmed).expect("trimmed")).expect("reader");
         assert_eq!(reader.timeline().duration(), Duration::from_millis(1_500));
@@ -1968,11 +1941,8 @@ mod tests {
             Ok(DaemonNotice::RecordingSaved { .. })
         ));
 
-        // Discarded: gone, and nothing more saved or said.
-        let discarded = draft(&host, "discarded");
-        let draft_path = discarded.report.path.clone();
-        host.conclude_review(discarded, ReviewOutcome::Discard, &no_ui);
-        assert!(!draft_path.exists());
+        // Discarded: nothing more written, saved or said.
+        host.conclude_review(draft("discarded"), ReviewOutcome::Discard, &no_ui);
         assert_eq!(saved(&directory).len(), 2);
         assert!(notices.try_recv().is_err());
 
@@ -1992,17 +1962,17 @@ mod tests {
         // One review is open, so the next waits; when the open one closes, Captastic exiting,
         // the waiting one is saved too rather than reviewed.
         lock(&host.inner.reviews).open = true;
-        host.queue_review(draft(&host, "second"), &no_ui);
+        host.queue_review(draft("second"), &no_ui);
         assert_eq!(lock(&host.inner.reviews).waiting.len(), 1);
         host.conclude_review(
-            draft(&host, "first"),
+            draft("first"),
             captastic_windows::ReviewOutcome::Closed,
             &no_ui,
         );
         assert_eq!(saved(&directory).len(), 2);
         assert!(!lock(&host.inner.reviews).open);
         // And with no desktop UI at all, a review cannot open, so the recording is saved.
-        host.queue_review(draft(&host, "third"), &no_ui);
+        host.queue_review(draft("third"), &no_ui);
         assert_eq!(saved(&directory).len(), 3);
         assert_eq!(
             notices
@@ -2015,27 +1985,32 @@ mod tests {
     }
 
     #[test]
-    fn drafts_left_behind_are_saved_at_startup_and_empty_ones_removed() {
+    fn an_edit_still_being_encoded_at_exit_is_saved_as_recorded() {
         use crate::daemon::DaemonNotice;
 
-        let directory = directory("recover");
+        let directory = directory("exit-while-saving");
         let (host, notices, _history) = reviewing_host(&directory);
-        let left = draft(&host, "left-behind");
-        let empty = host.inner.drafts_directory.join("empty.mp4");
-        std::fs::write(&empty, b"").expect("empty draft");
-        host.recover_drafts();
-        assert!(!left.report.path.exists());
-        assert!(!empty.exists());
+        // An edited save that will not finish before the deadline.
+        let (_release, wait) = std::sync::mpsc::channel::<()>();
+        let unsaved = Arc::new(Mutex::new(Some(draft("slow"))));
+        let recorded = lock(&unsaved).as_ref().expect("draft").recording.clone();
+        let join = thread::spawn(move || {
+            let _ = wait.recv();
+        });
+        lock(&host.inner.savers).push(Saver {
+            join,
+            unsaved: unsaved.clone(),
+        });
+        host.stop_before(Instant::now() + Duration::from_millis(50));
         let files = saved(&directory);
         assert_eq!(files.len(), 1);
-        assert_eq!(
-            files[0].file_name().and_then(|n| n.to_str()),
-            Some("left-behind.gif")
-        );
+        assert_eq!(std::fs::read(&files[0]).expect("saved"), recorded.to_vec());
         assert!(matches!(
             notices.try_recv(),
-            Ok(DaemonNotice::RecordingRecovered { .. })
+            Ok(DaemonNotice::RecordingSaved { .. })
         ));
+        // The edit, finishing later, finds the draft taken and saves nothing more.
+        assert!(lock(&unsaved).is_none());
         let _ = std::fs::remove_dir_all(&directory);
     }
 }

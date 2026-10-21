@@ -9,9 +9,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use captastic_core::{CaptureError, CaptureErrorKind};
-use windows::core::{w, Error as WindowsError, HSTRING, PCWSTR};
+use windows::core::{w, Error as WindowsError, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
-use windows::Win32::Storage::FileSystem::{SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Shutdown::{ShutdownBlockReasonCreate, ShutdownBlockReasonDestroy};
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -375,14 +374,6 @@ pub fn reveal_in_folder(file: &Path) -> Result<(), CaptureError> {
         ));
     }
     Ok(())
-}
-
-/// Marks `path` hidden, as Windows hides folders of its own.
-pub fn hide_path(path: &Path) -> Result<(), CaptureError> {
-    let wide = HSTRING::from(path.as_os_str());
-    // SAFETY: The path is a null-terminated wide string that lives for the call.
-    unsafe { SetFileAttributesW(PCWSTR(wide.as_ptr()), FILE_ATTRIBUTE_HIDDEN) }
-        .map_err(|error| native_error("hide_path", error))
 }
 
 pub fn show_error_dialog(message: &str) {

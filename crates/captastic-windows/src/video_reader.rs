@@ -5,17 +5,20 @@
 //! converts them to BGRA, reading on from the frame before when frames are asked for in order and
 //! seeking to the key frame before the one wanted otherwise. [`crate::Mp4Writer`] puts a key frame
 //! at least every second, so a jump decodes at most a second of video.
+//!
+//! The MP4 is read from a file or, for a recording still in review, from memory.
 
 use std::path::Path;
 use std::time::Duration;
 
 use captastic_core::{PlaybackError, RecordingFrames, Timeline};
-use windows::core::{GUID, HSTRING, PCWSTR};
+use windows::core::{w, ComInterface, GUID, HSTRING, PCWSTR};
 use windows::Win32::Media::MediaFoundation::{
     IMFAttributes, IMFMediaType, IMFSourceReader, MFCreateAttributes, MFCreateMediaType,
-    MFCreateSourceReaderFromURL, MFMediaType_Video, MFVideoArea, MFVideoFormat_RGB32,
-    MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_MINIMUM_DISPLAY_APERTURE,
-    MF_MT_SUBTYPE, MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED, MF_SOURCE_READERF_ENDOFSTREAM,
+    MFCreateSourceReaderFromByteStream, MFCreateSourceReaderFromURL, MFMediaType_Video,
+    MFVideoArea, MFVideoFormat_RGB32, MF_BYTESTREAM_CONTENT_TYPE, MF_MT_DEFAULT_STRIDE,
+    MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_MINIMUM_DISPLAY_APERTURE, MF_MT_SUBTYPE,
+    MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED, MF_SOURCE_READERF_ENDOFSTREAM,
     MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
 };
 use windows::Win32::System::Com::StructuredStorage::{PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0};
@@ -58,14 +61,60 @@ fn failure(operation: &str, error: impl std::fmt::Display) -> PlaybackError {
 
 const STREAM: u32 = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
 
+/// Where an MP4 is read from.
+#[derive(Clone, Copy)]
+enum Source<'a> {
+    File(&'a Path),
+    Memory(&'a [u8]),
+}
+
+impl Source<'_> {
+    /// A source reader of the MP4, made with `attributes`.
+    ///
+    /// # Safety
+    /// Media Foundation must be started on this thread, which the reader is then used on.
+    unsafe fn reader(
+        self,
+        attributes: Option<&IMFAttributes>,
+    ) -> windows::core::Result<IMFSourceReader> {
+        // SAFETY: Per this function's contract; every object is made here.
+        unsafe {
+            match self {
+                Self::File(path) => {
+                    let url = HSTRING::from(path.as_os_str());
+                    MFCreateSourceReaderFromURL(PCWSTR(url.as_ptr()), attributes)
+                }
+                Self::Memory(bytes) => {
+                    let stream = crate::video::memory_byte_stream(bytes)?;
+                    // Without a file name to go by, the stream says what it holds.
+                    if let Ok(stream_attributes) = stream.cast::<IMFAttributes>() {
+                        let _ = stream_attributes
+                            .SetString(&MF_BYTESTREAM_CONTENT_TYPE, w!("video/mp4"));
+                    }
+                    MFCreateSourceReaderFromByteStream(&stream, attributes)
+                }
+            }
+        }
+    }
+}
+
 impl Mp4Reader {
     pub fn open(path: &Path) -> Result<Self, PlaybackError> {
+        Self::open_source(Source::File(path))
+    }
+
+    /// Reads the MP4 held in `bytes`, which it copies.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, PlaybackError> {
+        Self::open_source(Source::Memory(bytes))
+    }
+
+    fn open_source(source: Source<'_>) -> Result<Self, PlaybackError> {
         let media_foundation = MediaFoundation::start()
             .map_err(|error| failure("starting Media Foundation", error))?;
-        let url = HSTRING::from(path.as_os_str());
         // SAFETY: Every object below is created here, on this thread, and used only by it.
         let (timeline, origin, width, height, reader, layout) = unsafe {
-            let index = MFCreateSourceReaderFromURL(PCWSTR(url.as_ptr()), None)
+            let index = source
+                .reader(None)
                 .map_err(|error| failure("opening the MP4", error))?;
             let native = index
                 .GetNativeMediaType(STREAM, 0)
@@ -111,7 +160,8 @@ impl Mp4Reader {
             attributes
                 .SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)
                 .map_err(|error| failure("enabling video processing", error))?;
-            let reader = MFCreateSourceReaderFromURL(PCWSTR(url.as_ptr()), &attributes)
+            let reader = source
+                .reader(Some(&attributes))
                 .map_err(|error| failure("opening the MP4 to decode", error))?;
             let wanted =
                 MFCreateMediaType().map_err(|error| failure("creating a media type", error))?;
@@ -440,5 +490,42 @@ mod tests {
         }
         drop(reader);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    #[ignore = "needs Media Foundation's H.264 encoder, which a Windows Server CI image may lack"]
+    fn an_mp4_written_into_memory_reads_back_from_memory() {
+        let (width, height) = (160_u32, 96_u32);
+        let mut writer = crate::Mp4Writer::create_in_memory(width, height, 30).expect("writer");
+        for step in 0..30_u32 {
+            writer
+                .push(
+                    &bars(width, height, (step / 3 + 1) * 8),
+                    Duration::from_micros(u64::from(step) * 33_333),
+                )
+                .expect("push");
+        }
+        let (bytes, summary) = writer
+            .finish_in_memory(Duration::from_secs(1))
+            .expect("finish");
+        assert_eq!(
+            &bytes[4..8],
+            b"ftyp",
+            "an MP4 starts with its file type box"
+        );
+        assert!(summary.frames_written >= 10, "{summary:?}");
+
+        let mut reader = Mp4Reader::from_bytes(&bytes).expect("reader");
+        assert_eq!(reader.size(), (width, height));
+        let timeline = reader.timeline().clone();
+        assert!(
+            timeline.duration().abs_diff(Duration::from_secs(1)) < Duration::from_millis(50),
+            "{timeline:?}"
+        );
+        let last = timeline.len() - 1;
+        let frame = reader.frame(last).expect("last frame").to_vec();
+        assert_eq!(white_rows(&frame, width, height), 80);
+        let frame = reader.frame(0).expect("first frame").to_vec();
+        assert_eq!(white_rows(&frame, width, height), 8);
     }
 }

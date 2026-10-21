@@ -3,6 +3,8 @@
 ## Status
 
 Accepted for the Windows prototype, 2026-10-17. Extends ADR 0011 within Milestone 9, for 0.4.0.
+Amended 2026-10-21: a recording in review is held in memory rather than in a drafts folder on disk,
+at the maintainer's request; see *Amendment* below.
 
 ## Context
 
@@ -27,12 +29,12 @@ for a screen recording: trimming its ends and cropping its area. Four things sha
 notification area offers the same switch as **Review Recordings**, written back like **Save
 Captures to Disk**. With review off, a recording is saved as ADR 0011 describes.
 
-**The recording is reviewed from a draft, and read back from it.** A recording is encoded exactly
-as ADR 0011 describes, but into `.captastic-drafts`, a hidden folder in the output directory, rather
-than into the output directory itself. The review window reads the draft back: GIF frames are kept
-in their compressed form and decoded on demand, and MP4 frames are decoded by Media Foundation's
-source reader, seeking from the nearest key frame. Memory stays near the size of the file however
-long the recording is.
+**The recording is reviewed from memory, and read back from there.** A recording is encoded exactly
+as ADR 0011 describes, but into memory rather than into a file: the encoded GIF or MP4, the size
+the file would be, not its raw frames. The review window reads it back: GIF frames are kept in their
+compressed form and decoded on demand, and MP4 frames are decoded by Media Foundation's source
+reader, seeking from the nearest key frame. Memory stays near the size of the file however long the
+recording is.
 
 **The review window plays the recording and offers two edits, trim and crop.**
 
@@ -47,17 +49,19 @@ long the recording is.
   recording's pixels. An MP4's crop is kept to even sides, as H.264 requires.
 
 **Save** writes the recording into the output directory, named as before, records it in capture
-history, and raises the "Recording saved" notification. Saved unchanged, the draft is moved there
-as it is, with no encoding. Saved trimmed or cropped, the kept frames are decoded, cropped and
-encoded again by the writers ADR 0011 uses, then the draft is removed. The window closes at
+history, and raises the "Recording saved" notification. Saved unchanged, the recording's bytes are
+written there as they are, with no encoding. Saved trimmed or cropped, the kept frames are decoded,
+cropped and encoded again into memory by the writers ADR 0011 uses, and the result is written. The
+window closes at
 **Save**, and the "Recording saved" notification says when the file is ready; an edited save takes
 as long as encoding the span kept.
 
 **Discarding is always deliberate.** **Discard**, Escape and the window's close button all ask
-first: *"Discard this recording? It will be deleted."* Only **OK** deletes the draft. Captastic
-exiting during a review saves the recording unchanged, as exiting during a recording finishes it.
-A draft left behind by Captastic ending without that chance, a crash or a power cut, is saved into
-the output directory the next time Captastic starts, and a notification says so.
+first: *"Discard this recording? It will be deleted."* Only **OK** lets it go, and since it was
+never written, nothing is left behind. Captastic exiting during a review saves the recording
+unchanged, as exiting during a recording finishes it; an edited save still encoding when exit's
+deadline passes saves the recording unchanged instead. A crash or a power cut during a review loses
+the recording.
 
 **One review at a time.** A recording finished while another is in review waits for that one to be
 saved or discarded, so two review windows never compete for the same name or the same attention.
@@ -75,7 +79,17 @@ The capture hotkey and still captures are unaffected by a review.
 - Reading recordings back is new code: a GIF reader in `captastic-core` and an MP4 reader in
   `captastic-windows`, each tested by reading back what its writer wrote.
 
+## Amendment (2026-10-21)
+
+As first built, a recording in review was encoded into `.captastic-drafts`, a hidden folder in the
+output directory, and a draft left there by a crash was saved at the next start. Trying it, the
+maintainer asked that recordings in review not be kept on disk at all: a review either saves the
+result or discards it entirely. Holding the encoded recording in memory does that, at the cost of
+"nothing may be lost by accident" for a crash during a review, which is accepted. The memory held
+is the encoded file's size, plus one copy while an MP4 is decoded for the review; a recording that
+waits behind another review holds its own.
+
 ## Slices
 
-As listed under Milestone 9 in `ROADMAP.md`: reading recordings back; drafts, saving and recovery;
+As listed under Milestone 9 in `ROADMAP.md`: reading recordings back; holding, saving and discarding;
 the review window with trim; crop.

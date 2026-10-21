@@ -755,9 +755,10 @@ length.
 5. **Reading recordings back** ([ADR 0012](docs/adr/0012-recording-review.md)): a GIF reader that
    keeps frames compressed and decodes them on demand, and an MP4 reader on Media Foundation's
    source reader, each tested against its writer.
-6. **Drafts, saving and recovery**: recordings encoded into a hidden drafts folder, saved unchanged
-   by a move or edited by a re-encode, `recording.review` and the **Review Recordings** tray switch,
-   and drafts recovered at startup.
+6. **Holding, saving and discarding**: recordings encoded into memory until the review ends, saved
+   unchanged as recorded or edited by a re-encode, `recording.review` and the **Review Recordings**
+   tray switch. First built with a drafts folder on disk and recovery after a crash; changed on
+   2026-10-21 so that nothing is written before **Save**.
 7. **The review window with trim**: playback, a timeline with start and end handles, frame, second
    and change stepping, **I** and **O**, millisecond readouts, Save, and Discard that asks first.
 8. **Crop** in the review window.
