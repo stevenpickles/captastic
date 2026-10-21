@@ -109,6 +109,11 @@ Milestone 5's criterion vacuously and on purpose.
   keep recording through desktop duplication, unchanged. Chosen over reopening a capture from
   history in the editor (Milestone 6's last slice) and a first cross-platform proof (Milestone 7),
   which stay candidates for later releases.
+- **Sound in MP4 recordings.** An MP4 recording can carry the computer's sound, the system mix
+  through WASAPI loopback, encoded as AAC beside the H.264. It is off by default and turned on with
+  **Record Sound**, and the review window plays it; see
+  [ADR 0015](docs/adr/0015-recording-system-audio.md). Asked for on 2026-10-21, reversing 0.4.0's
+  "no audio".
 - **Alongside: captures an agent can start.** A shipped command-line surface through which an agent
   or a script asks the running Captastic for a capture and gets back where it went; see
   [Milestone 10](#milestone-10--captures-started-from-the-command-line). Asked for on 2026-10-21.
@@ -127,13 +132,15 @@ Milestone 5's criterion vacuously and on purpose.
 - **A manual desktop checklist for every slice that changes overlay or desktop behaviour**, run
   before merge. For window recording it covers at least: a window covered part-way through, moved,
   resized, minimised and restored, and closed during a recording; a window spanning two displays; a
-  GPU-rendered window (a browser or a game); and a window Windows will not let WGC capture. For the
+  GPU-rendered window (a browser or a game); and a window Windows will not let WGC capture. For
+  sound, an MP4 with a video playing, with silence, and with headphones plugged in part-way. For the
   command line, a capture started by an agent on the installed build, with and without Captastic
   running.
 - **The disposable-VM checklist** in [docs/chocolatey.md](docs/chocolatey.md), before the tag, with
   the shipped command added to it.
 - **Release notes** that say what a window recording now contains, what happens when Windows refuses
-  to capture a window, and exactly what the command line can capture without the user's hand on the
+  to capture a window, that sound is off by default, is MP4 only and is the whole system mix (never
+  the microphone), and exactly what the command line can capture without the user's hand on the
   overlay.
 
 ## Release readiness — v0.4.0
@@ -790,6 +797,7 @@ length.
   to be trimmed to the millisecond and cropped before it is saved; Save unchanged costs no encode,
   and discarding always asks first.
 - **Not in 0.4.0:** audio, marks drawn on recordings, and still captures while a recording runs.
+  Audio, for MP4 only, comes in 0.5.0 ([ADR 0015](docs/adr/0015-recording-system-audio.md)).
 
 ### Proposed slices
 
@@ -878,6 +886,17 @@ open for as long as the recording runs.
    the behaviour ADR 0013 chooses for a window WGC cannot capture, and the README, notes and ADR
    0011 updated to retire the "recorded as its area" limitation.
 
+**Sound (ADR 0015)**, a second strand of the same section, sharing nothing with the WGC work but
+the MP4 writer:
+
+5. **Loopback capture**: a WASAPI loopback client on the default output device, conversion and
+   downmix to 16-bit stereo, silence written while nothing plays, and the device changing or
+   disappearing mid-recording.
+6. **Sound in the MP4**: an AAC stream on the sink writer, stamped on the recording's clock;
+   `recording.audio`, the **Record Sound** row (greyed for GIF) and the bar's speaker glyph.
+7. **Sound in the review**: the AAC stream read back and played in step with the playhead, with a
+   mute button, and a trimmed save's sound cut and encoded again.
+
 **0.5.0 exit criteria**, on top of the ones above:
 
 - A window recording contains the window's pixels and nothing else, however it is covered, moved or
@@ -885,6 +904,9 @@ open for as long as the recording runs.
 - Resizing, minimising or closing the window during a recording never yields an invalid file, and
   the result matches what ADR 0013 promises.
 - Region and display recordings, and still captures, initialise no WGC session.
+- With **Record Sound** on, an MP4 recording's sound stays in step with its picture from the first
+  frame to the last, through silence and a change of output device. With it off, or for GIF, a
+  recording is exactly what 0.4.0 wrote.
 
 ## Milestone 10 — Captures started from the command line
 

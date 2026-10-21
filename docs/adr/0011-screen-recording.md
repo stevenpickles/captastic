@@ -6,6 +6,8 @@ Accepted for the Windows prototype, 2026-10-15. Governs Milestone 9, the 0.4.0 t
 Trimming, ruled out of 0.4.0 below, was brought into it by [ADR 0012](0012-recording-review.md).
 From 0.5.0, [ADR 0013](0013-window-recording.md) records a window through Windows Graphics Capture,
 superseding the first *As built* note below for windows it can capture.
+From 0.5.0, an MP4 recording can also carry the system's sound, off by default, per
+[ADR 0015](0015-recording-system-audio.md).
 
 ## Context
 
