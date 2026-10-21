@@ -112,6 +112,13 @@ Milestone 5's criterion vacuously and on purpose.
 - **Alongside: captures an agent can start.** A shipped command-line surface through which an agent
   or a script asks the running Captastic for a capture and gets back where it went; see
   [Milestone 10](#milestone-10--captures-started-from-the-command-line). Asked for on 2026-10-21.
+- **The maintainer's choices for the two ADRs**, made on 2026-10-21:
+  - a window resized during a recording is scaled to fit the starting size, proportions kept;
+  - a window WGC cannot capture is recorded as its area, as in 0.4.0, and the notification says so;
+  - a command-line capture asks the running daemon, and captures on its own when Captastic is not
+    running;
+  - every command-line capture is announced by a notification and marked in history, with no
+    setting to silence it.
 
 ### Gates — before the tag
 
