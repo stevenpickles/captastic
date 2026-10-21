@@ -57,8 +57,21 @@ const MAX_NAME_ATTEMPTS: u32 = 100;
 
 /// Where a recording's frames come from.
 pub trait FrameSource {
-    /// The newest frame of the display the recording is on, whole.
+    /// The newest frame: the whole display the recording is on, or the window being recorded.
     fn next_frame(&mut self) -> Result<CpuFrame, CaptureError>;
+
+    /// Whether each frame is the recorded thing itself - a window recorded through Windows
+    /// Graphics Capture (ADR 0013) - to be fitted to the recording's size, rather than a display
+    /// the recorded area is cropped from.
+    fn frames_are_the_area(&self) -> bool {
+        false
+    }
+
+    /// Whether what is recorded has gone - a window that closed - which ends the recording and
+    /// keeps it.
+    fn has_ended(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -84,6 +97,8 @@ impl RecordingSettings {
 pub enum RecordingEnd {
     Stopped,
     TimeLimit,
+    /// The window being recorded closed.
+    WindowClosed,
 }
 
 /// A finished recording.
@@ -168,7 +183,18 @@ fn record_into(
     let started = Instant::now();
     let interval = Duration::from_secs(1) / settings.format.frame_rate();
     let first = source.next_frame().map_err(RecordingError::Source)?;
-    let area = recorded_area(&first, area)?;
+    let whole = source.frames_are_the_area();
+    let area = if whole {
+        // The recording keeps the window's first size, whatever it is resized to later.
+        Rect {
+            x: 0,
+            y: 0,
+            width: first.width(),
+            height: first.height(),
+        }
+    } else {
+        recorded_area(&first, area)?
+    };
     let (width, height) = output_size(settings, area.width, area.height);
     let queue = Arc::new(FrameQueue::with_capacity(queue_capacity(
         width as usize * height as usize * 4,
@@ -182,7 +208,10 @@ fn record_into(
             .spawn(move || encode(&queue, format, path.as_deref(), width, height))
             .map_err(|error| RecordingError::Encode(error.to_string()))?
     };
-    queue.push(frame_pixels(&first, area, width, height)?, Duration::ZERO);
+    queue.push(
+        pixels_for(&first, whole, area, width, height)?,
+        Duration::ZERO,
+    );
     let mut captured = 1_u64;
     let mut failures = 0_u32;
     let mut next = started + interval;
@@ -194,6 +223,9 @@ fn record_into(
             }
             if started.elapsed() >= settings.max_duration {
                 break Some(RecordingEnd::TimeLimit);
+            }
+            if source.has_ended() {
+                break Some(RecordingEnd::WindowClosed);
             }
             let now = Instant::now();
             if now >= next {
@@ -219,8 +251,11 @@ fn record_into(
                 failures = 0;
                 captured += 1;
                 let at = started.elapsed();
-                queue.push(frame_pixels(&frame, area, width, height)?, at);
+                queue.push(pixels_for(&frame, whole, area, width, height)?, at);
             }
+            // The window closed between the check above and this frame: it ends the recording,
+            // as the check would have.
+            Err(_) if source.has_ended() => break RecordingEnd::WindowClosed,
             Err(error) => {
                 failures += 1;
                 log::debug!(
@@ -266,6 +301,50 @@ fn recorded_area(frame: &CpuFrame, area: Rect) -> Result<Rect, RecordingError> {
     let display = frame.metadata.source_rect;
     area.intersection(display)
         .ok_or(RecordingError::OutsideDisplay { area, display })
+}
+
+/// A frame's pixels at the recording's size: the area cropped from a display, or a window that
+/// has been resized since the recording started fitted to it.
+fn pixels_for(
+    frame: &CpuFrame,
+    whole: bool,
+    area: Rect,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, RecordingError> {
+    if whole && (frame.width(), frame.height()) != (area.width, area.height) {
+        return fitted_pixels(frame, width, height);
+    }
+    frame_pixels(frame, area, width, height)
+}
+
+/// A window frame scaled to fit inside `width` by `height` with its proportions kept, centred on
+/// black (ADR 0013): a GIF or MP4 keeps one size, so a resized window is shown whole rather than
+/// cropped.
+fn fitted_pixels(frame: &CpuFrame, width: u32, height: u32) -> Result<Vec<u8>, RecordingError> {
+    let (from_width, from_height) = (frame.width(), frame.height());
+    let scale = (f64::from(width) / f64::from(from_width.max(1)))
+        .min(f64::from(height) / f64::from(from_height.max(1)));
+    let fitted_width = ((f64::from(from_width) * scale).round() as u32).clamp(1, width);
+    let fitted_height = ((f64::from(from_height) * scale).round() as u32).clamp(1, height);
+    let whole = Rect {
+        x: 0,
+        y: 0,
+        width: from_width,
+        height: from_height,
+    };
+    let fitted = frame_pixels(frame, whole, fitted_width, fitted_height)?;
+    let mut canvas = [0, 0, 0, u8::MAX].repeat(width as usize * height as usize);
+    let (left, top) = (
+        ((width - fitted_width) / 2) as usize,
+        ((height - fitted_height) / 2) as usize,
+    );
+    let row = fitted_width as usize * 4;
+    for y in 0..fitted_height as usize {
+        let at = ((top + y) * width as usize + left) * 4;
+        canvas[at..at + row].copy_from_slice(&fitted[y * row..(y + 1) * row]);
+    }
+    Ok(canvas)
 }
 
 /// The size a recording of `width` by `height` is written at.
@@ -593,12 +672,72 @@ impl FrameSource for CaptureThreadFrames {
     }
 }
 
+/// A window recorded through a Windows Graphics Capture session of its own (ADR 0013), so it is
+/// recorded as itself however it is covered or moved, rather than as its area on the screen.
+struct WindowFrames {
+    session: captastic_windows::WgcWindowSession,
+    capture_id: CaptureId,
+    display_id: captastic_core::DisplayId,
+}
+
+impl FrameSource for WindowFrames {
+    fn next_frame(&mut self) -> Result<CpuFrame, CaptureError> {
+        let frame = self.session.latest()?;
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            width: frame.width,
+            height: frame.height,
+        };
+        CpuFrame::new(
+            frame.pixels,
+            frame.width,
+            frame.height,
+            frame.width * 4,
+            captastic_core::PixelFormat::Bgra8Unorm,
+            captastic_core::FrameOrigin::TopLeft,
+            captastic_core::ColorSpace::Srgb,
+            captastic_core::FrameMetadata {
+                capture_id: self.capture_id,
+                backend: "windows-graphics-capture".to_owned(),
+                display_id: self.display_id.clone(),
+                // The window's own surface: the frame is the whole of what is recorded.
+                source_rect: bounds,
+                rotation_degrees: 0,
+                capture_mode: captastic_core::CaptureMode::Latest { max_age_ms: None },
+                presentation_offset_ns: None,
+                timing_provenance: captastic_core::TimingProvenance::ArrivalTime,
+                native_ready_offset_ns: 0,
+                cpu_ready_offset_ns: None,
+                frame_age_ns: None,
+                verified_current_offset_ns: None,
+                frame_generation: Some(frame.sequence),
+                copy_count: 1,
+                pool_slot: None,
+                cursor: None,
+            },
+        )
+        .map_err(|error| CaptureError::synthetic(format!("a window frame was invalid: {error}")))
+    }
+
+    fn frames_are_the_area(&self) -> bool {
+        true
+    }
+
+    fn has_ended(&self) -> bool {
+        self.session.is_closed()
+    }
+}
+
 /// What the overlay confirmed with **Record**.
 pub struct RecordingRequest {
     pub capture_id: captastic_core::CaptureId,
     pub display_id: captastic_core::DisplayId,
     /// The recorded area, in desktop coordinates.
     pub area: Rect,
+    /// The window chosen, when the Window tool was: recorded through Windows Graphics Capture
+    /// where Windows allows it, and as `area` otherwise (ADR 0013).
+    pub window: Option<captastic_windows::NativeWindowHandle>,
     pub window_title: Option<String>,
     pub window_application: Option<String>,
 }
@@ -626,6 +765,9 @@ struct HostInner {
     /// Where `recording.format` is written back when **Record As** changes it.
     config_path: Option<PathBuf>,
     json_output: bool,
+    /// Whether `[capture] cursor` includes the pointer, which a window recorded through Windows
+    /// Graphics Capture asks Windows to draw rather than having it composited.
+    window_cursor: bool,
     /// Whether a recording started now is reviewed before it is saved.
     review: AtomicBool,
     /// The review open, if any, and the drafts waiting for it to end.
@@ -683,6 +825,7 @@ impl RecordingHost {
         capture_sender: std::sync::mpsc::SyncSender<crate::daemon::CaptureCommand>,
         config_path: Option<PathBuf>,
         json_output: bool,
+        window_cursor: bool,
     ) -> Self {
         let review = AtomicBool::new(config.review);
         Self {
@@ -702,6 +845,7 @@ impl RecordingHost {
                 capture_sender,
                 config_path,
                 json_output,
+                window_cursor,
             }),
         }
     }
@@ -858,7 +1002,7 @@ impl RecordingHost {
         desktop_ui: Arc<Mutex<Option<captastic_windows::DesktopUi>>>,
     ) {
         let inner = &self.inner;
-        let mut frames = CaptureThreadFrames {
+        let mut display_frames = CaptureThreadFrames {
             sender: inner.capture_sender.clone(),
             source: if request.display_id == captastic_core::DisplayId::virtual_desktop() {
                 captastic_core::CaptureSource::VirtualDesktop
@@ -866,14 +1010,43 @@ impl RecordingHost {
                 captastic_core::CaptureSource::Display(request.display_id.clone())
             },
         };
-        let result = match destination {
-            Destination::File(path) => record(&mut frames, request.area, settings, &path, &stop)
-                .map(|report| (report, None)),
-            Destination::Review { stem } => {
-                record_in_memory(&mut frames, request.area, settings, &stop)
-                    .map(|(report, recording)| (report, Some((stem, recording))))
+        let mut window_frames = request.window.and_then(|window| {
+            match captastic_windows::WgcWindowSession::start(window, inner.window_cursor) {
+                Ok(session) => {
+                    log::info!(
+                        "recording {} records the window itself, through Windows Graphics Capture",
+                        request.capture_id.0
+                    );
+                    Some(WindowFrames {
+                        session,
+                        capture_id: request.capture_id,
+                        display_id: request.display_id.clone(),
+                    })
+                }
+                Err(error) => {
+                    // ADR 0013: recorded as its area on the screen, as before, rather than not
+                    // at all.
+                    log::info!(
+                        "recording {} records the window's area on the screen: Windows Graphics \
+                         Capture could not capture the window ({error})",
+                        request.capture_id.0
+                    );
+                    None
+                }
             }
+        });
+        let frames: &mut dyn FrameSource = match window_frames.as_mut() {
+            Some(frames) => frames,
+            None => &mut display_frames,
         };
+        let result = match destination {
+            Destination::File(path) => {
+                record(frames, request.area, settings, &path, &stop).map(|report| (report, None))
+            }
+            Destination::Review { stem } => record_in_memory(frames, request.area, settings, &stop)
+                .map(|(report, recording)| (report, Some((stem, recording)))),
+        };
+        drop(window_frames);
         hide_indicator(Some(&desktop_ui));
         *lock(&inner.stop) = None;
         inner.active.store(false, Ordering::Release);
@@ -1581,6 +1754,77 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
+    /// A window recorded as itself: 40 by 30 until it is resized to 80 by 20, closing after a
+    /// number of frames.
+    struct Window {
+        served: u32,
+        resize_after: u32,
+        close_after: u32,
+    }
+
+    impl FrameSource for Window {
+        fn next_frame(&mut self) -> Result<CpuFrame, CaptureError> {
+            self.served += 1;
+            let bounds = if self.served > self.resize_after {
+                rect(0, 0, 80, 20)
+            } else {
+                rect(0, 0, 40, 30)
+            };
+            Ok(frame(bounds, 200))
+        }
+
+        fn frames_are_the_area(&self) -> bool {
+            true
+        }
+
+        fn has_ended(&self) -> bool {
+            self.served >= self.close_after
+        }
+    }
+
+    #[test]
+    fn a_resized_window_keeps_the_recording_size_and_a_closed_one_ends_it_kept() {
+        let directory = directory("window");
+        let path = reserve_path(&directory, "clip", "gif").expect("reserve");
+        let mut source = Window {
+            served: 0,
+            resize_after: 3,
+            close_after: 6,
+        };
+        let stop = AtomicBool::new(false);
+        // The area is ignored for a window: the frames are the window.
+        let report = record(
+            &mut source,
+            rect(500, 500, 1, 1),
+            settings(RecordingFormat::Gif, 30.0),
+            &path,
+            &stop,
+        )
+        .expect("record");
+        assert_eq!(report.ended, RecordingEnd::WindowClosed);
+        assert_eq!((report.width, report.height), (40, 30));
+        assert_eq!(report.frames_captured, 6);
+        assert_eq!(&std::fs::read(&path).expect("read")[..6], b"GIF89a");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_resized_window_is_fitted_whole_and_centred_on_black() {
+        let pixel = |pixels: &[u8], width: u32, x: u32, y: u32| -> [u8; 4] {
+            let at = ((y * width + x) * 4) as usize;
+            pixels[at..at + 4].try_into().expect("pixel")
+        };
+        // Wider than the recording: scaled down to 40 by 10, with bands above and below.
+        let wide = fitted_pixels(&frame(rect(0, 0, 80, 20), 200), 40, 30).expect("fit");
+        assert_eq!(wide.len(), 40 * 30 * 4);
+        assert_eq!(pixel(&wide, 40, 20, 5), [0, 0, 0, 255]);
+        assert_eq!(pixel(&wide, 40, 20, 15), [200; 4]);
+        assert_eq!(pixel(&wide, 40, 20, 25), [0, 0, 0, 255]);
+        // Smaller, in the same proportions: scaled up to fill it.
+        let small = fitted_pixels(&frame(rect(0, 0, 20, 15), 200), 40, 30).expect("fit");
+        assert!(small.chunks_exact(4).all(|pixel| pixel == [200; 4]));
+    }
+
     #[test]
     fn a_source_that_keeps_failing_ends_the_recording_and_leaves_no_file() {
         let directory = directory("fail");
@@ -1692,6 +1936,7 @@ mod tests {
             capture_sender,
             None,
             false,
+            false,
         );
         let desktop_ui = Arc::new(Mutex::new(None));
         host.start(
@@ -1699,6 +1944,7 @@ mod tests {
                 capture_id: captastic_core::CaptureId(5),
                 display_id: DisplayId::primary(),
                 area: rect(20, 10, 100, 80),
+                window: None,
                 window_title: None,
                 window_application: None,
             },
@@ -1711,6 +1957,7 @@ mod tests {
                 capture_id: captastic_core::CaptureId(6),
                 display_id: DisplayId::primary(),
                 area: rect(0, 0, 10, 10),
+                window: None,
                 window_title: None,
                 window_application: None,
             },
@@ -1845,6 +2092,7 @@ mod tests {
             notice_sender,
             capture_sender,
             None,
+            false,
             false,
         );
         (host, notices, history)

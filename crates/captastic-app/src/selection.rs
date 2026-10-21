@@ -627,6 +627,9 @@ impl SelectionWorker {
                                     capture_id: publication.capture_id,
                                     display_id: selected_frame.metadata.display_id.clone(),
                                     area: selection.rect,
+                                    window: selection
+                                        .window
+                                        .filter(|_| selection.kind == captastic_windows::SelectionKind::Window),
                                     window_title: publication.window_title.clone(),
                                     window_application: publication.window_application.clone(),
                                 };
