@@ -14,8 +14,12 @@ mod layout;
 mod machine;
 mod pin;
 mod raster;
+mod recording_frame;
+mod review;
 mod shell;
 mod snap;
+mod text_mark;
+mod vector;
 mod window_enumeration;
 
 use layout::{
@@ -26,10 +30,10 @@ use layout::{
 use raster::{
     apply_dim_wash, build_blurred_background, draw_antialiased_rounded_outline, draw_camera_icon,
     draw_checkmark, draw_display_icon, draw_edit_icon, draw_filled_ellipse, draw_lines,
-    draw_outline, draw_outline_rect, draw_pin_icon, draw_region_icon, draw_resize_handles,
-    draw_round_box, draw_surface_nearest, draw_text, draw_window_icon, draw_window_surface,
-    fill_device_rect, fill_live_background, fitted_surface_rect, measure_ui_text, rgb,
-    scaled_corner_radius, TextAlignment,
+    draw_outline, draw_outline_rect, draw_pin_icon, draw_record_icon, draw_region_icon,
+    draw_resize_handles, draw_round_box, draw_surface_nearest, draw_text, draw_window_icon,
+    draw_window_surface, fill_device_rect, fill_live_background, fitted_surface_rect,
+    measure_ui_text, rgb, scaled_corner_radius, TextAlignment,
 };
 pub use shell::flush_desktop_composition;
 use shell::{
@@ -121,6 +125,7 @@ const UI_FONT_HEIGHT: i32 = 21;
 /// for text at 96 DPI, and widening the menu for one row is a worse trade than the shorter name.
 pub use desktop_ui::DesktopUi;
 pub use editor::EditOutcome;
+pub use review::ReviewOutcome;
 
 const SNAP_TO_WINDOWS_LABEL: &str = "Snap to Edges";
 /// The Options row for file output. Shorter than the notification area's "Save Captures to Disk"
@@ -144,6 +149,8 @@ pub enum ConfirmIntent {
     Pin,
     /// **Edit** or Ctrl+Enter: withhold it until the editor publishes the edited image.
     Edit,
+    /// **Record**: record the selection over time to a GIF or MP4 instead (ADR 0011).
+    Record,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -359,8 +366,12 @@ pub struct OverlayDestinations {
     /// Whether **Pin** is offered. Only a daemon can keep a pinned window open after the overlay
     /// closes, so a one-shot capture greys it.
     pub pin_available: bool,
-    /// Whether **Edit** is offered. Greyed until the editor exists (ADR 0010, slice 2).
+    /// Whether **Edit** is offered. Only a daemon hosts the editor, so a one-shot capture greys
+    /// it.
     pub edit_available: bool,
+    /// What **Record** records into, or `None` when this run cannot record: a recording outlives
+    /// the overlay, so only a daemon can run one (ADR 0011).
+    pub record_format: Option<captastic_config::RecordingFormat>,
 }
 
 impl OverlayDestinations {
@@ -371,6 +382,7 @@ impl OverlayDestinations {
         file_output_switchable: false,
         pin_available: false,
         edit_available: false,
+        record_format: None,
     };
 }
 
@@ -401,6 +413,11 @@ pub enum OverlayUiUpdate {
     /// UI preference: the receiver hands it to the daemon, which starts or stops the file worker
     /// and records `output.enabled` exactly as it does for the notification-area item.
     FileOutput { enabled: bool },
+    /// The user chose, from the Options menu, what **Record** records into. Handed to the daemon,
+    /// which uses it for this and later recordings and writes it back as `recording.format`.
+    RecordingFormat {
+        format: captastic_config::RecordingFormat,
+    },
 }
 
 #[derive(Clone, Default)]
@@ -778,6 +795,8 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
             file_output_switchable: destinations.file_output_switchable,
             pin_available: destinations.pin_available,
             edit_available: destinations.edit_available,
+            record_format: destinations.record_format,
+            record_armed: false,
             hovered_control: None,
             pointer_local: None,
             hovered: None,
@@ -997,6 +1016,23 @@ fn cache_overlay_state(
         font_resource: _font_resource,
     });
     SelectionOutcome::from_run(result, display_change_reason)
+}
+
+/// The window to bring forward as the overlay closes, when it is not the one that had focus before.
+///
+/// A window recording records the window's area on the screen (ADR 0011), so the chosen window
+/// has to be on top when it starts: handing focus back to the window that had it would put that
+/// window over the chosen one whenever they overlap, and the recording would show it instead.
+fn focus_after_run(outcome: &SelectionOutcome) -> Option<HWND> {
+    match outcome {
+        SelectionOutcome::Selected(selection)
+            if selection.intent == ConfirmIntent::Record
+                && selection.kind == SelectionKind::Window =>
+        {
+            selection.window.map(|window| HWND(window.raw()))
+        }
+        _ => None,
+    }
 }
 
 enum WindowPreviewState {
@@ -1223,7 +1259,7 @@ fn apply_overlay_ui_update(state: &mut LiveUiState, update: &OverlayUiUpdate) {
         OverlayUiUpdate::RegionZoom { mode } => state.region_zoom = Some(*mode),
         // Not UI state: the daemon owns the answer, and every run is told it afresh from the
         // destination set rather than from what an earlier run asked for.
-        OverlayUiUpdate::FileOutput { .. } => {}
+        OverlayUiUpdate::FileOutput { .. } | OverlayUiUpdate::RecordingFormat { .. } => {}
         OverlayUiUpdate::Interaction {
             display_id,
             tool,
@@ -1369,7 +1405,7 @@ fn run_overlay(
     controller.inner.hwnd.store(0, Ordering::SeqCst);
     let previous_foreground = state.previous_foreground;
     let outcome = cache_overlay_state(state, resources);
-    restore_input_context(previous_foreground);
+    restore_input_context(focus_after_run(&outcome).unwrap_or(previous_foreground));
     drop(class_guard);
     Ok(outcome)
 }
@@ -2070,6 +2106,13 @@ fn apply_overlay_effects(
                     sink.submit(OverlayUiUpdate::RegionZoom {
                         mode: mode.to_config(),
                     });
+                }
+            }
+            OverlayEffect::RequestRecordingFormat { format } => {
+                // SAFETY: Shared borrow released at the block's end.
+                let state = unsafe { &*state_pointer };
+                if let Some(sink) = state.ui_updates.as_ref() {
+                    sink.submit(OverlayUiUpdate::RecordingFormat { format });
                 }
             }
             OverlayEffect::RequestFileOutput { enabled } => {
@@ -3988,6 +4031,25 @@ fn draw_toolbar(state: &OverlayState) {
         state,
         draw_edit_icon,
     );
+    if state.model.record_armed {
+        // Held down, as a chosen tool is, while it waits for a window to be clicked.
+        let color = rgb(76, 76, 82);
+        draw_round_box(
+            device,
+            layout.record,
+            color,
+            color,
+            tokens.control_corner_radius,
+        );
+    }
+    draw_action_button(
+        device,
+        layout.record,
+        ToolbarControl::Record,
+        state.model.record_format.is_some(),
+        state,
+        draw_record_icon,
+    );
 
     let capture_enabled = state.model.selection.is_some();
     let capture_color = if capture_enabled {
@@ -4046,8 +4108,14 @@ fn draw_action_button(
 ) {
     let metrics = state.model.display_environment.metrics;
     let tokens = metrics.toolbar_tokens();
-    let enabled = available && state.model.selection.is_some();
-    if enabled && state.model.hovered_control == Some(control) {
+    // Record can also be pressed before a window is chosen, to record the next one clicked.
+    let enabled = available
+        && (state.model.selection.is_some()
+            || (control == ToolbarControl::Record && state.model.tool == CaptureTool::Window));
+    if enabled
+        && state.model.hovered_control == Some(control)
+        && !(control == ToolbarControl::Record && state.model.record_armed)
+    {
         let color = rgb(58, 58, 63);
         draw_round_box(device, bounds, color, color, tokens.control_corner_radius);
     }
@@ -4118,6 +4186,24 @@ fn draw_hover_tooltip(device: HDC, state: &OverlayState, layout: ToolbarLayout) 
                 "Select something to edit"
             };
             (layout.edit, value.to_owned())
+        }
+        Some(ToolbarControl::Record) => {
+            let value = match state.model.record_format {
+                None => "Recording needs Captastic running in the notification area",
+                Some(_) if state.model.record_armed => {
+                    "Click a window to record it (press Record again to cancel)"
+                }
+                Some(_)
+                    if state.model.selection.is_none()
+                        && state.model.tool == CaptureTool::Window =>
+                {
+                    "Press, then click a window to record it"
+                }
+                Some(_) if state.model.selection.is_none() => "Select something to record",
+                Some(captastic_config::RecordingFormat::Gif) => "Record as an animated GIF",
+                Some(captastic_config::RecordingFormat::Mp4) => "Record as an MP4 video",
+            };
+            (layout.record, value.to_owned())
         }
         Some(ToolbarControl::Capture) => {
             let value = if state.model.selection.is_some() {
@@ -4259,6 +4345,14 @@ fn draw_view_tag(state: &OverlayState, layout: ToolbarLayout) {
     );
 }
 
+/// The Record As row's label.
+const fn record_format_label(format: Option<captastic_config::RecordingFormat>) -> &'static str {
+    match format {
+        Some(captastic_config::RecordingFormat::Mp4) => "Record As: MP4",
+        _ => "Record As: GIF",
+    }
+}
+
 fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
     let metrics = state.model.display_environment.metrics;
     let tokens = metrics.toolbar_tokens();
@@ -4282,6 +4376,7 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
             ToolbarControl::FileOutputDestination,
             layout.file_output_destination,
         ),
+        (ToolbarControl::RecordFormat, layout.record_format),
         (ToolbarControl::Cancel, layout.cancel),
     ];
     for (control, row) in rows {
@@ -4427,6 +4522,25 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
         TextAlignment::Left,
         tokens.font_height,
     );
+    // Cycles between the two formats like the zoom row cycles its modes, so its label says which
+    // is chosen and there is no checkmark. Greyed in a run that cannot record.
+    draw_text(
+        device,
+        UiRect {
+            left: layout.record_format.left + tokens.menu_text_offset,
+            top: layout.record_format.top,
+            right: layout.record_format.right - tokens.text_padding,
+            bottom: layout.record_format.bottom,
+        },
+        record_format_label(state.model.record_format),
+        if state.model.record_format.is_some() {
+            rgb(245, 245, 247)
+        } else {
+            rgb(130, 130, 136)
+        },
+        TextAlignment::Left,
+        tokens.font_height,
+    );
     draw_lines(
         device,
         &[
@@ -4557,6 +4671,43 @@ mod tests {
             presenter_fallback_reason: None,
             window_frame: None,
         }
+    }
+
+    #[test]
+    fn only_a_window_recording_brings_its_window_forward() {
+        let window = NativeWindowHandle::from_raw(0x1234);
+        let outcome = |kind, intent, window| {
+            SelectionOutcome::Selected(Box::new(OverlaySelection {
+                kind,
+                intent,
+                window,
+                ..selection_for_tests()
+            }))
+        };
+        assert_eq!(
+            focus_after_run(&outcome(
+                SelectionKind::Window,
+                ConfirmIntent::Record,
+                Some(window)
+            )),
+            Some(HWND(0x1234))
+        );
+        // Anything else hands focus back to the window that had it.
+        for intent in [
+            ConfirmIntent::Capture,
+            ConfirmIntent::Pin,
+            ConfirmIntent::Edit,
+        ] {
+            assert_eq!(
+                focus_after_run(&outcome(SelectionKind::Window, intent, Some(window))),
+                None
+            );
+        }
+        assert_eq!(
+            focus_after_run(&outcome(SelectionKind::Region, ConfirmIntent::Record, None)),
+            None
+        );
+        assert_eq!(focus_after_run(&SelectionOutcome::Cancelled), None);
     }
 
     #[test]
@@ -5691,17 +5842,17 @@ mod tests {
     fn toolbar_position_restores_from_normalized_work_area_coordinates() {
         let environment = test_display_environment(2560, 1440, 1400, 144);
         let layout = ToolbarLayout::new(environment, ToolbarLayout::default_origin(environment));
-        assert_eq!(layout.bounds.width(), 771);
+        assert_eq!(layout.bounds.width(), 837);
         assert_eq!(layout.bounds.height(), 84);
         assert!(layout.bounds.bottom <= environment.work_area.bottom);
         assert_eq!(
             remembered_toolbar_position(Some((0.5, 0.5)), None, environment),
-            Some(POINT { x: 895, y: 658 })
+            Some(POINT { x: 862, y: 658 })
         );
         let smaller = test_display_environment(1920, 1080, 1040, 96);
         assert_eq!(
             remembered_toolbar_position(Some((0.5, 0.5)), None, smaller),
-            Some(POINT { x: 703, y: 492 })
+            Some(POINT { x: 681, y: 492 })
         );
     }
 
@@ -5710,7 +5861,7 @@ mod tests {
         let environment = test_display_environment(1920, 1080, 1040, 96);
         assert_eq!(
             remembered_toolbar_position(None, Some((3700, 2000)), environment),
-            Some(POINT { x: 1398, y: 976 })
+            Some(POINT { x: 1354, y: 976 })
         );
     }
 

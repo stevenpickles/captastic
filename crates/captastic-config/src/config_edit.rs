@@ -15,25 +15,37 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
 
-use toml_edit::{value, Document, Item, Table};
+use toml_edit::{value, Document, Item, Table, Value};
 
 use crate::fsio::{atomic_write, finalize_new, replace_file, FileLock};
-use crate::{ConfigError, CONFIG_SCHEMA_VERSION};
+use crate::{ConfigError, RecordingFormat, CONFIG_SCHEMA_VERSION};
+
+/// One setting a command writes into the user's file, and why a file created for it exists.
+struct Setting {
+    section: &'static str,
+    key: &'static str,
+    value: Value,
+    /// Completes "Created by Captastic when ..." in a file written for this setting alone.
+    created_when: &'static str,
+}
 
 /// What a configuration file created for a single setting starts as.
 ///
 /// Reached when the default profile has never been written and the user turns file output on from
 /// the notification area. Everything absent stays at its default, which is what the comment says
 /// so the next reader of a two-line configuration is not left guessing.
-fn new_document(enabled: bool) -> String {
+fn new_document(setting: &Setting) -> String {
     format!(
-        "# Created by Captastic when \"Save Captures to Disk\" was switched on from the\n\
-         # notification area. Every setting not named here keeps its default; see\n\
+        "# Created by Captastic when {}. Every setting not named here keeps its default; see\n\
          # captastic.example.toml for the full list.\n\
          schema_version = {CONFIG_SCHEMA_VERSION}\n\
          \n\
-         [output]\n\
-         enabled = {enabled}\n"
+         [{}]\n\
+         {} = {}\n",
+        setting.created_when,
+        setting.section,
+        setting.key,
+        setting.value.to_string().trim(),
     )
 }
 
@@ -49,6 +61,47 @@ fn new_document(enabled: bool) -> String {
 /// neither does the user's text editor — so "it was not there a moment ago" is not a licence to
 /// replace whatever is there now.
 pub fn set_output_enabled(path: &Path, enabled: bool) -> Result<(), ConfigError> {
+    set_setting(
+        path,
+        &Setting {
+            section: "output",
+            key: "enabled",
+            value: Value::from(enabled),
+            created_when: "\"Save Captures to Disk\" was switched on from the\n# notification area",
+        },
+    )
+}
+
+/// Sets `recording.format` in the configuration at `path`, preserving everything else in the
+/// file, exactly as [`set_output_enabled`] does for its setting: the overlay's **Record As** row
+/// is a choice the user expects to keep.
+pub fn set_recording_format(path: &Path, format: RecordingFormat) -> Result<(), ConfigError> {
+    set_setting(
+        path,
+        &Setting {
+            section: "recording",
+            key: "format",
+            value: Value::from(format.extension()),
+            created_when: "\"Record As\" was changed in the overlay's\n# Options menu",
+        },
+    )
+}
+
+/// Sets `recording.review` in the configuration at `path`, preserving everything else in the
+/// file, as the notification area's **Review Recordings** switch is flipped.
+pub fn set_recording_review(path: &Path, review: bool) -> Result<(), ConfigError> {
+    set_setting(
+        path,
+        &Setting {
+            section: "recording",
+            key: "review",
+            value: Value::from(review),
+            created_when: "\"Review Recordings\" was switched from the\n# notification area",
+        },
+    )
+}
+
+fn set_setting(path: &Path, setting: &Setting) -> Result<(), ConfigError> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
@@ -80,7 +133,7 @@ pub fn set_output_enabled(path: &Path, enabled: bool) -> Result<(), ConfigError>
         let Some(text) = existing else {
             // Created, not replaced: between the read above and this write, anything may have put
             // a configuration there, and replacing it would destroy a file this call never read.
-            match atomic_write(path, new_document(enabled).as_bytes(), finalize_new) {
+            match atomic_write(path, new_document(setting).as_bytes(), finalize_new) {
                 Ok(()) => return Ok(()),
                 Err(source) if source.kind() == ErrorKind::AlreadyExists && attempt == 0 => {
                     continue
@@ -94,7 +147,7 @@ pub fn set_output_enabled(path: &Path, enabled: bool) -> Result<(), ConfigError>
             }
         };
         let mut document = text.parse::<Document>()?;
-        set_enabled(&mut document, enabled)?;
+        set_key(&mut document, setting)?;
         return atomic_write(path, document.to_string().as_bytes(), replace_file).map_err(
             |source| ConfigError::Write {
                 path: path.display().to_string(),
@@ -111,11 +164,11 @@ pub fn set_output_enabled(path: &Path, enabled: bool) -> Result<(), ConfigError>
     })
 }
 
-/// Writes the key into `[output]`, creating the table if the file has never mentioned it.
-fn set_enabled(document: &mut Document, enabled: bool) -> Result<(), ConfigError> {
+/// Writes the setting into its table, creating the table if the file has never mentioned it.
+fn set_key(document: &mut Document, setting: &Setting) -> Result<(), ConfigError> {
     let output = document
         .as_table_mut()
-        .entry("output")
+        .entry(setting.section)
         .or_insert_with(|| Item::Table(Table::new()));
     // A table Captastic just created would otherwise be written without its `[output]` header,
     // leaving the key at the top level where the strict parser rejects it as unknown.
@@ -127,17 +180,18 @@ fn set_enabled(document: &mut Document, enabled: bool) -> Result<(), ConfigError
     let type_name = output.type_name();
     let table = output.as_table_like_mut().ok_or_else(|| {
         ConfigError::InvalidValue(format!(
-            "output must be a table to hold output.enabled, not {type_name}"
+            "{} must be a table to hold {}.{}, not {type_name}",
+            setting.section, setting.section, setting.key
         ))
     })?;
     // Assigned through the existing entry where there is one, rather than inserted over it:
     // inserting replaces the key as well as the value, and a comment the user wrote above
     // `enabled` is attached to that key. Replacing it would delete their note as the price of
     // flipping their setting.
-    match table.get_mut("enabled") {
-        Some(existing) => *existing = value(enabled),
+    match table.get_mut(setting.key) {
+        Some(existing) => *existing = value(setting.value.clone()),
         None => {
-            table.insert("enabled", value(enabled));
+            table.insert(setting.key, value(setting.value.clone()));
         }
     }
     Ok(())
@@ -157,6 +211,55 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory).expect("create test directory");
         directory
+    }
+
+    #[test]
+    fn the_recording_format_is_written_into_its_own_section_beside_everything_else() {
+        let directory = temporary_directory("recording-format");
+        let path = directory.join("captastic.toml");
+        fs::write(&path, "schema_version = 1\n\n[output]\nenabled = true\n").expect("seed");
+        set_recording_format(&path, RecordingFormat::Mp4).expect("set mp4");
+        let updated = fs::read_to_string(&path).expect("read back");
+        assert!(updated.contains("[recording]"), "{updated}");
+        assert!(updated.contains("format = \"mp4\""), "{updated}");
+        assert!(updated.contains("enabled = true"), "{updated}");
+        let config: crate::AppConfig =
+            toml::from_str(&updated).expect("still a valid configuration");
+        assert_eq!(config.recording.format, RecordingFormat::Mp4);
+        set_recording_format(&path, RecordingFormat::Gif).expect("set gif");
+        let config: crate::AppConfig =
+            toml::from_str(&fs::read_to_string(&path).expect("read")).expect("valid");
+        assert_eq!(config.recording.format, RecordingFormat::Gif);
+        // And a file created for this setting alone is a valid configuration too.
+        let fresh = directory.join("fresh.toml");
+        set_recording_format(&fresh, RecordingFormat::Mp4).expect("create");
+        let text = fs::read_to_string(&fresh).expect("read");
+        let config: crate::AppConfig = toml::from_str(&text).expect("valid");
+        assert_eq!(config.recording.format, RecordingFormat::Mp4);
+        assert!(text.contains("Record As"), "{text}");
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn the_review_switch_is_written_beside_the_recording_format() {
+        let directory = temporary_directory("recording-review");
+        let path = directory.join("captastic.toml");
+        fs::write(
+            &path,
+            "schema_version = 1\n\n[recording]\nformat = \"mp4\"\n",
+        )
+        .expect("seed");
+        set_recording_review(&path, false).expect("turn review off");
+        let config: crate::AppConfig =
+            toml::from_str(&fs::read_to_string(&path).expect("read")).expect("valid");
+        assert!(!config.recording.review);
+        assert_eq!(config.recording.format, RecordingFormat::Mp4);
+        let fresh = directory.join("fresh.toml");
+        set_recording_review(&fresh, false).expect("create");
+        let config: crate::AppConfig =
+            toml::from_str(&fs::read_to_string(&fresh).expect("read")).expect("valid");
+        assert!(!config.recording.review);
+        let _ = fs::remove_dir_all(&directory);
     }
 
     #[test]

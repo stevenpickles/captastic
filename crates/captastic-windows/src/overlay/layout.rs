@@ -1,10 +1,10 @@
 use windows::Win32::Foundation::POINT;
 
-const TOOLBAR_WIDTH: i32 = 514;
+const TOOLBAR_WIDTH: i32 = 558;
 const TOOLBAR_HEIGHT: i32 = 56;
 const TOOLBAR_BOTTOM_MARGIN: i32 = 24;
 const MENU_WIDTH: i32 = 248;
-const MENU_HEIGHT: i32 = 292;
+const MENU_HEIGHT: i32 = 332;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ToolbarControl {
@@ -15,6 +15,7 @@ pub(super) enum ToolbarControl {
     Options,
     Pin,
     Edit,
+    Record,
     Capture,
     DimBackground,
     SnapToWindows,
@@ -22,6 +23,7 @@ pub(super) enum ToolbarControl {
     PreviewView,
     ClipboardDestination,
     FileOutputDestination,
+    RecordFormat,
     Cancel,
 }
 
@@ -461,6 +463,7 @@ pub(super) struct ToolbarLayout {
     pub(super) options: UiRect,
     pub(super) pin: UiRect,
     pub(super) edit: UiRect,
+    pub(super) record: UiRect,
     pub(super) capture: UiRect,
     pub(super) menu: UiRect,
     pub(super) dim_background: UiRect,
@@ -469,6 +472,7 @@ pub(super) struct ToolbarLayout {
     pub(super) preview_view: UiRect,
     pub(super) clipboard_destination: UiRect,
     pub(super) file_output_destination: UiRect,
+    pub(super) record_format: UiRect,
     pub(super) cancel: UiRect,
 }
 
@@ -557,10 +561,16 @@ impl ToolbarLayout {
             right: left + metrics.px(380),
             bottom: control_bottom,
         };
-        let capture = UiRect {
-            left: left + metrics.px(388),
+        let record = UiRect {
+            left: left + metrics.px(380),
             top: control_top,
-            right: left + metrics.px(508),
+            right: left + metrics.px(424),
+            bottom: control_bottom,
+        };
+        let capture = UiRect {
+            left: left + metrics.px(432),
+            top: control_top,
+            right: left + metrics.px(552),
             bottom: control_bottom,
         };
 
@@ -607,6 +617,7 @@ impl ToolbarLayout {
             options,
             pin,
             edit,
+            record,
             capture,
             dim_background: UiRect {
                 left: row_left,
@@ -644,11 +655,17 @@ impl ToolbarLayout {
                 right: row_right,
                 bottom: menu.top + metrics.px(246),
             },
-            cancel: UiRect {
+            record_format: UiRect {
                 left: row_left,
                 top: menu.top + metrics.px(246),
                 right: row_right,
                 bottom: menu.top + metrics.px(286),
+            },
+            cancel: UiRect {
+                left: row_left,
+                top: menu.top + metrics.px(286),
+                right: row_right,
+                bottom: menu.top + metrics.px(326),
             },
             menu,
         }
@@ -674,6 +691,9 @@ impl ToolbarLayout {
             if self.file_output_destination.contains(point) {
                 return Some(ToolbarControl::FileOutputDestination);
             }
+            if self.record_format.contains(point) {
+                return Some(ToolbarControl::RecordFormat);
+            }
             if self.cancel.contains(point) {
                 return Some(ToolbarControl::Cancel);
             }
@@ -694,6 +714,8 @@ impl ToolbarLayout {
             Some(ToolbarControl::Pin)
         } else if self.edit.contains(point) {
             Some(ToolbarControl::Edit)
+        } else if self.record.contains(point) {
+            Some(ToolbarControl::Record)
         } else if self.capture.contains(point) {
             Some(ToolbarControl::Capture)
         } else {
@@ -1074,10 +1096,10 @@ mod tests {
     #[test]
     fn compact_toolbar_scales_at_supported_dpi_levels() {
         for (dpi, expected_width, expected_height, expected_menu) in [
-            (96, 514, 56, (248, 292)),
-            (120, 643, 70, (310, 365)),
-            (144, 771, 84, (372, 438)),
-            (192, 1028, 112, (496, 584)),
+            (96, 558, 56, (248, 332)),
+            (120, 698, 70, (310, 415)),
+            (144, 837, 84, (372, 498)),
+            (192, 1116, 112, (496, 664)),
         ] {
             let environment = DisplayEnvironment {
                 work_area: UiRect {
@@ -1107,6 +1129,7 @@ mod tests {
                 layout.preview_view,
                 layout.clipboard_destination,
                 layout.file_output_destination,
+                layout.record_format,
                 layout.cancel,
             ];
             for row in rows {

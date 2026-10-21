@@ -354,20 +354,49 @@ impl HistoryRecorder {
     }
 
     fn record(&self, job: &OutputJob, report: &WriteReport) {
+        self.remember(
+            captastic_config::HistoryEntry {
+                path: report.path.clone(),
+                captured_at_micros: captastic_config::HistoryEntry::micros_since_epoch(
+                    SystemTime::now(),
+                ),
+                bytes: report.bytes as u64,
+                width: job.frame.width(),
+                height: job.frame.height(),
+                display: job.frame.metadata.display_id.0.clone(),
+                mode: job.action.as_str().to_owned(),
+            },
+            job.capture_id,
+        );
+    }
+
+    /// Remembers a saved recording, as a capture is remembered, so the notification area's
+    /// history entries reach it (ADR 0011).
+    pub fn record_recording(&self, report: &crate::recording::RecordingReport, display: &str) {
+        self.remember(
+            captastic_config::HistoryEntry {
+                path: report.path.clone(),
+                captured_at_micros: captastic_config::HistoryEntry::micros_since_epoch(
+                    SystemTime::now(),
+                ),
+                bytes: report.bytes,
+                width: report.width,
+                height: report.height,
+                display: display.to_owned(),
+                mode: "recording".to_owned(),
+            },
+            captastic_core::CaptureId(0),
+        );
+    }
+
+    fn remember(
+        &self,
+        entry: captastic_config::HistoryEntry,
+        capture_id: captastic_core::CaptureId,
+    ) {
         if self.policy.max_items == 0 {
             return;
         }
-        let entry = captastic_config::HistoryEntry {
-            path: report.path.clone(),
-            captured_at_micros: captastic_config::HistoryEntry::micros_since_epoch(
-                SystemTime::now(),
-            ),
-            bytes: report.bytes as u64,
-            width: job.frame.width(),
-            height: job.frame.height(),
-            display: job.frame.metadata.display_id.0.clone(),
-            mode: job.action.as_str().to_owned(),
-        };
         match self.store.record(entry, self.policy, SystemTime::now()) {
             Ok(dropped) if !dropped.is_empty() => {
                 // Only the count: a path is the user's business and belongs in their history file,
@@ -378,7 +407,7 @@ impl HistoryRecorder {
             Err(error) => {
                 crate::logging::warn(format_args!(
                     "capture {} was written but could not be recorded in history: {error}",
-                    job.capture_id.0
+                    capture_id.0
                 ));
             }
         }

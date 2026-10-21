@@ -1,5 +1,5 @@
 //! The editor: a window that crops, redacts and marks up a capture before it is published
-//! (ADR 0010, Milestone 6 slices 2 and 3).
+//! (ADR 0010, Milestone 6 slices 2 to 4).
 //!
 //! Editors live on the `captastic-desktop-ui` thread beside the pins, any number at once. What
 //! they edit is a [`captastic_core::Edit`]; this module is the window around it. Nothing an editor
@@ -8,10 +8,12 @@
 //! Exactly one [`EditOutcome`] is reported for every editor, whichever way it ends.
 //!
 //! The capture is shown at its physical size when the window has room, and scaled down when it
-//! does not. Every mark - a redaction, a box, a pen, marker or highlighter stroke - is painted into
+//! does not. Every mark - a redaction, a box, an arrow, a pen, marker or highlighter stroke - is painted into
 //! the preview by the same code that paints the published image, so what is on screen is what will
 //! be sent. A mark being drawn is painted the same way as it grows, redrawing only the pixels it
-//! covers.
+//! covers, and so is text as it is typed.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use captastic_core::{
     paint_mark, CaptureError, Color, CpuFrame, Edit, FrameAlpha, Mark, PixelFormat, Rect,
@@ -26,28 +28,30 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::HiDpi::AdjustWindowRectExForDpi;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE, VK_RETURN,
+    TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ADD, VK_ESCAPE, VK_OEM_MINUS, VK_OEM_PLUS,
+    VK_RETURN, VK_SUBTRACT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, LoadCursorW, MessageBoxW,
     SetCursor, SetForegroundWindow, SetWindowPos, ShowWindow, HTCLIENT, IDC_ARROW, IDC_CROSS,
-    IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, IDYES, MB_ICONWARNING,
-    MB_YESNO, MINMAXINFO, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WM_CAPTURECHANGED, WM_CLOSE,
-    WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SIZE, WS_EX_APPWINDOW,
-    WS_OVERLAPPEDWINDOW,
+    IDC_IBEAM, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, IDYES,
+    MB_ICONWARNING, MB_YESNO, MINMAXINFO, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WM_CAPTURECHANGED,
+    WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SIZE,
+    WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
 };
 
 use super::desktop_ui::{desktop_error, forget_window, release_window_state, window_state};
 use super::layout::{UiMetrics, UiRect};
 use super::raster::{
-    draw_edit_icon, draw_ellipse, draw_filled_ellipse, draw_lines, draw_outline_rect,
-    draw_round_box, draw_surface_to_rect, draw_text, fill_device_rect, measure_ui_text, rgb,
-    TextAlignment,
+    draw_lines, draw_outline_rect, draw_round_box, draw_surface_to_rect, draw_text,
+    fill_device_rect, measure_ui_text, rgb, TextAlignment,
 };
 use super::shell::{
     capture_pointer, modifiers, query_display_environment, release_pointer_capture, FrozenSurface,
 };
+use super::text_mark::{layout_text, TextLayout};
+use super::vector::{bgr, Bgr, Diagonal, Painter};
 
 pub(super) const EDITOR_CLASS_NAME: PCWSTR = w!("CaptasticEditor-v1");
 const EDITOR_WINDOW_NAME: PCWSTR = w!("Edit capture - Captastic");
@@ -75,9 +79,24 @@ const DRAG_THRESHOLD_DIP: i32 = 3;
 /// How far, in capture pixels, the pointer must move before a stroke takes another point.
 const STROKE_STEP: f32 = 0.75;
 /// Wide enough for every button and swatch at every scaling.
-const MINIMUM_CLIENT_DIP: (i32, i32) = (760, 320);
+const MINIMUM_CLIENT_DIP: (i32, i32) = (928, 320);
 /// How far a box's corners are rounded: enough to soften them, not enough to read as a pill.
 const BOX_RADIUS_DIP: f32 = 6.0;
+/// The sizes text can be, in device-independent pixels to the em, smallest first.
+const TEXT_SIZES_DIP: [i32; 5] = [14, 18, 24, 32, 48];
+/// Where in [`TEXT_SIZES_DIP`] text starts: large enough to stand out from what it annotates.
+const DEFAULT_TEXT_SIZE: usize = 2;
+/// The widths an arrow can be, in device-independent pixels, thinnest first.
+const ARROW_SIZES_DIP: [f32; 6] = [2.0, 3.0, 4.0, 6.0, 8.0, 12.0];
+const DEFAULT_ARROW_SIZE: usize = 2;
+/// What the last editor was left with, for the next one Captastic opens: the colour, as an index
+/// into [`PALETTE`], and the arrow and text sizes, as indexes into theirs. Editors all live on the
+/// one desktop UI thread; atomics only make the statics safe to share.
+static REMEMBERED_COLOUR: AtomicUsize = AtomicUsize::new(RED);
+static REMEMBERED_ARROW_SIZE: AtomicUsize = AtomicUsize::new(DEFAULT_ARROW_SIZE);
+static REMEMBERED_TEXT_SIZE: AtomicUsize = AtomicUsize::new(DEFAULT_TEXT_SIZE);
+/// The most one piece of text holds, in bytes, so a held key cannot grow it without end.
+const MAXIMUM_TEXT_BYTES: usize = 4096;
 /// The share of the display's work area a new editor may take.
 const MAXIMUM_WORK_AREA_SHARE: f64 = 0.9;
 
@@ -97,7 +116,6 @@ const PALETTE: [(&str, Color); 7] = [
     ("White", Color::rgb(255, 255, 255)),
 ];
 const RED: usize = 0;
-const YELLOW: usize = 1;
 
 /// How an editor ended. Reported exactly once per editor.
 #[derive(Debug)]
@@ -121,30 +139,28 @@ enum EditorTool {
     Crop,
     Redact,
     Box,
+    Arrow,
+    Text,
     Pen,
     Marker,
     Highlighter,
 }
 
 impl EditorTool {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 8] = [
         Self::Crop,
         Self::Redact,
         Self::Box,
+        Self::Arrow,
+        Self::Text,
         Self::Pen,
         Self::Marker,
         Self::Highlighter,
     ];
 
-    /// Which of the drawing tools' remembered colours this tool uses, if it draws in colour.
-    const fn colour_slot(self) -> Option<usize> {
-        match self {
-            Self::Crop | Self::Redact => None,
-            Self::Box => Some(0),
-            Self::Pen => Some(1),
-            Self::Marker => Some(2),
-            Self::Highlighter => Some(3),
-        }
+    /// Whether the tool draws in the colour in hand.
+    const fn draws(self) -> bool {
+        !matches!(self, Self::Crop | Self::Redact)
     }
 
     /// How wide the tool draws, in device-independent pixels of the display the capture came
@@ -152,10 +168,10 @@ impl EditorTool {
     const fn width_dip(self) -> f32 {
         match self {
             Self::Pen => 3.0,
-            Self::Box => 4.0,
+            Self::Box | Self::Arrow => 4.0,
             Self::Marker => 10.0,
             Self::Highlighter => 22.0,
-            Self::Crop | Self::Redact => 0.0,
+            Self::Crop | Self::Redact | Self::Text => 0.0,
         }
     }
 
@@ -164,6 +180,8 @@ impl EditorTool {
             Self::Crop => "Crop (C)",
             Self::Redact => "Redact (R)",
             Self::Box => "Box (B)",
+            Self::Arrow => "Arrow (A)",
+            Self::Text => "Text (T)",
             Self::Pen => "Pen (P)",
             Self::Marker => "Marker (M)",
             Self::Highlighter => "Highlighter (H)",
@@ -176,6 +194,10 @@ enum EditorButton {
     Tool(EditorTool),
     /// A colour in [`PALETTE`], by index.
     Swatch(usize),
+    /// Thinner arrows or smaller text.
+    Smaller,
+    /// Thicker arrows or larger text.
+    Larger,
     Undo,
     Redo,
     Cancel,
@@ -187,6 +209,8 @@ impl EditorButton {
         match self {
             Self::Tool(tool) => Some(tool.tooltip().to_owned()),
             Self::Swatch(index) => Some(format!("{} ({})", PALETTE[index].0, index + 1)),
+            Self::Smaller => Some("Smaller arrow or text (Ctrl+Minus)".to_owned()),
+            Self::Larger => Some("Larger arrow or text (Ctrl+Plus)".to_owned()),
             Self::Undo => Some("Undo (Ctrl+Z)".to_owned()),
             Self::Redo => Some("Redo (Ctrl+Y)".to_owned()),
             Self::Cancel | Self::Done => None,
@@ -254,6 +278,12 @@ impl EditorLayout {
                 if last { GROUP_GAP_DIP } else { SWATCH_GAP_DIP },
             );
         }
+        place(
+            EditorButton::Smaller,
+            ICON_BUTTON_WIDTH_DIP,
+            ICON_BUTTON_GAP_DIP,
+        );
+        place(EditorButton::Larger, ICON_BUTTON_WIDTH_DIP, GROUP_GAP_DIP);
         place(
             EditorButton::Undo,
             ICON_BUTTON_WIDTH_DIP,
@@ -352,7 +382,7 @@ impl EditorLayout {
 
 /// The capture pixels spanned by a drag between two fractional pixel positions: every pixel the
 /// drag touches, so a drag over a single pixel covers it.
-fn rect_between(a: (f64, f64), b: (f64, f64)) -> Option<Rect> {
+pub(super) fn rect_between(a: (f64, f64), b: (f64, f64)) -> Option<Rect> {
     Rect::from_edges(
         a.0.min(b.0).floor() as i64,
         a.1.min(b.1).floor() as i64,
@@ -363,7 +393,7 @@ fn rect_between(a: (f64, f64), b: (f64, f64)) -> Option<Rect> {
 
 /// What a press on the crop takes hold of.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Grip {
+pub(super) enum Grip {
     Move,
     Resize {
         left: bool,
@@ -376,7 +406,7 @@ enum Grip {
 /// The part of the crop, drawn at `crop`, under `point`. Edges and corners win over the inside,
 /// and an uncropped capture's inside is not offered for moving: dragging there draws a new crop,
 /// which is what someone starting to crop means.
-fn grip_at(crop: UiRect, point: POINT, tolerance: i32, cropped: bool) -> Option<Grip> {
+pub(super) fn grip_at(crop: UiRect, point: POINT, tolerance: i32, cropped: bool) -> Option<Grip> {
     let within_x = point.x >= crop.left - tolerance && point.x <= crop.right + tolerance;
     let within_y = point.y >= crop.top - tolerance && point.y <= crop.bottom + tolerance;
     if !within_x || !within_y {
@@ -407,7 +437,7 @@ fn grip_at(crop: UiRect, point: POINT, tolerance: i32, cropped: bool) -> Option<
 
 /// The crop `start` after its grip has been dragged by `(dx, dy)` capture pixels, kept within
 /// `bounds` and at least one pixel in each direction.
-fn adjust_crop(start: Rect, grip: Grip, dx: i64, dy: i64, bounds: Rect) -> Rect {
+pub(super) fn adjust_crop(start: Rect, grip: Grip, dx: i64, dy: i64, bounds: Rect) -> Rect {
     match grip {
         Grip::Move => Rect {
             x: (i64::from(start.x) + dx).clamp(0, i64::from(bounds.width) - i64::from(start.width))
@@ -447,7 +477,7 @@ fn adjust_crop(start: Rect, grip: Grip, dx: i64, dy: i64, bounds: Rect) -> Rect 
 
 /// Darkens every pixel of `area` outside `keep`, in a tightly packed BGRA buffer `width` pixels
 /// wide, so the crop reads as what will be kept.
-fn dim_outside(pixels: &mut [u8], width: usize, area: UiRect, keep: UiRect) {
+pub(super) fn dim_outside(pixels: &mut [u8], width: usize, area: UiRect, keep: UiRect) {
     let height = pixels.len() / (width * 4).max(1);
     let clamp_x = |value: i32| value.clamp(0, width as i32) as usize;
     let clamp_y = |value: i32| value.clamp(0, height as i32) as usize;
@@ -512,7 +542,7 @@ fn compose_preview(source: &CpuFrame, marks: &[Mark]) -> Vec<u8> {
 /// A press on the canvas, and what it is doing.
 #[derive(Clone, Debug)]
 enum Drag {
-    /// Drawing a rectangle between two points: a redaction, a box, or a crop from scratch.
+    /// Drawing between two points: a redaction, a box, an arrow, or a crop from scratch.
     Draw {
         tool: EditorTool,
         anchor: POINT,
@@ -531,6 +561,65 @@ enum Drag {
         tool: EditorTool,
         points: Vec<(f32, f32)>,
     },
+    /// Moving one end of the arrow at `index` among the edit's marks.
+    ArrowEnd {
+        index: usize,
+        /// The point, rather than the tail.
+        tip: bool,
+        current: POINT,
+    },
+}
+
+/// Text being typed, not yet a mark: it is shown as the mark it would be, and becomes one on
+/// Enter, on a click elsewhere, or on any toolbar button but a colour.
+#[derive(Clone, Debug)]
+struct TextEntry {
+    /// The capture pixel clicked, where the first line starts and which it is centred on.
+    anchor: (f64, f64),
+    text: String,
+    /// The first half of a character from beyond the Basic Multilingual Plane, such as an emoji,
+    /// waiting for its second.
+    high_surrogate: Option<u16>,
+    layout: TextLayout,
+    /// Pixels to the em, in the capture.
+    size: i32,
+    color: Color,
+    /// The text mark this was opened from, which it replaces when finished.
+    replacing: Option<usize>,
+}
+
+impl TextEntry {
+    /// The first line's top-left, in capture pixels.
+    fn origin(&self) -> (i32, i32) {
+        (
+            self.anchor.0.round() as i32,
+            (self.anchor.1 - f64::from(self.layout.line_height) / 2.0).round() as i32,
+        )
+    }
+
+    fn mark(&self) -> Option<Mark> {
+        let mask = self.layout.mask.clone()?;
+        let (x, y) = self.origin();
+        Some(Mark::Text {
+            at: (x + self.layout.mask_offset.0, y + self.layout.mask_offset.1),
+            text: self.text.clone(),
+            size: self.size.max(1) as u32,
+            color: self.color,
+            mask,
+        })
+    }
+
+    /// Where the caret is, in capture pixels: one pixel wide and a line tall.
+    fn caret(&self) -> Rect {
+        let (x, y) = self.origin();
+        let (left, top, height) = self.layout.caret;
+        Rect {
+            x: x + left,
+            y: y + top,
+            width: 1,
+            height: height.max(1) as u32,
+        }
+    }
 }
 
 /// One editor's state, owned by its window.
@@ -546,10 +635,16 @@ struct EditorState {
     pending_dirty: Option<Rect>,
     back_buffer: Option<FrozenSurface>,
     tool: EditorTool,
-    /// The drawing tool a swatch applies to while Crop or Redact is chosen.
+    /// The drawing tool a swatch picks up while Crop or Redact is chosen.
     last_drawing_tool: EditorTool,
-    /// The palette index each drawing tool draws in, by [`EditorTool::colour_slot`].
-    colours: [usize; 4],
+    /// The palette index every drawing tool draws in.
+    colour_index: usize,
+    /// The text being typed, if any.
+    typing: Option<TextEntry>,
+    /// The size text is typed at, as an index into [`TEXT_SIZES_DIP`].
+    text_size: usize,
+    /// The width arrows are drawn at, as an index into [`ARROW_SIZES_DIP`].
+    arrow_size: usize,
     /// Capture pixels per device-independent pixel on the display the capture came from.
     stroke_unit: f32,
     drag: Option<Drag>,
@@ -588,33 +683,68 @@ impl EditorState {
         }
     }
 
-    /// The mark a drag in progress would make, if it ended here.
+    /// The mark a drag in progress would make, if it ended here, or the text being typed.
     fn pending_mark(&self) -> Option<Mark> {
-        match self.drag.as_ref()? {
+        let Some(drag) = self.drag.as_ref() else {
+            return self.typing.as_ref().and_then(TextEntry::mark);
+        };
+        match drag {
             Drag::Draw {
                 tool,
                 anchor,
                 current,
                 moved: true,
             } => {
-                let rect = rect_between(
+                let (from, to) = (
                     self.layout.image_point(*anchor),
                     self.layout.image_point(*current),
-                )?;
+                );
+                if *tool == EditorTool::Arrow {
+                    return Some(Mark::Arrow {
+                        from: (from.0 as f32, from.1 as f32),
+                        to: (to.0 as f32, to.1 as f32),
+                        color: self.colour(),
+                        width: self.width(*tool),
+                    });
+                }
+                let rect = rect_between(from, to)?;
                 match tool {
                     EditorTool::Redact => Some(Mark::Redaction(rect)),
                     EditorTool::Box => Some(Mark::Rectangle {
                         rect,
-                        color: self.colour(*tool),
+                        color: self.colour(),
                         width: self.width(*tool).round().max(1.0) as u32,
                         radius: BOX_RADIUS_DIP * self.stroke_unit,
                     }),
                     _ => None,
                 }
             }
+            Drag::ArrowEnd {
+                index,
+                tip,
+                current,
+            } => {
+                let Some(Mark::Arrow {
+                    from,
+                    to,
+                    color,
+                    width,
+                }) = self.edit.marks().get(*index)
+                else {
+                    return None;
+                };
+                let (x, y) = self.layout.image_point(*current);
+                let moved = (x as f32, y as f32);
+                Some(Mark::Arrow {
+                    from: if *tip { *from } else { moved },
+                    to: if *tip { moved } else { *to },
+                    color: *color,
+                    width: *width,
+                })
+            }
             Drag::Stroke { tool, points } => Some(Mark::Stroke {
                 points: points.clone(),
-                color: self.colour(*tool),
+                color: self.colour(),
                 width: self.width(*tool),
                 style: if *tool == EditorTool::Highlighter {
                     StrokeStyle::Highlighter
@@ -626,26 +756,49 @@ impl EditorState {
         }
     }
 
-    fn colour(&self, tool: EditorTool) -> Color {
-        let slot = tool.colour_slot().unwrap_or(0);
-        PALETTE[self.colours[slot]].1
+    fn colour(&self) -> Color {
+        PALETTE[self.colour_index].1
     }
 
     fn width(&self, tool: EditorTool) -> f32 {
-        (tool.width_dip() * self.stroke_unit).max(1.0)
+        let dip = if tool == EditorTool::Arrow {
+            ARROW_SIZES_DIP[self.arrow_size]
+        } else {
+            tool.width_dip()
+        };
+        (dip * self.stroke_unit).max(1.0)
     }
 
-    /// The drawing tool whose colour the swatches show and set.
-    fn colour_tool(&self) -> EditorTool {
-        if self.tool.colour_slot().is_some() {
-            self.tool
-        } else {
-            self.last_drawing_tool
-        }
+    /// Where a step of `step` would take the size of the tool in hand, if it has a size and the
+    /// step stays within its range.
+    fn stepped_size(&self, step: i32) -> Option<usize> {
+        let (current, count) = match self.tool {
+            EditorTool::Arrow => (self.arrow_size, ARROW_SIZES_DIP.len()),
+            EditorTool::Text => (self.text_size, TEXT_SIZES_DIP.len()),
+            _ => return None,
+        };
+        let next = current as i32 + step;
+        (0..count as i32).contains(&next).then_some(next as usize)
+    }
+
+    /// The size text is typed at, in capture pixels to the em.
+    fn text_pixels(&self) -> i32 {
+        ((TEXT_SIZES_DIP[self.text_size] as f32 * self.stroke_unit).round() as i32).max(1)
+    }
+
+    /// Whether there is anything to lose: an edit made, or text typed and not yet committed.
+    fn has_changes(&self) -> bool {
+        self.edit.is_modified()
+            || self
+                .typing
+                .as_ref()
+                .is_some_and(|entry| !entry.text.is_empty())
     }
 
     fn button_enabled(&self, button: EditorButton) -> bool {
         match button {
+            EditorButton::Smaller => self.stepped_size(-1).is_some(),
+            EditorButton::Larger => self.stepped_size(1).is_some(),
             EditorButton::Undo => self.edit.can_undo(),
             EditorButton::Redo => self.edit.can_redo(),
             _ => true,
@@ -654,19 +807,64 @@ impl EditorState {
 
     fn choose_tool(&mut self, tool: EditorTool) {
         self.tool = tool;
-        if tool.colour_slot().is_some() {
+        if tool.draws() {
             self.last_drawing_tool = tool;
         }
     }
 
-    /// A swatch sets the colour of the drawing tool in hand, or picks up the last one used, since
-    /// choosing a colour means meaning to draw.
+    /// A swatch sets the colour every drawing tool draws in, and recolours text being typed. With
+    /// Crop or Redact in hand it picks up the last drawing tool, since choosing a colour means
+    /// meaning to draw.
     fn choose_colour(&mut self, index: usize) {
-        let tool = self.colour_tool();
-        self.choose_tool(tool);
-        if let Some(slot) = tool.colour_slot() {
-            self.colours[slot] = index;
+        if !self.tool.draws() {
+            self.choose_tool(self.last_drawing_tool);
         }
+        self.colour_index = index;
+        REMEMBERED_COLOUR.store(index, Ordering::Relaxed);
+        if let Some(entry) = self.typing.as_mut() {
+            entry.color = PALETTE[index].1;
+        }
+    }
+
+    /// The end of an arrow under a client point, topmost first, and whether it is the point.
+    fn arrow_end_at(&self, point: POINT) -> Option<(usize, bool)> {
+        let reach = f64::from(self.metrics.px(GRIP_TOLERANCE_DIP));
+        let near = |end: (f32, f32)| {
+            let x = f64::from(self.layout.image.left) + f64::from(end.0) * self.layout.scale;
+            let y = f64::from(self.layout.image.top) + f64::from(end.1) * self.layout.scale;
+            (x - f64::from(point.x)).hypot(y - f64::from(point.y)) <= reach
+        };
+        self.edit
+            .marks()
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, mark)| match mark {
+                Mark::Arrow { to, .. } if near(*to) => Some((index, true)),
+                Mark::Arrow { from, .. } if near(*from) => Some((index, false)),
+                _ => None,
+            })
+    }
+
+    /// The text mark under a capture pixel, topmost first.
+    fn text_at(&self, at: (f64, f64)) -> Option<usize> {
+        let (x, y) = (at.0.floor() as i64, at.1.floor() as i64);
+        self.edit
+            .marks()
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, mark)| {
+                let bounds = match mark {
+                    Mark::Text { .. } => mark.bounds()?,
+                    _ => return None,
+                };
+                let inside = x >= i64::from(bounds.x)
+                    && x < bounds.right()
+                    && y >= i64::from(bounds.y)
+                    && y < bounds.bottom();
+                inside.then_some(index)
+            })
     }
 }
 
@@ -762,8 +960,17 @@ fn open_editor(
         back_buffer: None,
         tool: EditorTool::Crop,
         last_drawing_tool: EditorTool::Pen,
-        // Red ink for the box, pen and marker; a highlighter is yellow.
-        colours: [RED, RED, RED, YELLOW],
+        // Red ink for the box, pen, marker and arrow; a highlighter is yellow.
+        colour_index: REMEMBERED_COLOUR
+            .load(Ordering::Relaxed)
+            .min(PALETTE.len() - 1),
+        arrow_size: REMEMBERED_ARROW_SIZE
+            .load(Ordering::Relaxed)
+            .min(ARROW_SIZES_DIP.len() - 1),
+        typing: None,
+        text_size: REMEMBERED_TEXT_SIZE
+            .load(Ordering::Relaxed)
+            .min(TEXT_SIZES_DIP.len() - 1),
         stroke_unit: metrics.dpi as f32 / UiMetrics::BASE_DPI as f32,
         drag: None,
         pressed: None,
@@ -897,7 +1104,7 @@ pub(super) unsafe extern "system" fn editor_window_proc(
         WM_CAPTURECHANGED => {
             // SAFETY: As above. Losing the pointer mid-drag abandons the drag.
             let state = unsafe { &mut *state_pointer };
-            let dropped = state.drag.take().is_some();
+            let dropped = abandon_drag(state);
             if dropped || state.pressed.take().is_some() {
                 show_pending(state);
                 invalidate(hwnd);
@@ -906,6 +1113,11 @@ pub(super) unsafe extern "system" fn editor_window_proc(
         }
         WM_KEYDOWN => {
             key_pressed(hwnd, state_pointer, wparam.0 as u16);
+            LRESULT(0)
+        }
+        WM_CHAR => {
+            // SAFETY: As above.
+            char_typed(hwnd, unsafe { &mut *state_pointer }, wparam.0 as u16);
             LRESULT(0)
         }
         WM_CLOSE => {
@@ -975,6 +1187,7 @@ fn set_cursor(hwnd: HWND, state: &EditorState) {
     } else {
         match &state.drag {
             Some(Drag::Crop { grip, .. }) => grip_cursor(*grip),
+            Some(Drag::ArrowEnd { .. }) => IDC_SIZEALL,
             Some(_) => IDC_CROSS,
             None => match state.tool {
                 EditorTool::Crop => grip_at(
@@ -984,6 +1197,8 @@ fn set_cursor(hwnd: HWND, state: &EditorState) {
                     state.edit.crop() != state.edit.bounds(),
                 )
                 .map_or(IDC_CROSS, grip_cursor),
+                EditorTool::Text => IDC_IBEAM,
+                EditorTool::Arrow if state.arrow_end_at(point).is_some() => IDC_SIZEALL,
                 _ => IDC_CROSS,
             },
         }
@@ -995,7 +1210,7 @@ fn set_cursor(hwnd: HWND, state: &EditorState) {
     }
 }
 
-fn grip_cursor(grip: Grip) -> PCWSTR {
+pub(super) fn grip_cursor(grip: Grip) -> PCWSTR {
     match grip {
         Grip::Move => IDC_SIZEALL,
         Grip::Resize {
@@ -1040,7 +1255,7 @@ fn pointer_moved(hwnd: HWND, state: &mut EditorState, point: POINT) {
                 (point.x - anchor.x).abs() >= threshold || (point.y - anchor.y).abs() >= threshold;
             changed = true;
         }
-        Some(Drag::Crop { current, .. }) => {
+        Some(Drag::Crop { current, .. } | Drag::ArrowEnd { current, .. }) => {
             *current = point;
             changed = true;
         }
@@ -1066,6 +1281,11 @@ fn pointer_moved(hwnd: HWND, state: &mut EditorState, point: POINT) {
 
 fn pointer_pressed(hwnd: HWND, state: &mut EditorState, point: POINT) {
     if let Some(button) = state.layout.button_at(point) {
+        // A colour recolours the text being typed; anything else finishes it first, so Done
+        // publishes it and Undo takes it back.
+        if !matches!(button, EditorButton::Swatch(_)) {
+            commit_typing(state);
+        }
         if state.button_enabled(button) {
             state.pressed = Some(button);
             capture_pointer(hwnd);
@@ -1081,8 +1301,27 @@ fn pointer_pressed(hwnd: HWND, state: &mut EditorState, point: POINT) {
         current: point,
         moved: false,
     };
+    if state.tool == EditorTool::Arrow {
+        if let Some((index, tip)) = state.arrow_end_at(point) {
+            state.drag = Some(Drag::ArrowEnd {
+                index,
+                tip,
+                current: point,
+            });
+            leave_out_of_preview(state, index);
+            show_pending(state);
+            capture_pointer(hwnd);
+            invalidate(hwnd);
+            return;
+        }
+    }
     let drag = match state.tool {
-        EditorTool::Redact | EditorTool::Box => draw(state.tool),
+        EditorTool::Text => {
+            start_typing(state, state.layout.image_point(point));
+            invalidate(hwnd);
+            return;
+        }
+        EditorTool::Redact | EditorTool::Box | EditorTool::Arrow => draw(state.tool),
         EditorTool::Pen | EditorTool::Marker | EditorTool::Highlighter => {
             let (x, y) = state.layout.image_point(point);
             Drag::Stroke {
@@ -1123,7 +1362,13 @@ fn pointer_released(hwnd: HWND, state: &mut EditorState, point: POINT) -> Option
     let pressed = state.pressed.take();
     // Taken before releasing: the release sends WM_CAPTURECHANGED, which would abandon both.
     release_pointer_capture();
-    if drag.is_some() {
+    if let Some(Drag::ArrowEnd { index, .. }) = drag {
+        if let Some(mark) = mark {
+            state.edit.replace(index, Some(mark));
+        }
+        refresh_preview(state);
+        invalidate(hwnd);
+    } else if drag.is_some() {
         if let Some(crop) = crop {
             state.edit.set_crop(crop);
         }
@@ -1154,6 +1399,8 @@ fn press_button(hwnd: HWND, state_pointer: *mut EditorState, button: EditorButto
                     refresh_preview(state);
                 }
             }
+            EditorButton::Smaller => resize(state, -1),
+            EditorButton::Larger => resize(state, 1),
             EditorButton::Cancel | EditorButton::Done => {}
         }
     }
@@ -1175,6 +1422,8 @@ fn key_button(key: u16, ctrl: bool, shift: bool) -> Option<EditorButton> {
         (0x43, false) => tool(EditorTool::Crop),
         (0x52, false) => tool(EditorTool::Redact),
         (0x42, false) => tool(EditorTool::Box),
+        (0x41, false) => tool(EditorTool::Arrow),
+        (0x54, false) => tool(EditorTool::Text),
         (0x50, false) => tool(EditorTool::Pen),
         (0x4D, false) => tool(EditorTool::Marker),
         (0x48, false) => tool(EditorTool::Highlighter),
@@ -1185,13 +1434,50 @@ fn key_button(key: u16, ctrl: bool, shift: bool) -> Option<EditorButton> {
     }
 }
 
+/// Ctrl with plus or minus, on the main row or the number pad: a step up or down in text size.
+fn text_size_step(key: u16, ctrl: bool) -> Option<i32> {
+    if !ctrl {
+        None
+    } else if key == VK_OEM_PLUS.0 || key == VK_ADD.0 {
+        Some(1)
+    } else if key == VK_OEM_MINUS.0 || key == VK_SUBTRACT.0 {
+        Some(-1)
+    } else {
+        None
+    }
+}
+
 fn key_pressed(hwnd: HWND, state_pointer: *mut EditorState, key: u16) {
     let held = modifiers();
+    {
+        // SAFETY: The editor's state lives until WM_NCDESTROY on this thread; the borrow ends
+        // with this block.
+        let state = unsafe { &mut *state_pointer };
+        if let Some(step) = text_size_step(key, held.ctrl) {
+            if state.drag.is_none() {
+                resize(state, step);
+                invalidate(hwnd);
+            }
+            return;
+        }
+        if state.typing.is_some() {
+            // Keys type while text is open: none of them is a tool, a colour or a shortcut.
+            if key == VK_ESCAPE.0 {
+                discard_typing(state);
+            } else if key == VK_RETURN.0 && held.shift {
+                type_text(state, "\n");
+            } else if key == VK_RETURN.0 {
+                commit_typing(state);
+            }
+            invalidate(hwnd);
+            return;
+        }
+    }
     if key == VK_ESCAPE.0 {
         // SAFETY: The editor's state lives until WM_NCDESTROY on this thread; the borrow ends
         // before the cancel below.
         let state = unsafe { &mut *state_pointer };
-        if state.drag.take().is_some() {
+        if abandon_drag(state) {
             // Escape mid-drag drops the drag, not the edit.
             show_pending(state);
             release_pointer_capture();
@@ -1291,10 +1577,228 @@ fn show_pending(state: &mut EditorState) {
     }
 }
 
+/// Makes the tool in hand a step larger or smaller. Text being typed takes the new size, and so
+/// does an arrow when the last thing done was drawing or moving it, so what was just drawn can be
+/// adjusted without drawing it again.
+fn resize(state: &mut EditorState, step: i32) {
+    let Some(size) = state.stepped_size(step) else {
+        return;
+    };
+    match state.tool {
+        EditorTool::Text => {
+            state.text_size = size;
+            REMEMBERED_TEXT_SIZE.store(size, Ordering::Relaxed);
+            let pixels = state.text_pixels();
+            if let Some(entry) = state.typing.as_mut() {
+                entry.size = pixels;
+            }
+            retype(state);
+        }
+        EditorTool::Arrow => {
+            state.arrow_size = size;
+            REMEMBERED_ARROW_SIZE.store(size, Ordering::Relaxed);
+            let width = state.width(EditorTool::Arrow);
+            let last = state.edit.last_changed();
+            if let Some((
+                index,
+                Some(Mark::Arrow {
+                    from, to, color, ..
+                }),
+            )) = last.map(|index| (index, state.edit.marks().get(index).cloned()))
+            {
+                let thicker = Mark::Arrow {
+                    from,
+                    to,
+                    color,
+                    width,
+                };
+                if state.edit.replace(index, Some(thicker)) {
+                    refresh_preview(state);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Opens text at `at`, a capture pixel, finishing any text already open.
+///
+/// A click on text already there opens that text instead, with the caret at its end, to be
+/// edited where it is, in its own size and colour.
+fn start_typing(state: &mut EditorState, at: (f64, f64)) {
+    commit_typing(state);
+    if let Some(index) = state.text_at(at) {
+        if let Some(Mark::Text {
+            at,
+            text,
+            size,
+            color,
+            ..
+        }) = state.edit.marks().get(index).cloned()
+        {
+            match layout_text(&text, size as i32) {
+                Ok(layout) => {
+                    // The inverse of TextEntry::origin and TextEntry::mark.
+                    let origin = (at.0 - layout.mask_offset.0, at.1 - layout.mask_offset.1);
+                    state.typing = Some(TextEntry {
+                        anchor: (
+                            f64::from(origin.0),
+                            f64::from(origin.1) + f64::from(layout.line_height) / 2.0,
+                        ),
+                        text,
+                        high_surrogate: None,
+                        layout,
+                        size: size as i32,
+                        color,
+                        replacing: Some(index),
+                    });
+                    leave_out_of_preview(state, index);
+                    show_pending(state);
+                }
+                Err(error) => log::warn!("could not reopen text in the editor: {error}"),
+            }
+            return;
+        }
+    }
+    let size = state.text_pixels();
+    match layout_text("", size) {
+        Ok(layout) => {
+            state.typing = Some(TextEntry {
+                anchor: at,
+                text: String::new(),
+                high_surrogate: None,
+                layout,
+                size,
+                color: state.colour(),
+                replacing: None,
+            });
+        }
+        Err(error) => log::warn!("could not start typing in the editor: {error}"),
+    }
+}
+
+/// Makes the text being typed a mark, if it shows anything. Reopened text replaces the mark it
+/// came from, and text emptied out removes it.
+fn commit_typing(state: &mut EditorState) {
+    let Some(entry) = state.typing.take() else {
+        return;
+    };
+    let mark = entry.mark();
+    match entry.replacing {
+        Some(index) => {
+            state.edit.replace(index, mark);
+            refresh_preview(state);
+        }
+        None => {
+            if let Some(mark) = mark {
+                commit_mark(state, mark);
+            }
+            show_pending(state);
+        }
+    }
+}
+
+/// Throws away the text being typed; reopened text goes back to how it was.
+fn discard_typing(state: &mut EditorState) {
+    if let Some(entry) = state.typing.take() {
+        if entry.replacing.is_some() {
+            refresh_preview(state);
+        } else {
+            show_pending(state);
+        }
+    }
+}
+
+/// Drops the drag in progress, if any, putting back a mark it had taken out of the preview.
+/// Returns whether there was one.
+fn abandon_drag(state: &mut EditorState) -> bool {
+    match state.drag.take() {
+        Some(Drag::ArrowEnd { .. }) => {
+            refresh_preview(state);
+            true
+        }
+        Some(_) => true,
+        None => false,
+    }
+}
+
+/// Shows every committed mark but the one at `index`, which is being changed and is drawn as the
+/// pending mark meanwhile, over the others.
+fn leave_out_of_preview(state: &mut EditorState, index: usize) {
+    let others: Vec<Mark> = state
+        .edit
+        .marks()
+        .iter()
+        .enumerate()
+        .filter(|(at, _)| *at != index)
+        .map(|(_, mark)| mark.clone())
+        .collect();
+    state.committed = compose_preview(state.edit.source(), &others);
+    state.pending_dirty = None;
+    // SAFETY: Completes any queued GDI read of the preview before its pixels are replaced.
+    let _ = unsafe { GdiFlush() };
+    if let Err(error) = state.preview.write_pixels(&state.committed) {
+        log::warn!("could not redraw the editor's preview: {error}");
+    }
+}
+
+/// Lays the text being typed out again, after it or its size changed, and shows it.
+fn retype(state: &mut EditorState) {
+    if let Some(entry) = state.typing.as_mut() {
+        match layout_text(&entry.text, entry.size) {
+            Ok(layout) => entry.layout = layout,
+            Err(error) => log::warn!("could not lay out the editor's text: {error}"),
+        }
+    }
+    show_pending(state);
+}
+
+fn type_text(state: &mut EditorState, value: &str) {
+    if let Some(entry) = state.typing.as_mut() {
+        if entry.text.len() + value.len() <= MAXIMUM_TEXT_BYTES {
+            entry.text.push_str(value);
+        }
+    }
+    retype(state);
+}
+
+/// A character typed, one UTF-16 unit at a time, as WM_CHAR delivers it.
+fn char_typed(hwnd: HWND, state: &mut EditorState, unit: u16) {
+    let Some(entry) = state.typing.as_mut() else {
+        return;
+    };
+    match unit {
+        0x08 => {
+            entry.high_surrogate = None;
+            entry.text.pop();
+            retype(state);
+        }
+        0xD800..=0xDBFF => entry.high_surrogate = Some(unit),
+        0xDC00..=0xDFFF => {
+            let Some(high) = entry.high_surrogate.take() else {
+                return;
+            };
+            if let Some(Ok(character)) = char::decode_utf16([high, unit]).next() {
+                type_text(state, character.encode_utf8(&mut [0; 4]));
+            }
+        }
+        // Enter, Tab, Escape and Ctrl with a letter arrive as control characters: they are keys,
+        // handled as keys, not text.
+        _ if unit < 0x20 || unit == 0x7F => return,
+        _ => {
+            entry.high_surrogate = None;
+            if let Some(character) = char::from_u32(u32::from(unit)) {
+                type_text(state, character.encode_utf8(&mut [0; 4]));
+            }
+        }
+    }
+    invalidate(hwnd);
+}
+
 /// Cancels, after asking first when there are edits to lose.
 fn request_cancel(hwnd: HWND, state_pointer: *mut EditorState) {
     // SAFETY: The editor's state lives until WM_NCDESTROY on this thread; read and released.
-    let modified = unsafe { (*state_pointer).edit.is_modified() };
+    let modified = unsafe { (*state_pointer).has_changes() };
     if modified {
         // SAFETY: hwnd is this thread's live editor and both strings are static. The box runs a
         // modal loop; nothing in it can end this editor, since only it and shutdown close one,
@@ -1317,7 +1821,11 @@ fn request_cancel(hwnd: HWND, state_pointer: *mut EditorState) {
 fn finish_done(hwnd: HWND, state_pointer: *mut EditorState) {
     // SAFETY: The editor's state lives until WM_NCDESTROY on this thread; the borrow ends with
     // the render.
-    let rendered = unsafe { (*state_pointer).edit.render() };
+    let rendered = unsafe {
+        let state = &mut *state_pointer;
+        commit_typing(state);
+        state.edit.render()
+    };
     let outcome = match rendered {
         Ok(frame) => EditOutcome::Done(Box::new(frame)),
         Err(error) => EditOutcome::Failed(format!("the edited capture could not be made: {error}")),
@@ -1405,11 +1913,98 @@ fn compose(state: &EditorState, surface: &FrozenSurface) {
     if state.tool == EditorTool::Crop {
         draw_crop_handles(device, crop_on_screen, metrics, accent);
     }
+    if state.tool == EditorTool::Arrow {
+        draw_arrow_handles(device, state, accent);
+    }
+    if let Some(entry) = &state.typing {
+        // A frame around the text being typed, so it is plain which text is open.
+        let caret = entry.caret();
+        let extent = entry
+            .mark()
+            .and_then(|mark| mark.bounds())
+            .map_or(caret, |bounds| union(bounds, caret));
+        let frame = layout.client_rect(extent);
+        let margin = metrics.px(4);
+        draw_outline_rect(
+            device,
+            frame.left - margin,
+            frame.top - margin,
+            frame.right + margin,
+            frame.bottom + margin,
+            accent,
+            metrics.px(1).max(1),
+        );
+        draw_typing_hint(
+            device,
+            state,
+            UiRect {
+                left: frame.left - margin,
+                top: frame.top - margin,
+                right: frame.right + margin,
+                bottom: frame.bottom + margin,
+            },
+        );
+        let caret = layout.client_rect(caret);
+        let colour = entry.color;
+        fill_device_rect(
+            device,
+            native(UiRect {
+                right: caret.left + metrics.px(2).max(1),
+                bottom: caret.bottom.max(caret.top + 1),
+                ..caret
+            }),
+            rgb(colour.red, colour.green, colour.blue),
+        );
+    }
     draw_toolbar(device, state, crop);
+    paint_icons(state, surface);
     draw_tooltip(device, state);
 }
 
-fn draw_crop_handles(device: HDC, crop: UiRect, metrics: UiMetrics, accent: COLORREF) {
+/// A handle on each end of every arrow, so it is plain they can be taken hold of. The arrow
+/// being changed shows its ends where they are going.
+fn draw_arrow_handles(device: HDC, state: &EditorState, accent: COLORREF) {
+    let metrics = state.metrics;
+    let layout = &state.layout;
+    let half = metrics.px(HANDLE_SIZE_DIP) / 2;
+    let border = metrics.px(1).max(1);
+    let moving = match &state.drag {
+        Some(Drag::ArrowEnd { index, .. }) => Some(*index),
+        _ => None,
+    };
+    let pending = moving.and_then(|_| state.pending_mark());
+    let marks = state.edit.marks().iter().enumerate();
+    for (index, mark) in marks {
+        let shown = if moving == Some(index) {
+            pending.as_ref()
+        } else {
+            Some(mark)
+        };
+        let Some(Mark::Arrow { from, to, .. }) = shown else {
+            continue;
+        };
+        for end in [*from, *to] {
+            let x = layout.image.left + (f64::from(end.0) * layout.scale).round() as i32;
+            let y = layout.image.top + (f64::from(end.1) * layout.scale).round() as i32;
+            let outer = UiRect {
+                left: x - half,
+                top: y - half,
+                right: x + half,
+                bottom: y + half,
+            };
+            fill_device_rect(device, native(outer), accent);
+            let inner = UiRect {
+                left: outer.left + border,
+                top: outer.top + border,
+                right: outer.right - border,
+                bottom: outer.bottom - border,
+            };
+            fill_device_rect(device, native(inner), rgb(255, 255, 255));
+        }
+    }
+}
+
+pub(super) fn draw_crop_handles(device: HDC, crop: UiRect, metrics: UiMetrics, accent: COLORREF) {
     let half = metrics.px(HANDLE_SIZE_DIP) / 2;
     let border = metrics.px(1).max(1);
     let middle_x = (crop.left + crop.right) / 2;
@@ -1454,24 +2049,12 @@ fn draw_toolbar(device: HDC, state: &EditorState, crop: Rect) {
         }),
         rgb(60, 60, 65),
     );
-    let colour_tool = state.colour_tool();
-    let current_colour = colour_tool
-        .colour_slot()
-        .map(|slot| state.colours[slot])
-        .unwrap_or(RED);
     for (button, bounds) in &layout.buttons {
         let (button, bounds) = (*button, *bounds);
         let enabled = state.button_enabled(button);
         let hovered = enabled && state.hovered == Some(button);
-        if let EditorButton::Swatch(index) = button {
-            draw_swatch(
-                device,
-                bounds,
-                index,
-                index == current_colour,
-                hovered,
-                metrics,
-            );
+        if let EditorButton::Swatch(_) = button {
+            // Painted antialiased after GDI is done: see paint_icons.
             continue;
         }
         let selected = button == EditorButton::Tool(state.tool);
@@ -1494,6 +2077,8 @@ fn draw_toolbar(device: HDC, state: &EditorState, crop: Rect) {
             EditorButton::Tool(tool) => draw_tool_icon(device, bounds, tool, ink, metrics),
             EditorButton::Undo => draw_history_icon(device, bounds, false, ink, metrics),
             EditorButton::Redo => draw_history_icon(device, bounds, true, ink, metrics),
+            EditorButton::Smaller => draw_size_icon(device, bounds, false, ink, metrics),
+            EditorButton::Larger => draw_size_icon(device, bounds, true, ink, metrics),
             EditorButton::Cancel | EditorButton::Done => draw_text(
                 device,
                 bounds,
@@ -1521,53 +2106,260 @@ fn draw_toolbar(device: HDC, state: &EditorState, crop: Rect) {
     }
 }
 
-fn draw_swatch(
-    device: HDC,
+/// The toolbar's antialiased icons: the marker and highlighter, each showing the colour it draws
+/// in, and the colour swatches. Painted into the back buffer's pixels once GDI has finished with
+/// it, and before the tooltip, which may sit over them.
+fn paint_icons(state: &EditorState, surface: &FrozenSurface) {
+    // SAFETY: Completes every queued GDI draw before the pixels are touched directly.
+    let _ = unsafe { GdiFlush() };
+    // SAFETY: The surface's DIB holds exactly byte_length writable bytes, owned by this thread.
+    let pixels = unsafe { std::slice::from_raw_parts_mut(surface.bits, surface.byte_length) };
+    let mut painter = Painter::new(pixels, surface.width as usize);
+    let metrics = state.metrics;
+    let chosen_colour = Some(state.colour_index);
+    let ink = bgr(245, 245, 247);
+    for (button, bounds) in &state.layout.buttons {
+        let hovered = state.hovered == Some(*button);
+        match *button {
+            EditorButton::Swatch(index) => paint_swatch(
+                &mut painter,
+                *bounds,
+                index,
+                chosen_colour == Some(index),
+                hovered,
+                metrics,
+            ),
+            EditorButton::Tool(EditorTool::Pen) => paint_pen(
+                &mut painter,
+                *bounds,
+                ink,
+                colour_bgr(state.colour()),
+                metrics,
+            ),
+            EditorButton::Tool(EditorTool::Marker) => paint_marker(
+                &mut painter,
+                *bounds,
+                ink,
+                colour_bgr(state.colour()),
+                metrics,
+            ),
+            EditorButton::Tool(EditorTool::Highlighter) => paint_highlighter(
+                &mut painter,
+                *bounds,
+                ink,
+                colour_bgr(state.colour()),
+                metrics,
+            ),
+            EditorButton::Tool(EditorTool::Arrow) => {
+                paint_arrow(&mut painter, *bounds, ink, metrics)
+            }
+            EditorButton::Tool(EditorTool::Text) => {
+                paint_text_icon(&mut painter, *bounds, ink, metrics)
+            }
+            _ => {}
+        }
+    }
+}
+
+const fn colour_bgr(colour: Color) -> Bgr {
+    bgr(colour.red, colour.green, colour.blue)
+}
+
+fn icon_frame(bounds: UiRect, metrics: UiMetrics) -> (f32, f32, f32) {
+    let (left, top, size) = icon_box(bounds, metrics);
+    (left as f32, top as f32, size as f32)
+}
+
+/// A slim pen on the diagonal with a conical nib, its point in the colour it draws.
+fn paint_pen(painter: &mut Painter, bounds: UiRect, ink: Bgr, point: Bgr, metrics: UiMetrics) {
+    let (left, top, size) = icon_frame(bounds, metrics);
+    let pen = Diagonal::new(left, top, size, 0.06);
+    let half = 0.11;
+    // The nib: a cone in the body colour, its point in the ink.
+    painter.polygon(
+        &[pen.at(0.0, 0.0), pen.at(0.30, -half), pen.at(0.30, half)],
+        ink,
+        1.0,
+    );
+    painter.polygon(
+        &[pen.at(0.0, 0.0), pen.at(0.13, -0.05), pen.at(0.13, 0.05)],
+        point,
+        1.0,
+    );
+    painter.polygon(
+        &pen.quad([(0.30, -half), (0.38, -half), (0.38, half), (0.30, half)]),
+        bgr(160, 160, 166),
+        1.0,
+    );
+    painter.polygon(
+        &pen.quad([(0.38, -half), (0.86, -half), (0.86, half), (0.38, half)]),
+        ink,
+        1.0,
+    );
+    painter.capsule(pen.at(0.86, 0.0), pen.at(0.90, 0.0), half * size, ink, 1.0);
+}
+
+/// A chisel-tipped marker on the diagonal, its tip in the colour it draws.
+fn paint_marker(painter: &mut Painter, bounds: UiRect, ink: Bgr, tip: Bgr, metrics: UiMetrics) {
+    let (left, top, size) = icon_frame(bounds, metrics);
+    let pen = Diagonal::new(left, top, size, 0.06);
+    let half = 0.17;
+    // A rim of the body colour around the tip, so a black or dark tip still reads on the toolbar.
+    painter.polygon(
+        &pen.quad([(-0.03, -0.12), (0.30, -0.15), (0.30, 0.15), (0.12, 0.15)]),
+        ink,
+        1.0,
+    );
+    painter.polygon(
+        &pen.quad([(0.02, -0.08), (0.28, -0.11), (0.28, 0.11), (0.14, 0.11)]),
+        tip,
+        1.0,
+    );
+    // The collar, then the barrel with a rounded end.
+    painter.polygon(
+        &pen.quad([(0.28, -half), (0.38, -half), (0.38, half), (0.28, half)]),
+        bgr(160, 160, 166),
+        1.0,
+    );
+    painter.polygon(
+        &pen.quad([(0.38, -half), (0.80, -half), (0.80, half), (0.38, half)]),
+        ink,
+        1.0,
+    );
+    painter.capsule(pen.at(0.80, 0.0), pen.at(0.86, 0.0), half * size, ink, 1.0);
+    // A cap line across the barrel.
+    painter.polygon(
+        &pen.quad([(0.66, -half), (0.69, -half), (0.69, half), (0.66, half)]),
+        bgr(160, 160, 166),
+        1.0,
+    );
+}
+
+/// A broad highlighter laying down a translucent stroke of its colour.
+fn paint_highlighter(
+    painter: &mut Painter,
+    bounds: UiRect,
+    ink: Bgr,
+    colour: Bgr,
+    metrics: UiMetrics,
+) {
+    let (left, top, size) = icon_frame(bounds, metrics);
+    // The stroke it has drawn, across the bottom.
+    let stroke_y = top + size * 0.86;
+    painter.capsule(
+        (left + size * 0.08, stroke_y),
+        (left + size * 0.92, stroke_y),
+        size * 0.12,
+        colour,
+        0.7,
+    );
+    // The highlighter, its broad flat tip resting on the end of the stroke.
+    let pen = Diagonal::new(left + size * 0.12, top - size * 0.10, size, 0.10);
+    let half = 0.2;
+    painter.polygon(
+        &pen.quad([(0.0, -0.16), (0.22, -half), (0.22, half), (0.0, 0.16)]),
+        ink,
+        1.0,
+    );
+    painter.polygon(
+        &pen.quad([(0.03, -0.12), (0.20, -0.15), (0.20, 0.15), (0.03, 0.12)]),
+        colour,
+        1.0,
+    );
+    painter.polygon(
+        &pen.quad([(0.22, -half), (0.32, -half), (0.32, half), (0.22, half)]),
+        bgr(160, 160, 166),
+        1.0,
+    );
+    painter.polygon(
+        &pen.quad([(0.32, -half), (0.76, -half), (0.76, half), (0.32, half)]),
+        ink,
+        1.0,
+    );
+    painter.capsule(pen.at(0.76, 0.0), pen.at(0.80, 0.0), half * size, ink, 1.0);
+}
+
+/// An arrow on the diagonal, pointing up and to the right.
+fn paint_arrow(painter: &mut Painter, bounds: UiRect, ink: Bgr, metrics: UiMetrics) {
+    let (left, top, size) = icon_frame(bounds, metrics);
+    let line = metrics.toolbar_tokens().icon_stroke as f32;
+    let tip = (left + size * 0.9, top + size * 0.1);
+    let base = (left + size * 0.58, top + size * 0.42);
+    painter.capsule(
+        (left + size * 0.12, top + size * 0.88),
+        base,
+        line * 0.75,
+        ink,
+        1.0,
+    );
+    // The head: its point at the tip, its base square to the shaft.
+    let spread = size * 0.2 * std::f32::consts::FRAC_1_SQRT_2;
+    painter.polygon(
+        &[
+            tip,
+            (base.0 - spread, base.1 - spread),
+            (base.0 + spread, base.1 + spread),
+        ],
+        ink,
+        1.0,
+    );
+}
+
+/// A capital T.
+fn paint_text_icon(painter: &mut Painter, bounds: UiRect, ink: Bgr, metrics: UiMetrics) {
+    let (left, top, size) = icon_frame(bounds, metrics);
+    let line = metrics.toolbar_tokens().icon_stroke as f32 * 1.25;
+    let (bar_top, bar_left, bar_right) =
+        (top + size * 0.12, left + size * 0.14, left + size * 0.86);
+    painter.polygon(
+        &[
+            (bar_left, bar_top),
+            (bar_right, bar_top),
+            (bar_right, bar_top + line),
+            (bar_left, bar_top + line),
+        ],
+        ink,
+        1.0,
+    );
+    let middle = left + size / 2.0;
+    painter.polygon(
+        &[
+            (middle - line / 2.0, bar_top),
+            (middle + line / 2.0, bar_top),
+            (middle + line / 2.0, top + size * 0.9),
+            (middle - line / 2.0, top + size * 0.9),
+        ],
+        ink,
+        1.0,
+    );
+}
+
+/// A colour swatch: a disc with a quiet rim, so black and white both read on the toolbar, and a
+/// ring when it is the colour in use or under the pointer.
+fn paint_swatch(
+    painter: &mut Painter,
     bounds: UiRect,
     index: usize,
     chosen: bool,
     hovered: bool,
     metrics: UiMetrics,
 ) {
-    let colour = PALETTE[index].1;
-    let radius = metrics.px(SWATCH_DIAMETER_DIP) / 2;
-    let (x, y) = (
-        (bounds.left + bounds.right) / 2,
-        (bounds.top + bounds.bottom) / 2,
+    let colour = colour_bgr(PALETTE[index].1);
+    let centre = (
+        (bounds.left + bounds.right) as f32 / 2.0,
+        (bounds.top + bounds.bottom) as f32 / 2.0,
     );
-    draw_filled_ellipse(
-        device,
-        x - radius,
-        y - radius,
-        x + radius,
-        y + radius,
-        rgb(colour.red, colour.green, colour.blue),
-    );
-    // A thin rim so black reads against the toolbar and white against nothing at all.
-    draw_ellipse(
-        device,
-        x - radius,
-        y - radius,
-        x + radius,
-        y + radius,
-        rgb(120, 120, 126),
-        1,
-    );
+    let radius = metrics.px(SWATCH_DIAMETER_DIP) as f32 / 2.0;
+    let line = (metrics.dpi as f32 / UiMetrics::BASE_DPI as f32).max(1.0);
+    painter.circle(centre, radius, colour, 1.0);
+    painter.ring(centre, radius, line, bgr(130, 130, 136), 0.9);
     if chosen || hovered {
-        let ring = radius + metrics.px(3);
-        draw_ellipse(
-            device,
-            x - ring,
-            y - ring,
-            x + ring,
-            y + ring,
-            if chosen {
-                rgb(245, 245, 247)
-            } else {
-                rgb(140, 140, 146)
-            },
-            metrics.px(2).max(1),
-        );
+        let ring = if chosen {
+            bgr(245, 245, 247)
+        } else {
+            bgr(140, 140, 146)
+        };
+        painter.ring(centre, radius + line * 3.5, line * 2.0, ring, 1.0);
     }
 }
 
@@ -1646,38 +2438,34 @@ fn draw_tool_icon(
                 stroke,
             );
         }
-        EditorTool::Pen => draw_edit_icon(device, bounds, ink, metrics),
-        EditorTool::Marker => {
-            draw_lines(
-                device,
-                &[
-                    (left + quarter / 2, bottom - quarter / 2),
-                    (right - quarter / 2, top + quarter / 2),
-                ],
-                ink,
-                (stroke * 3).max(3),
-            );
-        }
-        EditorTool::Highlighter => {
-            let colour = PALETTE[YELLOW].1;
-            fill_device_rect(
-                device,
-                RECT {
-                    left,
-                    top: top + size / 2 - quarter / 2,
-                    right,
-                    bottom: top + size / 2 + quarter,
-                },
-                rgb(colour.red, colour.green, colour.blue),
-            );
-            draw_lines(
-                device,
-                &[(left, top + quarter), (right, top + quarter)],
-                ink,
-                stroke,
-            );
-            draw_lines(device, &[(left, bottom), (right, bottom)], ink, stroke);
-        }
+        // Painted antialiased after GDI is done: see paint_icons.
+        EditorTool::Arrow
+        | EditorTool::Text
+        | EditorTool::Pen
+        | EditorTool::Marker
+        | EditorTool::Highlighter => {}
+    }
+}
+
+/// A minus for Smaller, a plus for Larger.
+fn draw_size_icon(device: HDC, bounds: UiRect, larger: bool, ink: COLORREF, metrics: UiMetrics) {
+    let stroke = metrics.toolbar_tokens().icon_stroke;
+    let (left, top, size) = icon_box(bounds, metrics);
+    let inset = size / 5;
+    let middle = (left + size / 2, top + size / 2);
+    draw_lines(
+        device,
+        &[(left + inset, middle.1), (left + size - inset, middle.1)],
+        ink,
+        stroke,
+    );
+    if larger {
+        draw_lines(
+            device,
+            &[(middle.0, top + inset), (middle.0, top + size - inset)],
+            ink,
+            stroke,
+        );
     }
 }
 
@@ -1713,6 +2501,48 @@ fn draw_history_icon(
         ],
         ink,
         stroke,
+    );
+}
+
+/// How to finish the text being typed, in a label just below its frame, or above it when the
+/// frame is near the bottom of the canvas.
+fn draw_typing_hint(device: HDC, state: &EditorState, frame: UiRect) {
+    let metrics = state.metrics;
+    let tokens = metrics.toolbar_tokens();
+    let text = "Enter to finish \u{00b7} Shift+Enter new line \u{00b7} Esc to discard";
+    let measured = measure_ui_text(device, text, tokens.font_height);
+    let width = measured.cx + tokens.tooltip_padding_x * 2;
+    let height = (measured.cy + tokens.tooltip_padding_y * 2).max(metrics.px(28));
+    let canvas = state.layout.canvas;
+    let gap = metrics.px(6);
+    let top = if frame.bottom + gap + height <= canvas.bottom {
+        frame.bottom + gap
+    } else {
+        (frame.top - gap - height).max(canvas.top)
+    };
+    let left = frame
+        .left
+        .clamp(canvas.left, (canvas.right - width).max(canvas.left));
+    let bounds = UiRect {
+        left,
+        top,
+        right: left + width,
+        bottom: top + height,
+    };
+    draw_round_box(
+        device,
+        bounds,
+        rgb(31, 31, 34),
+        rgb(ACCENT_RGB.0, ACCENT_RGB.1, ACCENT_RGB.2),
+        tokens.tooltip_corner_radius,
+    );
+    draw_text(
+        device,
+        bounds,
+        text,
+        rgb(248, 248, 250),
+        TextAlignment::Center,
+        tokens.font_height,
     );
 }
 
@@ -1966,6 +2796,150 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
+        // Blue chosen, then the pen, then the arrow: the colour stays blue. An arrow dragged across
+        // the middle, then its point dragged elsewhere, then Done: it is blue in the image.
+        let report = sender.clone();
+        host.edit(
+            frame.detached(),
+            frame.metadata.source_rect,
+            move |outcome| {
+                let _ = report.send(outcome);
+            },
+        )
+        .expect("the edit request is accepted");
+        let editor = find_editor();
+        post(editor, WM_KEYDOWN, usize::from(b'4'), 0);
+        post(editor, WM_KEYDOWN, usize::from(b'P'), 0);
+        post(editor, WM_KEYDOWN, usize::from(b'A'), 0);
+        post(editor, WM_LBUTTONDOWN, 1, at(1, middle_y));
+        post(editor, WM_MOUSEMOVE, 1, at(client.right - 2, middle_y));
+        post(editor, WM_LBUTTONUP, 0, at(client.right - 2, middle_y));
+        post(
+            editor,
+            WM_LBUTTONDOWN,
+            1,
+            at(client.right - 3, middle_y + 1),
+        );
+        post(editor, WM_MOUSEMOVE, 1, at(client.right - 3, middle_y + 9));
+        post(editor, WM_LBUTTONUP, 0, at(client.right - 3, middle_y + 9));
+        post(editor, WM_KEYDOWN, usize::from(VK_RETURN.0), 0);
+        match outcomes
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the editor answered")
+        {
+            EditOutcome::Done(edited) => {
+                let blue = PALETTE[3].1;
+                let ink = [blue.blue, blue.green, blue.red, 255];
+                assert!(
+                    edited.pixels().chunks_exact(4).any(|pixel| pixel == ink),
+                    "no pixel was inked: {:?}",
+                    edited.pixels()
+                );
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // SAFETY: IsWindow accepts any handle, live or not.
+        while unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(editor) }.as_bool() {
+            assert!(
+                Instant::now() < deadline,
+                "the finished editor never closed"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Text typed in the middle of the capture, committed with Enter, then Done with Enter: the
+        // text is in the published image. Typing T as text must not switch tools.
+        let report = sender.clone();
+        host.edit(
+            frame.detached(),
+            frame.metadata.source_rect,
+            move |outcome| {
+                let _ = report.send(outcome);
+            },
+        )
+        .expect("the edit request is accepted");
+        let editor = find_editor();
+        post(editor, WM_KEYDOWN, usize::from(b'T'), 0);
+        post(
+            editor,
+            WM_LBUTTONDOWN,
+            1,
+            at(client.right / 2 - 6, middle_y),
+        );
+        post(editor, WM_LBUTTONUP, 0, at(client.right / 2 - 6, middle_y));
+        for character in "MMT".encode_utf16() {
+            post(editor, WM_CHAR, usize::from(character), 0);
+        }
+        post(editor, WM_KEYDOWN, usize::from(VK_RETURN.0), 0);
+        post(editor, WM_KEYDOWN, usize::from(VK_RETURN.0), 0);
+        match outcomes
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the editor answered")
+        {
+            EditOutcome::Done(edited) => {
+                // The capture is mid-grey. The blue chosen in the editor before this one is
+                // remembered, so the text pulls some pixel well toward blue.
+                assert!(
+                    edited
+                        .pixels()
+                        .chunks_exact(4)
+                        .any(|pixel| pixel[0] > pixel[1].saturating_add(40)),
+                    "no pixel was inked: {:?}",
+                    edited.pixels()
+                );
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // SAFETY: IsWindow accepts any handle, live or not.
+        while unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(editor) }.as_bool() {
+            assert!(
+                Instant::now() < deadline,
+                "the finished editor never closed"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Text typed and finished, then clicked again, emptied and finished: the text is gone, so
+        // nothing is left to lose and Escape cancels without asking.
+        let report = sender.clone();
+        host.edit(
+            frame.detached(),
+            frame.metadata.source_rect,
+            move |outcome| {
+                let _ = report.send(outcome);
+            },
+        )
+        .expect("the edit request is accepted");
+        let editor = find_editor();
+        let spot = at(client.right / 2 - 6, middle_y);
+        post(editor, WM_KEYDOWN, usize::from(b'T'), 0);
+        post(editor, WM_LBUTTONDOWN, 1, spot);
+        post(editor, WM_LBUTTONUP, 0, spot);
+        post(editor, WM_CHAR, usize::from(b'M'), 0);
+        post(editor, WM_CHAR, usize::from(b'M'), 0);
+        post(editor, WM_KEYDOWN, usize::from(VK_RETURN.0), 0);
+        post(editor, WM_LBUTTONDOWN, 1, spot);
+        post(editor, WM_LBUTTONUP, 0, spot);
+        post(editor, WM_CHAR, 0x08, 0);
+        post(editor, WM_CHAR, 0x08, 0);
+        post(editor, WM_KEYDOWN, usize::from(VK_RETURN.0), 0);
+        post(editor, WM_KEYDOWN, usize::from(VK_ESCAPE.0), 0);
+        assert!(matches!(
+            outcomes.recv_timeout(Duration::from_secs(5)),
+            Ok(EditOutcome::Cancelled)
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // SAFETY: IsWindow accepts any handle, live or not.
+        while unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(editor) }.as_bool() {
+            assert!(
+                Instant::now() < deadline,
+                "the finished editor never closed"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
         // Escape on an unedited capture cancels without asking.
         let report = sender.clone();
         host.edit(
@@ -2092,6 +3066,17 @@ mod tests {
             key_button(u16::from(b'B'), false, false),
             Some(EditorButton::Tool(EditorTool::Box))
         );
+        assert_eq!(
+            key_button(u16::from(b'A'), false, false),
+            Some(EditorButton::Tool(EditorTool::Arrow))
+        );
+        assert_eq!(
+            key_button(u16::from(b'T'), false, false),
+            Some(EditorButton::Tool(EditorTool::Text))
+        );
+        assert_eq!(text_size_step(VK_OEM_PLUS.0, true), Some(1));
+        assert_eq!(text_size_step(VK_SUBTRACT.0, true), Some(-1));
+        assert_eq!(text_size_step(VK_OEM_PLUS.0, false), None);
         assert_eq!(
             key_button(u16::from(b'M'), false, false),
             Some(EditorButton::Tool(EditorTool::Marker))

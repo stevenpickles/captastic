@@ -257,6 +257,13 @@ pub(super) struct OverlayModel {
     pub(super) pin_available: bool,
     /// Whether **Edit** may end this run; see `OverlayDestinations::edit_available`.
     pub(super) edit_available: bool,
+    /// What **Record** records into, or `None` when this run cannot record; see
+    /// `OverlayDestinations::record_format`.
+    pub(super) record_format: Option<captastic_config::RecordingFormat>,
+    /// Whether **Record** was pressed under the Window tool before a window was chosen, so the
+    /// next window clicked is recorded rather than captured. A window click confirms at once,
+    /// which leaves no chosen window waiting for the button the way a region does.
+    pub(super) record_armed: bool,
     pub(super) hovered_control: Option<ToolbarControl>,
     pub(super) pointer_local: Option<POINT>,
     /// The window-chooser candidate under the pointer. The shell owns the thumbnail
@@ -464,6 +471,10 @@ pub(super) enum OverlayEffect {
     /// Ask the daemon to turn file output on or off. Not a persistence effect: the daemon starts
     /// or stops the file worker and records `output.enabled` itself, exactly as it does for the
     /// notification-area item, so the two places cannot disagree about what the setting means.
+    /// The user chose, from the Options menu, what **Record** records into.
+    RequestRecordingFormat {
+        format: captastic_config::RecordingFormat,
+    },
     RequestFileOutput {
         enabled: bool,
     },
@@ -786,6 +797,17 @@ fn toolbar_control_pressed(
         ToolbarControl::Capture => return confirm_or_capture(model, confirm_intent(modifiers)),
         ToolbarControl::Pin => return confirm(model, ConfirmIntent::Pin),
         ToolbarControl::Edit => return confirm(model, ConfirmIntent::Edit),
+        ToolbarControl::Record
+            if model.tool == CaptureTool::Window
+                && model.selection.is_none()
+                && model.record_format.is_some() =>
+        {
+            // Nothing is chosen yet under the Window tool: arm, so the next window clicked is
+            // recorded. Pressing it again disarms.
+            model.record_armed = !model.record_armed;
+            effects.push(OverlayEffect::RefreshWindowChrome);
+        }
+        ToolbarControl::Record => return confirm(model, ConfirmIntent::Record),
         ToolbarControl::DimBackground => {
             model.dim_background = !model.dim_background;
         }
@@ -829,6 +851,22 @@ fn toolbar_control_pressed(
                 });
             }
         }
+        ToolbarControl::RecordFormat => {
+            // The same optimism as the disk row: the label changes at the click, and the daemon
+            // records the choice for this and later recordings.
+            if let Some(format) = model.record_format {
+                let next = match format {
+                    captastic_config::RecordingFormat::Gif => {
+                        captastic_config::RecordingFormat::Mp4
+                    }
+                    captastic_config::RecordingFormat::Mp4 => {
+                        captastic_config::RecordingFormat::Gif
+                    }
+                };
+                model.record_format = Some(next);
+                effects.push(OverlayEffect::RequestRecordingFormat { format: next });
+            }
+        }
         ToolbarControl::Cancel => return cancel(model),
     }
     effects.push(OverlayEffect::SetCursor(CursorIntent::Arrow));
@@ -870,6 +908,7 @@ pub(super) fn activate_tool(model: &mut OverlayModel, tool: CaptureTool) -> Vec<
     model.moving_region = None;
     model.active_snaps = NO_SNAPS;
     model.loupe.forget_motion();
+    model.record_armed = false;
     let tool_changed = model.tool != tool;
     let mut effects = Vec::new();
     if tool_changed {
@@ -1209,7 +1248,13 @@ fn window_preview_resolved(
     model.selection = rect;
     model.selection_kind = rect.map(|_| SelectionKind::Window);
     if model.selection.is_some() {
-        // A ready preview confirms immediately; the shell attaches the captured frame.
+        // A ready preview confirms immediately; the shell attaches the captured frame. An armed
+        // Record outranks the click's own keys: it is what the user set out to do.
+        let intent = if model.record_armed {
+            ConfirmIntent::Record
+        } else {
+            intent
+        };
         confirm_or_capture(model, intent)
     } else {
         // Not ready (or empty space): stay in the chooser. The preview cache deliberately does
@@ -1291,6 +1336,7 @@ fn confirm(model: &mut OverlayModel, intent: ConfirmIntent) -> Vec<OverlayEffect
         ConfirmIntent::Capture => true,
         ConfirmIntent::Pin => model.pin_available,
         ConfirmIntent::Edit => model.edit_available,
+        ConfirmIntent::Record => model.record_format.is_some(),
     };
     if !available {
         return Vec::new();
@@ -1743,6 +1789,8 @@ mod tests {
             file_output_switchable: true,
             pin_available: true,
             edit_available: false,
+            record_format: None,
+            record_armed: false,
             hovered_control: None,
             pointer_local: None,
             hovered: None,
@@ -2706,6 +2754,136 @@ mod tests {
             Some(CloseOutcome::Confirmed { intent, .. }) => Some(intent),
             _ => None,
         }
+    }
+
+    #[test]
+    fn record_confirms_with_its_intent_only_when_the_run_can_record() {
+        let layout = layout_for(&region_model_with_selection());
+        let press = |at: POINT| OverlayInput::PointerDown {
+            point: at,
+            window_slot: None,
+            time_ms: 0,
+            modifiers: Modifiers::default(),
+        };
+        let mut model = region_model_with_selection();
+        model.record_format = Some(captastic_config::RecordingFormat::Gif);
+        let effects = transition(&mut model, press(center(layout.record)));
+        assert_eq!(confirmed_intent(&effects), Some(ConfirmIntent::Record));
+
+        // A run with nothing behind it to keep a recording going does not record.
+        let mut model = region_model_with_selection();
+        model.record_format = None;
+        let effects = transition(&mut model, press(center(layout.record)));
+        assert_eq!(confirmed_intent(&effects), None);
+    }
+
+    #[test]
+    fn record_under_the_window_tool_arms_the_next_window_click() {
+        let layout = layout_for(&region_model());
+        let press_record = OverlayInput::PointerDown {
+            point: center(layout.record),
+            window_slot: None,
+            time_ms: 0,
+            modifiers: Modifiers::default(),
+        };
+        let chosen = OverlayInput::WindowPreviewResolved {
+            rect: Some(Rect {
+                x: 20,
+                y: 30,
+                width: 200,
+                height: 100,
+            }),
+            intent: ConfirmIntent::Capture,
+        };
+        let mut model = region_model();
+        model.tool = CaptureTool::Window;
+        model.selection = None;
+        model.selection_kind = None;
+        model.record_format = Some(captastic_config::RecordingFormat::Mp4);
+
+        // Pressing Record with no window chosen arms rather than ending the run.
+        let effects = transition(&mut model, press_record.clone());
+        assert!(model.record_armed);
+        assert_eq!(confirmed_intent(&effects), None);
+        let effects = transition(&mut model, chosen.clone());
+        assert_eq!(confirmed_intent(&effects), Some(ConfirmIntent::Record));
+
+        // Pressing it again disarms, and the click captures as before.
+        let mut model = region_model();
+        model.tool = CaptureTool::Window;
+        model.selection = None;
+        model.selection_kind = None;
+        model.record_format = Some(captastic_config::RecordingFormat::Gif);
+        transition(&mut model, press_record.clone());
+        transition(&mut model, press_record.clone());
+        assert!(!model.record_armed);
+        let effects = transition(&mut model, chosen.clone());
+        assert_eq!(confirmed_intent(&effects), Some(ConfirmIntent::Capture));
+
+        // Switching tools disarms.
+        let mut model = region_model();
+        model.tool = CaptureTool::Window;
+        model.selection = None;
+        model.selection_kind = None;
+        model.record_format = Some(captastic_config::RecordingFormat::Gif);
+        transition(&mut model, press_record.clone());
+        activate_tool(&mut model, CaptureTool::Region);
+        assert!(!model.record_armed);
+
+        // A run that cannot record does not arm.
+        let mut model = region_model();
+        model.tool = CaptureTool::Window;
+        model.selection = None;
+        model.selection_kind = None;
+        model.record_format = None;
+        transition(&mut model, press_record);
+        assert!(!model.record_armed);
+    }
+
+    #[test]
+    fn the_record_as_row_switches_format_and_tells_the_daemon() {
+        let mut model = region_model_with_selection();
+        model.record_format = Some(captastic_config::RecordingFormat::Gif);
+        model.options_open = true;
+        let layout = layout_for(&model);
+        let row = OverlayInput::PointerDown {
+            point: center(layout.record_format),
+            window_slot: None,
+            time_ms: 0,
+            modifiers: Modifiers::default(),
+        };
+        let effects = transition(&mut model, row.clone());
+        assert_eq!(
+            model.record_format,
+            Some(captastic_config::RecordingFormat::Mp4)
+        );
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            OverlayEffect::RequestRecordingFormat {
+                format: captastic_config::RecordingFormat::Mp4
+            }
+        )));
+        transition(&mut model, row);
+        assert_eq!(
+            model.record_format,
+            Some(captastic_config::RecordingFormat::Gif)
+        );
+        // Greyed in a run that cannot record: the row does nothing.
+        let mut model = region_model_with_selection();
+        model.record_format = None;
+        model.options_open = true;
+        let effects = transition(
+            &mut model,
+            OverlayInput::PointerDown {
+                point: center(layout.record_format),
+                window_slot: None,
+                time_ms: 0,
+                modifiers: Modifiers::default(),
+            },
+        );
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, OverlayEffect::RequestRecordingFormat { .. })));
     }
 
     #[test]

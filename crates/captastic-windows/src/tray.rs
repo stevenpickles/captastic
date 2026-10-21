@@ -1,7 +1,7 @@
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use windows::Win32::System::Shutdown::{ShutdownBlockReasonCreate, ShutdownBlockR
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Shell::{
     ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR,
-    NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+    NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
@@ -38,6 +38,7 @@ const TRAY_CALLBACK: u32 = WM_APP + 1;
 const TRAY_SET_STARTUP: u32 = WM_APP + 2;
 const TRAY_SET_HAS_HISTORY: u32 = WM_APP + 5;
 const TRAY_SET_FILE_OUTPUT: u32 = WM_APP + 4;
+const TRAY_SET_REVIEW: u32 = WM_APP + 6;
 const TRAY_SHOW_ERROR: u32 = WM_APP + 3;
 const TRAY_ICON_ID: u32 = 1;
 const APPLICATION_ICON_RESOURCE_ID: usize = 1;
@@ -53,6 +54,11 @@ const COMMAND_EXIT: usize = 1_009;
 const COMMAND_FILE_OUTPUT: usize = 1_010;
 const COMMAND_CLOSE_PINS: usize = 1_011;
 const COMMAND_PINS_CLICKABLE: usize = 1_012;
+const COMMAND_OPEN_CAPTURES_FOLDER: usize = 1_013;
+const COMMAND_REVIEW: usize = 1_014;
+/// Sent to the tray callback when the person clicks a notification. Defined by hand, as the
+/// shell's headers do: `WM_USER + 5`.
+const NIN_BALLOONUSERCLICK: u32 = 0x0405;
 const SESSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(4);
 const TRAY_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const TRAY_STOP_POLL: Duration = Duration::from_millis(5);
@@ -71,10 +77,14 @@ pub enum TrayEvent {
     OpenLastCapture,
     /// Reveal the most recently written capture in the file manager.
     ShowInFolder,
+    /// Open the folder captures and recordings are saved to.
+    OpenCapturesFolder,
     /// Apply retention now, rather than waiting for the next capture to do it.
     PruneHistory,
     /// Start or stop writing captures to disk, and remember which the user chose.
     ToggleFileOutput,
+    /// Turn reviewing recordings before they are saved on or off, and remember which.
+    ToggleReview,
     /// Close every pinned capture (ADR 0010).
     ClosePins,
     /// Make every pinned capture clickable again, the only way back for a click-through pin.
@@ -184,6 +194,21 @@ impl TrayIcon {
         .map_err(|error| native_error("update_file_output_menu", error))
     }
 
+    /// Tells the tray whether recordings are reviewed before they are saved, which is what the
+    /// checkmark beside `Review Recordings` reports.
+    pub fn set_review_enabled(&self, enabled: bool) -> Result<(), CaptureError> {
+        // SAFETY: hwnd identifies the live hidden tray window owned by the tray thread.
+        unsafe {
+            PostMessageW(
+                HWND(self.hwnd),
+                TRAY_SET_REVIEW,
+                WPARAM(usize::from(enabled)),
+                LPARAM(0),
+            )
+        }
+        .map_err(|error| native_error("update_review_menu", error))
+    }
+
     /// Tells the tray whether there is a remembered capture, which decides whether the history
     /// menu entries are usable.
     pub fn set_has_history(&self, has_history: bool) -> Result<(), CaptureError> {
@@ -208,11 +233,52 @@ impl TrayIcon {
         title: impl Into<String>,
         message: impl Into<String>,
     ) -> Result<(), CaptureError> {
+        self.notify(title.into(), message.into(), false)
+    }
+
+    /// A notification that something went as asked, with the information icon rather than the
+    /// error one: a saved recording, for instance.
+    pub fn show_info_with_title(
+        &self,
+        title: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Result<(), CaptureError> {
+        self.notify(title.into(), message.into(), true)
+    }
+
+    /// An information notification about a file, which shows that file in its folder when it
+    /// is clicked: a saved recording, for instance.
+    pub fn show_info_revealing(
+        &self,
+        title: impl Into<String>,
+        message: impl Into<String>,
+        file: PathBuf,
+    ) -> Result<(), CaptureError> {
+        self.send_notification(TrayNotification {
+            title: title.into(),
+            message: message.into(),
+            informational: true,
+            reveal: Some(file),
+        })
+    }
+
+    fn notify(
+        &self,
+        title: String,
+        message: String,
+        informational: bool,
+    ) -> Result<(), CaptureError> {
+        self.send_notification(TrayNotification {
+            title,
+            message,
+            informational,
+            reveal: None,
+        })
+    }
+
+    fn send_notification(&self, notification: TrayNotification) -> Result<(), CaptureError> {
         self.notification_sender
-            .try_send(TrayNotification {
-                title: title.into(),
-                message: message.into(),
-            })
+            .try_send(notification)
             .map_err(|error| tray_error("queue_tray_error", error.to_string()))?;
         // SAFETY: hwnd identifies the live hidden tray window owned by the tray thread.
         unsafe { PostMessageW(HWND(self.hwnd), TRAY_SHOW_ERROR, WPARAM(0), LPARAM(0)) }
@@ -285,6 +351,31 @@ pub fn open_path(path: &Path) -> Result<(), CaptureError> {
     Ok(())
 }
 
+/// Opens the file manager on the folder holding `file`, with the file selected.
+pub fn reveal_in_folder(file: &Path) -> Result<(), CaptureError> {
+    let parameters = format!("/select,\"{}\"", file.display());
+    let mut parameters: Vec<u16> = parameters.encode_utf16().collect();
+    parameters.push(0);
+    // SAFETY: Both strings are null-terminated for this call; the rest are deliberately null.
+    let result = unsafe {
+        ShellExecuteW(
+            HWND(0),
+            w!("open"),
+            w!("explorer.exe"),
+            PCWSTR(parameters.as_ptr()),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if result.0 <= 32 {
+        return Err(tray_error(
+            "reveal_in_folder",
+            format!("ShellExecuteW returned {} for {}", result.0, file.display()),
+        ));
+    }
+    Ok(())
+}
+
 pub fn show_error_dialog(message: &str) {
     show_dialog(message, MB_ICONERROR);
 }
@@ -348,6 +439,7 @@ fn run_tray(
         session_shutdown_requested,
         session_drain_completed,
         model: machine::TrayModel::new(startup_enabled, file_output_enabled),
+        last_reveal: None,
     });
     let state_pointer = Box::into_raw(state);
     // SAFETY: The registered class is live and state_pointer remains allocated through the loop.
@@ -472,6 +564,9 @@ struct TrayState {
     session_shutdown_requested: Arc<AtomicBool>,
     session_drain_completed: Arc<AtomicBool>,
     model: machine::TrayModel,
+    /// The file the most recent notification was about, which clicking it reveals. Every
+    /// notification replaces it, so clicking one about something else reveals nothing.
+    last_reveal: Option<PathBuf>,
 }
 
 /// The tray window's decision core: the window procedure translates each Win32 message into a
@@ -493,6 +588,9 @@ mod machine {
         /// the only thing that knows whether the file worker actually started, and reported here
         /// through [`TrayInput::FileOutputChanged`].
         pub(super) file_output_enabled: bool,
+        /// Whether recordings are reviewed before they are saved, as the daemon last reported it
+        /// through [`TrayInput::ReviewChanged`].
+        pub(super) review_enabled: bool,
         pub(super) has_history: bool,
         pub(super) icon: IconState,
         pub(super) session: SessionPhase,
@@ -509,6 +607,8 @@ mod machine {
                 paused: false,
                 startup_enabled,
                 file_output_enabled,
+                // The default, until the daemon reports the configuration.
+                review_enabled: true,
                 // Nothing is known about history until the daemon reports it.
                 has_history: false,
                 icon: IconState::Absent,
@@ -550,8 +650,10 @@ mod machine {
         Menu(TrayMenuCommand),
         StartupStateChanged(bool),
         FileOutputChanged(bool),
+        ReviewChanged(bool),
         HistoryAvailabilityChanged(bool),
         NotificationsPosted,
+        NotificationClicked,
         QueryEndSession,
         EndSession {
             committed: bool,
@@ -572,8 +674,10 @@ mod machine {
         OpenLogs,
         OpenLastCapture,
         ShowInFolder,
+        OpenCapturesFolder,
         PruneHistory,
         ToggleFileOutput,
+        ToggleReview,
         ClosePins,
         MakePinsClickable,
         ToggleStartup,
@@ -600,12 +704,16 @@ mod machine {
             /// Whether captures are being written to disk, which decides whether
             /// `Save Captures to Disk` is shown checked.
             file_output_enabled: bool,
+            /// Whether `Review Recordings` is shown checked.
+            review_enabled: bool,
             /// Whether there is a remembered capture to open, which decides whether the history
             /// entries are usable or greyed.
             has_history: bool,
         },
         /// Drain the queued notifications into balloons.
         DrainNotifications,
+        /// Show the file the last notification was about, if it was about one.
+        RevealNotifiedFile,
         SendEvent(TrayEvent),
         CreateShutdownBlockReason,
         DestroyShutdownBlockReason,
@@ -673,6 +781,7 @@ mod machine {
                     paused: model.paused,
                     startup_enabled: model.startup_enabled,
                     file_output_enabled: model.file_output_enabled,
+                    review_enabled: model.review_enabled,
                     has_history: model.has_history,
                 }],
                 Handled,
@@ -708,6 +817,11 @@ mod machine {
                 vec![TrayEffect::SendEvent(TrayEvent::ShowInFolder)],
                 Handled,
             ),
+            TrayInput::Menu(TrayMenuCommand::OpenCapturesFolder) => (
+                vec![TrayEffect::SendEvent(TrayEvent::OpenCapturesFolder)],
+                Handled,
+            ),
+            TrayInput::NotificationClicked => (vec![TrayEffect::RevealNotifiedFile], Handled),
             TrayInput::Menu(TrayMenuCommand::PruneHistory) => (
                 vec![TrayEffect::SendEvent(TrayEvent::PruneHistory)],
                 Handled,
@@ -726,6 +840,11 @@ mod machine {
                 vec![TrayEffect::SendEvent(TrayEvent::ToggleFileOutput)],
                 Handled,
             ),
+            TrayInput::Menu(TrayMenuCommand::ToggleReview) => (
+                // Reported like the disk switch: the daemon applies it and says so.
+                vec![TrayEffect::SendEvent(TrayEvent::ToggleReview)],
+                Handled,
+            ),
             TrayInput::Menu(TrayMenuCommand::ToggleStartup) => (
                 vec![TrayEffect::SendEvent(TrayEvent::ToggleStartup)],
                 Handled,
@@ -741,6 +860,10 @@ mod machine {
             TrayInput::FileOutputChanged(enabled) => {
                 // Like the history flag: read when the menu is next opened, so nothing redraws.
                 model.file_output_enabled = enabled;
+                (Vec::new(), Handled)
+            }
+            TrayInput::ReviewChanged(enabled) => {
+                model.review_enabled = enabled;
                 (Vec::new(), Handled)
             }
             TrayInput::HistoryAvailabilityChanged(has_history) => {
@@ -894,6 +1017,7 @@ fn translate_tray_message(
         TRAY_CALLBACK => match lparam.0 as u32 {
             WM_LBUTTONDBLCLK => TranslatedMessage::Input(TrayInput::IconDoubleClick),
             WM_RBUTTONUP | WM_CONTEXTMENU => TranslatedMessage::Input(TrayInput::IconContextMenu),
+            NIN_BALLOONUSERCLICK => TranslatedMessage::Input(TrayInput::NotificationClicked),
             _ => TranslatedMessage::Consumed,
         },
         WM_COMMAND => match wparam.0 & 0xffff {
@@ -909,11 +1033,17 @@ fn translate_tray_message(
             COMMAND_SHOW_IN_FOLDER => {
                 TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::ShowInFolder))
             }
+            COMMAND_OPEN_CAPTURES_FOLDER => {
+                TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::OpenCapturesFolder))
+            }
             COMMAND_PRUNE_HISTORY => {
                 TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::PruneHistory))
             }
             COMMAND_FILE_OUTPUT => {
                 TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::ToggleFileOutput))
+            }
+            COMMAND_REVIEW => {
+                TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::ToggleReview))
             }
             COMMAND_CLOSE_PINS => {
                 TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::ClosePins))
@@ -931,6 +1061,7 @@ fn translate_tray_message(
         TRAY_SET_FILE_OUTPUT => {
             TranslatedMessage::Input(TrayInput::FileOutputChanged(wparam.0 != 0))
         }
+        TRAY_SET_REVIEW => TranslatedMessage::Input(TrayInput::ReviewChanged(wparam.0 != 0)),
         TRAY_SET_HAS_HISTORY => {
             TranslatedMessage::Input(TrayInput::HistoryAvailabilityChanged(wparam.0 != 0))
         }
@@ -1001,6 +1132,7 @@ fn apply_tray_effect(hwnd: HWND, state_pointer: *mut TrayState, effect: machine:
             paused,
             startup_enabled,
             file_output_enabled,
+            review_enabled,
             has_history,
         } => {
             if let Err(error) = show_context_menu(
@@ -1008,6 +1140,7 @@ fn apply_tray_effect(hwnd: HWND, state_pointer: *mut TrayState, effect: machine:
                 paused,
                 startup_enabled,
                 file_output_enabled,
+                review_enabled,
                 has_history,
             ) {
                 log::warn!("failed to show tray menu: {error}");
@@ -1019,10 +1152,23 @@ fn apply_tray_effect(hwnd: HWND, state_pointer: *mut TrayState, effect: machine:
                 unsafe { (*state_pointer).notification_receiver.try_recv() }
             };
             let Ok(message) = message else { break };
+            // SAFETY: A short write to this thread's state; nothing else runs meanwhile.
+            unsafe { (*state_pointer).last_reveal = message.reveal.clone() };
             if let Err(error) = show_error_notification(hwnd, &message) {
                 log::warn!("failed to show tray error notification: {error}");
             }
         },
+        TrayEffect::RevealNotifiedFile => {
+            let file = {
+                // SAFETY: A short read of this thread's state, ended before the shell is called.
+                unsafe { (*state_pointer).last_reveal.clone() }
+            };
+            if let Some(file) = file {
+                if let Err(error) = reveal_in_folder(&file) {
+                    log::warn!("failed to show a notified file in its folder: {error}");
+                }
+            }
+        }
         TrayEffect::SendEvent(event) => send_tray_event(state_pointer, event),
         TrayEffect::CreateShutdownBlockReason => {
             // SAFETY: hwnd is this live top-level window and the reason is static UTF-16.
@@ -1177,6 +1323,10 @@ fn modify_tray_tooltip(hwnd: HWND, paused: bool) -> Result<(), CaptureError> {
 struct TrayNotification {
     title: String,
     message: String,
+    /// The information icon rather than the error one.
+    informational: bool,
+    /// The file clicking the notification shows in its folder.
+    reveal: Option<PathBuf>,
 }
 
 fn show_error_notification(
@@ -1191,7 +1341,11 @@ fn show_error_notification(
     );
     write_wide(&mut data.szInfoTitle, &notification.title);
     write_wide(&mut data.szInfo, &notification.message);
-    data.dwInfoFlags = NIIF_ERROR;
+    data.dwInfoFlags = if notification.informational {
+        NIIF_INFO
+    } else {
+        NIIF_ERROR
+    };
     // SAFETY: data identifies the existing icon and contains terminated notification buffers.
     if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
         return Err(last_error("show_tray_error_notification"));
@@ -1234,6 +1388,7 @@ fn show_context_menu(
     paused: bool,
     startup_enabled: bool,
     file_output_enabled: bool,
+    review_enabled: bool,
     has_history: bool,
 ) -> Result<(), CaptureError> {
     // SAFETY: Creates an empty popup menu owned by this function.
@@ -1305,6 +1460,17 @@ fn show_context_menu(
             )
         }
         .map_err(|error| native_error("append_show_in_folder_menu", error))?;
+        // Always usable: the folder is there to open whether or not anything is remembered.
+        // SAFETY: menu and static labels are live for each call.
+        unsafe {
+            AppendMenuW(
+                menu,
+                MF_STRING,
+                COMMAND_OPEN_CAPTURES_FOLDER,
+                w!("Open Captures Folder"),
+            )
+        }
+        .map_err(|error| native_error("append_open_captures_folder_menu", error))?;
         // SAFETY: menu and static labels are live for each call.
         unsafe {
             AppendMenuW(
@@ -1331,6 +1497,14 @@ fn show_context_menu(
             )
         }
         .map_err(|error| native_error("append_pins_clickable_menu", error))?;
+        let review_flags = if review_enabled {
+            MF_STRING | MF_CHECKED
+        } else {
+            MF_STRING
+        };
+        // SAFETY: menu and static label are live for the call.
+        unsafe { AppendMenuW(menu, review_flags, COMMAND_REVIEW, w!("Review Recordings")) }
+            .map_err(|error| native_error("append_review_menu", error))?;
         let startup_flags = if startup_enabled {
             MF_STRING | MF_CHECKED
         } else {
@@ -1669,6 +1843,24 @@ mod tests {
                 WM_CONTEXTMENU as isize,
                 TranslatedMessage::Input(TrayInput::IconContextMenu),
             ),
+            (
+                TRAY_CALLBACK,
+                0,
+                NIN_BALLOONUSERCLICK as isize,
+                TranslatedMessage::Input(TrayInput::NotificationClicked),
+            ),
+            (
+                WM_COMMAND,
+                COMMAND_REVIEW,
+                0,
+                TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::ToggleReview)),
+            ),
+            (
+                WM_COMMAND,
+                COMMAND_OPEN_CAPTURES_FOLDER,
+                0,
+                TranslatedMessage::Input(TrayInput::Menu(TrayMenuCommand::OpenCapturesFolder)),
+            ),
             // Hover and move notifications are acknowledged without a product decision.
             (TRAY_CALLBACK, 0, 0x0200, TranslatedMessage::Consumed),
             (
@@ -1917,6 +2109,11 @@ mod tests {
         for (command, expected) in [
             (TrayMenuCommand::OpenLastCapture, TrayEvent::OpenLastCapture),
             (TrayMenuCommand::ShowInFolder, TrayEvent::ShowInFolder),
+            (TrayMenuCommand::ToggleReview, TrayEvent::ToggleReview),
+            (
+                TrayMenuCommand::OpenCapturesFolder,
+                TrayEvent::OpenCapturesFolder,
+            ),
             (TrayMenuCommand::PruneHistory, TrayEvent::PruneHistory),
         ] {
             let (effects, handled) = transition(&mut model, TrayInput::Menu(command));
@@ -1937,6 +2134,7 @@ mod tests {
                 paused: false,
                 startup_enabled: false,
                 file_output_enabled: false,
+                review_enabled: true,
                 has_history: false,
             }]
         );
@@ -1954,6 +2152,7 @@ mod tests {
                 paused: false,
                 startup_enabled: false,
                 file_output_enabled: false,
+                review_enabled: true,
                 has_history: true,
             }]
         );
@@ -1969,6 +2168,7 @@ mod tests {
                 paused: false,
                 startup_enabled: true,
                 file_output_enabled: false,
+                review_enabled: true,
                 has_history: false,
             }]
         );
@@ -1986,6 +2186,7 @@ mod tests {
                 paused: true,
                 startup_enabled: false,
                 file_output_enabled: false,
+                review_enabled: true,
                 has_history: true,
             }]
         );
@@ -2150,6 +2351,7 @@ mod tests {
                 paused: false,
                 startup_enabled: false,
                 file_output_enabled: false,
+                review_enabled: true,
                 has_history: false,
             }]
         );
@@ -2166,6 +2368,7 @@ mod tests {
                 paused: false,
                 startup_enabled: false,
                 file_output_enabled: true,
+                review_enabled: true,
                 has_history: false,
             }]
         );
@@ -2188,6 +2391,34 @@ mod tests {
     }
 
     #[test]
+    fn the_review_switch_is_reported_and_checked_once_the_daemon_says_so() {
+        let mut model = TrayModel::new(false, false);
+        assert!(model.review_enabled, "reviewing is the default");
+        let (effects, _) = transition(&mut model, TrayInput::Menu(TrayMenuCommand::ToggleReview));
+        assert_eq!(
+            effects,
+            vec![TrayEffect::SendEvent(TrayEvent::ToggleReview)]
+        );
+        assert!(
+            model.review_enabled,
+            "still on until the daemon says otherwise"
+        );
+        let (effects, _) = transition(&mut model, TrayInput::ReviewChanged(false));
+        assert!(effects.is_empty());
+        let (effects, _) = transition(&mut model, TrayInput::IconContextMenu);
+        assert_eq!(
+            effects,
+            vec![TrayEffect::ShowMenu {
+                paused: false,
+                startup_enabled: false,
+                file_output_enabled: false,
+                review_enabled: false,
+                has_history: false,
+            }]
+        );
+    }
+
+    #[test]
     fn a_daemon_that_starts_with_file_output_on_opens_the_menu_checked() {
         // `output.enabled = true` in the configuration: the first menu the user opens has to
         // agree with where their captures have been going since startup.
@@ -2199,6 +2430,7 @@ mod tests {
                 paused: false,
                 startup_enabled: false,
                 file_output_enabled: true,
+                review_enabled: true,
                 has_history: false,
             }]
         );

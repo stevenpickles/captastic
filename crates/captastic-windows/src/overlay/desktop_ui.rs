@@ -26,6 +26,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::editor::{create_editor, editor_window_proc, EditFinished, EDITOR_CLASS_NAME};
 use super::pin::{create_pin, pin_window_proc, set_click_through, PIN_CLASS_NAME};
+use super::recording_frame::{
+    create_recording_frame, recording_frame_proc, RECORDING_FRAME_CLASS_NAME,
+};
+use super::review::{create_review, review_window_proc, ReviewFinished, REVIEW_CLASS_NAME};
 use super::shell::{PrivateFontResource, ThreadDpiContext};
 
 const HOST_CLASS_NAME: PCWSTR = w!("CaptasticDesktopUiHost-v1");
@@ -56,6 +60,18 @@ enum UiCommand {
     },
     ClosePins,
     MakePinsClickable,
+    ShowRecording {
+        area: Rect,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        limit: Duration,
+    },
+    HideRecording,
+    Review {
+        recording: std::sync::Arc<[u8]>,
+        format: captastic_config::RecordingFormat,
+        at: Rect,
+        on_finish: ReviewFinished,
+    },
 }
 
 /// The `captastic-desktop-ui` thread and the way to ask it for windows.
@@ -117,6 +133,41 @@ impl DesktopUi {
             at,
             on_finish: Box::new(on_finish),
         })
+    }
+
+    /// Shows the recording indicator around `area`: a red border and a bar with the elapsed time
+    /// and a **Stop** button that sets `stop`. Replaces an indicator already showing.
+    pub fn show_recording(
+        &self,
+        area: Rect,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        limit: Duration,
+    ) -> Result<(), CaptureError> {
+        self.request(UiCommand::ShowRecording { area, stop, limit })
+    }
+
+    /// Opens a review of `recording`, the bytes of a recording in `format` not yet saved, on the
+    /// display around `at` (ADR 0012). `on_finish` is called on the desktop UI thread exactly once,
+    /// however the review ends, unless this returns an error: then the request never reached the
+    /// thread and `on_finish` has been dropped uncalled.
+    pub fn review(
+        &self,
+        recording: std::sync::Arc<[u8]>,
+        format: captastic_config::RecordingFormat,
+        at: Rect,
+        on_finish: impl FnOnce(super::ReviewOutcome) + Send + 'static,
+    ) -> Result<(), CaptureError> {
+        self.request(UiCommand::Review {
+            recording,
+            format,
+            at,
+            on_finish: Box::new(on_finish),
+        })
+    }
+
+    /// Takes the recording indicator down.
+    pub fn hide_recording(&self) -> Result<(), CaptureError> {
+        self.request(UiCommand::HideRecording)
     }
 
     pub fn close_all_pins(&self) -> Result<(), CaptureError> {
@@ -193,6 +244,8 @@ struct HostState {
     instance: HINSTANCE,
     pins: Vec<HWND>,
     editors: Vec<HWND>,
+    reviews: Vec<HWND>,
+    recording: Option<HWND>,
     /// The overlay's typeface, which editors draw their toolbar in. Each overlay run registers
     /// and removes its own, so this thread holds one for as long as it has windows to draw.
     _font: PrivateFontResource,
@@ -237,11 +290,32 @@ fn run_host(
             lpszClassName: EDITOR_CLASS_NAME,
             ..Default::default()
         })?;
+        register_class(WNDCLASSW {
+            lpfnWndProc: Some(review_window_proc),
+            hInstance: instance,
+            // SAFETY: As for the editor's class.
+            hIcon: unsafe {
+                LoadIconW(instance, PCWSTR(APPLICATION_ICON_RESOURCE_ID as *const u16))
+            }
+            .unwrap_or_default(),
+            // SAFETY: IDC_ARROW is a valid system cursor resource.
+            hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
+            lpszClassName: REVIEW_CLASS_NAME,
+            ..Default::default()
+        })?;
+        register_class(WNDCLASSW {
+            lpfnWndProc: Some(recording_frame_proc),
+            hInstance: instance,
+            lpszClassName: RECORDING_FRAME_CLASS_NAME,
+            ..Default::default()
+        })?;
         let state = Box::new(HostState {
             commands,
             instance,
             pins: Vec::new(),
             editors: Vec::new(),
+            reviews: Vec::new(),
+            recording: None,
             _font: font,
         });
         let state_pointer = Box::into_raw(state);
@@ -295,7 +369,13 @@ fn run_host(
     HOST_WINDOW.with(|cell| cell.set(0));
     // Every window of every class is gone, so a later host can register them afresh. Failure
     // changes nothing: `register_class` accepts a class that is still registered.
-    for class in [EDITOR_CLASS_NAME, PIN_CLASS_NAME, HOST_CLASS_NAME] {
+    for class in [
+        REVIEW_CLASS_NAME,
+        RECORDING_FRAME_CLASS_NAME,
+        EDITOR_CLASS_NAME,
+        PIN_CLASS_NAME,
+        HOST_CLASS_NAME,
+    ] {
         // SAFETY: Unregisters a class registered by this thread, after its last window.
         let _ = unsafe { UnregisterClassW(class, instance) };
     }
@@ -372,6 +452,8 @@ unsafe extern "system" fn host_window_proc(
             unsafe {
                 close_pins(state_pointer);
                 close_editors(state_pointer);
+                close_reviews(state_pointer);
+                close_recording(state_pointer);
             }
             // SAFETY: hwnd is this thread's live host window.
             let _ = unsafe { DestroyWindow(hwnd) };
@@ -413,6 +495,32 @@ unsafe fn apply(state: *mut HostState, command: UiCommand) {
                 unsafe { (*state).editors.push(editor) };
             }
         }
+        UiCommand::ShowRecording { area, stop, limit } => {
+            // SAFETY: Per this function's contract; the borrow ends before the window is made.
+            unsafe { close_recording(state) };
+            // SAFETY: As above.
+            let instance = unsafe { (*state).instance };
+            match create_recording_frame(instance, area, stop, limit) {
+                // SAFETY: As above.
+                Ok(frame) => unsafe { (*state).recording = Some(frame) },
+                Err(error) => log::warn!("could not show the recording border: {error}"),
+            }
+        }
+        // SAFETY: As above.
+        UiCommand::HideRecording => unsafe { close_recording(state) },
+        UiCommand::Review {
+            recording,
+            format,
+            at,
+            on_finish,
+        } => {
+            // SAFETY: Per this function's contract; the borrow ends before create_review runs.
+            let instance = unsafe { (*state).instance };
+            if let Some(review) = create_review(instance, &recording, format, at, on_finish) {
+                // SAFETY: As above.
+                unsafe { (*state).reviews.push(review) };
+            }
+        }
         // SAFETY: As above.
         UiCommand::ClosePins => unsafe { close_pins(state) },
         UiCommand::MakePinsClickable => {
@@ -440,12 +548,34 @@ unsafe fn close_pins(state: *mut HostState) {
 
 /// # Safety
 /// `state` must be the host window's live state, used only on its thread.
+unsafe fn close_recording(state: *mut HostState) {
+    // SAFETY: Per this function's contract, taken for the same reason as the pins.
+    if let Some(frame) = unsafe { (*state).recording.take() } {
+        // SAFETY: The handle is the indicator window created on this thread.
+        let _ = unsafe { DestroyWindow(frame) };
+    }
+}
+
+/// # Safety
+/// `state` must be the host window's live state, used only on its thread.
 unsafe fn close_editors(state: *mut HostState) {
     // SAFETY: Per this function's contract, and taken for the same reason as the pins.
     let editors = std::mem::take(unsafe { &mut (*state).editors });
     for editor in editors {
         // SAFETY: Each handle is an editor window created on this thread.
         let _ = unsafe { DestroyWindow(editor) };
+    }
+}
+
+/// # Safety
+/// `state` must be the host window's live state, used only on its thread.
+unsafe fn close_reviews(state: *mut HostState) {
+    // SAFETY: Per this function's contract, and taken for the same reason as the pins. A review
+    // closed here answers that it was closed, and its recording is kept.
+    let reviews = std::mem::take(unsafe { &mut (*state).reviews });
+    for review in reviews {
+        // SAFETY: Each handle is a review window created on this thread.
+        let _ = unsafe { DestroyWindow(review) };
     }
 }
 
@@ -463,6 +593,10 @@ pub(super) fn forget_window(hwnd: HWND) {
     unsafe {
         (*state).pins.retain(|pin| *pin != hwnd);
         (*state).editors.retain(|editor| *editor != hwnd);
+        (*state).reviews.retain(|review| *review != hwnd);
+        if (*state).recording == Some(hwnd) {
+            (*state).recording = None;
+        }
     }
 }
 

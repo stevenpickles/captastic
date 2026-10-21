@@ -27,6 +27,10 @@ mod startup;
 #[cfg(windows)]
 mod tray;
 #[cfg(windows)]
+mod video;
+#[cfg(windows)]
+mod video_reader;
+#[cfg(windows)]
 mod window_capture;
 #[cfg(windows)]
 mod window_capture_wgc;
@@ -59,7 +63,7 @@ pub use overlay::{
     select_from_frozen_frame_with_initial_tool, select_from_frozen_frame_with_initial_tool_and_ui,
     select_from_preview_source_with_initial_tool_and_ui, ConfirmIntent, DesktopUi, EditOutcome,
     InitialSelectionTool, NativeWindowHandle, OverlayController, OverlayDestinations,
-    OverlayResources, OverlaySelection, OverlayUiUpdate, PreviewView, SelectionKind,
+    OverlayResources, OverlaySelection, OverlayUiUpdate, PreviewView, ReviewOutcome, SelectionKind,
     SelectionOutcome, SelectionPreviewSource, DISPLAY_CHANGE_MONITORS,
 };
 #[cfg(windows)]
@@ -67,6 +71,12 @@ pub use session::{desktop_state, DesktopState};
 #[cfg(windows)]
 pub use startup::{disable_startup, enable_startup, startup_command};
 #[cfg(windows)]
-pub use tray::{open_path, show_error_dialog, show_info_dialog, TrayEvent, TrayIcon};
+pub use tray::{
+    open_path, reveal_in_folder, show_error_dialog, show_info_dialog, TrayEvent, TrayIcon,
+};
+#[cfg(windows)]
+pub use video::{mp4_frame_size, Mp4Writer, VideoSummary, MP4_MAXIMUM_SIZE};
+#[cfg(windows)]
+pub use video_reader::Mp4Reader;
 #[cfg(windows)]
 pub use window_capture::{captured_window_frame, materialize_selection};

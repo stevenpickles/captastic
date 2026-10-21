@@ -99,6 +99,7 @@ struct ResolvedDaemonArgs {
     self_trigger_interval_ms: Option<u64>,
     json: bool,
     startup_warnings: Vec<String>,
+    recording: captastic_config::RecordingConfig,
 }
 
 #[cfg(windows)]
@@ -233,6 +234,7 @@ fn resolve_daemon_args_with_default(
         self_trigger_interval_ms: args.self_trigger_interval_ms,
         json: args.json,
         startup_warnings,
+        recording: config.recording.clone(),
     })
 }
 
@@ -292,6 +294,8 @@ struct CaptureWorkerContext {
     /// Every destination a finished capture is offered to, read per capture because the set can
     /// change while the daemon runs.
     destinations: crate::output::OutputDestinations,
+    /// Set while a recording runs; still captures are refused meanwhile (ADR 0011).
+    recording_active: Arc<AtomicBool>,
 }
 
 #[cfg(windows)]
@@ -316,6 +320,7 @@ fn run_capture_worker(context: CaptureWorkerContext) {
         commands: command_receiver,
         selection_sender,
         destinations,
+        recording_active,
     } = context;
     let mut recovery: Option<BackendRecovery> = None;
     let mut backend = match super::create_backend(&backend_name, &display_policy, cpu_slots) {
@@ -474,6 +479,51 @@ fn run_capture_worker(context: CaptureWorkerContext) {
             }
         };
         match command {
+            CaptureCommand::Trigger(_) if recording_active.load(Ordering::Acquire) => {
+                // One recording at a time and no stills beside it, so the two never compete for
+                // the engine's readback buffers. Not an attempt: nothing was captured or dropped.
+                log::info!("a capture was refused because a recording is running");
+                let _ = capture_notices.try_send(DaemonNotice::RecordingInProgress);
+            }
+            CaptureCommand::RecordFrame(request) => {
+                let result = match backend.as_mut() {
+                    None => Err(captastic_core::CaptureError::synthetic(
+                        "the capture engine is recovering",
+                    )),
+                    Some(active_backend) => {
+                        let capture_id = CaptureId(next_capture_id);
+                        next_capture_id = next_capture_id.saturating_add(1);
+                        let capture_request = CaptureRequest {
+                            id: capture_id,
+                            triggered_at: Instant::now(),
+                            source: request.source.clone(),
+                            mode: CaptureMode::Latest { max_age_ms: None },
+                            cpu_frame: true,
+                            retain_native_frame: false,
+                            // The configured policy, as for a still: a recording of someone
+                            // showing how to do something wants the pointer they did it with.
+                            cursor,
+                        };
+                        let mut recorder = EventRecorder::with_capacity(16);
+                        active_backend
+                            .capture(&capture_request, &mut recorder)
+                            .and_then(|outcome| {
+                                outcome.frame.ok_or_else(|| {
+                                    captastic_core::CaptureError::synthetic(
+                                        "the capture engine returned no frame",
+                                    )
+                                })
+                            })
+                    }
+                };
+                if let Err(error) = &result {
+                    if requires_backend_recovery(error) && recovery.is_none() {
+                        backend.take();
+                        recovery = Some(BackendRecovery::immediate());
+                    }
+                }
+                let _ = request.reply.try_send(result);
+            }
             CaptureCommand::Trigger(trigger) => {
                 if capture_budget_exhausted(max_captures, attempts) {
                     // Only reachable while an earlier attempt is still selecting; the loop
@@ -1003,6 +1053,23 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let (notice_sender, notice_receiver) =
         mpsc::sync_channel::<DaemonNotice>(args.selection_queue_capacity.max(1));
     let confirmed_regions = Arc::new(Mutex::new(args.confirmed_regions.clone()));
+    // Recordings are saved where captures are, named by the same template, and recorded in the
+    // same history - whether or not still captures are being saved (ADR 0011).
+    let recordings = crate::recording::RecordingHost::new(
+        args.recording.clone(),
+        args.output_directory.clone(),
+        args.output_filename_template.clone(),
+        crate::file_output::HistoryRecorder::new(
+            args.history_store.clone(),
+            args.history_retention,
+        ),
+        notice_sender.clone(),
+        command_sender.clone(),
+        args.ui_state_store
+            .config_path()
+            .map(std::path::Path::to_path_buf),
+        args.json,
+    );
     let mut selection_worker = args
         .selection
         .then(|| {
@@ -1020,6 +1087,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                 args.selection_queue_capacity,
                 confirmed_regions.clone(),
                 args.ui_state_store.clone(),
+                Some(recordings.clone()),
             )
         })
         .transpose()?;
@@ -1050,6 +1118,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         commands: command_receiver,
         selection_sender,
         destinations: destinations.clone(),
+        recording_active: recordings.active_flag(),
     };
     let capture_join = thread::Builder::new()
         .name("captastic-capture".to_owned())
@@ -1142,6 +1211,11 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     };
     if let Some(tray) = tray.as_ref() {
         refresh_tray_history(&args.history_store, tray);
+        if let Err(error) = tray.set_review_enabled(recordings.review_enabled()) {
+            crate::logging::warn(format_args!(
+                "failed to show the review setting in the notification area: {error}"
+            ));
+        }
         for warning in &args.startup_warnings {
             if let Err(error) =
                 tray.show_error_with_title("Captastic configuration recovered", warning.clone())
@@ -1373,7 +1447,22 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                     }
                     last_notice_message = Some(message.clone());
                     if let Some(tray) = tray.as_ref() {
-                        if let Err(error) = tray.show_error_with_title(notice.title(), message) {
+                        let revealing = match &notice {
+                            DaemonNotice::RecordingSaved { path, .. }
+                            | DaemonNotice::RecordingEditFailed { path, .. } => Some(path.clone()),
+                            _ => None,
+                        };
+                        let shown = if let Some(path) = revealing {
+                            // The recording is in history now, which the tray's history entries
+                            // need to know even when still captures are not being saved.
+                            refresh_tray_history(&args.history_store, tray);
+                            tray.show_info_revealing(notice.title(), message, path)
+                        } else if notice.is_informational() {
+                            tray.show_info_with_title(notice.title(), message)
+                        } else {
+                            tray.show_error_with_title(notice.title(), message)
+                        };
+                        if let Err(error) = shown {
                             crate::logging::warn(format_args!(
                                 "failed to surface a daemon notice in the notification area: {error}"
                             ));
@@ -1426,6 +1515,9 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                             captastic_windows::TrayEvent::ShowInFolder => {
                                 show_last_capture_in_folder(&args.history_store, tray);
                             }
+                            captastic_windows::TrayEvent::OpenCapturesFolder => {
+                                open_captures_folder(&args.output_directory, tray);
+                            }
                             captastic_windows::TrayEvent::PruneHistory => {
                                 prune_history_from_tray(
                                     &args.history_store,
@@ -1444,6 +1536,15 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                     requested,
                                     "notification area",
                                 );
+                            }
+                            captastic_windows::TrayEvent::ToggleReview => {
+                                let enabled = !recordings.review_enabled();
+                                recordings.set_review(enabled);
+                                if let Err(error) = tray.set_review_enabled(enabled) {
+                                    crate::logging::warn(format_args!(
+                                        "failed to update the review setting in the notification area: {error}"
+                                    ));
+                                }
                             }
                             captastic_windows::TrayEvent::ClosePins => {
                                 if let Some(worker) = workers.selection() {
@@ -1636,11 +1737,7 @@ fn show_last_capture_in_folder(
 ) {
     match latest_capture(store) {
         Ok(Some(path)) => {
-            let Some(directory) = path.parent() else {
-                notify_history_problem(tray, "The remembered capture has no folder.".to_owned());
-                return;
-            };
-            if let Err(error) = captastic_windows::open_path(directory) {
+            if let Err(error) = captastic_windows::reveal_in_folder(&path) {
                 notify_history_problem(
                     tray,
                     format!("Captastic could not open the folder: {error}"),
@@ -1656,6 +1753,26 @@ fn show_last_capture_in_folder(
             tray,
             format!("Captastic could not read its capture history: {error}"),
         ),
+    }
+}
+
+/// Opens the folder captures and recordings are saved to, making it first if nothing has been
+/// saved there yet, so the menu entry always leads somewhere.
+#[cfg(windows)]
+fn open_captures_folder(directory: &std::path::Path, tray: &captastic_windows::TrayIcon) {
+    let opened = std::fs::create_dir_all(directory)
+        .map_err(|error| error.to_string())
+        .and_then(|()| captastic_windows::open_path(directory).map_err(|error| error.to_string()));
+    if let Err(error) = opened {
+        crate::logging::warn(format_args!("could not open the captures folder: {error}"));
+        if let Err(error) = tray.show_error_with_title(
+            "Captastic could not open the captures folder",
+            format!("{}: {error}", directory.display()),
+        ) {
+            crate::logging::warn(format_args!(
+                "failed to surface a captures-folder problem in the notification area: {error}"
+            ));
+        }
     }
 }
 
@@ -3080,7 +3197,17 @@ pub(crate) enum CaptureCommand {
     /// cancellation, which produces no other command. Without it the capture worker could never
     /// observe that a `--max-captures` attempt had finished.
     SelectionFinished(CaptureId),
+    /// A recording asks for the newest frame of its display (ADR 0011).
+    RecordFrame(Box<RecordFrameRequest>),
     Shutdown,
+}
+
+/// One frame for a recording, answered on `reply`.
+#[cfg(windows)]
+pub(crate) struct RecordFrameRequest {
+    pub(crate) source: CaptureSource,
+    pub(crate) reply:
+        mpsc::SyncSender<Result<captastic_core::CpuFrame, captastic_core::CaptureError>>,
 }
 
 /// Something the user asked for that will not happen, raised by a worker thread for the main
@@ -3102,6 +3229,25 @@ pub(crate) enum DaemonNotice {
     CaptureEngineUnavailable,
     /// The capture engine came back after `CaptureEngineUnavailable` was raised.
     CaptureEngineRecovered,
+    /// A capture or a second recording was asked for while a recording runs.
+    RecordingInProgress,
+    /// A recording was saved to the output directory.
+    RecordingSaved {
+        file_name: String,
+        /// Where it was saved, which clicking the notification shows.
+        path: std::path::PathBuf,
+        /// How it ended, for a recording saved as soon as it ended; `None` once it has been
+        /// reviewed, when that is no longer news.
+        ended: Option<crate::recording::RecordingEnd>,
+    },
+    /// A recording failed, and nothing was saved.
+    RecordingFailed { message: String },
+    /// A reviewed recording could not be trimmed or cropped, so it was saved as recorded.
+    RecordingEditFailed {
+        file_name: String,
+        path: std::path::PathBuf,
+        message: String,
+    },
 }
 
 #[cfg(windows)]
@@ -3111,7 +3257,19 @@ impl DaemonNotice {
             Self::DroppedSelection { .. } => "Captastic could not finish a capture",
             Self::CaptureEngineUnavailable => "Captastic cannot capture right now",
             Self::CaptureEngineRecovered => "Captastic can capture again",
+            Self::RecordingInProgress => "Captastic is recording",
+            Self::RecordingSaved { .. } => "Recording saved",
+            Self::RecordingFailed { .. } => "Captastic could not save the recording",
+            Self::RecordingEditFailed { .. } => "Captastic could not trim the recording",
         }
+    }
+
+    /// Whether this is news rather than a problem, shown with the information icon.
+    fn is_informational(&self) -> bool {
+        matches!(
+            self,
+            Self::CaptureEngineRecovered | Self::RecordingSaved { .. } | Self::RecordingInProgress
+        )
     }
 
     fn message(&self) -> String {
@@ -3128,6 +3286,27 @@ impl DaemonNotice {
             Self::CaptureEngineRecovered => {
                 "The capture engine recovered. Captures are running again.".to_owned()
             }
+            Self::RecordingInProgress => {
+                "Stop the recording with its Stop button before capturing again.".to_owned()
+            }
+            Self::RecordingSaved {
+                file_name, ended, ..
+            } => match ended {
+                Some(crate::recording::RecordingEnd::TimeLimit) => format!(
+                    "{file_name} was saved when the recording reached its time limit. Click to \
+                     show it in its folder."
+                ),
+                Some(crate::recording::RecordingEnd::Stopped) | None => {
+                    format!("{file_name} was saved. Click to show it in its folder.")
+                }
+            },
+            Self::RecordingFailed { message } => format!("Nothing was saved: {message}."),
+            Self::RecordingEditFailed {
+                file_name, message, ..
+            } => format!(
+                "{file_name} was saved as it was recorded instead: {message}. Click to show it in \
+                 its folder."
+            ),
         }
     }
 }

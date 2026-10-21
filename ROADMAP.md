@@ -64,12 +64,16 @@ public release, but it gates neither a release nor the milestones below.
 | v0.1.0 | 2026-09-03 | The first tag: unsigned, no performance claim, the release mechanics exercised end to end | [notes](docs/release-notes-v0.1.0.md) |
 | v0.1.1 | 2026-09-16 | Patch: the dock-switch first-capture fixes (PR #83) | [notes](docs/release-notes-v0.1.1.md) |
 | v0.2.0 | 2026-09-17 | Output formats, region precision, the frozen view, the file-output toggle, benchmark evidence | [notes](docs/release-notes-v0.2.0.md) |
+| v0.3.0 | 2026-10-15 | Pinning; the editor with crop, redaction, boxes, pen, marker and highlighter; one windowless executable; relaunch after an upgrade | [notes](docs/release-notes-v0.3.0.md) |
 
 The v0.2.0 manual checklists found two defects that nothing else had (#94, the frozen view presented
 with `ULW_OPAQUE` was not opaque; #95, the default output directory ignored a redirected Pictures
 folder), which is the standing argument for running a manual checklist before every release that
-changes overlay or desktop behaviour. No release has yet been pushed to the Chocolatey community
-repository; that is deliberately deferred to 0.3.0 (below).
+changes overlay or desktop behaviour. The v0.3.0 walk-throughs found three more (Shift and Ctrl on
+Capture and on a double-click, and the pin's right-click menu). v0.3.0 was cut without the
+disposable-VM checklist, at the maintainer's call, and its notes say so. It is the first release
+submitted to the Chocolatey community repository; the submission is made by hand and has to pass
+validation and moderation before `choco install captastic` resolves against the default source.
 
 **Branch model for every formal release.** Cut a `release/v<version>` branch from `dev`, merge it
 to `main` by pull request, tag `v<version>` on `main`, and then merge the release branch back to
@@ -85,10 +89,43 @@ procedure in [benchmarks/README.md](benchmarks/README.md) has been run and the s
 figure are committed. Every release so far has published no absolute number, which satisfies
 Milestone 5's criterion vacuously and on purpose.
 
+## Release readiness — v0.4.0
+
+**Status:** every gate below met on 2026-10-21, ready to tag. The desktop checklists passed for
+every slice (#118-#131), the disposable-VM checklist passed, and the release notes are drafted in
+[docs/release-notes-v0.4.0.md](docs/release-notes-v0.4.0.md). The 0.3.0 Chocolatey submission
+was approved on 2026-10-19. Decided on 2026-10-15:
+
+- **Theme: recording.** 0.4.0 adds recording a region, window or display as an **animated GIF**,
+  and as MP4 video; see [Milestone 9](#milestone-9--screen-recording-and-animated-gif) and
+  [ADR 0011](docs/adr/0011-screen-recording.md), which settles how a recording is started, seen and
+  stopped, what bounds its length and memory, and where the file goes.
+- **The editor keeps improving alongside it.** Antialiased pen, marker, highlighter and swatch
+  icons are the first 0.4.0 change; arrows and text (Milestone 6 slices 3 and 4) follow, and may
+  ship in 0.4.0 or a 0.4.x on their own schedule.
+- **Carried from 0.3.0:** the disposable-VM checklist v0.3.0 shipped without, and seeing the first
+  Chocolatey community submission through moderation.
+
+### Gates — before the tag
+
+- **Milestone 9 merged and its exit criteria met**: recording a region, window or display to an
+  animated GIF and to MP4 on disk, started from the overlay's **Record** button and stopped by its
+  **Stop** bar or the time limit, with the indicator visible for the whole recording and absent from
+  it. A recording that cannot be seen to be running, or cannot be stopped, may not ship.
+- **A manual desktop checklist for every slice that changes overlay or desktop behaviour**, run
+  before merge.
+- **The disposable-VM checklist** in [docs/chocolatey.md](docs/chocolatey.md), this time before the
+  tag.
+- **Release notes** that say plainly what a recording contains (the region and the pointer, never
+  audio) and that the indicator itself is never recorded.
+- **Recording review** (ADR 0012, Milestone 9 slices 5 to 8) merged and checked on the desktop,
+  added to 0.4.0 on 2026-10-17.
+
 ## Release readiness — v0.3.0
 
-**Status:** feature-complete on `dev` (workspace version 0.3.0); release preparation under way.
-Decided on 2026-10-15:
+**Status:** shipped 2026-10-15 (tag `v0.3.0` on `main` at c9763fe, published with its archive,
+checksum, Chocolatey package and manifest, all hashes verified). The workspace is now 0.4.0. Kept
+below as the record of what 0.3.0 was planned around. Decided on 2026-10-15:
 
 - **Theme: pinning and annotation (Milestone 6).** It was the decision gate's open choice against a
   first cross-platform proof; it wins because it is user-visible, ungated, and buildable and
@@ -556,9 +593,12 @@ Each lands as its own pull request with a manual desktop checklist.
    destructive redaction (an opaque fill over the exported pixels, never a blur or a reversible
    layer), with the capture withheld until **Done** and then published through the destination set.
 3. **Shapes and highlights** (`feature/70/editor-shapes-and-pens`, built on slice 2). Box outlines,
-   pen, marker and highlighter strokes in a six-colour palette, painted in order with redaction.
-   Arrows are still to come.
-4. **Text.** Text annotations, with DPI-correct font rendering in the exported pixels.
+   pen, marker and highlighter strokes in a seven-colour palette, painted in order with redaction.
+   Arrows followed in 0.4.0 (`feature/76/editor-arrows`).
+4. **Text** (`feature/77/editor-text`, 0.4.0). Text annotations, with DPI-correct font rendering
+   in the exported pixels: the editor rasterizes Segoe UI with grayscale antialiasing into a
+   coverage mask at the capture's scaling, and the model paints the mask, so the published pixels
+   are the ones shown while typing.
 5. **History integration.** Opening a recent capture in the editor, once modal versus concurrent is
    settled and proven by the slices above.
 
@@ -672,6 +712,71 @@ still when the desktop will not.
   trip through a running daemon was observed on 2026-09-17 (PR #89 checklist 11, PR #92
   checklist 7).
 
+## Milestone 9 — Screen recording and animated GIF
+
+**Outcome:** a region, window or display can be recorded for a few seconds to a minute and saved as
+an animated GIF, small enough to drop into a chat, an issue or a document, and later as video, with
+the same overlay, the same destinations, and no effect on still captures.
+
+The capture engine already produces timed frames: DXGI duplication for displays and regions, and
+Windows Graphics Capture for windows. Recording reuses those sources at a steady frame rate and adds
+a streaming encoder, so a recording's memory is bounded by the encoder's window rather than its
+length.
+
+### Decisions (ADR 0011)
+
+[ADR 0011](docs/adr/0011-screen-recording.md) settles them; the user-facing choices were made on
+2026-10-15.
+
+- **Start:** a **Record** button on the overlay toolbar, for every tool, and no recording hotkey.
+- **Seen and stopped:** a red border around the area with a **Stop** bar outside it, both excluded
+  from the recording; a recording stops at **Stop** or at `recording.max_seconds` (60 by default),
+  and every other ending (exit, display change, the window closing) finalizes what was recorded.
+- **Formats:** GIF and MP4 both in 0.4.0, chosen by an Options row, **Record As**. GIF at 15 fps,
+  at most 1280 px on its longer side, NeuQuant palettes and transparent unchanged pixels; MP4 at
+  30 fps and native size through Media Foundation's H.264 encoder.
+- **Destination:** a file in the output directory and history, always; the clipboard is untouched,
+  and a balloon names the file.
+- **Memory:** frames stream through a bounded queue to an encoder thread; a slow encoder drops the
+  oldest unencoded frame rather than grow.
+- **Review before saving (ADR 0012):** a finished recording opens in a review window, by default,
+  to be trimmed to the millisecond and cropped before it is saved; Save unchanged costs no encode,
+  and discarding always asks first.
+- **Not in 0.4.0:** audio, marks drawn on recordings, and still captures while a recording runs.
+
+### Proposed slices
+
+1. **The recording engine** (#117). Frames from the existing sources at a steady rate into a bounded
+   queue, a recording state the daemon owns, still captures refused while it runs, and a stop path
+   that always finalizes a valid file.
+2. **Animated GIF output** (#115). NeuQuant quantization, transparent unchanged pixels and streaming
+   encode on a worker, with the dimension and duration limits.
+3. **Starting, seeing and stopping a recording** (`feature/75/record-button`). The **Record**
+   button, the **Record As** row, the excluded border and its **Stop** bar, the time limit, and the
+   saved-file balloon.
+4. **MP4 output** (#116) through Media Foundation's sink writer.
+5. **Reading recordings back** ([ADR 0012](docs/adr/0012-recording-review.md)): a GIF reader that
+   keeps frames compressed and decodes them on demand, and an MP4 reader on Media Foundation's
+   source reader, each tested against its writer.
+6. **Holding, saving and discarding**: recordings encoded into memory until the review ends, saved
+   unchanged as recorded or edited by a re-encode, `recording.review` and the **Review Recordings**
+   tray switch. First built with a drafts folder on disk and recovery after a crash; changed on
+   2026-10-21 so that nothing is written before **Save**.
+7. **The review window with trim**: playback, a timeline with start and end handles, frame, second
+   and change stepping, **I** and **O**, millisecond readouts, Save, and Discard that asks first.
+8. **Crop** in the review window.
+
+All eight gate the 0.4.0 tag.
+
+### Exit criteria
+
+- Still-capture latency and memory are unchanged when no recording is running.
+- A recording is visible for its whole duration, and the indicator never appears in it.
+- Every way a recording ends - stop, limit, error, Captastic exiting - leaves either a valid file or
+  nothing, and says which.
+- A one-minute recording at the default settings stays within a documented memory ceiling, however
+  large the area.
+
 ## Architecture hardening backlog
 
 These items were deliberately separated from the code-review remediation branch because each
@@ -763,24 +868,25 @@ disposition are recorded in
 [docs/investigations.md](docs/investigations.md#the-2026-08-code-architecture-and-roadmap-review).
 The order below reflects what remains.
 
-1. Ship 0.3.0: `release/v0.3.0` to `main`, the disposable-VM checklist (portable installer and
-   upgrade relaunch included), the tag, the release notes, the back-merge and version bump, and the
-   first Chocolatey community push.
-2. Milestone 6's remaining slices as 0.3.x: arrows and text on the editor model, then reopening a
+1. See the first Chocolatey community submission through validation and moderation, and run the
+   disposable-VM checklist that v0.3.0 shipped without; a defect it finds is a 0.3.x patch.
+2. 0.4.0's theme, recording ([Milestone 9](#milestone-9--screen-recording-and-animated-gif)), as
+   ADR 0011 settles it: the engine, GIF output, the controls to start, see and stop it, and MP4.
+3. Milestone 6's remaining slices beside it: arrows and text on the editor model, then reopening a
    capture from history in the editor.
-3. Finish Milestone 5's evidence work, which is now measurement rather than code: the operator
+4. Finish Milestone 5's evidence work, which is now measurement rather than code: the operator
    claim runs from [benchmarks/README.md](benchmarks/README.md), after which the absolute budget
    ceilings can be set and a figure can be published. The sequence-marker workload and Milestone 3's
    window-capture backend trait stay deferred — the first needs a desk, a mouse and a rotatable
    display and gates no release claim; the second changes no user-visible contract.
-4. Complete Milestone 1 (multi-adapter composition and the hardware validation matrix) when the
+5. Complete Milestone 1 (multi-adapter composition and the hardware validation matrix) when the
    hardware is available; it needs a second adapter, not design.
-5. Settle the outstanding design decisions — latest-mode currency on an idle desktop,
+6. Settle the outstanding design decisions — latest-mode currency on an idle desktop,
    `fresh` + `virtual_desktop`, and control-event hardening. Milestone 4's two product questions are
    answered (ADR 0008), and the mouse-capture/software-KVM contract is settled in ADR 0009: each use
    takes the pointer source that answers its own question, and Captastic promises nothing about
    where a foreign owner has put the mouse.
-6. Cross-platform work (Milestone 7), the decision gate's other candidate, after Milestone 6.
+7. Cross-platform work (Milestone 7), the decision gate's other candidate, after Milestone 6.
 
 ### Lifecycle recovery: what the investigation settled
 
@@ -796,11 +902,14 @@ not reproduced on demand, is in
 
 ## Recommended next branch
 
-`release/v0.3.0`, cut from `dev` once this preparation is merged, and its pull request to `main`.
-The tag waits for the disposable-VM checklist in [docs/chocolatey.md](docs/chocolatey.md); after
-it, the release workflow publishes the GitHub release, the drafted notes are pasted in, the release
-branch is merged back to `dev` with the workspace version advanced to 0.4.0, and the Chocolatey
-package is pushed by hand.
+`feature/72/recording-engine`: Milestone 9 slice 1 as [ADR 0011](docs/adr/0011-screen-recording.md)
+describes it — frames from the existing sources at a steady rate into a bounded queue of detached
+copies, a recording state the daemon owns, still captures refused while it runs, and a stop path
+that always finalizes. The antialiased editor icons (`feature/71/editor-icons`) are the first 0.4.0
+change, already built.
+Alongside: the disposable-VM checklist in [docs/chocolatey.md](docs/chocolatey.md) that v0.3.0
+shipped without, whatever the Chocolatey moderators ask of the first submission, and Milestone 6's
+arrow tool when it fits.
 
 FakeBackend fidelity keeps its leverage and is worth extending as gaps appear: much of Milestone 4
 shipped with daemon-side behaviour verified only by unit tests, because a second daemon cannot start

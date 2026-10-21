@@ -1,7 +1,8 @@
 //! What an editor does to a capture, independent of any window that shows it (ADR 0010).
 //!
 //! An [`Edit`] holds a capture and the operations made on it so far: one crop and any number of
-//! [`Mark`]s - redactions, box outlines and pen, marker and highlighter strokes - each undoable.
+//! [`Mark`]s - redactions, box outlines, arrows, pen, marker and highlighter strokes, and text -
+//! each undoable.
 //! Nothing touches the capture's pixels until [`Edit::render`], which makes the image that will be
 //! published, painting the marks in the order they were made.
 //!
@@ -39,6 +40,47 @@ impl Color {
     }
 }
 
+/// Rasterized text: how much of each pixel the letters cover, from 0 to 255, row by row.
+///
+/// Whoever lays text out also rasterizes it, with the platform's fonts; an edit only paints the
+/// result. That keeps fonts out of the model, and means the published pixels are exactly the
+/// pixels that were shown while typing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GlyphMask {
+    width: u32,
+    height: u32,
+    coverage: Arc<[u8]>,
+}
+
+impl GlyphMask {
+    /// A mask `width` by `height`, or nothing if `coverage` is not exactly one byte per pixel.
+    pub fn new(width: u32, height: u32, coverage: Vec<u8>) -> Option<Self> {
+        let expected = (width as usize).checked_mul(height as usize)?;
+        (coverage.len() == expected).then(|| Self {
+            width,
+            height,
+            coverage: Arc::from(coverage),
+        })
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn coverage(&self) -> &[u8] {
+        &self.coverage
+    }
+
+    /// Whether any pixel is covered at all: blank text, spaces alone, covers none.
+    pub fn is_blank(&self) -> bool {
+        self.coverage.iter().all(|value| *value == 0)
+    }
+}
+
 /// How a freehand stroke is laid on the capture.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StrokeStyle {
@@ -69,6 +111,24 @@ pub enum Mark {
         width: f32,
         style: StrokeStyle,
     },
+    /// A straight arrow from `from` to `to`: a shaft `width` pixels across with a round tail, and
+    /// a filled head whose point is exactly `to`.
+    Arrow {
+        from: (f32, f32),
+        to: (f32, f32),
+        color: Color,
+        width: f32,
+    },
+    /// Text, as `mask` laid with its top-left pixel at `at` and coloured `color`. `text` is what
+    /// was typed and `size` the pixels to the em it was rasterized at, kept so the text can be
+    /// laid out again and edited; only the mask is painted.
+    Text {
+        at: (i32, i32),
+        text: String,
+        size: u32,
+        color: Color,
+        mask: GlyphMask,
+    },
 }
 
 impl Mark {
@@ -77,6 +137,32 @@ impl Mark {
         match self {
             Self::Redaction(rect) | Self::Rectangle { rect, .. } => {
                 (rect.width > 0 && rect.height > 0).then_some(*rect)
+            }
+            Self::Text { at, mask, .. } => (mask.width > 0 && mask.height > 0).then_some(Rect {
+                x: at.0,
+                y: at.1,
+                width: mask.width,
+                height: mask.height,
+            }),
+            Self::Arrow {
+                from, to, width, ..
+            } => {
+                let shape = ArrowShape::new(*from, *to, *width)?;
+                let reach = width / 2.0 + 1.0;
+                let (mut left, mut top) = (from.0.min(to.0), from.1.min(to.1));
+                let (mut right, mut bottom) = (from.0.max(to.0), from.1.max(to.1));
+                for (x, y) in shape.head {
+                    left = left.min(x);
+                    top = top.min(y);
+                    right = right.max(x);
+                    bottom = bottom.max(y);
+                }
+                Rect::from_edges(
+                    (left - reach).floor() as i64,
+                    (top - reach).floor() as i64,
+                    (right + reach).ceil() as i64,
+                    (bottom + reach).ceil() as i64,
+                )
             }
             Self::Stroke { points, width, .. } => {
                 let reach = width / 2.0 + 1.0;
@@ -105,8 +191,17 @@ impl Mark {
 /// One undoable operation.
 #[derive(Clone, Debug, PartialEq)]
 enum Step {
-    Crop { before: Rect, after: Rect },
+    Crop {
+        before: Rect,
+        after: Rect,
+    },
     Mark(Mark),
+    /// The mark at `index` changed to `after`, or removed when there is no `after`.
+    Replace {
+        index: usize,
+        before: Mark,
+        after: Option<Mark>,
+    },
 }
 
 /// A capture being edited.
@@ -182,12 +277,41 @@ impl Edit {
     /// drawn, and only offered to a capture of eight-bit pixels, since nothing paints a colour
     /// into a wider one yet.
     pub fn add(&mut self, mark: Mark) -> bool {
+        let Some(mark) = self.accept(mark) else {
+            return false;
+        };
+        self.record(Step::Mark(mark));
+        true
+    }
+
+    /// Changes the mark at `index` to `mark`, keeping its place in the painting order, or removes
+    /// it when `mark` is `None`. Returns whether anything changed: a replacement [`Edit::add`]
+    /// would refuse, one the same as the mark it replaces, or an index with no mark, is not an
+    /// operation.
+    pub fn replace(&mut self, index: usize, mark: Option<Mark>) -> bool {
+        let Some(before) = self.marks.get(index).cloned() else {
+            return false;
+        };
+        let after = match mark {
+            Some(mark) => match self.accept(mark) {
+                Some(mark) if mark != before => Some(mark),
+                _ => return false,
+            },
+            None => None,
+        };
+        self.record(Step::Replace {
+            index,
+            before,
+            after,
+        });
+        true
+    }
+
+    /// The mark as it would be kept, or nothing if it is not one to keep.
+    fn accept(&self, mark: Mark) -> Option<Mark> {
         let bounds = self.bounds();
         let mark = match mark {
-            Mark::Redaction(rect) => match rect.intersection(bounds) {
-                Some(rect) => Mark::Redaction(rect),
-                None => return false,
-            },
+            Mark::Redaction(rect) => Mark::Redaction(rect.intersection(bounds)?),
             drawn => {
                 let eight_bit = matches!(
                     self.source.format().encoding(),
@@ -200,16 +324,32 @@ impl Edit {
                 let drawable = match &drawn {
                     Mark::Rectangle { width, .. } => *width > 0,
                     Mark::Stroke { width, .. } => *width > 0.0,
+                    // Bounds already refuse an arrow with no length or no width.
+                    Mark::Arrow { .. } => true,
+                    Mark::Text { mask, .. } => !mask.is_blank(),
                     Mark::Redaction(_) => true,
                 };
                 if !eight_bit || !visible || !drawable {
-                    return false;
+                    return None;
                 }
                 drawn
             }
         };
-        self.record(Step::Mark(mark));
-        true
+        Some(mark)
+    }
+
+    /// The mark the last operation made or changed, if the last operation was one that left a
+    /// mark: so an editor can adjust what was just drawn.
+    pub fn last_changed(&self) -> Option<usize> {
+        match self.undo.last()? {
+            Step::Mark(_) => self.marks.len().checked_sub(1),
+            Step::Replace {
+                index,
+                after: Some(_),
+                ..
+            } => Some(*index),
+            _ => None,
+        }
     }
 
     pub fn can_undo(&self) -> bool {
@@ -234,6 +374,17 @@ impl Edit {
             Step::Crop { before, .. } => self.crop = *before,
             Step::Mark(_) => {
                 self.marks.pop();
+            }
+            Step::Replace {
+                index,
+                before,
+                after,
+            } => {
+                if after.is_some() {
+                    self.marks[*index] = before.clone();
+                } else {
+                    self.marks.insert(*index, before.clone());
+                }
             }
         }
         self.redo.push(step);
@@ -261,6 +412,12 @@ impl Edit {
         match step {
             Step::Crop { after, .. } => self.crop = after,
             Step::Mark(mark) => self.marks.push(mark),
+            Step::Replace { index, after, .. } => match after {
+                Some(mark) => self.marks[index] = mark,
+                None => {
+                    self.marks.remove(index);
+                }
+            },
         }
     }
 
@@ -392,6 +549,112 @@ pub fn paint_mark(
                 }
             }
         }
+        Mark::Text {
+            at, color, mask, ..
+        } => {
+            let ink = ordered(*color, blue_first);
+            let mask_width = mask.width as usize;
+            for y in reach.y..(reach.bottom() as i32) {
+                let row = (y - at.1) as usize * mask_width;
+                for x in reach.x..(reach.right() as i32) {
+                    let value = mask.coverage[row + (x - at.0) as usize];
+                    if value > 0 {
+                        let at = offset(x, y);
+                        let cover = f32::from(value) / 255.0;
+                        blend_over(&mut pixels[at..at + 4], &ink, cover, alpha);
+                    }
+                }
+            }
+        }
+        Mark::Arrow {
+            from,
+            to,
+            color,
+            width,
+        } => {
+            let Some(shape) = ArrowShape::new(*from, *to, *width) else {
+                return;
+            };
+            let ink = ordered(*color, blue_first);
+            for y in reach.y..(reach.bottom() as i32) {
+                for x in reach.x..(reach.right() as i32) {
+                    let cover = shape.coverage((x as f32 + 0.5, y as f32 + 0.5));
+                    if cover > 0.0 {
+                        let at = offset(x, y);
+                        blend_over(&mut pixels[at..at + 4], &ink, cover, alpha);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// An arrow's outline: a shaft from the tail to the base of its head, and the head, a triangle.
+struct ArrowShape {
+    tail: (f32, f32),
+    /// Where the shaft meets the head, at the middle of the head's base.
+    base: (f32, f32),
+    radius: f32,
+    /// The point, then the two corners of the base.
+    head: [(f32, f32); 3],
+}
+
+impl ArrowShape {
+    /// The shape of an arrow `width` pixels across, or nothing if it has no length or no width.
+    ///
+    /// The head is long in proportion to the width, so a heavier arrow has a larger head, and
+    /// never more than three fifths of the arrow, so a short one is still mostly arrow.
+    fn new(from: (f32, f32), to: (f32, f32), width: f32) -> Option<Self> {
+        let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+        let length = (dx * dx + dy * dy).sqrt();
+        if !(length >= 1.0 && width > 0.0) {
+            return None;
+        }
+        let direction = (dx / length, dy / length);
+        let across = (-direction.1, direction.0);
+        let head_length = (width * 3.5 + 6.0).min(length * 0.6);
+        let half = (head_length * 0.55).max(width);
+        let base = (
+            to.0 - direction.0 * head_length,
+            to.1 - direction.1 * head_length,
+        );
+        Some(Self {
+            tail: from,
+            base,
+            radius: width / 2.0,
+            head: [
+                to,
+                (base.0 + across.0 * half, base.1 + across.1 * half),
+                (base.0 - across.0 * half, base.1 - across.1 * half),
+            ],
+        })
+    }
+
+    /// How much of the pixel centred at `point` the arrow covers, from 0 to 1.
+    fn coverage(&self, point: (f32, f32)) -> f32 {
+        let shaft =
+            (self.radius + 0.5 - distance_to_segment(point, self.tail, self.base)).clamp(0.0, 1.0);
+        // The head's distance is the largest of its distances outside each edge, which is exact
+        // along the edges and slightly sharpens the corners, as an arrowhead should be.
+        let centre = (
+            (self.head[0].0 + self.head[1].0 + self.head[2].0) / 3.0,
+            (self.head[0].1 + self.head[1].1 + self.head[2].1) / 3.0,
+        );
+        let mut outside = f32::MIN;
+        for index in 0..3 {
+            let start = self.head[index];
+            let end = self.head[(index + 1) % 3];
+            let (ex, ey) = (end.0 - start.0, end.1 - start.1);
+            let length = (ex * ex + ey * ey).sqrt().max(f32::EPSILON);
+            let mut normal = (ey / length, -ex / length);
+            // Point the normal away from the middle, whichever way round the corners run.
+            if (centre.0 - start.0) * normal.0 + (centre.1 - start.1) * normal.1 > 0.0 {
+                normal = (-normal.0, -normal.1);
+            }
+            outside = outside.max((point.0 - start.0) * normal.0 + (point.1 - start.1) * normal.1);
+        }
+        let head = (0.5 - outside).clamp(0.0, 1.0);
+        shaft.max(head)
     }
 }
 
@@ -957,6 +1220,137 @@ mod tests {
     }
 
     #[test]
+    fn an_arrow_has_a_shaft_and_a_head_whose_point_is_where_it_ends() {
+        let mut edit = Edit::new(white(40, 21));
+        assert!(edit.add(Mark::Arrow {
+            from: (2.0, 10.5),
+            to: (38.0, 10.5),
+            color: RED,
+            width: 2.0,
+        }));
+        let rendered = edit.render().expect("render");
+        let red = [RED.blue, RED.green, RED.red, 255];
+        // The shaft: solid along its middle, clear a little above it.
+        assert_eq!(pixel(&rendered, 10, 10), red);
+        assert_eq!(pixel(&rendered, 10, 7), [255; 4]);
+        // The head is wider than the shaft: solid above and below the line near its base.
+        assert_eq!(pixel(&rendered, 28, 7), red);
+        assert_eq!(pixel(&rendered, 28, 13), red);
+        // It narrows to its point, which reaches the end and goes no further.
+        assert_ne!(pixel(&rendered, 37, 10), [255; 4]);
+        assert_eq!(pixel(&rendered, 39, 10), [255; 4]);
+        assert_eq!(pixel(&rendered, 37, 6), [255; 4]);
+        // Nothing behind the tail.
+        assert_eq!(pixel(&rendered, 0, 10), [255; 4]);
+    }
+
+    #[test]
+    fn an_arrow_points_whichever_way_it_was_drawn() {
+        let mut down = Edit::new(white(21, 40));
+        down.add(Mark::Arrow {
+            from: (10.5, 2.0),
+            to: (10.5, 38.0),
+            color: RED,
+            width: 2.0,
+        });
+        let mut up = Edit::new(white(21, 40));
+        up.add(Mark::Arrow {
+            from: (10.5, 38.0),
+            to: (10.5, 2.0),
+            color: RED,
+            width: 2.0,
+        });
+        let (down, up) = (down.render().expect("down"), up.render().expect("up"));
+        // The wide part is near the end each points to.
+        assert_ne!(pixel(&down, 7, 28), [255; 4]);
+        assert_eq!(pixel(&down, 7, 10), [255; 4]);
+        assert_ne!(pixel(&up, 7, 11), [255; 4]);
+        assert_eq!(pixel(&up, 7, 29), [255; 4]);
+    }
+
+    #[test]
+    fn text_paints_its_mask_in_its_colour_where_it_was_placed() {
+        let mut edit = Edit::new(white(6, 5));
+        // A two-by-two mask: full, half, nothing, full.
+        let mask = GlyphMask::new(2, 2, vec![255, 128, 0, 255]).expect("mask");
+        assert!(edit.add(Mark::Text {
+            at: (3, 2),
+            text: "x".to_owned(),
+            size: 12,
+            color: RED,
+            mask,
+        }));
+        let rendered = edit.render().expect("render");
+        let red = [RED.blue, RED.green, RED.red, 255];
+        assert_eq!(pixel(&rendered, 3, 2), red);
+        assert_eq!(pixel(&rendered, 4, 3), red);
+        assert_eq!(pixel(&rendered, 3, 3), [255; 4]);
+        // Half covered is half way from white to the colour.
+        let half = pixel(&rendered, 4, 2);
+        assert!(half[2] > 230 && (130..=150).contains(&half[1]), "{half:?}");
+        // Nothing outside the mask.
+        assert_eq!(pixel(&rendered, 2, 2), [255; 4]);
+        assert_eq!(pixel(&rendered, 5, 4), [255; 4]);
+    }
+
+    #[test]
+    fn text_hanging_off_the_capture_is_clipped_and_blank_text_is_refused() {
+        let mut edit = Edit::new(white(4, 4));
+        let mask = GlyphMask::new(3, 3, vec![255; 9]).expect("mask");
+        assert!(edit.add(Mark::Text {
+            at: (-1, 2),
+            text: "x".to_owned(),
+            size: 12,
+            color: RED,
+            mask,
+        }));
+        let rendered = edit.render().expect("render");
+        assert_eq!(pixel(&rendered, 0, 3), [RED.blue, RED.green, RED.red, 255]);
+        assert_eq!(pixel(&rendered, 2, 3), [255; 4]);
+        assert!(!edit.add(Mark::Text {
+            at: (0, 0),
+            text: "  ".to_owned(),
+            size: 12,
+            color: RED,
+            mask: GlyphMask::new(2, 1, vec![0, 0]).expect("mask"),
+        }));
+        assert!(GlyphMask::new(2, 2, vec![0; 3]).is_none());
+    }
+
+    #[test]
+    fn a_mark_replaced_keeps_its_place_and_undo_puts_it_back() {
+        let mut edit = Edit::new(white(40, 40));
+        let arrow = |to: (f32, f32)| Mark::Arrow {
+            from: (2.0, 2.0),
+            to,
+            color: RED,
+            width: 2.0,
+        };
+        edit.add(arrow((20.0, 20.0)));
+        edit.redact(rect(0, 0, 4, 4));
+        assert_eq!(edit.last_changed(), Some(1));
+        assert!(edit.replace(0, Some(arrow((30.0, 10.0)))));
+        assert_eq!(edit.marks()[0], arrow((30.0, 10.0)));
+        assert_eq!(edit.marks()[1], Mark::Redaction(rect(0, 0, 4, 4)));
+        // The same mark again, one that would be refused, and no mark at all are not operations.
+        assert!(!edit.replace(0, Some(arrow((30.0, 10.0)))));
+        assert!(!edit.replace(0, Some(arrow((2.0, 2.0)))));
+        assert!(!edit.replace(5, None));
+        assert!(edit.undo());
+        assert_eq!(edit.marks()[0], arrow((20.0, 20.0)));
+        assert!(edit.redo());
+        assert_eq!(edit.marks()[0], arrow((30.0, 10.0)));
+        assert_eq!(edit.last_changed(), Some(0));
+        // Removing one, and undoing that, restores it where it was.
+        assert!(edit.replace(0, None));
+        assert_eq!(edit.marks(), [Mark::Redaction(rect(0, 0, 4, 4))]);
+        assert_eq!(edit.last_changed(), None);
+        assert!(edit.undo());
+        assert_eq!(edit.marks()[0], arrow((30.0, 10.0)));
+        assert_eq!(edit.marks().len(), 2);
+    }
+
+    #[test]
     fn a_mark_that_misses_the_capture_or_has_no_width_is_refused() {
         let mut edit = Edit::new(white(4, 4));
         assert!(!edit.add(Mark::Rectangle {
@@ -976,6 +1370,13 @@ mod tests {
             color: RED,
             width: 2.0,
             style: StrokeStyle::Ink,
+        }));
+        // An arrow with no length has no direction to point in.
+        assert!(!edit.add(Mark::Arrow {
+            from: (2.0, 2.0),
+            to: (2.2, 2.0),
+            color: RED,
+            width: 2.0,
         }));
         assert!(!edit.can_undo());
     }

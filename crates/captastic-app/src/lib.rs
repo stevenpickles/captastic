@@ -31,6 +31,8 @@ mod output;
 #[cfg(windows)]
 mod output_metrics;
 #[cfg(windows)]
+mod recording;
+#[cfg(windows)]
 mod selection;
 #[cfg(windows)]
 mod worker_registry;
@@ -161,6 +163,7 @@ fn invocation_name(command: Option<&Command>) -> &'static str {
         Command::Stop => "stop",
         Command::Displays { .. } => "displays",
         Command::Capture(_) => "capture",
+        Command::Record(_) => "record",
         Command::Benchmark(_) => "benchmark",
         Command::Version { .. } => "version",
         Command::Doctor { .. } => "doctor",
@@ -213,6 +216,7 @@ fn run(cli: Cli) -> Result<(), AppError> {
             print_value(json, &displays)
         }
         Command::Capture(args) => capture(args),
+        Command::Record(args) => record(args),
         Command::Benchmark(args) => benchmark(args),
         Command::Version { json } => version(json),
         Command::Doctor { json } => doctor(json),
@@ -314,6 +318,157 @@ fn stop() -> Result<(), AppError> {
 /// pixels to be able to show the frozen view at all - and then materializes from whichever view
 /// the user was looking at when they confirmed, taking a second capture only when that view was
 /// the live desktop.
+/// `captastic-dev record`: records the display, or part of it, to a GIF or MP4 the way the
+/// daemon's Record button does, for development and for checking the encoders on real frames.
+#[cfg(windows)]
+fn record(args: cli::RecordArgs) -> Result<(), AppError> {
+    use captastic_config::RecordingFormat;
+
+    struct BackendFrames {
+        backend: Box<dyn CaptureBackend>,
+        source: CaptureSource,
+        cursor: captastic_core::CursorMode,
+        next_id: u64,
+    }
+
+    impl recording::FrameSource for BackendFrames {
+        fn next_frame(&mut self) -> Result<captastic_core::CpuFrame, captastic_core::CaptureError> {
+            self.next_id += 1;
+            let request = CaptureRequest {
+                id: CaptureId(self.next_id),
+                triggered_at: Instant::now(),
+                source: self.source.clone(),
+                mode: captastic_core::CaptureMode::Latest { max_age_ms: None },
+                cpu_frame: true,
+                retain_native_frame: false,
+                cursor: self.cursor,
+            };
+            let mut recorder = EventRecorder::with_capacity(16);
+            self.backend
+                .capture(&request, &mut recorder)?
+                .frame
+                .ok_or_else(|| {
+                    captastic_core::CaptureError::synthetic("the backend returned no CPU frame")
+                })
+        }
+    }
+
+    let config = one_shot_config(args.config.as_deref())?;
+    let display_policy = resolve_display_policy(&args.display)?;
+    let backend = create_backend(&args.backend, &display_policy, 2)?;
+    let source = resolve_capture_source(&display_policy, backend.displays())?;
+    let mut frames = BackendFrames {
+        backend,
+        source,
+        cursor: configured_cursor_mode(&config),
+        next_id: 0,
+    };
+    let mut settings = recording::RecordingSettings::from_config(&config.recording);
+    if let Some(format) = args.format {
+        settings.format = match format {
+            cli::RecordFormatArg::Gif => RecordingFormat::Gif,
+            cli::RecordFormatArg::Mp4 => RecordingFormat::Mp4,
+        };
+    }
+    if !(1..=captastic_config::RecordingConfig::MAX_SECONDS).contains(&args.seconds) {
+        return Err(AppError::InvalidArgument(format!(
+            "--seconds must be between 1 and {}",
+            captastic_config::RecordingConfig::MAX_SECONDS
+        )));
+    }
+    settings.max_duration = std::time::Duration::from_secs(u64::from(args.seconds));
+    let first = recording::FrameSource::next_frame(&mut frames)?;
+    let area = match args.region.as_deref() {
+        Some(region) => parse_region(region)?,
+        None => first.metadata.source_rect,
+    };
+    let path = match args.output {
+        Some(path) => {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(|error| {
+                    AppError::InvalidArgument(format!("{}: {error}", path.display()))
+                })?;
+            path
+        }
+        None => {
+            let directory = configured_output_directory(&config)?;
+            let stem = filename_template::expand(
+                &config.output.filename_template,
+                &filename_template::TemplateContext {
+                    timestamp_micros: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |elapsed| elapsed.as_micros()),
+                    display: &first.metadata.display_id.0,
+                    mode: "recording",
+                    width: area.width,
+                    height: area.height,
+                    application: None,
+                    title: None,
+                },
+            );
+            recording::reserve_path(&directory, &stem, settings.format.extension())
+                .map_err(|error| AppError::BackendUnavailable(error.to_string()))?
+        }
+    };
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let report = recording::record(&mut frames, area, settings, &path, &stop)
+        .map_err(|error| AppError::BackendUnavailable(error.to_string()))?;
+    if args.json {
+        println!(
+            "{}",
+            json!({
+                "schema_version": 1,
+                "event": "recording_complete",
+                "report": report,
+            })
+        );
+    } else {
+        println!(
+            "recorded {}x{} for {:.1} s to {} ({} bytes, {} frames captured, {} written, {} dropped)",
+            report.width,
+            report.height,
+            report.duration.as_secs_f64(),
+            report.path.display(),
+            report.bytes,
+            report.frames_captured,
+            report.frames_written,
+            report.frames_dropped
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn record(_args: cli::RecordArgs) -> Result<(), AppError> {
+    Err(AppError::InvalidArgument(
+        "recording is only implemented on Windows".to_owned(),
+    ))
+}
+
+/// `x,y,width,height` in desktop pixels.
+#[cfg(windows)]
+fn parse_region(value: &str) -> Result<captastic_core::Rect, AppError> {
+    let parts: Vec<&str> = value.split(',').map(str::trim).collect();
+    let invalid =
+        || AppError::InvalidArgument(format!("--region must be x,y,width,height, got {value}"));
+    let [x, y, width, height] = parts.as_slice() else {
+        return Err(invalid());
+    };
+    let rect = captastic_core::Rect {
+        x: x.parse().map_err(|_| invalid())?,
+        y: y.parse().map_err(|_| invalid())?,
+        width: width.parse().map_err(|_| invalid())?,
+        height: height.parse().map_err(|_| invalid())?,
+    };
+    if rect.width == 0 || rect.height == 0 {
+        return Err(invalid());
+    }
+    Ok(rect)
+}
+
 fn capture(args: cli::CaptureArgs) -> Result<(), AppError> {
     if (args.selection || args.clipboard) && !args.cpu_frame {
         return Err(AppError::InvalidArgument(
@@ -400,6 +555,8 @@ fn capture(args: cli::CaptureArgs) -> Result<(), AppError> {
                     // ADR 0010's second slice.
                     pin_available: false,
                     edit_available: false,
+                    // A recording outlives the overlay; only a daemon can run one.
+                    record_format: None,
                 },
                 &mut overlay_resources,
             )?;
