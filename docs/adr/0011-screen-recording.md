@@ -106,6 +106,8 @@ What implementing this settled, for the next reader:
   and a persistent one is a second capture engine. A window recording therefore records the
   rectangle the window occupied when **Record** was pressed, from the same desktop duplication as
   regions, and records whatever is in that rectangle - including another window moved over it.
+  So the chosen window is brought to the front as the overlay closes, rather than focus going back
+  to the window that had it, which would otherwise cover it wherever the two overlap.
 - **Frames come from the daemon's capture thread**, one `RecordFrame` request at a time, so a
   recording shares the engine's display list and recovery. Each is a full CPU readback cropped to
   the area; reading back only the area on the GPU is a later optimization.

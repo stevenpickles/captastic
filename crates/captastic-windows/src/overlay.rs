@@ -1018,6 +1018,23 @@ fn cache_overlay_state(
     SelectionOutcome::from_run(result, display_change_reason)
 }
 
+/// The window to bring forward as the overlay closes, when it is not the one that had focus before.
+///
+/// A window recording records the window's area on the screen (ADR 0011), so the chosen window
+/// has to be on top when it starts: handing focus back to the window that had it would put that
+/// window over the chosen one whenever they overlap, and the recording would show it instead.
+fn focus_after_run(outcome: &SelectionOutcome) -> Option<HWND> {
+    match outcome {
+        SelectionOutcome::Selected(selection)
+            if selection.intent == ConfirmIntent::Record
+                && selection.kind == SelectionKind::Window =>
+        {
+            selection.window.map(|window| HWND(window.raw()))
+        }
+        _ => None,
+    }
+}
+
 enum WindowPreviewState {
     Ready(Box<WindowPreview>),
     Unavailable(NativeWindowHandle),
@@ -1388,7 +1405,7 @@ fn run_overlay(
     controller.inner.hwnd.store(0, Ordering::SeqCst);
     let previous_foreground = state.previous_foreground;
     let outcome = cache_overlay_state(state, resources);
-    restore_input_context(previous_foreground);
+    restore_input_context(focus_after_run(&outcome).unwrap_or(previous_foreground));
     drop(class_guard);
     Ok(outcome)
 }
@@ -4654,6 +4671,43 @@ mod tests {
             presenter_fallback_reason: None,
             window_frame: None,
         }
+    }
+
+    #[test]
+    fn only_a_window_recording_brings_its_window_forward() {
+        let window = NativeWindowHandle::from_raw(0x1234);
+        let outcome = |kind, intent, window| {
+            SelectionOutcome::Selected(Box::new(OverlaySelection {
+                kind,
+                intent,
+                window,
+                ..selection_for_tests()
+            }))
+        };
+        assert_eq!(
+            focus_after_run(&outcome(
+                SelectionKind::Window,
+                ConfirmIntent::Record,
+                Some(window)
+            )),
+            Some(HWND(0x1234))
+        );
+        // Anything else hands focus back to the window that had it.
+        for intent in [
+            ConfirmIntent::Capture,
+            ConfirmIntent::Pin,
+            ConfirmIntent::Edit,
+        ] {
+            assert_eq!(
+                focus_after_run(&outcome(SelectionKind::Window, intent, Some(window))),
+                None
+            );
+        }
+        assert_eq!(
+            focus_after_run(&outcome(SelectionKind::Region, ConfirmIntent::Record, None)),
+            None
+        );
+        assert_eq!(focus_after_run(&SelectionOutcome::Cancelled), None);
     }
 
     #[test]
