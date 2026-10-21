@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed, 2026-10-21. Governs Milestone 9's 0.5.0 section. The user-facing choices (resizing, and
+Accepted for the Windows prototype, 2026-10-21. Governs Milestone 9's 0.5.0 section. The user-facing choices (resizing, and
 what happens when a window cannot be captured) were made by the maintainer on 2026-10-21. Amends the
 first *As built* note of [ADR 0011](0011-screen-recording.md).
 
