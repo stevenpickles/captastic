@@ -49,8 +49,6 @@ windows = { workspace = true, features = [
     "Win32_System_Shutdown",
     "Win32_System_StationsAndDesktops",
     "Win32_Security",
-    # Hiding the folder recordings wait in for their review.
-    "Win32_Storage_FileSystem",
     "Win32_System_Threading",
     "Win32_System_Variant",
     "Win32_System_WinRT",

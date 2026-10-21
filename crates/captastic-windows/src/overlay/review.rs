@@ -15,7 +15,6 @@
 //! pull its edges and corners. An MP4's crop is kept to even sides, as H.264 needs, so what is
 //! shown is what is saved.
 
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use captastic_config::RecordingFormat;
@@ -517,30 +516,26 @@ impl ReviewState {
 }
 
 fn open_reader(
-    path: &Path,
+    recording: &[u8],
     format: RecordingFormat,
 ) -> Result<Box<dyn RecordingFrames>, PlaybackError> {
     match format {
-        RecordingFormat::Gif => {
-            let bytes = std::fs::read(path)
-                .map_err(|error| PlaybackError(format!("{}: {error}", path.display())))?;
-            Ok(Box::new(GifReader::new(&bytes)?))
-        }
-        RecordingFormat::Mp4 => Ok(Box::new(crate::Mp4Reader::open(path)?)),
+        RecordingFormat::Gif => Ok(Box::new(GifReader::new(recording)?)),
+        RecordingFormat::Mp4 => Ok(Box::new(crate::Mp4Reader::from_bytes(recording)?)),
     }
 }
 
-/// Opens a review of the recording at `path`, centred on the display around `at`. A review that
+/// Opens a review of `recording`, the bytes of a recording in `format`, centred on the display around `at`. A review that
 /// cannot be opened reports [`ReviewOutcome::Failed`] before this returns, so `on_finish` is
 /// always answered.
 pub(super) fn create_review(
     instance: HINSTANCE,
-    path: &Path,
+    recording: &[u8],
     format: RecordingFormat,
     at: Rect,
     on_finish: ReviewFinished,
 ) -> Option<HWND> {
-    match open_review(instance, path, format, at) {
+    match open_review(instance, recording, format, at) {
         Ok((hwnd, state_pointer)) => {
             // SAFETY: The window was just created on this thread with this state, and nothing has
             // run on it that could have ended it.
@@ -556,11 +551,11 @@ pub(super) fn create_review(
 
 fn open_review(
     instance: HINSTANCE,
-    path: &Path,
+    recording: &[u8],
     format: RecordingFormat,
     at: Rect,
 ) -> Result<(HWND, *mut ReviewState), CaptureError> {
-    let reader = open_reader(path, format)
+    let reader = open_reader(recording, format)
         .map_err(|error| desktop_error("open_recording_for_review", error.to_string()))?;
     let (width, height) = reader.size();
     let timeline = reader.timeline().clone();
@@ -1131,8 +1126,8 @@ fn request_discard(hwnd: HWND, state_pointer: *mut ReviewState) {
 }
 
 fn finish(hwnd: HWND, state_pointer: *mut ReviewState, outcome: ReviewOutcome) {
-    // SAFETY: As above. The reader is closed first, so the draft can be moved or deleted by
-    // whoever is told; the answer is taken out so it is given once.
+    // SAFETY: As above. The reader is closed first, so its copy of the recording is freed before
+    // whoever is told saves it; the answer is taken out so it is given once.
     let on_finish = unsafe {
         drop((*state_pointer).reader.take());
         (*state_pointer).on_finish.take()
@@ -1606,7 +1601,7 @@ mod tests {
     }
 
     /// A GIF of `seconds` at 15 frames a second whose picture moves a white bar two pixels a frame.
-    fn moving_gif(seconds: u64) -> std::path::PathBuf {
+    fn moving_gif(seconds: u64) -> std::sync::Arc<[u8]> {
         let (width, height) = (320_u32, 180_u32);
         let mut writer = captastic_core::GifWriter::new(Vec::new(), width, height).expect("writer");
         for step in 0..seconds * 15 {
@@ -1628,12 +1623,7 @@ mod tests {
                 .expect("push");
         }
         let (bytes, _) = writer.finish(Duration::from_secs(seconds)).expect("finish");
-        let path = std::env::temp_dir().join(format!(
-            "captastic-review-{}-{seconds}.gif",
-            std::process::id()
-        ));
-        std::fs::write(&path, bytes).expect("write the GIF");
-        path
+        bytes.into()
     }
 
     #[test]
@@ -1667,7 +1657,7 @@ mod tests {
         };
         let _dpi = super::super::shell::ThreadDpiContext::enter_per_monitor_v2()
             .expect("per-monitor DPI awareness for the test thread");
-        let path = moving_gif(3);
+        let recording = moving_gif(3);
         let area = Rect {
             x: 0,
             y: 0,
@@ -1679,9 +1669,14 @@ mod tests {
 
         // Five frames in, I; the end, three frames back, O; Enter saves exactly that span.
         let report = sender.clone();
-        host.review(path.clone(), RecordingFormat::Gif, area, move |outcome| {
-            let _ = report.send(outcome);
-        })
+        host.review(
+            recording.clone(),
+            RecordingFormat::Gif,
+            area,
+            move |outcome| {
+                let _ = report.send(outcome);
+            },
+        )
         .expect("the review request is accepted");
         let review = find(REVIEW_CLASS_NAME, PCWSTR::null());
         for _ in 0..5 {
@@ -1750,9 +1745,14 @@ mod tests {
 
         // The close button asks; Cancel keeps the review open, OK discards.
         let report = sender.clone();
-        host.review(path.clone(), RecordingFormat::Gif, area, move |outcome| {
-            let _ = report.send(outcome);
-        })
+        host.review(
+            recording.clone(),
+            RecordingFormat::Gif,
+            area,
+            move |outcome| {
+                let _ = report.send(outcome);
+            },
+        )
         .expect("the review request is accepted");
         let review = find(REVIEW_CLASS_NAME, PCWSTR::null());
         post(review, WM_CLOSE, 0);
@@ -1769,9 +1769,14 @@ mod tests {
 
         // Shut down with a review open: it answers Closed, and the recording is kept.
         let report = sender.clone();
-        host.review(path.clone(), RecordingFormat::Gif, area, move |outcome| {
-            let _ = report.send(outcome);
-        })
+        host.review(
+            recording.clone(),
+            RecordingFormat::Gif,
+            area,
+            move |outcome| {
+                let _ = report.send(outcome);
+            },
+        )
         .expect("the review request is accepted");
         find(REVIEW_CLASS_NAME, PCWSTR::null());
         assert!(host.stop(Instant::now() + Duration::from_secs(5)));
@@ -1782,8 +1787,8 @@ mod tests {
 
         // A recording that cannot be read is reported, and kept.
         let host = DesktopUi::start().expect("the desktop UI thread starts again");
-        let missing = path.with_extension("missing.gif");
-        host.review(missing, RecordingFormat::Gif, area, move |outcome| {
+        let garbled: std::sync::Arc<[u8]> = recording[..recording.len() / 2].into();
+        host.review(garbled, RecordingFormat::Gif, area, move |outcome| {
             let _ = sender.send(outcome);
         })
         .expect("the review request is accepted");
@@ -1792,6 +1797,5 @@ mod tests {
             Ok(ReviewOutcome::Failed(_))
         ));
         drop(host);
-        let _ = std::fs::remove_file(&path);
     }
 }

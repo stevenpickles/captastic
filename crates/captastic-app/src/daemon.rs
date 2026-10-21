@@ -1227,10 +1227,6 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
         }
     }
 
-    // A recording left in review by a Captastic that could not finish it is saved now, and the
-    // notice reaches the notification area with the others (ADR 0012).
-    recordings.recover_drafts();
-
     let active_hotkeys = args
         .hotkey_bindings
         .iter()
@@ -1453,8 +1449,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                     if let Some(tray) = tray.as_ref() {
                         let revealing = match &notice {
                             DaemonNotice::RecordingSaved { path, .. }
-                            | DaemonNotice::RecordingEditFailed { path, .. }
-                            | DaemonNotice::RecordingRecovered { path, .. } => Some(path.clone()),
+                            | DaemonNotice::RecordingEditFailed { path, .. } => Some(path.clone()),
                             _ => None,
                         };
                         let shown = if let Some(path) = revealing {
@@ -3253,11 +3248,6 @@ pub(crate) enum DaemonNotice {
         path: std::path::PathBuf,
         message: String,
     },
-    /// A recording Captastic ended without saving - a crash, a power cut - was saved at startup.
-    RecordingRecovered {
-        file_name: String,
-        path: std::path::PathBuf,
-    },
 }
 
 #[cfg(windows)]
@@ -3271,7 +3261,6 @@ impl DaemonNotice {
             Self::RecordingSaved { .. } => "Recording saved",
             Self::RecordingFailed { .. } => "Captastic could not save the recording",
             Self::RecordingEditFailed { .. } => "Captastic could not trim the recording",
-            Self::RecordingRecovered { .. } => "Recording recovered",
         }
     }
 
@@ -3279,10 +3268,7 @@ impl DaemonNotice {
     fn is_informational(&self) -> bool {
         matches!(
             self,
-            Self::CaptureEngineRecovered
-                | Self::RecordingSaved { .. }
-                | Self::RecordingInProgress
-                | Self::RecordingRecovered { .. }
+            Self::CaptureEngineRecovered | Self::RecordingSaved { .. } | Self::RecordingInProgress
         )
     }
 
@@ -3320,10 +3306,6 @@ impl DaemonNotice {
             } => format!(
                 "{file_name} was saved as it was recorded instead: {message}. Click to show it in \
                  its folder."
-            ),
-            Self::RecordingRecovered { file_name, .. } => format!(
-                "{file_name} was left unsaved when Captastic last stopped, and is saved now. Click \
-                 to show it in its folder."
             ),
         }
     }

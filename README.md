@@ -502,9 +502,9 @@ then move the rectangle or pull its edges and corners as in the image editor; **
 keeps the whole picture again, and an MP4's crop keeps even sides, as H.264 needs. **Space** plays the span kept,
 **Save** (Enter) saves it, and **Discard**, Escape or the close button ask before deleting the
 recording. Saved without trimming or cropping, the recording is kept exactly as recorded; otherwise
-what is kept is encoded again. Until it is saved a recording waits in a hidden `.captastic-drafts` folder in the
-output directory; Captastic exiting during a review saves it as it is, and a recording left there by
-a crash is saved the next time Captastic starts. `recording.review = false`, or **Review Recordings**
+what is kept is encoded again. Until it is saved a recording is held in memory and nothing is
+written to disk, so **Discard** leaves no trace; Captastic exiting during a review saves it as it
+is, but a recording in review is lost if Captastic crashes. `recording.review = false`, or **Review Recordings**
 in the notification-area menu, saves recordings as soon as they end instead.
 
 A recording is always saved to the output directory, named by the same template as stills and

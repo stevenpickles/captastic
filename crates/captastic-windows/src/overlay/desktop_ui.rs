@@ -67,7 +67,7 @@ enum UiCommand {
     },
     HideRecording,
     Review {
-        path: std::path::PathBuf,
+        recording: std::sync::Arc<[u8]>,
         format: captastic_config::RecordingFormat,
         at: Rect,
         on_finish: ReviewFinished,
@@ -146,19 +146,19 @@ impl DesktopUi {
         self.request(UiCommand::ShowRecording { area, stop, limit })
     }
 
-    /// Opens a review of the recording at `path`, a draft in `format`, on the display around
-    /// `at` (ADR 0012). `on_finish` is called on the desktop UI thread exactly once, however the
-    /// review ends, unless this returns an error: then the request never reached the thread and
-    /// `on_finish` has been dropped uncalled. The window has closed the file by then.
+    /// Opens a review of `recording`, the bytes of a recording in `format` not yet saved, on the
+    /// display around `at` (ADR 0012). `on_finish` is called on the desktop UI thread exactly once,
+    /// however the review ends, unless this returns an error: then the request never reached the
+    /// thread and `on_finish` has been dropped uncalled.
     pub fn review(
         &self,
-        path: std::path::PathBuf,
+        recording: std::sync::Arc<[u8]>,
         format: captastic_config::RecordingFormat,
         at: Rect,
         on_finish: impl FnOnce(super::ReviewOutcome) + Send + 'static,
     ) -> Result<(), CaptureError> {
         self.request(UiCommand::Review {
-            path,
+            recording,
             format,
             at,
             on_finish: Box::new(on_finish),
@@ -509,14 +509,14 @@ unsafe fn apply(state: *mut HostState, command: UiCommand) {
         // SAFETY: As above.
         UiCommand::HideRecording => unsafe { close_recording(state) },
         UiCommand::Review {
-            path,
+            recording,
             format,
             at,
             on_finish,
         } => {
             // SAFETY: Per this function's contract; the borrow ends before create_review runs.
             let instance = unsafe { (*state).instance };
-            if let Some(review) = create_review(instance, &path, format, at, on_finish) {
+            if let Some(review) = create_review(instance, &recording, format, at, on_finish) {
                 // SAFETY: As above.
                 unsafe { (*state).reviews.push(review) };
             }

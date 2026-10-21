@@ -8,6 +8,9 @@
 //! written when the next one arrives, for exactly as long as it was on screen, and a frame
 //! identical to the one before it is not encoded again but lengthens it. A still screen therefore
 //! costs one frame however long it is recorded.
+//!
+//! An MP4 is written into a file or, for a recording that is reviewed before it is saved, into
+//! memory (ADR 0012), from where [`Mp4Writer::finish_in_memory`] hands back its bytes.
 
 use std::path::Path;
 use std::time::Duration;
@@ -15,15 +18,17 @@ use std::time::Duration;
 use captastic_core::{CaptureError, CaptureErrorKind};
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Media::MediaFoundation::{
-    IMFAttributes, IMFMediaType, IMFSample, IMFSinkWriter, MFCreateAttributes, MFCreateMediaType,
-    MFCreateMemoryBuffer, MFCreateSample, MFCreateSinkWriterFromURL, MFMediaType_Video, MFShutdown,
-    MFStartup, MFTranscodeContainerType_MPEG4, MFVideoFormat_H264, MFVideoFormat_RGB32,
+    IMFAttributes, IMFByteStream, IMFMediaType, IMFSample, IMFSinkWriter, MFCreateAttributes,
+    MFCreateMFByteStreamOnStream, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
+    MFCreateSinkWriterFromURL, MFMediaType_Video, MFShutdown, MFStartup,
+    MFTranscodeContainerType_MPEG4, MFVideoFormat_H264, MFVideoFormat_RGB32,
     MFVideoInterlace_Progressive, MFSTARTUP_FULL, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE,
     MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
     MF_MT_MAX_KEYFRAME_SPACING, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
     MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_TRANSCODE_CONTAINERTYPE, MF_VERSION,
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+use windows::Win32::UI::Shell::SHCreateMemStream;
 
 /// The largest frame the Windows H.264 encoder accepts (level 5.1). Larger recordings are scaled
 /// to fit inside it.
@@ -35,6 +40,8 @@ const MINIMUM_BITRATE: u32 = 1_000_000;
 const MAXIMUM_BITRATE: u32 = 40_000_000;
 /// Media Foundation counts time in 100-nanosecond units.
 const TICKS_PER_SECOND: u128 = 10_000_000;
+/// The most copied into or out of a byte stream in one call.
+const BYTE_STREAM_CHUNK: usize = 16 * 1024 * 1024;
 
 /// The size a `width` by `height` recording is encoded at: scaled down, keeping its shape, to fit
 /// [`MP4_MAXIMUM_SIZE`], then rounded down to even sides, which H.264's 4:2:0 sampling needs.
@@ -109,6 +116,8 @@ pub struct Mp4Writer {
     stream: u32,
     first_at: Option<Duration>,
     summary: VideoSummary,
+    /// Where the MP4 is written when it is written into memory.
+    memory: Option<IMFByteStream>,
     _media_foundation: MediaFoundation,
 }
 
@@ -118,6 +127,25 @@ impl Mp4Writer {
     /// and the stream's nominal rate; each frame's real timing is its own.
     pub fn create(
         path: &Path,
+        width: u32,
+        height: u32,
+        frame_rate: u32,
+    ) -> Result<Self, CaptureError> {
+        Self::create_into(Some(path), width, height, frame_rate)
+    }
+
+    /// As [`create`](Self::create), but writes the MP4 into memory, for
+    /// [`finish_in_memory`](Self::finish_in_memory) to hand back.
+    pub fn create_in_memory(
+        width: u32,
+        height: u32,
+        frame_rate: u32,
+    ) -> Result<Self, CaptureError> {
+        Self::create_into(None, width, height, frame_rate)
+    }
+
+    fn create_into(
+        path: Option<&Path>,
         width: u32,
         height: u32,
         frame_rate: u32,
@@ -134,6 +162,12 @@ impl Mp4Writer {
         let bitrate =
             (f64::from(width) * f64::from(height) * f64::from(frame_rate) * BITS_PER_PIXEL)
                 .clamp(f64::from(MINIMUM_BITRATE), f64::from(MAXIMUM_BITRATE)) as u32;
+        let memory = match path {
+            Some(_) => None,
+            None => {
+                Some(memory_byte_stream(&[]).map_err(|error| video_error("create_memory", error))?)
+            }
+        };
         // SAFETY: Each call below configures COM objects created here, on this thread, with GUIDs
         // and values that outlive the call.
         let writer = unsafe {
@@ -148,9 +182,14 @@ impl Mp4Writer {
             attributes
                 .SetGUID(&MF_TRANSCODE_CONTAINERTYPE, &MFTranscodeContainerType_MPEG4)
                 .map_err(|error| video_error("set_container_type", error))?;
-            let url = HSTRING::from(path.as_os_str());
-            let writer = MFCreateSinkWriterFromURL(PCWSTR(url.as_ptr()), None, &attributes)
-                .map_err(|error| video_error("create_sink_writer", error))?;
+            let writer = match path {
+                Some(path) => {
+                    let url = HSTRING::from(path.as_os_str());
+                    MFCreateSinkWriterFromURL(PCWSTR(url.as_ptr()), None, &attributes)
+                }
+                None => MFCreateSinkWriterFromURL(PCWSTR::null(), memory.as_ref(), &attributes),
+            }
+            .map_err(|error| video_error("create_sink_writer", error))?;
 
             let output =
                 MFCreateMediaType().map_err(|error| video_error("create_output_type", error))?;
@@ -192,6 +231,7 @@ impl Mp4Writer {
             height,
             first_at: None,
             summary: VideoSummary::default(),
+            memory,
             _media_foundation: media_foundation,
         })
     }
@@ -224,6 +264,24 @@ impl Mp4Writer {
     /// Writes the last frame, shown until `end` after the recording started, and finalizes the
     /// file. A writer dropped without this leaves an unplayable file.
     pub fn finish(mut self, end: Duration) -> Result<VideoSummary, CaptureError> {
+        self.finalize(end)
+    }
+
+    /// As [`finish`](Self::finish), for a writer from [`create_in_memory`](Self::create_in_memory):
+    /// returns the finished MP4's bytes with what it contains.
+    pub fn finish_in_memory(
+        mut self,
+        end: Duration,
+    ) -> Result<(Vec<u8>, VideoSummary), CaptureError> {
+        let summary = self.finalize(end)?;
+        let memory = self.memory.as_ref().ok_or_else(|| {
+            video_failure("mp4_in_memory", "the MP4 was written to a file".to_owned())
+        })?;
+        let bytes = read_byte_stream(memory).map_err(|error| video_error("read_memory", error))?;
+        Ok((bytes, summary))
+    }
+
+    fn finalize(&mut self, end: Duration) -> Result<VideoSummary, CaptureError> {
         let first_at = self.first_at.unwrap_or(end);
         let end_duration = end.saturating_sub(first_at);
         if let Some(pending) = self.pending.take() {
@@ -316,6 +374,42 @@ unsafe fn set_video_type(
             .map_err(|error| video_error("set_pixel_aspect_ratio", error))?;
     }
     Ok(())
+}
+
+/// A growable byte stream in memory holding a copy of `bytes`, positioned at its start: where an
+/// MP4 in memory is written, or read from.
+///
+/// A shell memory stream, because Media Foundation sees an `HGLOBAL` stream as read only.
+pub(crate) fn memory_byte_stream(bytes: &[u8]) -> windows::core::Result<IMFByteStream> {
+    // SAFETY: The stream copies `bytes` and owns its memory, released with it.
+    unsafe {
+        let stream = SHCreateMemStream((!bytes.is_empty()).then_some(bytes))
+            .ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_OUTOFMEMORY))?;
+        MFCreateMFByteStreamOnStream(&stream)
+    }
+}
+
+/// Everything in `byte_stream`, from its start.
+fn read_byte_stream(byte_stream: &IMFByteStream) -> windows::core::Result<Vec<u8>> {
+    // SAFETY: The stream is this thread's and the buffer has room for each read.
+    unsafe {
+        let length = usize::try_from(byte_stream.GetLength()?)
+            .map_err(|_| windows::core::Error::from(windows::Win32::Foundation::E_OUTOFMEMORY))?;
+        byte_stream.SetCurrentPosition(0)?;
+        let mut bytes = vec![0; length];
+        let mut filled = 0;
+        while filled < length {
+            let end = (filled + BYTE_STREAM_CHUNK).min(length);
+            let mut read = 0_u32;
+            byte_stream.Read(&mut bytes[filled..end], &mut read)?;
+            if read == 0 {
+                bytes.truncate(filled);
+                break;
+            }
+            filled += read as usize;
+        }
+        Ok(bytes)
+    }
 }
 
 fn ticks(duration: Duration) -> i64 {
