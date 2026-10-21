@@ -5,7 +5,9 @@ window selection, persistent UI state, a notification-area desktop experience, c
 installation, and release packaging. v0.1.0 through v0.4.0 have shipped: v0.3.0 made Captastic one
 windowless executable and added pinning and the editor (Milestone 6), and v0.4.0 added recording to
 GIF and MP4 with a review window (Milestone 9), while keeping the low-latency, native capture path
-untouched when they are not used. `dev` is now 0.5.0, whose theme is not yet chosen.
+untouched when they are not used. `dev` is now 0.5.0, which records a window through Windows
+Graphics Capture, so that a window recording holds the window itself rather than its area on the
+screen, and lets an agent or script start a capture from the command line.
 
 This roadmap is ordered by user impact and architectural dependency, with release readiness placed
 first because it is the only time-bound section. Closed investigations have moved to
@@ -92,6 +94,40 @@ the back-merge pull request from `main` instead of from the release branch.
 procedure in [benchmarks/README.md](benchmarks/README.md) has been run and the sets that support the
 figure are committed. Every release so far has published no absolute number, which satisfies
 Milestone 5's criterion vacuously and on purpose.
+
+## Release readiness — v0.5.0
+
+**Status:** planned 2026-10-21; nothing built yet. The 0.4.0 Chocolatey submission was pushed on
+2026-10-21 and is in moderation. Decided on 2026-10-21:
+
+- **Theme: recording a window itself.** 0.4.0 records a window as the rectangle it occupied when
+  **Record** was pressed, so anything moved over it, always-on-top windows, and the desktop behind a
+  window that moves all end up in the recording. That is 0.4.0's main known limitation. 0.5.0 records
+  a window through Windows Graphics Capture (WGC), which sees the window's own pixels however it is
+  covered and wherever it goes; see
+  [Milestone 9's 0.5.0 section](#050-recording-a-window-itself-adr-0013). Regions and displays
+  keep recording through desktop duplication, unchanged. Chosen over reopening a capture from
+  history in the editor (Milestone 6's last slice) and a first cross-platform proof (Milestone 7),
+  which stay candidates for later releases.
+- **Alongside: captures an agent can start.** A shipped command-line surface through which an agent
+  or a script asks the running Captastic for a capture and gets back where it went; see
+  [Milestone 10](#milestone-10--captures-started-from-the-command-line). Asked for on 2026-10-21.
+
+### Gates — before the tag
+
+- **The 0.5.0 slices of Milestones 9 and 10 merged**, with Milestone 9's exit criteria still met
+  and the 0.5.0 criteria of both.
+- **A manual desktop checklist for every slice that changes overlay or desktop behaviour**, run
+  before merge. For window recording it covers at least: a window covered part-way through, moved,
+  resized, minimised and restored, and closed during a recording; a window spanning two displays; a
+  GPU-rendered window (a browser or a game); and a window Windows will not let WGC capture. For the
+  command line, a capture started by an agent on the installed build, with and without Captastic
+  running.
+- **The disposable-VM checklist** in [docs/chocolatey.md](docs/chocolatey.md), before the tag, with
+  the shipped command added to it.
+- **Release notes** that say what a window recording now contains, what happens when Windows refuses
+  to capture a window, and exactly what the command line can capture without the user's hand on the
+  overlay.
 
 ## Release readiness — v0.4.0
 
@@ -781,6 +817,121 @@ All eight gate the 0.4.0 tag.
 - A one-minute recording at the default settings stays within a documented memory ceiling, however
   large the area.
 
+### 0.5.0: recording a window itself (ADR 0013)
+
+**Why.** ADR 0011 recorded a window as its area on the screen. Recording through WGC would follow
+the window and see it when covered, but a capture session for every frame was far too slow, and a
+session kept open for the whole recording amounted to a second capture engine. 0.5.0 builds that
+engine, for window recordings only. Still window capture already falls back to WGC one frame at a
+time ([Milestone 3](#milestone-3--windows-graphics-capture-for-windows)); 0.5.0 keeps the session
+open for as long as the recording runs.
+
+**Questions ADR 0013 must settle before any code:**
+
+- **Where the session lives.** A persistent capture item, frame pool and session owned by a
+  recording-only source in `captastic-windows`, on its own thread and WinRT apartment, keeping the
+  uncached-factory rule `window_capture_wgc.rs` documents. It must not touch the daemon's capture
+  thread, so display and region recordings and still captures initialise no WGC at all. Whether
+  this is also the moment for Milestone 3's narrow window-capture backend trait, or that waits.
+- **Pacing.** WGC delivers a frame only when the window changes. The recording takes the newest
+  frame at its own 15 or 30 fps and repeats the last one when nothing new has arrived, as the GIF
+  writer's unchanged-pixel handling already expects.
+- **Size changes.** A GIF or MP4 keeps one size, fixed when the recording starts. When the window is
+  resized, either scale each frame to fit inside that size and letterbox it, or crop and pad at
+  1:1. The frame pool is recreated at the new size either way.
+- **Minimised, hidden and closed.** Minimised: repeat the last frame or show a placeholder, and keep
+  recording until **Stop**. Closed: the capture item's `Closed` event ends the recording and keeps
+  what was recorded, as ADR 0011 already promises.
+- **What is in the frame.** The window's own pixels, at their physical size, including where the
+  window is partly off-screen or spans two displays. The pointer only when `[capture] cursor`
+  includes it, through `IsCursorCaptureEnabled`. The yellow capture border is turned off, as for
+  stills, where Windows allows it; the ADR must say what is shown where it does not.
+- **The indicator.** The red border and the **Stop** bar follow the window as it moves and is
+  resized, and they stay excluded from the recording. Whether they hide while the window is
+  minimised.
+- **When WGC cannot capture the window.** WGC may be unsupported, or the window protected or
+  elevated above Captastic. Either fall back to 0.4.0's area recording and say so in the
+  notification, or refuse the recording with a reason. The overlay should not offer a promise it
+  cannot keep.
+- **Cost.** GPU readback of every frame at 30 fps for a large window, within Milestone 9's memory
+  ceiling, and with no change to still-capture latency.
+
+**Proposed slices:**
+
+1. **ADR 0013** (`docs/adr-0013-window-recording`), answering the questions above, with the
+   user-facing choices made by the maintainer.
+2. **A persistent WGC window source** in `captastic-windows`: one session for the life of a
+   recording, the newest frame read back on request, resizing, minimised and closed windows, and
+   clean teardown. Tested against a test window, with the desktop tests ignored on hosted CI as the
+   existing WGC tests are.
+3. **Recording a window through it**: a window recording's `FrameSource` drawn from that session,
+   the fixed output size and its resize rule, and the pointer setting. Region and display
+   recordings stay as they are.
+4. **The indicator follows the window, and the fallback**: the border and bar track the window,
+   the behaviour ADR 0013 chooses for a window WGC cannot capture, and the README, notes and ADR
+   0011 updated to retire the "recorded as its area" limitation.
+
+**0.5.0 exit criteria**, on top of the ones above:
+
+- A window recording contains the window's pixels and nothing else, however it is covered, moved or
+  partly off-screen during the recording.
+- Resizing, minimising or closing the window during a recording never yields an invalid file, and
+  the result matches what ADR 0013 promises.
+- Region and display recordings, and still captures, initialise no WGC session.
+
+## Milestone 10 — Captures started from the command line
+
+**Outcome:** an agent, a script or a terminal user can ask Captastic for a capture and get back,
+in a form a program can read, what was captured and where it went, from the shipped install.
+
+**Where it starts.** Since 0.3.0 `captastic.exe` is a windowless program that writes no structured
+output, and the command line, `captastic-dev`, is a developer tool that is not shipped (PR #101).
+`captastic-dev capture` and `record` run a one-shot capture engine of their own rather than asking
+the running daemon, and the daemon's only control channel is the named stop event of
+[ADR 0007](docs/adr/0007-daemon-control-trust.md), which carries no request and no answer.
+
+**Questions ADR 0014 must settle before any code:**
+
+- **What ships.** A console executable beside `captastic.exe` (say `captastic-cli.exe`), or
+  console attachment from `captastic.exe` itself; and which of `captastic-dev`'s commands it
+  carries. The JSON events `captastic-dev` already prints are the starting point for its output.
+- **Through the daemon, or on its own.** Asking the running daemon over a request-and-answer
+  channel (a named pipe, scoped to the session as ADR 0007 scopes the stop event) keeps one capture
+  engine, its settings, history and notifications; a one-shot engine works when nothing is running.
+  Which is primary, and what happens when Captastic is not running: start it, capture on its own,
+  or fail with a reason.
+- **What it can capture.** A display, the virtual desktop, a rectangle, a window named by handle,
+  title or process, the last region, and whether a command can open the overlay and wait for the
+  user's choice. Recordings too, or stills only for now.
+- **Where the result goes.** A file path in the output, the clipboard or not (an agent's capture
+  should not silently replace the user's clipboard, after the clipboard-backup lessons of
+  2026-08), the history, and an explicit output path.
+- **Consent and visibility.** A capture the user did not start reveals their screen to whatever
+  asked. The trust boundary stays the session, as in ADR 0007, but the ADR must say whether such a
+  capture is always announced (a notification naming it as command-line), whether it can be turned
+  off in the configuration, and whether it is logged as such in history.
+- **Agent use.** Whether to document it as a tool for coding agents (a short usage page with the
+  command, its JSON and its exit codes), and whether a Model Context Protocol server is in scope or
+  left for later.
+
+**Proposed slices:**
+
+1. **ADR 0014** (`docs/adr-0014-command-line-capture`), answering the questions above, with the
+   user-facing choices made by the maintainer.
+2. **A request channel to the daemon**: one request, one answer, scoped to the session, with the
+   daemon's capture path behind it; tested through FakeBackend as the daemon tests are.
+3. **The shipped command**: the executable or console mode ADR 0014 chooses, its capture command,
+   JSON output and exit codes, packaged in the ZIP and the Chocolatey package (shim included).
+4. **Agent documentation and the visibility rule**: the notification and history marking ADR 0014
+   chooses, a usage page, and the README.
+
+**0.5.0 exit criteria:**
+
+- From the installed build, one command captures a chosen display, rectangle or window and prints,
+  as JSON, where the capture went, with an exit code that distinguishes success, refusal and failure.
+- A capture started this way is visible to the user in exactly the way ADR 0014 promises.
+- Still-capture latency and the overlay are unchanged for captures the user starts.
+
 ## Architecture hardening backlog
 
 These items were deliberately separated from the code-review remediation branch because each
@@ -874,23 +1025,26 @@ The order below reflects what remains.
 
 1. See the 0.4.0 Chocolatey submission through validation and moderation; a defect found after
    the tag is a 0.4.x patch.
-2. Choose 0.5.0's theme. Candidates already on this roadmap: Milestone 6's last slice, reopening a
-   capture from history in the editor; recording a window through Windows Graphics Capture rather
-   than as its area on the screen (0.4.0's main known limitation); and Milestone 7's first
-   cross-platform proof.
-3. Finish Milestone 5's evidence work, which is now measurement rather than code: the operator
+2. 0.5.0: recording a window through Windows Graphics Capture
+   ([Milestone 9's 0.5.0 section](#050-recording-a-window-itself-adr-0013)), ADR 0013 first; and
+   captures started from the command line
+   ([Milestone 10](#milestone-10--captures-started-from-the-command-line)), ADR 0014 first. The two
+   share no code and can proceed side by side.
+3. Milestone 6's last slice, reopening a capture from history in the editor, and Milestone 7's
+   first cross-platform proof, as candidates for the release after 0.5.0.
+4. Finish Milestone 5's evidence work, which is now measurement rather than code: the operator
    claim runs from [benchmarks/README.md](benchmarks/README.md), after which the absolute budget
    ceilings can be set and a figure can be published. The sequence-marker workload and Milestone 3's
    window-capture backend trait stay deferred — the first needs a desk, a mouse and a rotatable
    display and gates no release claim; the second changes no user-visible contract.
-4. Complete Milestone 1 (multi-adapter composition and the hardware validation matrix) when the
+5. Complete Milestone 1 (multi-adapter composition and the hardware validation matrix) when the
    hardware is available; it needs a second adapter, not design.
-5. Settle the outstanding design decisions — latest-mode currency on an idle desktop,
+6. Settle the outstanding design decisions — latest-mode currency on an idle desktop,
    `fresh` + `virtual_desktop`, and control-event hardening. Milestone 4's two product questions are
    answered (ADR 0008), and the mouse-capture/software-KVM contract is settled in ADR 0009: each use
    takes the pointer source that answers its own question, and Captastic promises nothing about
    where a foreign owner has put the mouse.
-6. Cross-platform work (Milestone 7), the decision gate's other candidate, if 0.5.0 does not take it.
+7. Cross-platform work (Milestone 7), the decision gate's other candidate (item 3).
 
 ### Lifecycle recovery: what the investigation settled
 
@@ -906,8 +1060,10 @@ not reproduced on demand, is in
 
 ## Recommended next branch
 
-None yet: the next branch follows from the choice of 0.5.0's theme (above). Meanwhile, whatever
-the Chocolatey moderators ask of the 0.4.0 submission, and any 0.4.x patch it or use turns up.
+`docs/adr-0013-window-recording` and `docs/adr-0014-command-line-capture`: the two ADRs, each
+settling the questions its section lists before any code, as ADR 0011 did for 0.4.0. Meanwhile,
+whatever the Chocolatey moderators ask of the 0.4.0 submission, and any 0.4.x patch it or use turns
+up.
 
 FakeBackend fidelity keeps its leverage and is worth extending as gaps appear: much of Milestone 4
 shipped with daemon-side behaviour verified only by unit tests, because a second daemon cannot start
