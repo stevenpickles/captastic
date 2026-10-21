@@ -34,6 +34,8 @@ mod video_reader;
 mod window_capture;
 #[cfg(windows)]
 mod window_capture_wgc;
+#[cfg(windows)]
+mod window_session_wgc;
 
 #[cfg(windows)]
 pub use clipboard::{
@@ -80,3 +82,5 @@ pub use video::{mp4_frame_size, Mp4Writer, VideoSummary, MP4_MAXIMUM_SIZE};
 pub use video_reader::Mp4Reader;
 #[cfg(windows)]
 pub use window_capture::{captured_window_frame, materialize_selection};
+#[cfg(windows)]
+pub use window_session_wgc::{WgcWindowSession, WindowFrame};

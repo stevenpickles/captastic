@@ -1031,6 +1031,48 @@ pub(crate) fn window_geometry(hwnd: HWND, window: Rect) -> WindowGeometry {
     }
 }
 
+/// Where a window's visible frame lands inside a raw Windows Graphics Capture surface, and where
+/// that frame is on the desktop.
+///
+/// A recording shows the window as the user sees it - the DWM visible frame, its own border
+/// included - rather than the still path's content with a rebuilt border. When the surface lines
+/// up with neither measured rectangle (the window resized since the frame was rendered, or the
+/// window is gone) the whole surface is kept and the desktop position is unknown.
+pub(crate) fn wgc_visible_frame(
+    hwnd: HWND,
+    surface_width: u32,
+    surface_height: u32,
+) -> (Rect, Option<Rect>) {
+    let surface = Rect {
+        x: 0,
+        y: 0,
+        width: surface_width,
+        height: surface_height,
+    };
+    let mut native = RECT::default();
+    // SAFETY: native is writable for the exact RECT size; a window that has closed fails cleanly.
+    if unsafe { GetWindowRect(hwnd, &mut native) }.is_err() {
+        return (surface, None);
+    }
+    let Some(window) = rect_from_native(native) else {
+        return (surface, None);
+    };
+    let geometry = window_geometry(hwnd, window);
+    for origin in [geometry.window, geometry.frame] {
+        if origin.width != surface_width || origin.height != surface_height {
+            continue;
+        }
+        if let Some(crop) =
+            translate_rect(geometry.frame, -i64::from(origin.x), -i64::from(origin.y))
+        {
+            if rect_contains(surface, crop) {
+                return (crop, Some(geometry.frame));
+            }
+        }
+    }
+    (surface, None)
+}
+
 /// Where the shared `content` crop lands inside a raw Windows Graphics Capture surface.
 #[derive(Debug, Eq, PartialEq)]
 struct WgcCrop {
@@ -1136,7 +1178,11 @@ fn inset_rect(rect: Rect, inset: u32) -> Option<Rect> {
     })
 }
 
-fn crop_bgra(source: &[u8], source_bounds: Rect, crop: Rect) -> Result<Vec<u8>, CaptureError> {
+pub(crate) fn crop_bgra(
+    source: &[u8],
+    source_bounds: Rect,
+    crop: Rect,
+) -> Result<Vec<u8>, CaptureError> {
     if crop.x < source_bounds.x
         || crop.y < source_bounds.y
         || crop.right() > source_bounds.right()
