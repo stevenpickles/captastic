@@ -98,6 +98,27 @@ mid-recording ends the recording and keeps what it has, as any other source fail
   and history report the output size, which is what they already report.
 - ADR 0011's first *As built* note is superseded for windows WGC can capture.
 
+## As built (0.5.0)
+
+What implementing this settled, for the next reader:
+
+- **One MTA reference for the process.** Every WGC thread joins the multithreaded apartment, and
+  when the last one leaves, Windows tears the apartment down while capture callbacks can still be
+  running, which crashed one session in two in back-to-back tests. The first session takes a
+  `CoIncrementMTAUsage` reference that is never released, so the apartment outlives every session.
+- **Closing is noticed two ways.** The capture item's `Closed` event is not always raised for a
+  window that is destroyed, so the session also checks `IsWindow` each time it wakes.
+- **The decision is made on the recording thread**, after the overlay has closed: the session is
+  started there, and the indicator, already showing around the window's starting rectangle, is told
+  to follow the window only once it has. So the `recording_started` JSON event is printed from that
+  thread, once the source is known, and carries `window_source` (`windows_graphics_capture` or
+  `screen_area`) for a window recording, with `fallback_reason` beside it for a fallback.
+- **The window is still brought to the front** for every window recording, not only the fallback:
+  the overlay hands focus over as it closes, before anyone knows whether WGC will capture the window,
+  and bringing forward a window recorded as itself costs nothing.
+- **The indicator follows the window's visible frame**, read every 33 ms on the desktop UI thread,
+  which is what a WGC recording records. While the window is minimised it stays where it was.
+
 ## Slices
 
 As listed under Milestone 9's 0.5.0 section in `ROADMAP.md`:

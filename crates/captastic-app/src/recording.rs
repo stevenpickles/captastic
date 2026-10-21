@@ -796,6 +796,9 @@ struct Draft {
     capture_id: CaptureId,
     display: String,
     area: Rect,
+    /// Whether a window was recorded as its area on the screen, since Windows would not let it be
+    /// captured itself (ADR 0013).
+    window_area: bool,
 }
 
 /// An edited recording being encoded on a thread of its own.
@@ -960,18 +963,6 @@ impl RecordingHost {
             settings.format,
             settings.max_duration.as_secs()
         );
-        if inner.json_output {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "schema_version": 1,
-                    "event": "recording_started",
-                    "capture_id": request.capture_id,
-                    "format": settings.format,
-                    "area": request.area,
-                })
-            );
-        }
         let host = self.clone();
         let thread_desktop_ui = desktop_ui.clone();
         let spawned = thread::Builder::new()
@@ -1010,6 +1001,8 @@ impl RecordingHost {
                 captastic_core::CaptureSource::Display(request.display_id.clone())
             },
         };
+        // Why a window is recorded as its area on the screen rather than as itself, if it is.
+        let mut window_area_reason = None;
         let mut window_frames = request.window.and_then(|window| {
             match captastic_windows::WgcWindowSession::start(window, inner.window_cursor) {
                 Ok(session) => {
@@ -1017,6 +1010,7 @@ impl RecordingHost {
                         "recording {} records the window itself, through Windows Graphics Capture",
                         request.capture_id.0
                     );
+                    follow_indicator(&desktop_ui, window);
                     Some(WindowFrames {
                         session,
                         capture_id: request.capture_id,
@@ -1031,10 +1025,33 @@ impl RecordingHost {
                          Capture could not capture the window ({error})",
                         request.capture_id.0
                     );
+                    window_area_reason = Some(error.to_string());
                     None
                 }
             }
         });
+        let window_area = window_area_reason.is_some();
+        if inner.json_output {
+            let mut event = serde_json::json!({
+                "schema_version": 1,
+                "event": "recording_started",
+                "capture_id": request.capture_id,
+                "format": settings.format,
+                "area": request.area,
+            });
+            if request.window.is_some() {
+                // How a window is recorded: as itself, or as its area on the screen and why.
+                event["window_source"] = if window_area {
+                    "screen_area".into()
+                } else {
+                    "windows_graphics_capture".into()
+                };
+                if let Some(reason) = &window_area_reason {
+                    event["fallback_reason"] = reason.as_str().into();
+                }
+            }
+            println!("{event}");
+        }
         let frames: &mut dyn FrameSource = match window_frames.as_mut() {
             Some(frames) => frames,
             None => &mut display_frames,
@@ -1073,6 +1090,7 @@ impl RecordingHost {
                             capture_id: request.capture_id,
                             display: request.display_id.0.clone(),
                             area: request.area,
+                            window_area,
                         };
                         if inner.exiting.load(Ordering::Acquire) {
                             // Stopped because Captastic is exiting: there is no one to review it.
@@ -1088,6 +1106,7 @@ impl RecordingHost {
                             &request.display_id.0,
                             &report,
                             ended,
+                            window_area,
                         );
                     }
                 }
@@ -1098,12 +1117,14 @@ impl RecordingHost {
 
     /// Records a saved recording in history and says so. `ended` is how the recording ended, for
     /// one saved straight away; a reviewed recording's ending is old news by the time it is saved.
+    /// `window_area` is whether a window was recorded as its area on the screen instead of itself.
     fn announce_saved(
         &self,
         capture_id: CaptureId,
         display: &str,
         report: &RecordingReport,
         ended: Option<RecordingEnd>,
+        window_area: bool,
     ) {
         let inner = &self.inner;
         log::info!(
@@ -1132,6 +1153,7 @@ impl RecordingHost {
                 file_name: file_name(&report.path),
                 path: report.path.clone(),
                 ended,
+                window_area,
             });
     }
 
@@ -1275,7 +1297,13 @@ impl RecordingHost {
                     path,
                     ..draft.report
                 };
-                self.announce_saved(draft.capture_id, &draft.display, &report, None);
+                self.announce_saved(
+                    draft.capture_id,
+                    &draft.display,
+                    &report,
+                    None,
+                    draft.window_area,
+                );
             }
             Err(error) => self.report_failure(draft.capture_id, &error),
         }
@@ -1316,7 +1344,13 @@ impl RecordingHost {
                     frames_written: summary.frames_written,
                     ..draft.report
                 };
-                self.announce_saved(draft.capture_id, &draft.display, &report, None);
+                self.announce_saved(
+                    draft.capture_id,
+                    &draft.display,
+                    &report,
+                    None,
+                    draft.window_area,
+                );
             }
             Err(error) => self.edit_failed(draft, &error.to_string()),
         }
@@ -1599,6 +1633,22 @@ fn show_indicator(
                 "the recording border could not be shown, so the recording is stopped: {error}"
             ));
             stop.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// Makes the indicator follow `window`, which is being recorded as itself and so wherever it goes
+/// (ADR 0013). An indicator that cannot follow stays where it is, which is worth a warning but not
+/// worth stopping the recording: **Stop** is still on the screen.
+fn follow_indicator(
+    desktop_ui: &Arc<Mutex<Option<captastic_windows::DesktopUi>>>,
+    window: captastic_windows::NativeWindowHandle,
+) {
+    if let Some(host) = lock(desktop_ui).as_ref() {
+        if let Err(error) = host.follow_recording(window) {
+            crate::logging::warn(format_args!(
+                "the recording border cannot follow its window: {error}"
+            ));
         }
     }
 }
@@ -2119,6 +2169,7 @@ mod tests {
             capture_id: CaptureId(3),
             display: "primary".to_owned(),
             area: rect(0, 0, 40, 30),
+            window_area: false,
         }
     }
 

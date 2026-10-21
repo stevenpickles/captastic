@@ -25,7 +25,7 @@ use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowLongPtrW, GetWindowRect, IsZoomed, SendMessageTimeoutW, GWL_STYLE,
+    GetWindowLongPtrW, GetWindowRect, IsIconic, IsWindow, IsZoomed, SendMessageTimeoutW, GWL_STYLE,
     PW_RENDERFULLCONTENT, SMTO_ABORTIFHUNG, SMTO_BLOCK, WM_NULL, WS_CAPTION,
 };
 
@@ -1029,6 +1029,22 @@ pub(crate) fn window_geometry(hwnd: HWND, window: Rect) -> WindowGeometry {
         content,
         border_thickness,
     }
+}
+
+/// Where `window` is on the desktop as the user sees it, its DWM visible frame: what a window
+/// recording through Windows Graphics Capture records, and what its indicator follows (ADR 0013).
+/// `None` while the window is minimised or once it has closed, when the indicator stays where it
+/// was.
+pub(crate) fn visible_window_frame(window: NativeWindowHandle) -> Option<Rect> {
+    let hwnd = HWND(window.raw());
+    // SAFETY: Read-only queries of a foreign window, which fail cleanly once it has closed.
+    if !unsafe { IsWindow(hwnd) }.as_bool() || unsafe { IsIconic(hwnd) }.as_bool() {
+        return None;
+    }
+    let mut native = RECT::default();
+    // SAFETY: native is writable for the exact RECT size.
+    unsafe { GetWindowRect(hwnd, &mut native) }.ok()?;
+    Some(window_geometry(hwnd, rect_from_native(native)?).frame)
 }
 
 /// Where a window's visible frame lands inside a raw Windows Graphics Capture surface, and where

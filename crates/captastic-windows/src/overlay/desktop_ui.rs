@@ -27,7 +27,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use super::editor::{create_editor, editor_window_proc, EditFinished, EDITOR_CLASS_NAME};
 use super::pin::{create_pin, pin_window_proc, set_click_through, PIN_CLASS_NAME};
 use super::recording_frame::{
-    create_recording_frame, recording_frame_proc, RECORDING_FRAME_CLASS_NAME,
+    create_recording_frame, follow_window, recording_frame_proc, RECORDING_FRAME_CLASS_NAME,
 };
 use super::review::{create_review, review_window_proc, ReviewFinished, REVIEW_CLASS_NAME};
 use super::shell::{PrivateFontResource, ThreadDpiContext};
@@ -64,6 +64,9 @@ enum UiCommand {
         area: Rect,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
         limit: Duration,
+    },
+    FollowRecording {
+        window: crate::NativeWindowHandle,
     },
     HideRecording,
     Review {
@@ -144,6 +147,12 @@ impl DesktopUi {
         limit: Duration,
     ) -> Result<(), CaptureError> {
         self.request(UiCommand::ShowRecording { area, stop, limit })
+    }
+
+    /// Makes the recording indicator follow `window` as it moves and is resized, for a window
+    /// recorded as itself (ADR 0013).
+    pub fn follow_recording(&self, window: crate::NativeWindowHandle) -> Result<(), CaptureError> {
+        self.request(UiCommand::FollowRecording { window })
     }
 
     /// Opens a review of `recording`, the bytes of a recording in `format` not yet saved, on the
@@ -504,6 +513,12 @@ unsafe fn apply(state: *mut HostState, command: UiCommand) {
                 // SAFETY: As above.
                 Ok(frame) => unsafe { (*state).recording = Some(frame) },
                 Err(error) => log::warn!("could not show the recording border: {error}"),
+            }
+        }
+        UiCommand::FollowRecording { window } => {
+            // SAFETY: Per this function's contract.
+            if let Some(frame) = unsafe { (*state).recording } {
+                follow_window(frame, window);
             }
         }
         // SAFETY: As above.

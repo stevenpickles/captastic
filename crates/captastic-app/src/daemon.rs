@@ -3240,6 +3240,9 @@ pub(crate) enum DaemonNotice {
         /// How it ended, for a recording saved as soon as it ended; `None` once it has been
         /// reviewed, when that is no longer news.
         ended: Option<crate::recording::RecordingEnd>,
+        /// Whether a window was recorded as its area on the screen, since Windows would not let it
+        /// be captured itself (ADR 0013).
+        window_area: bool,
     },
     /// A recording failed, and nothing was saved.
     RecordingFailed { message: String },
@@ -3291,20 +3294,33 @@ impl DaemonNotice {
                 "Stop the recording with its Stop button before capturing again.".to_owned()
             }
             Self::RecordingSaved {
-                file_name, ended, ..
-            } => match ended {
-                Some(crate::recording::RecordingEnd::TimeLimit) => format!(
-                    "{file_name} was saved when the recording reached its time limit. Click to \
-                     show it in its folder."
-                ),
-                Some(crate::recording::RecordingEnd::WindowClosed) => format!(
-                    "{file_name} was saved when the recorded window closed. Click to show it in \
-                     its folder."
-                ),
-                Some(crate::recording::RecordingEnd::Stopped) | None => {
-                    format!("{file_name} was saved. Click to show it in its folder.")
+                file_name,
+                ended,
+                window_area,
+                ..
+            } => {
+                let saved = match ended {
+                    Some(crate::recording::RecordingEnd::TimeLimit) => format!(
+                        "{file_name} was saved when the recording reached its time limit. Click \
+                         to show it in its folder."
+                    ),
+                    Some(crate::recording::RecordingEnd::WindowClosed) => format!(
+                        "{file_name} was saved when the recorded window closed. Click to show it \
+                         in its folder."
+                    ),
+                    Some(crate::recording::RecordingEnd::Stopped) | None => {
+                        format!("{file_name} was saved. Click to show it in its folder.")
+                    }
+                };
+                if *window_area {
+                    format!(
+                        "Recorded the window's area on the screen: Windows did not allow \
+                         capturing the window itself. {saved}"
+                    )
+                } else {
+                    saved
                 }
-            },
+            }
             Self::RecordingFailed { message } => format!("Nothing was saved: {message}."),
             Self::RecordingEditFailed {
                 file_name, message, ..
@@ -3801,6 +3817,26 @@ mod tests {
         assert_ne!(
             DaemonNotice::CaptureEngineUnavailable.title(),
             DaemonNotice::CaptureEngineRecovered.title()
+        );
+    }
+
+    #[test]
+    fn a_window_recorded_as_its_area_says_so_when_it_is_saved() {
+        let saved = |window_area| DaemonNotice::RecordingSaved {
+            file_name: "clip.gif".to_owned(),
+            path: std::path::PathBuf::from("clip.gif"),
+            ended: Some(crate::recording::RecordingEnd::WindowClosed),
+            window_area,
+        };
+        assert_eq!(
+            saved(false).message(),
+            "clip.gif was saved when the recorded window closed. Click to show it in its folder."
+        );
+        assert_eq!(
+            saved(true).message(),
+            "Recorded the window's area on the screen: Windows did not allow capturing the window \
+             itself. clip.gif was saved when the recorded window closed. Click to show it in its \
+             folder."
         );
     }
 

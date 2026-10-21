@@ -112,6 +112,9 @@ What implementing this settled, for the next reader:
   regions, and records whatever is in that rectangle - including another window moved over it.
   So the chosen window is brought to the front as the overlay closes, rather than focus going back
   to the window that had it, which would otherwise cover it wherever the two overlap.
+  *Superseded in 0.5.0* by [ADR 0013](0013-window-recording.md) for every window Windows Graphics
+  Capture can capture: such a window is recorded as itself, and the indicator follows it. This note
+  still describes the fallback for a window it cannot.
 - **Frames come from the daemon's capture thread**, one `RecordFrame` request at a time, so a
   recording shares the engine's display list and recovery. Each is a full CPU readback cropped to
   the area; reading back only the area on the GPU is a later optimization.
