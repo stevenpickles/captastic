@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed, 2026-10-21. Governs Milestone 10, part of 0.5.0. The user-facing choices (that the command
+Accepted for the Windows prototype, 2026-10-21. Governs Milestone 10, part of 0.5.0. The user-facing choices (that the command
 asks the running daemon and captures on its own when there is none, and that every such capture is
 announced) were made by the maintainer on 2026-10-21.
 
