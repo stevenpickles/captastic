@@ -1069,6 +1069,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             .config_path()
             .map(std::path::Path::to_path_buf),
         args.json,
+        args.cursor == CursorMode::Include,
     );
     let mut selection_worker = args
         .selection
@@ -3295,6 +3296,10 @@ impl DaemonNotice {
                 Some(crate::recording::RecordingEnd::TimeLimit) => format!(
                     "{file_name} was saved when the recording reached its time limit. Click to \
                      show it in its folder."
+                ),
+                Some(crate::recording::RecordingEnd::WindowClosed) => format!(
+                    "{file_name} was saved when the recorded window closed. Click to show it in \
+                     its folder."
                 ),
                 Some(crate::recording::RecordingEnd::Stopped) | None => {
                     format!("{file_name} was saved. Click to show it in its folder.")
