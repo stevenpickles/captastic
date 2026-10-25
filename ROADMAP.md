@@ -97,8 +97,8 @@ Milestone 5's criterion vacuously and on purpose.
 
 ## Release readiness — v0.5.0
 
-**Status:** planned 2026-10-21. Recording a window through WGC is built (#140, #141, #142); sound
-and the command line are not started yet. The 0.4.0 Chocolatey submission was pushed on
+**Status:** planned 2026-10-21. Recording a window through WGC is built (#140, #141, #142), and the
+command line's request channel (#143); sound is not started yet. The 0.4.0 Chocolatey submission was pushed on
 2026-10-21 and is in moderation. Decided on 2026-10-21:
 
 - **Theme: recording a window itself.** 0.4.0 records a window as the rectangle it occupied when
@@ -948,8 +948,10 @@ the running daemon, and the daemon's only control channel is the named stop even
 
 1. **ADR 0014** (`docs/adr-0014-command-line-capture`), answering the questions above, with the
    user-facing choices made by the maintainer.
-2. **A request channel to the daemon**: one request, one answer, scoped to the session, with the
-   daemon's capture path behind it; tested through FakeBackend as the daemon tests are.
+2. **A request channel to the daemon** (#143): one request, one answer, scoped to the session, with
+   the daemon's capture path behind it; tested through FakeBackend as the daemon tests are. It
+   answers `status`, `displays`, and captures of a display or a rectangle; window targets, the
+   last region, `--interactive` and `--clipboard` are refused as `unsupported` until slice 3.
 3. **The shipped command**: the executable or console mode ADR 0014 chooses, its capture command,
    JSON output and exit codes, packaged in the ZIP and the Chocolatey package (shim included).
 4. **Agent documentation and the visibility rule**: the notification and history marking ADR 0014
