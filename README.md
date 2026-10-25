@@ -478,7 +478,7 @@ one still open when Captastic exits is closed without copying anything.
 ### Screen recordings
 
 **Record**, beside **Edit** on the toolbar, records the selection over time instead of capturing it
-once: a region, a window's area on screen, or a whole display. While it runs, a red border surrounds
+once: a region, a window, or a whole display. While it runs, a red border surrounds
 the recorded area and a bar beside it shows the elapsed time and a **Stop** button; neither ever
 appears in the recording, and the bar never takes focus from what you are working in. A recording
 ends at **Stop** or when it reaches `recording.max_seconds` (60 by default, at most 600), and either
@@ -491,6 +491,15 @@ capturing). **Options -> Record As** chooses the format, and the choice is kept:
   frames is stored. What chats, issues and documents embed directly.
 - **MP4**: H.264 video at 30 frames a second and the recorded size, encoded by Windows on the GPU
   where it can be. Far smaller and smoother for anything long or large.
+
+A window is recorded as itself, through Windows Graphics Capture (ADR 0013): another window moved
+over it, or moving it, changes nothing in the recording, and the border and its bar follow it
+around. The recording keeps the size the window had when it started; a window resized during it is
+scaled to fit, its proportions kept, on black where it no longer fills the picture. A minimised
+window holds its last frame until it is restored, and closing the window ends the recording as
+**Stop** would. Where Windows does not let Captastic capture the window itself, it is recorded as its area
+on the screen instead, as 0.4.0 recorded every window: whatever is in that rectangle is recorded,
+including a window moved over it, and the notification says so when the recording is saved.
 
 When a recording ends it opens in a **review window** before it is saved (ADR 0012). It plays the
 recording back, and a timeline under the picture holds a handle for each end of the span to keep and

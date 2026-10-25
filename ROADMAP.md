@@ -97,7 +97,8 @@ Milestone 5's criterion vacuously and on purpose.
 
 ## Release readiness — v0.5.0
 
-**Status:** planned 2026-10-21; nothing built yet. The 0.4.0 Chocolatey submission was pushed on
+**Status:** planned 2026-10-21. Recording a window through WGC is built (#140, #141, #142); sound
+and the command line are not started yet. The 0.4.0 Chocolatey submission was pushed on
 2026-10-21 and is in moderation. Decided on 2026-10-21:
 
 - **Theme: recording a window itself.** 0.4.0 records a window as the rectangle it occupied when
@@ -875,14 +876,14 @@ open for as long as the recording runs.
 
 1. **ADR 0013** (`docs/adr-0013-window-recording`), answering the questions above, with the
    user-facing choices made by the maintainer.
-2. **A persistent WGC window source** in `captastic-windows`: one session for the life of a
+2. **A persistent WGC window source** (#140) in `captastic-windows`: one session for the life of a
    recording, the newest frame read back on request, resizing, minimised and closed windows, and
    clean teardown. Tested against a test window, with the desktop tests ignored on hosted CI as the
    existing WGC tests are.
-3. **Recording a window through it**: a window recording's `FrameSource` drawn from that session,
+3. **Recording a window through it** (#141): a window recording's `FrameSource` drawn from that session,
    the fixed output size and its resize rule, and the pointer setting. Region and display
    recordings stay as they are.
-4. **The indicator follows the window, and the fallback**: the border and bar track the window,
+4. **The indicator follows the window, and the fallback** (#142): the border and bar track the window,
    the behaviour ADR 0013 chooses for a window WGC cannot capture, and the README, notes and ADR
    0011 updated to retire the "recorded as its area" limitation.
 

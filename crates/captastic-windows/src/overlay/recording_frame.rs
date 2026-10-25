@@ -6,6 +6,10 @@
 //! recording and never in it. Everything but the bar is fully transparent, so clicks go through the
 //! border and the recorded area to whatever is beneath; the bar takes clicks for its button. It
 //! never takes focus: a recording of a window being typed into must not steal the typing.
+//!
+//! A window recorded through Windows Graphics Capture is recorded wherever it goes, so its
+//! indicator follows it (ADR 0013): the window's frame is read again at the recording's rate and the
+//! indicator laid out afresh around it whenever it has moved or changed size.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -29,6 +33,8 @@ use super::layout::{UiMetrics, UiRect};
 use super::raster::{draw_round_box, draw_text, rgb, TextAlignment};
 use super::shell::{query_display_environment, FrozenSurface};
 use super::vector::{bgr, Painter};
+use crate::window_capture::visible_window_frame;
+use crate::NativeWindowHandle;
 
 pub(super) const RECORDING_FRAME_CLASS_NAME: PCWSTR = w!("CaptasticRecordingFrame-v1");
 const RECORDING_FRAME_WINDOW_NAME: PCWSTR = w!("Captastic recording");
@@ -41,6 +47,9 @@ const BAR_GAP_DIP: i32 = 8;
 const BUTTON_SIZE_DIP: (i32, i32) = (72, 28);
 const TICK_ID: usize = 1;
 const TICK_MS: u32 = 250;
+const FOLLOW_ID: usize = 2;
+/// How often a followed window's frame is read: the faster of the two recording rates.
+const FOLLOW_MS: u32 = 33;
 /// The border and the dot: a recording red, not the accent blue of a selection.
 const RECORD_RED: (u8, u8, u8) = (232, 64, 56);
 
@@ -141,6 +150,10 @@ fn elapsed_label(elapsed: Duration, limit: Duration) -> String {
 }
 
 struct FrameState {
+    /// The area the indicator is around, in desktop coordinates.
+    area: Rect,
+    /// The window the indicator follows, once the recording records the window itself.
+    follow: Option<NativeWindowHandle>,
     geometry: FrameGeometry,
     metrics: UiMetrics,
     surface: FrozenSurface,
@@ -159,17 +172,11 @@ pub(super) fn create_recording_frame(
     stop: Arc<AtomicBool>,
     limit: Duration,
 ) -> Result<HWND, CaptureError> {
-    let environment = query_display_environment(area);
-    let metrics = environment.metrics;
-    let work = UiRect {
-        left: environment.work_area.left + area.x,
-        top: environment.work_area.top + area.y,
-        right: environment.work_area.right + area.x,
-        bottom: environment.work_area.bottom + area.y,
-    };
-    let geometry = frame_geometry(area, work, metrics);
+    let (geometry, metrics) = layout(area);
     let surface = FrozenSurface::empty(geometry.window.width, geometry.window.height)?;
     let state = Box::new(FrameState {
+        area,
+        follow: None,
         geometry,
         metrics,
         surface,
@@ -220,6 +227,59 @@ pub(super) fn create_recording_frame(
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     }
     Ok(hwnd)
+}
+
+/// The indicator's layout around `area`, on the display it is on.
+fn layout(area: Rect) -> (FrameGeometry, UiMetrics) {
+    let environment = query_display_environment(area);
+    let metrics = environment.metrics;
+    let work = UiRect {
+        left: environment.work_area.left + area.x,
+        top: environment.work_area.top + area.y,
+        right: environment.work_area.right + area.x,
+        bottom: environment.work_area.bottom + area.y,
+    };
+    (frame_geometry(area, work, metrics), metrics)
+}
+
+/// Makes the indicator `frame` follow `window` from now on.
+pub(super) fn follow_window(frame: HWND, window: NativeWindowHandle) {
+    let state_pointer = window_state::<FrameState>(frame, 0, LPARAM(0));
+    if state_pointer.is_null() {
+        return;
+    }
+    // SAFETY: frame is this thread's live indicator, whose state lives until WM_NCDESTROY, and
+    // nothing here dispatches a message.
+    unsafe { (*state_pointer).follow = Some(window) };
+    // SAFETY: frame is live; a null callback posts WM_TIMER to its procedure.
+    unsafe { SetTimer(frame, FOLLOW_ID, FOLLOW_MS, None) };
+}
+
+/// Lays the indicator out around where its window is now, when that has changed. A minimised
+/// window leaves it where it was, so **Stop** stays on the screen.
+fn follow(hwnd: HWND, state: &mut FrameState) {
+    let Some(area) = state.follow.and_then(visible_window_frame) else {
+        return;
+    };
+    if area == state.area {
+        return;
+    }
+    let (geometry, metrics) = layout(area);
+    if (geometry.window.width, geometry.window.height)
+        != (state.geometry.window.width, state.geometry.window.height)
+    {
+        match FrozenSurface::empty(geometry.window.width, geometry.window.height) {
+            Ok(surface) => state.surface = surface,
+            Err(error) => {
+                log::warn!("the recording border could not follow its window: {error}");
+                return;
+            }
+        }
+    }
+    state.area = area;
+    state.geometry = geometry;
+    state.metrics = metrics;
+    present(hwnd, state);
 }
 
 pub(super) unsafe extern "system" fn recording_frame_proc(
@@ -295,9 +355,15 @@ pub(super) unsafe extern "system" fn recording_frame_proc(
             present(hwnd, state);
             LRESULT(0)
         }
+        WM_TIMER if wparam.0 == FOLLOW_ID => {
+            follow(hwnd, state);
+            LRESULT(0)
+        }
         WM_DESTROY => {
             // SAFETY: hwnd is this thread's live window; a missing timer is a harmless failure.
             let _ = unsafe { KillTimer(hwnd, TICK_ID) };
+            // SAFETY: As above.
+            let _ = unsafe { KillTimer(hwnd, FOLLOW_ID) };
             forget_window(hwnd);
             LRESULT(0)
         }

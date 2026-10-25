@@ -444,9 +444,9 @@ mod tests {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostMessageW,
-        PostQuitMessage, RegisterClassW, SetWindowPos, TranslateMessage, MSG, SWP_NOMOVE,
-        SWP_NOZORDER, WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY, WNDCLASSW, WS_OVERLAPPEDWINDOW,
-        WS_VISIBLE,
+        PostQuitMessage, RegisterClassW, SetWindowPos, ShowWindow, TranslateMessage, MSG,
+        SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_MINIMIZE, WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY,
+        WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
     };
 
     #[test]
@@ -456,6 +456,15 @@ mod tests {
         let started = Instant::now();
         assert!(WgcWindowSession::start(NativeWindowHandle::from_raw(0x7ff0_0001), false).is_err());
         assert!(started.elapsed() < START_TIMEOUT + Duration::from_secs(1));
+    }
+
+    /// Held by each desktop test, so they take turns: a window opening, closing or taking focus
+    /// repaints the others' title bars, which a test that expects an unchanged window would see.
+    fn desktop() -> std::sync::MutexGuard<'static, ()> {
+        static DESKTOP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        DESKTOP
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// A window painted one solid colour, run on a thread of its own with its own message loop.
@@ -573,6 +582,12 @@ mod tests {
             .expect("resize");
         }
 
+        fn move_to(&self, x: i32, y: i32) {
+            // SAFETY: Moves the live test window; the call is marshalled to its own thread.
+            unsafe { SetWindowPos(HWND(self.hwnd), None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER) }
+                .expect("move");
+        }
+
         fn close(&mut self) {
             // SAFETY: Asks the live test window to close; its own thread destroys it.
             let _ = unsafe { PostMessageW(HWND(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
@@ -611,8 +626,41 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an interactive desktop"]
+    fn the_indicator_finds_its_window_wherever_it_goes_until_it_is_minimised_or_closed() {
+        let _desktop = desktop();
+        use crate::window_capture::visible_window_frame;
+        // Physical pixels, as the desktop UI thread the indicator lives on reads them.
+        // SAFETY: Changes only this test thread's DPI awareness.
+        let _ = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        let mut window = TestWindow::open_at(&RECORDED, 900, 600, 320, 240);
+        let first = visible_window_frame(window.handle()).expect("an open window has a frame");
+        // The visible frame, without the invisible resize border around it.
+        assert!(first.width <= 320 && first.width + 32 > 320, "{first:?}");
+
+        // Away from the windows the other tests record, which a window passing over would change.
+        window.move_to(1000, 680);
+        let moved = visible_window_frame(window.handle()).expect("a moved window has a frame");
+        assert_eq!(
+            (moved.x - first.x, moved.y - first.y, moved.width),
+            (100, 80, first.width)
+        );
+        window.resize(480, 360);
+        let resized = visible_window_frame(window.handle()).expect("a resized window");
+        assert!(resized.width > first.width + 100, "{resized:?}");
+
+        // Minimised or closed, there is nothing to follow, and the indicator stays put.
+        // SAFETY: Minimises the live test window.
+        let _ = unsafe { ShowWindow(HWND(window.hwnd), SW_MINIMIZE) };
+        assert_eq!(visible_window_frame(window.handle()), None);
+        window.close();
+        assert_eq!(visible_window_frame(window.handle()), None);
+    }
+
+    #[test]
     #[ignore = "requires an interactive desktop with Windows Graphics Capture"]
     fn a_session_follows_its_window_through_a_resize_until_it_closes() {
+        let _desktop = desktop();
         let mut window = TestWindow::open(320, 240);
         thread::sleep(Duration::from_millis(300));
         let session = WgcWindowSession::start(window.handle(), false).expect("session");
@@ -645,6 +693,7 @@ mod tests {
     #[test]
     #[ignore = "requires an interactive desktop with Windows Graphics Capture"]
     fn a_covered_window_is_still_recorded_as_itself() {
+        let _desktop = desktop();
         let window = TestWindow::open(320, 240);
         thread::sleep(Duration::from_millis(300));
         let session = WgcWindowSession::start(window.handle(), false).expect("session");
@@ -662,6 +711,7 @@ mod tests {
     #[test]
     #[ignore = "requires an interactive desktop with Windows Graphics Capture"]
     fn an_unchanging_window_keeps_its_last_frame() {
+        let _desktop = desktop();
         let window = TestWindow::open(240, 180);
         thread::sleep(Duration::from_millis(300));
         let session = WgcWindowSession::start(window.handle(), false).expect("session");
