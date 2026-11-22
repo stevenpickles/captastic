@@ -772,7 +772,14 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1_000);
         let started = Instant::now();
         let capture = LoopbackCapture::start(started, sender).expect("thread");
-        std::thread::sleep(Duration::from_millis(1_500));
+        // With CAPTASTIC_EXPECT_SOUND set, something plays sound while this runs, and the test
+        // checks it was heard: see scripts/check-recording-audio.ps1.
+        let expect_sound = std::env::var_os("CAPTASTIC_EXPECT_SOUND").is_some();
+        std::thread::sleep(Duration::from_millis(if expect_sound {
+            3_000
+        } else {
+            1_500
+        }));
         let summary = capture.stop();
         let packets: Vec<AudioPacket> = receiver.try_iter().collect();
         if !summary.device_opened {
@@ -792,5 +799,31 @@ mod tests {
             end = packet.start + duration_at(packet.frames() as u64);
         }
         assert!(end >= Duration::from_millis(1_400), "{end:?} {summary:?}");
+        if expect_sound {
+            assert!(summary.device_opened, "{summary:?}");
+            // The loudest 50 ms, and when the sound began: the first 10 ms that is not quiet.
+            let mut samples = Vec::new();
+            for packet in &packets {
+                samples.extend_from_slice(&packet.samples);
+            }
+            let window = (AUDIO_SAMPLE_RATE as usize / 100) * 2;
+            let rms = |chunk: &[i16]| {
+                (chunk
+                    .iter()
+                    .map(|&s| f64::from(s) * f64::from(s))
+                    .sum::<f64>()
+                    / chunk.len().max(1) as f64)
+                    .sqrt()
+            };
+            let levels: Vec<f64> = samples.chunks(window).map(rms).collect();
+            let loudest = levels.iter().copied().fold(0.0, f64::max);
+            let onset = levels.iter().position(|&level| level > 300.0);
+            eprintln!(
+                "loudest 10 ms RMS {loudest:.0}, sound from {:?} ms, {} packets, {summary:?}",
+                onset.map(|index| index * 10),
+                packets.len()
+            );
+            assert!(loudest > 300.0, "no sound was heard");
+        }
     }
 }
