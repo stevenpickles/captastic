@@ -54,7 +54,7 @@ function Get-PeMachine([string]$Path) {
     }
 }
 
-foreach ($binary in @('captastic.exe')) {
+foreach ($binary in @('captastic.exe', 'captastic-cli.exe')) {
     $binaryPath = Join-Path $BinariesDirectory $binary
     if (-not (Test-Path -LiteralPath $binaryPath -PathType Leaf)) {
         throw "Distribution binary is missing: $binaryPath"
@@ -73,7 +73,7 @@ Remove-Item -LiteralPath "$archive.sha256" -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Path $packageDirectory -Force | Out-Null
 
 try {
-    foreach ($binary in @('captastic.exe')) {
+    foreach ($binary in @('captastic.exe', 'captastic-cli.exe')) {
         Copy-Item -LiteralPath (Join-Path $BinariesDirectory $binary) -Destination $packageDirectory
     }
     foreach ($file in @(

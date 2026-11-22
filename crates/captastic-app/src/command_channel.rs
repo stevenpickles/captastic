@@ -102,6 +102,14 @@ pub enum Reason {
     WriteFailed,
     /// The daemon is stopping.
     ShuttingDown,
+    /// No Captastic is running in this session to ask. Only `captastic-cli` says this.
+    NotRunning,
+    /// Every instance of the pipe stayed taken by other requests. Only `captastic-cli` says this.
+    Busy,
+    /// Something serves the pipe, but not this user's Captastic in this session.
+    UntrustedPipe,
+    /// The request was sent and no answer came back.
+    RequestFailed,
 }
 
 impl Reason {

@@ -17,6 +17,12 @@ path = "src/lib.rs"
 name = "captastic"
 path = "src/main.rs"
 
+# The command line that ships beside it (ADR 0014), built for the console subsystem so it writes to
+# the terminal that ran it and returns an exit code.
+[[bin]]
+name = "captastic-cli"
+path = "src/bin/captastic-cli.rs"
+
 # The developer command line. Packaging never includes it.
 [[bin]]
 name = "captastic-dev"

@@ -1,11 +1,14 @@
 # Chocolatey packaging
 
-Captastic's Chocolatey package is self-contained: the release executable, licenses,
+Captastic's Chocolatey package is self-contained: the release executables, licenses,
 documentation, and example configuration are embedded in the `.nupkg`. Installation and
 upgrades therefore do not download or execute a second installer. The package exposes
 `captastic.exe` on `PATH` through a GUI shim, so the shim holds no console open while Captastic
 runs, and adds it to the all-users Start Menu (`CommonPrograms`); the portable installer's shortcut
-is per-user instead. The developer command line, `captastic-dev.exe`, is not packaged. The all-users shortcut is a Chocolatey packaging convention only — the installed startup
+is per-user instead. `captastic-cli.exe`, the command line that asks the running Captastic for
+captures ([ADR 0014](adr/0014-command-line-capture.md)), gets a console shim instead, so a
+terminal waits for it and sees its output and exit code. The developer command line,
+`captastic-dev.exe`, is not packaged. The all-users shortcut is a Chocolatey packaging convention only — the installed startup
 entry, configuration, and daemon control remain scoped to the installing user's session.
 
 The package intentionally does not launch Captastic on its first installation. Start it from
@@ -126,7 +129,8 @@ Portable package, as a standard user:
 
 1. Download the ZIP and its `.sha256`, check the hash, `Unblock-File` the ZIP, extract it, and run
    `.\install.ps1`. Captastic appears in the notification area with no console window, and its Start
-   Menu shortcut exists.
+   Menu shortcut exists. `.\captastic-cli.exe status` in the install folder prints
+   `"running":true` and the daemon's version.
 2. Press the hotkey, choose a region, and press Enter: the clipboard holds the region.
 3. Confirm with **Pin** (Shift+Enter) and with **Edit** (Ctrl+Enter), then press **Done**: a pin
    appears, and the edited image reaches the clipboard.
@@ -138,13 +142,15 @@ Chocolatey package, from an elevated prompt, after restoring the snapshot:
 
 6. `choco install captastic --version <version>-vm.1 --pre --source <folder>`: nothing launches.
    Start it from the Start Menu; there is no console, and `(Get-Command captastic).Source` is the
-   Chocolatey shim.
+   Chocolatey shim. In a normal (not elevated) prompt, `captastic-cli capture --display primary`
+   prints the path of a new capture with exit code 0 and raises *Captured by a command-line
+   request*; `captastic-cli capture --window-title x` prints a refusal with exit code 2.
 7. Repeat steps 2 and 3.
 8. With Captastic running, `choco upgrade captastic --version <version> --source <folder>` to the
    release package: it stops, and comes back on its own within a few seconds. Task Manager's
    **Details** tab, with the **Elevated** column shown, reports `captastic.exe` as **No**, and the
    log's `starting daemon version=` line names the release.
-9. `choco uninstall captastic`: Captastic stops, the shim, shortcut and login entry are gone, and
+9. `choco uninstall captastic`: Captastic stops, both shims, the shortcut and login entry are gone, and
    `~/.captastic` remains.
 
 Record the result in the release notes' "What was not observed" section before publishing.
