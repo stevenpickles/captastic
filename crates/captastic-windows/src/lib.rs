@@ -1,4 +1,6 @@
 #[cfg(windows)]
+mod announce;
+#[cfg(windows)]
 mod clipboard;
 #[cfg(windows)]
 mod console;
@@ -39,6 +41,8 @@ mod window_capture_wgc;
 #[cfg(windows)]
 mod window_session_wgc;
 
+#[cfg(windows)]
+pub use announce::announce_capture;
 #[cfg(windows)]
 pub use clipboard::{
     ClipboardPayload, ClipboardPublishError, ClipboardPublishReport, ClipboardPublisher,

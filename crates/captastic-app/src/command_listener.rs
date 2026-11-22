@@ -25,9 +25,9 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a request waits on the capture worker, which may be busy with the user's own capture.
 const ENGINE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Where a command-line request's frames and displays come from: the daemon's capture worker, or a
-/// test's fake backend.
-pub(crate) trait CommandEngine: Send + 'static {
+/// Where a command-line request's frames and displays come from: the daemon's capture worker, the
+/// command line's own one-shot backend when no daemon is running, or a test's fake backend.
+pub(crate) trait CommandEngine {
     fn displays(&self) -> Result<Vec<DisplayInfo>, Failure>;
     fn frame(&self, source: CaptureSource) -> Result<CpuFrame, Failure>;
 }
@@ -48,6 +48,8 @@ pub(crate) struct Commands<E> {
     pub(crate) notices: Option<mpsc::SyncSender<crate::daemon::DaemonNotice>>,
     /// The display the pointer is on, for a `pointer` target.
     pub(crate) pointer: fn(&[DisplayInfo]) -> Result<DisplayId, Failure>,
+    /// Who took a capture, as the answer reports it: `daemon` or `one_shot`.
+    pub(crate) taken_by: &'static str,
 }
 
 impl<E: CommandEngine> Commands<E> {
@@ -115,7 +117,7 @@ impl<E: CommandEngine> Commands<E> {
         fields.insert("width".to_owned(), json!(frame.width()));
         fields.insert("height".to_owned(), json!(frame.height()));
         fields.insert("captured".to_owned(), plan.described);
-        fields.insert("taken_by".to_owned(), json!("daemon"));
+        fields.insert("taken_by".to_owned(), json!(self.taken_by));
         fields.insert("capture_id".to_owned(), json!(frame.metadata.capture_id.0));
         Ok(fields)
     }
@@ -173,7 +175,7 @@ pub(crate) struct CommandListener {
 }
 
 impl CommandListener {
-    pub(crate) fn start<E: CommandEngine>(
+    pub(crate) fn start<E: CommandEngine + Send + 'static>(
         server: captastic_windows::RequestPipeServer,
         commands: Commands<E>,
     ) -> std::io::Result<Self> {
@@ -407,6 +409,7 @@ mod tests {
             },
             notices: None,
             pointer: |_| panic!("the pointer was asked for"),
+            taken_by: "daemon",
         }
     }
 

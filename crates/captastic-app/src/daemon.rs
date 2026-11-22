@@ -1231,6 +1231,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                 },
                 notices: Some(notice_sender.clone()),
                 pointer: crate::command_listener::pointer_display,
+                taken_by: "daemon",
             },
         )
         .map_err(|error| {
@@ -3382,7 +3383,7 @@ pub(crate) enum DaemonNotice {
 
 #[cfg(windows)]
 impl DaemonNotice {
-    fn title(&self) -> &'static str {
+    pub(crate) fn title(&self) -> &'static str {
         match self {
             Self::DroppedSelection { .. } => "Captastic could not finish a capture",
             Self::CaptureEngineUnavailable => "Captastic cannot capture right now",
@@ -3406,7 +3407,7 @@ impl DaemonNotice {
         )
     }
 
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         match self {
             Self::DroppedSelection { capture_id, reason } => format!(
                 "Capture {} was not completed because {}.",

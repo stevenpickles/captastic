@@ -35,8 +35,42 @@ struct DesktopCli {
     /// Persistent log line format.
     #[arg(long, value_parser = ["compact", "json"])]
     log_format: Option<String>,
+    /// Announce a capture `captastic-cli` took while Captastic was not running, from an icon of
+    /// its own that goes away a few seconds later (ADR 0014). Not for people: `captastic-cli`
+    /// starts it, so the command line can return while the notification is still up.
+    #[arg(long, value_name = "FILE", hide = true)]
+    announce_command_line_capture: Option<PathBuf>,
     #[command(flatten)]
     daemon: DaemonArgs,
+}
+
+/// How long the icon of a one-shot announcement stays, so the notification can still be clicked.
+const ANNOUNCEMENT_LINGER: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Shows the announcement for a command-line capture taken without the daemon. Nothing else runs:
+/// no log, no daemon, no check for one, since a daemon started meanwhile changes nothing about a
+/// capture that has already been taken.
+pub(crate) fn announce(file: &std::path::Path) {
+    let notice = crate::daemon::DaemonNotice::CommandLineCapture {
+        file_name: file
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        path: file.to_path_buf(),
+    };
+    if let Err(error) = captastic_windows::announce_capture(
+        notice.title(),
+        &notice.message(),
+        file,
+        ANNOUNCEMENT_LINGER,
+    ) {
+        // The capture is already on disk; failing to say so must still be seen.
+        captastic_windows::show_info_dialog(&format!(
+            "{}\n\n{}\n\n({error})",
+            notice.title(),
+            file.display()
+        ));
+    }
 }
 
 pub fn main() {
@@ -54,6 +88,10 @@ pub fn main() {
             process::exit(error.exit_code());
         }
     };
+    if let Some(file) = desktop.announce_command_line_capture {
+        announce(&file);
+        return;
+    }
     // A second start - the Start Menu item clicked while Captastic is already in the notification
     // area - has nothing to do. Asked before the log is opened so it adds no line to the running
     // daemon's log; the daemon's own control event still refuses a real race further in.

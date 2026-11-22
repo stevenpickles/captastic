@@ -960,6 +960,8 @@ the running daemon, and the daemon's only control channel is the named stop even
      so and the others fail as `not_running`.
    - **3b**: the one-shot engine, so a capture works when Captastic is not running, with its own
      short-lived notification-area icon for the announcement.
+     The command line returns at once and a hidden `captastic.exe` holds the notification
+     (ADR 0014, As built).
    - **3c**: window targets and `windows`, then `--last-region`, `--clipboard` and
      `--interactive`, which the daemon refuses as `unsupported` until then.
 4. **Agent documentation and the visibility rule**: the notification and history marking ADR 0014

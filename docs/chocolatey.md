@@ -145,6 +145,9 @@ Chocolatey package, from an elevated prompt, after restoring the snapshot:
    Chocolatey shim. In a normal (not elevated) prompt, `captastic-cli capture --display primary`
    prints the path of a new capture with exit code 0 and raises *Captured by a command-line
    request*; `captastic-cli capture --window-title x` prints a refusal with exit code 2.
+   Quit Captastic from the tray and run the same capture again: it prints `"taken_by":"one_shot"`
+   with exit code 0 straight away, and the same notification appears from an icon that goes away
+   about ten seconds later.
 7. Repeat steps 2 and 3.
 8. With Captastic running, `choco upgrade captastic --version <version> --source <folder>` to the
    release package: it stops, and comes back on its own within a few seconds. Task Manager's

@@ -168,11 +168,13 @@ pub(crate) struct Outcome {
     pub(crate) code: i32,
 }
 
-/// Runs a parsed command, sending its request through `send`.
+/// Runs a parsed command, sending its request through `send`, or answering it through `one_shot`
+/// when no Captastic is running to ask.
 fn run(
     command: Subcommands,
     current_dir: &Path,
     send: impl FnOnce(&[u8]) -> Result<Vec<u8>, TransportError>,
+    one_shot: impl FnOnce(Command) -> Outcome,
 ) -> Outcome {
     let is_status = matches!(command, Subcommands::Status);
     let request = Request {
@@ -194,10 +196,9 @@ fn run(
                 .to_string(),
             code: EXIT_OK,
         },
-        Err(TransportError::NotRunning) => failure(
-            Reason::NotRunning,
-            "Captastic is not running in this session; start it and ask again",
-        ),
+        // The maintainer's choice of 2026-10-21: with nothing running, capture anyway, with the
+        // same configuration, output folder and announcement as the daemon.
+        Err(TransportError::NotRunning) => one_shot(request.command),
         Err(TransportError::Busy) => failure(
             Reason::Busy,
             "Captastic is busy with other requests; ask again",
@@ -351,12 +352,148 @@ fn send_to_daemon(_line: &[u8]) -> Result<Vec<u8>, TransportError> {
     ))
 }
 
+#[cfg(not(windows))]
+fn without_daemon(_command: Command) -> Outcome {
+    failure(Reason::NotRunning, "captastic-cli captures on Windows only")
+}
+
+/// Answers a request in this process, as the daemon would, when no daemon is running: the real
+/// backend, the user's configuration, their output folder, and the same announcement.
+#[cfg(windows)]
+fn without_daemon(command: Command) -> Outcome {
+    use crate::command_channel::answer_line;
+    use crate::command_listener::{pointer_display, CommandOutput, Commands};
+
+    let config = match crate::one_shot_config(None) {
+        Ok(config) => config,
+        Err(error) => {
+            return failure(
+                Reason::EngineUnavailable,
+                format!("the configuration could not be read: {error}"),
+            )
+        }
+    };
+    let directory = match crate::configured_output_directory(&config) {
+        Ok(directory) => directory,
+        Err(error) => return failure(Reason::WriteFailed, error.to_string()),
+    };
+    let backend = match crate::create_dxgi_backend(
+        &crate::DisplayPolicy::VirtualDesktop,
+        crate::BASE_CPU_BUFFER_SLOTS,
+    ) {
+        Ok(backend) => backend,
+        Err(error) => {
+            return failure(
+                Reason::EngineUnavailable,
+                format!("the screen could not be captured here: {error}"),
+            )
+        }
+    };
+    let (notice_sender, notices) = std::sync::mpsc::sync_channel(4);
+    let commands = Commands {
+        engine: OneShotEngine {
+            backend: std::cell::RefCell::new(backend),
+            cursor: crate::configured_cursor_mode(&config),
+            next_id: std::cell::Cell::new(1),
+        },
+        output: CommandOutput {
+            directory,
+            filename_template: config.output.filename_template.clone(),
+            format: config.output.format,
+            encode_options: captastic_core::EncodeOptions {
+                jpeg_quality: config.output.jpeg_quality,
+                ..captastic_core::EncodeOptions::default()
+            },
+        },
+        notices: Some(notice_sender),
+        pointer: pointer_display,
+        taken_by: "one_shot",
+    };
+    let outcome = from_answer(&answer_line(&commands.answer(command)));
+    drop(commands);
+    for notice in notices.try_iter() {
+        if let crate::daemon::DaemonNotice::CommandLineCapture { path, .. } = notice {
+            announce(&path);
+        }
+    }
+    outcome
+}
+
+/// The real backend, driven one request at a time on this thread.
+#[cfg(windows)]
+struct OneShotEngine {
+    backend: std::cell::RefCell<Box<dyn captastic_core::CaptureBackend>>,
+    cursor: captastic_core::CursorMode,
+    next_id: std::cell::Cell<u64>,
+}
+
+#[cfg(windows)]
+impl crate::command_listener::CommandEngine for OneShotEngine {
+    fn displays(
+        &self,
+    ) -> Result<Vec<captastic_core::DisplayInfo>, crate::command_channel::Failure> {
+        Ok(self.backend.borrow().displays().to_vec())
+    }
+
+    fn frame(
+        &self,
+        source: captastic_core::CaptureSource,
+    ) -> Result<captastic_core::CpuFrame, crate::command_channel::Failure> {
+        use crate::command_channel::Failure;
+        let id = self.next_id.get();
+        self.next_id.set(id.saturating_add(1));
+        let request = captastic_core::CaptureRequest {
+            id: captastic_core::CaptureId(id),
+            triggered_at: std::time::Instant::now(),
+            source,
+            mode: captastic_core::CaptureMode::Latest { max_age_ms: None },
+            cpu_frame: true,
+            retain_native_frame: false,
+            cursor: self.cursor,
+        };
+        let mut recorder = captastic_core::EventRecorder::with_capacity(16);
+        self.backend
+            .borrow_mut()
+            .capture(&request, &mut recorder)
+            .map_err(|error| Failure::new(Reason::CaptureFailed, error.to_string()))?
+            .frame
+            .ok_or_else(|| Failure::new(Reason::CaptureFailed, "the backend returned no frame"))
+    }
+}
+
+/// Hands the announcement to a short-lived `captastic.exe`, so this command returns while the
+/// notification is still up. If that cannot start, it is shown from here instead, waiting: a
+/// capture the user did not start is never left unannounced.
+#[cfg(windows)]
+fn announce(path: &Path) {
+    use std::process::Stdio;
+    let started = std::env::current_exe()
+        .map(|exe| exe.with_file_name("captastic.exe"))
+        .and_then(|desktop| {
+            std::process::Command::new(desktop)
+                .arg("--announce-command-line-capture")
+                .arg(path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+        });
+    if started.is_err() {
+        crate::desktop::announce(path);
+    }
+}
+
 /// `captastic-cli`'s entry point.
 pub fn main() -> ! {
     let outcome = match CommandLine::try_parse() {
         Ok(command_line) => {
             let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            run(command_line.command, &current_dir, send_to_daemon)
+            run(
+                command_line.command,
+                &current_dir,
+                send_to_daemon,
+                without_daemon,
+            )
         }
         Err(error) => match usage(&error) {
             Some(outcome) => {
@@ -386,11 +523,32 @@ mod tests {
     fn ask(arguments: &[&str], answer: Result<&str, TransportError>) -> (Option<Value>, Outcome) {
         let command = parse(arguments).expect("parses");
         let mut sent = None;
-        let outcome = run(command, Path::new(r"C:\work"), |line| {
-            sent = Some(serde_json::from_slice(line).expect("request is JSON"));
-            answer.map(|text| text.as_bytes().to_vec())
-        });
+        let outcome = run(
+            command,
+            Path::new(r"C:\work"),
+            |line| {
+                sent = Some(serde_json::from_slice(line).expect("request is JSON"));
+                answer.map(|text| text.as_bytes().to_vec())
+            },
+            |_| panic!("no one-shot capture was expected"),
+        );
         (sent, outcome)
+    }
+
+    /// Runs `arguments` with no daemon to ask, and returns the command the one-shot path got.
+    fn ask_without_daemon(arguments: &[&str]) -> (Option<Command>, Outcome) {
+        let command = parse(arguments).expect("parses");
+        let mut taken = None;
+        let outcome = run(
+            command,
+            Path::new(r"C:\work"),
+            |_| Err(TransportError::NotRunning),
+            |command| {
+                taken = Some(command);
+                from_answer(br#"{"version":1,"status":"ok","taken_by":"one_shot"}"#)
+            },
+        );
+        (taken, outcome)
     }
 
     #[test]
@@ -498,16 +656,42 @@ mod tests {
     }
 
     #[test]
-    fn a_capture_without_a_daemon_fails_as_not_running() {
-        let outcome = ask(
-            &["capture", "--display", "primary"],
-            Err(TransportError::NotRunning),
-        )
-        .1;
-        assert_eq!(outcome.code, EXIT_FAILED);
-        let line: Value = serde_json::from_str(&outcome.line).expect("json");
-        assert_eq!(line["status"], "failed");
-        assert_eq!(line["reason"], "not_running");
+    fn without_a_daemon_a_capture_is_taken_here() {
+        let (taken, outcome) = ask_without_daemon(&["capture", "--rect", "0,0,10,10"]);
+        assert_eq!(outcome.code, EXIT_OK);
+        assert!(
+            outcome.line.contains(r#""taken_by":"one_shot""#),
+            "{}",
+            outcome.line
+        );
+        let Some(Command::Capture(capture)) = taken else {
+            panic!("the capture went to the one-shot path: {taken:?}");
+        };
+        assert_eq!(
+            capture.target,
+            Target::Rect {
+                rect: Rect {
+                    x: 0,
+                    y: 0,
+                    width: 10,
+                    height: 10
+                }
+            }
+        );
+        let (taken, _) = ask_without_daemon(&["displays"]);
+        assert_eq!(taken, Some(Command::Displays));
+        // Status is the one command the one-shot path never answers: nothing is running.
+        let (taken, outcome) = ask_without_daemon(&["status"]);
+        assert_eq!(taken, None);
+        assert!(
+            outcome.line.contains(r#""running":false"#),
+            "{}",
+            outcome.line
+        );
+    }
+
+    #[test]
+    fn a_busy_or_untrusted_pipe_is_a_failure_not_a_one_shot() {
         let busy = ask(&["displays"], Err(TransportError::Busy)).1;
         assert_eq!(busy.code, EXIT_FAILED);
         assert!(busy.line.contains(r#""reason":"busy""#), "{}", busy.line);
