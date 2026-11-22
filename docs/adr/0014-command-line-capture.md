@@ -151,6 +151,18 @@ would wrap, so it can follow without changing them.
   settings for history and cloud sync, after the file is written. If the clipboard cannot be had,
   the answer fails as `clipboard_failed` and still gives the file's `path`. Answers say whether
   the capture went to the clipboard (`"clipboard":true` or `false`).
+- **`--interactive` follows the overlay's buttons (maintainer's choice of 2026-11-22).** The
+  overlay opens on the Region tool. Capture answers with the selection. Pin answers and pins it.
+  Edit answers with the edited image at the editor's Done. Record is refused as
+  `recording_unsupported`, and Esc (or the editor's cancel) as `cancelled`. The selection does
+  not go to the user's destinations: the command line writes its own file, and the clipboard
+  only with `--clipboard`.
+- **`--interactive` waits two minutes for a choice (maintainer's choice of 2026-11-22),** then
+  closes the overlay and refuses as `timed_out`. An overlay still queued behind the user's own is
+  never opened once the request has given up, so the user's own overlay is never closed by it.
+  Once the user confirms Edit, the request waits up to ten more minutes for the editor. Without
+  a daemon, `--interactive` is refused as `unsupported`. While it waits, other command-line
+  requests wait behind it, since the daemon answers one at a time.
 
 ## Slices
 

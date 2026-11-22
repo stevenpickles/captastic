@@ -123,6 +123,12 @@ pub enum Reason {
     NoLastRegion,
     /// The capture was written, and could not be put on the clipboard; `path` says where it is.
     ClipboardFailed,
+    /// The user closed the overlay, or the editor, without confirming.
+    Cancelled,
+    /// Nobody chose on the overlay in time; it was closed.
+    TimedOut,
+    /// The user chose Record, which the command line does not do yet.
+    RecordingUnsupported,
 }
 
 impl Reason {
@@ -140,6 +146,9 @@ impl Reason {
                 | Self::NoWindow
                 | Self::AmbiguousWindow
                 | Self::NoLastRegion
+                | Self::Cancelled
+                | Self::TimedOut
+                | Self::RecordingUnsupported
         )
     }
 }
@@ -466,8 +475,8 @@ pub fn plan_capture(
             "the last region is planned against the remembered regions",
         )),
         Target::Interactive => Err(Failure::new(
-            Reason::Unsupported,
-            "this Captastic cannot open the overlay for the command line yet",
+            Reason::BadRequest,
+            "an interactive target is answered by the overlay, not planned",
         )),
     }
 }
@@ -733,11 +742,16 @@ mod tests {
     }
 
     #[test]
-    fn targets_not_built_yet_are_refused_as_unsupported() {
-        let failure =
-            plan_capture(&Target::Interactive, &two_displays(), no_pointer).expect_err("not yet");
-        assert_eq!(failure.reason, Reason::Unsupported);
-        assert!(failure.reason.is_refusal());
+    fn targets_answered_elsewhere_are_not_planned_as_areas() {
+        for target in [
+            Target::Interactive,
+            Target::LastRegion,
+            Target::Window { handle: 1 },
+        ] {
+            let failure =
+                plan_capture(&target, &two_displays(), no_pointer).expect_err("elsewhere");
+            assert_eq!(failure.reason, Reason::BadRequest, "{target:?}");
+        }
     }
 
     fn remembered(x: i32, y: i32, width: u32, height: u32) -> ConfirmedRegion {

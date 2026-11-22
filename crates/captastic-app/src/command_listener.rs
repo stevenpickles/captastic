@@ -16,7 +16,7 @@ use std::time::Duration;
 use captastic_core::{
     encode_capture, CaptureSource, CpuFrame, DisplayId, DisplayInfo, EncodeOptions, OutputFormat,
 };
-use serde_json::{json, Map};
+use serde_json::{json, Map, Value};
 
 use crate::command_channel::{
     answer_line, choose_window, parse_request, plan_capture, plan_last_region, Answer,
@@ -27,6 +27,11 @@ use crate::command_channel::{
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a request waits on the capture worker, which may be busy with the user's own capture.
 const ENGINE_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long `--interactive` waits for the user to choose on the overlay (the maintainer's choice of
+/// 2026-11-22) before closing it.
+pub(crate) const INTERACTIVE_CHOICE_TIMEOUT: Duration = Duration::from_secs(120);
+/// How much longer it waits once the user has confirmed: they chose Edit and are in the editor.
+pub(crate) const INTERACTIVE_EDIT_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Where a command-line request's frames and displays come from: the daemon's capture worker, the
 /// command line's own one-shot backend when no daemon is running, or a test's fake backend.
@@ -41,6 +46,9 @@ pub(crate) trait CommandEngine {
     fn last_regions(&self) -> BTreeMap<String, ConfirmedRegion>;
     /// Puts a capture on the clipboard, under the user's `[clipboard]` settings.
     fn publish_clipboard(&self, frame: &CpuFrame) -> Result<(), String>;
+    /// Opens the overlay for the user to choose, and waits for what they confirm: the pixels and
+    /// a description of the choice.
+    fn interactive(&self) -> Result<(CpuFrame, Value), Failure>;
 }
 
 /// Where a capture is written when the request names no path.
@@ -96,6 +104,10 @@ impl<E: CommandEngine> Commands<E> {
     fn capture(&self, capture: CaptureCommand) -> Answer {
         let displays = self.engine.displays()?;
         let (frame, described) = match &capture.target {
+            Target::Interactive => {
+                let (frame, chosen) = self.engine.interactive()?;
+                (frame, json!({ "kind": "interactive", "chosen": chosen }))
+            }
             Target::Window { .. } | Target::WindowTitle { .. } | Target::Process { .. } => {
                 let window = choose_window(&capture.target, &self.engine.windows(&displays)?)?;
                 let frame = self.engine.window_frame(&window)?;
@@ -293,6 +305,8 @@ fn serve<E: CommandEngine>(
 /// The daemon's capture worker, asked through its command queue.
 pub(crate) struct DaemonEngine {
     pub(crate) commands: mpsc::SyncSender<crate::daemon::CaptureCommand>,
+    /// The overlay, to close one nobody answered in time. `None` when selection is turned off.
+    pub(crate) overlay: Option<captastic_windows::OverlayController>,
     /// The regions the overlay last confirmed, shared with the repeat-last-region hotkey.
     pub(crate) confirmed_regions: crate::selection::ConfirmedRegionCache,
     pub(crate) clipboard_retention: captastic_windows::ClipboardRetention,
@@ -361,12 +375,97 @@ impl CommandEngine for DaemonEngine {
         publish_to_clipboard(frame, self.clipboard_retention)
     }
 
+    fn interactive(&self) -> Result<(CpuFrame, Value), Failure> {
+        use crate::selection::{CommandLineSelection, CommandLineSelectionState};
+        use std::sync::atomic::Ordering;
+        let Some(overlay) = &self.overlay else {
+            return Err(Failure::new(
+                Reason::Unsupported,
+                "the overlay is turned off in this Captastic's configuration",
+            ));
+        };
+        let (reply, answer) = mpsc::sync_channel(1);
+        let state = std::sync::Arc::new(CommandLineSelectionState::default());
+        self.commands
+            .try_send(crate::daemon::command_line_trigger(CommandLineSelection {
+                reply,
+                state: state.clone(),
+            }))
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => Failure::new(
+                    Reason::EngineUnavailable,
+                    "the capture engine is busy; try again",
+                ),
+                mpsc::TrySendError::Disconnected(_) => {
+                    Failure::new(Reason::ShuttingDown, "Captastic is stopping")
+                }
+            })?;
+        let mut deadline = std::time::Instant::now() + INTERACTIVE_CHOICE_TIMEOUT;
+        let mut extended = false;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match answer.recv_timeout(left.max(Duration::from_millis(1))) {
+                Ok(outcome) => return interactive_answer(outcome),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(Failure::new(
+                        Reason::CaptureFailed,
+                        "the overlay closed without an answer",
+                    ))
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if state.confirmed.load(Ordering::SeqCst) && !extended {
+                        // Confirmed and in the editor: the choice is made, so give the edit time.
+                        deadline += INTERACTIVE_EDIT_TIMEOUT;
+                        extended = true;
+                        continue;
+                    }
+                    // Given up: an overlay still queued is never opened, and one on screen closes.
+                    state.abandoned.store(true, Ordering::SeqCst);
+                    if state.showing.load(Ordering::SeqCst) {
+                        overlay.cancel();
+                    }
+                    return Err(Failure::new(
+                        Reason::TimedOut,
+                        if extended {
+                            "nobody finished editing in time; nothing was captured"
+                        } else {
+                            "nobody chose on the overlay within two minutes; it was closed"
+                        },
+                    ));
+                }
+            }
+        }
+    }
+
     fn window_frame(&self, window: &WindowInfo) -> Result<CpuFrame, Failure> {
         // The window's display through the capture worker first: it waits behind the user's own
         // captures, is refused while a recording runs, and gives the window capture the reference
         // frame the overlay would give it.
         let reference = self.frame(window_display_source(window))?;
         capture_native_window(window, &reference)
+    }
+}
+
+/// What the overlay's answer means for the request.
+fn interactive_answer(
+    outcome: crate::selection::CommandLineOutcome,
+) -> Result<(CpuFrame, Value), Failure> {
+    use crate::selection::CommandLineOutcome;
+    match outcome {
+        CommandLineOutcome::Selected { frame, described } => Ok((*frame, described)),
+        CommandLineOutcome::Cancelled => Err(Failure::new(
+            Reason::Cancelled,
+            "the overlay was closed without choosing",
+        )),
+        CommandLineOutcome::RecordingRefused => Err(Failure::new(
+            Reason::RecordingUnsupported,
+            "Record was chosen; the command line takes still captures only",
+        )),
+        CommandLineOutcome::RecordingRunning => Err(Failure::new(
+            Reason::RecordingRunning,
+            "a recording is running; still captures wait until it ends",
+        )),
+        CommandLineOutcome::Failed(message) => Err(Failure::new(Reason::CaptureFailed, message)),
     }
 }
 
@@ -453,6 +552,8 @@ mod tests {
         backend: Mutex<captastic_core::FakeBackend>,
         recording: bool,
         last_regions: BTreeMap<String, ConfirmedRegion>,
+        /// What the overlay answers: the area the user chose, or why there is none.
+        interactive: Option<Result<Rect, Reason>>,
         /// The size of every capture put on the clipboard.
         clipboard: Mutex<Vec<(u32, u32)>>,
     }
@@ -469,6 +570,7 @@ mod tests {
                 )),
                 recording,
                 last_regions: BTreeMap::new(),
+                interactive: None,
                 clipboard: Mutex::new(Vec::new()),
             }
         }
@@ -485,6 +587,24 @@ mod tests {
 
         fn last_regions(&self) -> BTreeMap<String, ConfirmedRegion> {
             self.last_regions.clone()
+        }
+
+        fn interactive(&self) -> Result<(CpuFrame, Value), Failure> {
+            match &self.interactive {
+                Some(Ok(area)) => {
+                    let display = self.displays()?[0].id.clone();
+                    let frame = self
+                        .frame(CaptureSource::Display(display))?
+                        .crop(*area)
+                        .map_err(|error| Failure::new(Reason::CaptureFailed, error.to_string()))?;
+                    Ok((
+                        frame,
+                        json!({ "kind": "region", "rect": area, "intent": "capture" }),
+                    ))
+                }
+                Some(Err(reason)) => Err(Failure::new(*reason, "as the test asked")),
+                None => Err(Failure::new(Reason::Unsupported, "no overlay here")),
+            }
         }
 
         fn publish_clipboard(&self, frame: &CpuFrame) -> Result<(), String> {
@@ -841,6 +961,70 @@ mod tests {
         assert_eq!(
             *commands.engine.clipboard.lock().expect("clipboard"),
             vec![(50, 30)]
+        );
+    }
+
+    #[test]
+    fn an_interactive_choice_is_written_and_a_cancel_or_record_is_refused() {
+        let directory = Scratch::new();
+        let mut commands = commands(directory.path(), false);
+        let interactive = json!({
+            "version": 1, "command": "capture", "target": { "kind": "interactive" },
+        });
+        let ask = |commands: &Commands<FakeEngine>| {
+            let request: crate::command_channel::Request =
+                serde_json::from_value(interactive.clone()).expect("request");
+            commands.answer(request.command)
+        };
+        commands.engine.interactive = Some(Ok(Rect {
+            x: 5,
+            y: 6,
+            width: 70,
+            height: 40,
+        }));
+        let chosen = ask(&commands).expect("chosen");
+        assert_eq!(
+            (chosen["width"].clone(), chosen["height"].clone()),
+            (json!(70), json!(40))
+        );
+        assert_eq!(chosen["captured"]["kind"], "interactive");
+        assert_eq!(chosen["captured"]["chosen"]["kind"], "region");
+        assert!(PathBuf::from(chosen["path"].as_str().expect("path")).exists());
+
+        let written = std::fs::read_dir(directory.path()).expect("list").count();
+        for reason in [
+            Reason::Cancelled,
+            Reason::TimedOut,
+            Reason::RecordingUnsupported,
+            Reason::RecordingRunning,
+        ] {
+            commands.engine.interactive = Some(Err(reason));
+            let refused = ask(&commands).expect_err("no capture");
+            assert_eq!(refused.reason, reason);
+            assert!(refused.reason.is_refusal(), "{reason:?} is exit code 2");
+        }
+        assert_eq!(
+            std::fs::read_dir(directory.path()).expect("list").count(),
+            written
+        );
+    }
+
+    #[test]
+    fn the_overlay_answer_is_read_as_the_request_needs_it() {
+        use crate::selection::CommandLineOutcome;
+        let reason = |outcome| interactive_answer(outcome).expect_err("refused").reason;
+        assert_eq!(reason(CommandLineOutcome::Cancelled), Reason::Cancelled);
+        assert_eq!(
+            reason(CommandLineOutcome::RecordingRefused),
+            Reason::RecordingUnsupported
+        );
+        assert_eq!(
+            reason(CommandLineOutcome::RecordingRunning),
+            Reason::RecordingRunning
+        );
+        assert_eq!(
+            reason(CommandLineOutcome::Failed("gone".to_owned())),
+            Reason::CaptureFailed
         );
     }
 
