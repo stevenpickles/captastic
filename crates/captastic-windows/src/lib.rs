@@ -21,6 +21,8 @@ mod known_folders;
 #[cfg(windows)]
 mod overlay;
 #[cfg(windows)]
+mod request_pipe;
+#[cfg(windows)]
 mod session;
 #[cfg(windows)]
 mod startup;
@@ -67,6 +69,11 @@ pub use overlay::{
     InitialSelectionTool, NativeWindowHandle, OverlayController, OverlayDestinations,
     OverlayResources, OverlaySelection, OverlayUiUpdate, PreviewView, ReviewOutcome, SelectionKind,
     SelectionOutcome, SelectionPreviewSource, DISPLAY_CHANGE_MONITORS,
+};
+#[cfg(windows)]
+pub use request_pipe::{
+    request_pipe_name, send_request, RequestError, RequestPipeConnection, RequestPipeServer,
+    RequestPipeStopper,
 };
 #[cfg(windows)]
 pub use session::{desktop_state, DesktopState};

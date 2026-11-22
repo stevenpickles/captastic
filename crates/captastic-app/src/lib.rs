@@ -15,6 +15,9 @@ mod cli;
 #[cfg(windows)]
 mod clipboard;
 mod clock;
+mod command_channel;
+#[cfg(windows)]
+mod command_listener;
 mod compare;
 mod daemon;
 #[cfg(windows)]

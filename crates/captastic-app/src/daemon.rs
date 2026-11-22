@@ -485,6 +485,16 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                 log::info!("a capture was refused because a recording is running");
                 let _ = capture_notices.try_send(DaemonNotice::RecordingInProgress);
             }
+            CaptureCommand::CommandLine(request) => {
+                answer_command_line(
+                    *request,
+                    backend.as_mut(),
+                    recording_active.load(Ordering::Acquire),
+                    &mut next_capture_id,
+                    cursor,
+                    &mut recovery,
+                );
+            }
             CaptureCommand::RecordFrame(request) => {
                 let result = match backend.as_mut() {
                     None => Err(captastic_core::CaptureError::synthetic(
@@ -959,6 +969,80 @@ fn run_capture_worker(context: CaptureWorkerContext) {
 /// gets the worker detached and leaks the same objects anyway, only later and while also holding a
 /// thread. The kernel reclaims every one of them at process exit regardless, so declining to run
 /// the destructor gives up nothing and takes the driver off the shutdown path.
+/// Answers a command-line request's question of the capture engine on the capture worker, where
+/// the engine lives (ADR 0014). A frame is refused while a recording runs, as a hotkey is.
+#[cfg(windows)]
+fn answer_command_line(
+    request: crate::command_listener::EngineRequest,
+    backend: Option<&mut Box<dyn CaptureBackend>>,
+    recording: bool,
+    next_capture_id: &mut u64,
+    cursor: CursorMode,
+    recovery: &mut Option<BackendRecovery>,
+) {
+    use crate::command_channel::{Failure, Reason};
+    use crate::command_listener::EngineRequest;
+    let unavailable = || {
+        Failure::new(
+            Reason::EngineUnavailable,
+            "the capture engine is recovering or has no display to capture",
+        )
+    };
+    match request {
+        EngineRequest::Displays { reply } => {
+            let displays = backend
+                .map(|backend| backend.displays().to_vec())
+                .ok_or_else(unavailable);
+            let _ = reply.try_send(displays);
+        }
+        EngineRequest::Frame { reply, .. } if recording => {
+            log::info!("a command-line capture was refused because a recording is running");
+            let _ = reply.try_send(Err(Failure::new(
+                Reason::RecordingRunning,
+                "a recording is running; still captures wait until it ends",
+            )));
+        }
+        EngineRequest::Frame { source, reply } => {
+            let Some(backend) = backend else {
+                let _ = reply.try_send(Err(unavailable()));
+                return;
+            };
+            let capture_id = CaptureId(*next_capture_id);
+            *next_capture_id = next_capture_id.saturating_add(1);
+            let request = CaptureRequest {
+                id: capture_id,
+                triggered_at: Instant::now(),
+                source,
+                mode: CaptureMode::Latest { max_age_ms: None },
+                cpu_frame: true,
+                retain_native_frame: false,
+                cursor,
+            };
+            let mut recorder = EventRecorder::with_capacity(16);
+            let result = backend
+                .capture(&request, &mut recorder)
+                .and_then(|outcome| {
+                    outcome.frame.ok_or_else(|| {
+                        captastic_core::CaptureError::synthetic(
+                            "the capture engine returned no frame",
+                        )
+                    })
+                });
+            if let Err(error) = &result {
+                if requires_backend_recovery(error) && recovery.is_none() {
+                    *recovery = Some(BackendRecovery::immediate());
+                }
+            }
+            let _ = reply.try_send(result.map_err(|error| {
+                Failure::new(
+                    Reason::CaptureFailed,
+                    format!("the capture failed: {error}"),
+                )
+            }));
+        }
+    }
+}
+
 #[cfg(windows)]
 fn abandon_backend<B>(backend: Option<B>) {
     std::mem::forget(backend);
@@ -1129,6 +1213,39 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let ready = ready_receiver.recv().map_err(|error| {
         AppError::BackendUnavailable(format!("capture worker ended during startup: {error}"))
     })??;
+    // The command line's way in (ADR 0014). A daemon without it still captures for the user, so
+    // a pipe that cannot be had, because something already holds the name, is worth a warning and
+    // not worth refusing to start.
+    let _command_listener = match captastic_windows::RequestPipeServer::create() {
+        Ok(server) => crate::command_listener::CommandListener::start(
+            server,
+            crate::command_listener::Commands {
+                engine: crate::command_listener::DaemonEngine {
+                    commands: command_sender.clone(),
+                },
+                output: crate::command_listener::CommandOutput {
+                    directory: args.output_directory.clone(),
+                    filename_template: args.output_filename_template.clone(),
+                    format: args.output_format,
+                    encode_options: args.output_encode_options,
+                },
+                notices: Some(notice_sender.clone()),
+                pointer: crate::command_listener::pointer_display,
+            },
+        )
+        .map_err(|error| {
+            crate::logging::warn(format_args!(
+                "command-line requests are unavailable: their thread could not start: {error}"
+            ));
+        })
+        .ok(),
+        Err(error) => {
+            crate::logging::warn(format_args!(
+                "command-line requests are unavailable: {error}"
+            ));
+            None
+        }
+    };
     let dropped = Arc::new(AtomicU64::new(0));
     let paused = Arc::new(AtomicBool::new(false));
     let callback_sender = command_sender.clone();
@@ -1450,7 +1567,8 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                     if let Some(tray) = tray.as_ref() {
                         let revealing = match &notice {
                             DaemonNotice::RecordingSaved { path, .. }
-                            | DaemonNotice::RecordingEditFailed { path, .. } => Some(path.clone()),
+                            | DaemonNotice::RecordingEditFailed { path, .. }
+                            | DaemonNotice::CommandLineCapture { path, .. } => Some(path.clone()),
                             _ => None,
                         };
                         let shown = if let Some(path) = revealing {
@@ -3200,6 +3318,8 @@ pub(crate) enum CaptureCommand {
     SelectionFinished(CaptureId),
     /// A recording asks for the newest frame of its display (ADR 0011).
     RecordFrame(Box<RecordFrameRequest>),
+    /// A command-line request asks for the displays or a frame (ADR 0014).
+    CommandLine(Box<crate::command_listener::EngineRequest>),
     Shutdown,
 }
 
@@ -3252,6 +3372,12 @@ pub(crate) enum DaemonNotice {
         path: std::path::PathBuf,
         message: String,
     },
+    /// A command-line request captured the screen. Always raised, and never configurable: a
+    /// capture the user did not start must never be invisible (ADR 0014).
+    CommandLineCapture {
+        file_name: String,
+        path: std::path::PathBuf,
+    },
 }
 
 #[cfg(windows)]
@@ -3265,6 +3391,7 @@ impl DaemonNotice {
             Self::RecordingSaved { .. } => "Recording saved",
             Self::RecordingFailed { .. } => "Captastic could not save the recording",
             Self::RecordingEditFailed { .. } => "Captastic could not trim the recording",
+            Self::CommandLineCapture { .. } => "Captured by a command-line request",
         }
     }
 
@@ -3272,7 +3399,10 @@ impl DaemonNotice {
     fn is_informational(&self) -> bool {
         matches!(
             self,
-            Self::CaptureEngineRecovered | Self::RecordingSaved { .. } | Self::RecordingInProgress
+            Self::CaptureEngineRecovered
+                | Self::RecordingSaved { .. }
+                | Self::RecordingInProgress
+                | Self::CommandLineCapture { .. }
         )
     }
 
@@ -3327,6 +3457,10 @@ impl DaemonNotice {
             } => format!(
                 "{file_name} was saved as it was recorded instead: {message}. Click to show it in \
                  its folder."
+            ),
+            Self::CommandLineCapture { file_name, .. } => format!(
+                "A program asked Captastic for a capture of your screen, saved as {file_name}. \
+                 Click to show it in its folder."
             ),
         }
     }
@@ -3817,6 +3951,21 @@ mod tests {
         assert_ne!(
             DaemonNotice::CaptureEngineUnavailable.title(),
             DaemonNotice::CaptureEngineRecovered.title()
+        );
+    }
+
+    #[test]
+    fn a_command_line_capture_is_announced_as_news_that_shows_its_file() {
+        let notice = DaemonNotice::CommandLineCapture {
+            file_name: "shot.png".to_owned(),
+            path: std::path::PathBuf::from("shot.png"),
+        };
+        assert_eq!(notice.title(), "Captured by a command-line request");
+        assert!(notice.is_informational());
+        assert_eq!(
+            notice.message(),
+            "A program asked Captastic for a capture of your screen, saved as shot.png. Click to \
+             show it in its folder."
         );
     }
 
