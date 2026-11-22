@@ -142,6 +142,15 @@ would wrap, so it can follow without changing them.
   and none as `no_window`, both exit code 2. A window is captured with the overlay's own code,
   against a frame of its display taken through the capture worker, so it waits behind the user's
   captures and is refused while a recording runs.
+- **The last region is the one the repeat-last-region hotkey repeats.** `--last-region` takes the
+  region last confirmed on the overlay, from the daemon's memory or, without a daemon, from the
+  saved state, on a display that still has the size and rotation it had then. With regions
+  remembered on several displays it takes the one on the pointer's display. None usable is
+  refused as `no_last_region`, exit code 2.
+- **`--clipboard` publishes as the clipboard destination does**, under the user's `[clipboard]`
+  settings for history and cloud sync, after the file is written. If the clipboard cannot be had,
+  the answer fails as `clipboard_failed` and still gives the file's `path`. Answers say whether
+  the capture went to the clipboard (`"clipboard":true` or `false`).
 
 ## Slices
 

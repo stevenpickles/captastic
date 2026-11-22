@@ -9,10 +9,12 @@ this desktop while it runs, so run it when nobody is working at it:
 
 - It opens three test windows of its own: red "A", blue "B", and a green "Cover" that sits over
   part of A. Every capture it takes is of these windows or of a rectangle inside B, written to a
-  temporary folder, except one capture to the configured output folder, which it deletes again.
+  temporary folder.
 - It stops the Captastic that is running (through its control event, as the Chocolatey hook
-  does), runs the daemon from -BinariesDirectory instead, and when it is done starts the
-  executable that was running before again.
+  does), runs the daemon from -BinariesDirectory instead, on a configuration and state of its own
+  in the temporary folder, and when it is done starts the executable that was running before.
+- For the clipboard check it saves the clipboard's text and HTML immediately before, and puts
+  them back immediately after, whatever happens in between.
 - One-shot captures raise their notification from a short-lived icon; the script clicks one of
   them through the icon's own window message, which opens an Explorer window on the temporary
   folder that the script then closes.
@@ -52,7 +54,7 @@ foreach ($binary in @($daemonExecutable, $cli)) {
     }
 }
 
-Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Drawing, System.Windows.Forms
 Add-Type -Namespace CaptasticCheck -Name Native -MemberDefinition @'
 [DllImport("user32.dll", CharSet = CharSet.Unicode)]
 public static extern IntPtr FindWindow(string className, string windowName);
@@ -280,7 +282,45 @@ try {
         $capture.Code -eq 0 -and $stillThere -and $afterFive -and $gone)
 
     # ---- With the daemon from this build ----------------------------------------------------
-    $devDaemon = Start-Process -FilePath $daemonExecutable -PassThru
+    # Its own configuration, output folder and state: a remembered region over the middle of B,
+    # on B's display, for --last-region to repeat.
+    $configDirectory = Join-Path $workDirectory 'config'
+    $captureDirectory = Join-Path $workDirectory 'captures'
+    New-Item -ItemType Directory -Path $configDirectory, $captureDirectory | Out-Null
+    $configFile = Join-Path $configDirectory 'captastic.toml'
+    Set-Content -LiteralPath $configFile -Encoding utf8 -Value @"
+schema_version = 1
+
+[output]
+directory = '$captureDirectory'
+"@
+    $displaysNow = (Invoke-Cli @('displays')).Json.displays
+    $displayB = $displaysNow | Where-Object { $_.id -eq $windowB.display } | Select-Object -First 1
+    $rectB = $windowB.rect
+    $region = @{
+        x = $rectB.x + [int]($rectB.width / 4) - $displayB.bounds.x
+        y = $rectB.y + [int]($rectB.height / 4) - $displayB.bounds.y
+        width = [int]($rectB.width / 2)
+        height = [int]($rectB.height / 2)
+    }
+    $regionToml = "x = $($region.x)`ny = $($region.y)`nwidth = $($region.width)`nheight = $($region.height)"
+    $sourceToml = "width = $($displayB.bounds.width)`nheight = $($displayB.bounds.height)`nrotation_degrees = $($displayB.rotation_degrees)"
+    Set-Content -LiteralPath (Join-Path $configDirectory 'state.toml') -Encoding utf8 -Value @"
+schema_version = 1
+
+[displays.'$($displayB.id)'.last_region]
+$regionToml
+
+[displays.'$($displayB.id)'.last_region_source]
+$sourceToml
+
+[displays.'$($displayB.id)'.last_confirmed_region]
+$regionToml
+
+[displays.'$($displayB.id)'.last_confirmed_region_source]
+$sourceToml
+"@
+    $devDaemon = Start-Process -FilePath $daemonExecutable -PassThru -ArgumentList @('--config', $configFile)
     $running = Wait-Until { (Invoke-Cli @('status')).Json.running -eq $true } 20
     $status = Invoke-Cli @('status')
     Add-Result 'status with the daemon running' (
@@ -342,21 +382,48 @@ try {
         $capture.Code -eq 0 -and (Test-Path (Join-Path $relative 'here.png')))
 
     $default = Invoke-Cli @('capture', '--rect', $inner)
-    $defaultWritten = $default.Json.path -and (Test-Path -LiteralPath $default.Json.path)
-    Add-Result 'without --output the capture goes to the output folder' ($default.Code -eq 0 -and $defaultWritten) "$($default.Json.path)"
-    if ($defaultWritten) {
-        Remove-Item -LiteralPath $default.Json.path -Force
-    }
+    $defaultWritten = $default.Json.path -and (Test-Path -LiteralPath $default.Json.path) -and
+        $default.Json.path.StartsWith($captureDirectory, [System.StringComparison]::OrdinalIgnoreCase)
+    Add-Result 'without --output the capture goes to the configured output folder' (
+        $default.Code -eq 0 -and $defaultWritten) "$($default.Json.path)"
 
-    foreach ($case in @(
-        @{ Name = '--last-region'; Arguments = @('capture', '--last-region') },
-        @{ Name = '--interactive'; Arguments = @('capture', '--interactive') },
-        @{ Name = '--clipboard'; Arguments = @('capture', '--rect', $inner, '--clipboard') }
-    )) {
-        $answer = Invoke-Cli $case.Arguments
-        Add-Result "$($case.Name) is refused as unsupported (until it is built)" (
-            $answer.Code -eq 2 -and $answer.Json.reason -eq 'unsupported')
+    $lastRegion = Invoke-Cli @('capture', '--last-region', '--output', (Join-Path $workDirectory 'last-region.png'))
+    $colours = if ($lastRegion.Code -eq 0) { Measure-Colours $lastRegion.Json.path } else { $null }
+    Add-Result 'the last region is captured where it was confirmed' (
+        $lastRegion.Code -eq 0 -and $lastRegion.Json.captured.kind -eq 'last_region' -and
+        $colours -and $colours.Blue -gt 0.9 -and $colours.Width -eq $region.width) "exit $($lastRegion.Code)"
+
+    # The clipboard: saved immediately before, put back immediately after, whatever happens.
+    $savedText = [System.Windows.Forms.Clipboard]::GetText([System.Windows.Forms.TextDataFormat]::UnicodeText)
+    $savedHtml = [System.Windows.Forms.Clipboard]::GetText([System.Windows.Forms.TextDataFormat]::Html)
+    try {
+        $plain = Invoke-Cli @('capture', '--rect', $inner, '--output', (Join-Path $workDirectory 'no-clipboard.png'))
+        $untouched = -not [System.Windows.Forms.Clipboard]::ContainsImage()
+        Add-Result 'without --clipboard the clipboard is left alone' (
+            $plain.Code -eq 0 -and $plain.Json.clipboard -eq $false -and $untouched)
+        $copied = Invoke-Cli @('capture', '--rect', $inner, '--clipboard', '--output', (Join-Path $workDirectory 'clipboard.png'))
+        $image = [System.Windows.Forms.Clipboard]::GetImage()
+        Add-Result '--clipboard puts the capture on the clipboard too' (
+            $copied.Code -eq 0 -and $copied.Json.clipboard -eq $true -and $image -and
+            $image.Width -eq [int]($rect.width / 2) -and (Test-Path -LiteralPath $copied.Json.path)) (
+            "exit $($copied.Code), clipboard image $(if ($image) { "$($image.Width)x$($image.Height)" } else { 'none' })")
+        if ($image) { $image.Dispose() }
+    } finally {
+        $restore = [System.Windows.Forms.DataObject]::new()
+        if ($savedText) { $restore.SetText($savedText, [System.Windows.Forms.TextDataFormat]::UnicodeText) }
+        if ($savedHtml) { $restore.SetText($savedHtml, [System.Windows.Forms.TextDataFormat]::Html) }
+        if ($savedText -or $savedHtml) {
+            [System.Windows.Forms.Clipboard]::SetDataObject($restore, $true)
+        } else {
+            [System.Windows.Forms.Clipboard]::Clear()
+        }
     }
+    $restored = [System.Windows.Forms.Clipboard]::GetText([System.Windows.Forms.TextDataFormat]::UnicodeText)
+    Add-Result 'the clipboard is put back as it was' ($restored -eq $savedText)
+
+    $interactive = Invoke-Cli @('capture', '--interactive')
+    Add-Result '--interactive is refused as unsupported (until it is built)' (
+        $interactive.Code -eq 2 -and $interactive.Json.reason -eq 'unsupported')
 
     $usage = Invoke-Cli @('capture', '--rect', '1,2,3')
     Add-Result 'a wrong command line is a usage answer' ($usage.Code -eq 64 -and $usage.Json.status -eq 'usage')
