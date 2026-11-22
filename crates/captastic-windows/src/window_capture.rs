@@ -94,6 +94,16 @@ pub fn captured_window_frame(selection: &OverlaySelection) -> Option<CpuFrame> {
         .flatten()
 }
 
+/// Captures one window as the overlay would on confirming it, WGC first and `PrintWindow` where
+/// WGC cannot, for a command-line request (ADR 0014). `reference_metadata` is a frame of the
+/// window's display, as the overlay passes its frozen desktop.
+pub fn capture_window_frame(
+    handle: NativeWindowHandle,
+    reference_metadata: &FrameMetadata,
+) -> Result<CpuFrame, CaptureError> {
+    capture_window(handle, reference_metadata)
+}
+
 pub(crate) fn capture_window(
     handle: NativeWindowHandle,
     reference_metadata: &FrameMetadata,
@@ -106,6 +116,29 @@ pub(crate) fn capture_window_visual(
     reference_metadata: &FrameMetadata,
 ) -> Result<CapturedWindow, CaptureError> {
     capture_window_bounded(handle, reference_metadata, None)
+}
+
+/// Whether Windows scales this window's drawing to its monitor: a window that is not per-monitor
+/// DPI aware, shown on a monitor whose DPI is not the one it draws at. `PrintWindow` hands such a
+/// window back at the size it draws, in the top-left corner of a bitmap the size it is shown, so
+/// Windows Graphics Capture, which takes it as composited, goes first.
+fn window_is_dpi_scaled(hwnd: HWND) -> bool {
+    use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONEAREST};
+    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+    // SAFETY: Reads the DPI the window draws at: 96 for an unaware window, the system DPI for a
+    // system-aware one, its monitor's for a per-monitor aware one.
+    let window_dpi = unsafe { GetDpiForWindow(hwnd) };
+    if window_dpi == 0 {
+        return false;
+    }
+    // SAFETY: Finds the monitor showing most of a live top-level window.
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    let (mut dpi_x, mut dpi_y) = (0_u32, 0_u32);
+    // SAFETY: Both outputs are writable locals for this synchronous query.
+    if unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }.is_err() {
+        return false;
+    }
+    dpi_x != 0 && dpi_x != window_dpi
 }
 
 /// What a window capture can say about the cursor, which is only ever that it has none.
@@ -337,11 +370,22 @@ fn capture_window_inner(
     })?;
     let geometry = window_geometry(hwnd, capture_bounds);
     let visible_bounds = geometry.content;
-    let probe_wgc_error = if !window_is_responsive(hwnd) {
+    let wgc_first = if !window_is_responsive(hwnd) {
         log::debug!(
             "window handle=0x{:X} did not answer the responsiveness probe; using Windows Graphics Capture",
             handle.raw()
         );
+        true
+    } else if window_is_dpi_scaled(hwnd) {
+        log::debug!(
+            "window handle=0x{:X} is drawn at another DPI and scaled by Windows; using Windows Graphics Capture first",
+            handle.raw()
+        );
+        true
+    } else {
+        false
+    };
+    let probe_wgc_error = if wgc_first {
         match capture_window_with_wgc(hwnd, reference_metadata, max_pixels, &geometry, deadline) {
             Ok(capture) => return Ok(capture),
             Err(error) => {

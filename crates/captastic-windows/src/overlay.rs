@@ -45,6 +45,7 @@ use shell::{
     ThreadDpiContext, LOUPE_TIMER_ID, REGION_CURSOR_CENTER,
 };
 use snap::{SnapAxis, SnapTarget, SnapTargetKind, SnapTargets, NO_SNAPS};
+pub use window_enumeration::{capturable_windows, CapturableWindow};
 use window_enumeration::{enumerate_visible_windows, WindowCandidate};
 
 use machine::{
@@ -214,12 +215,13 @@ pub(crate) enum Presenter {
 pub struct NativeWindowHandle(isize);
 
 impl NativeWindowHandle {
-    #[cfg(test)]
-    pub(crate) const fn from_raw(raw: isize) -> Self {
+    /// A handle as `captastic-cli windows` printed it. Nothing is checked here: a capture of it
+    /// first finds it among the windows that may be captured.
+    pub const fn from_raw(raw: isize) -> Self {
         Self(raw)
     }
 
-    pub(crate) const fn raw(self) -> isize {
+    pub const fn raw(self) -> isize {
         self.0
     }
 }

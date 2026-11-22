@@ -16,8 +16,8 @@ use captastic_core::{
 use serde_json::{json, Map};
 
 use crate::command_channel::{
-    answer_line, parse_request, plan_capture, Answer, CaptureCommand, Command, Failure, Reason,
-    MAX_REQUEST_BYTES,
+    answer_line, choose_window, parse_request, plan_capture, Answer, CaptureCommand, Command,
+    Failure, Reason, Target, WindowInfo, MAX_REQUEST_BYTES,
 };
 
 /// How long a client has to send its request, and to read its answer.
@@ -30,6 +30,10 @@ const ENGINE_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) trait CommandEngine {
     fn displays(&self) -> Result<Vec<DisplayInfo>, Failure>;
     fn frame(&self, source: CaptureSource) -> Result<CpuFrame, Failure>;
+    /// The windows that may be captured, frontmost first.
+    fn windows(&self, displays: &[DisplayInfo]) -> Result<Vec<WindowInfo>, Failure>;
+    /// One window, captured as the overlay captures a window it is given.
+    fn window_frame(&self, window: &WindowInfo) -> Result<CpuFrame, Failure>;
 }
 
 /// Where a capture is written when the request names no path.
@@ -71,6 +75,13 @@ impl<E: CommandEngine> Commands<E> {
                 fields.insert("displays".to_owned(), json!(displays));
                 Ok(fields)
             }
+            Command::Windows => {
+                let displays = self.engine.displays()?;
+                let windows = self.engine.windows(&displays)?;
+                let mut fields = Map::new();
+                fields.insert("windows".to_owned(), json!(windows));
+                Ok(fields)
+            }
             Command::Capture(capture) => self.capture(capture),
         }
     }
@@ -83,16 +94,28 @@ impl<E: CommandEngine> Commands<E> {
             ));
         }
         let displays = self.engine.displays()?;
-        let plan = plan_capture(&capture.target, &displays, || (self.pointer)(&displays))?;
-        let frame = self.engine.frame(plan.source.clone())?;
-        let frame = match plan.crop {
-            Some(area) => frame.crop(area).map_err(|error| {
-                Failure::new(
-                    Reason::CaptureFailed,
-                    format!("the capture could not be cropped to the rectangle: {error}"),
-                )
-            })?,
-            None => frame,
+        let (frame, described) = match &capture.target {
+            Target::Window { .. } | Target::WindowTitle { .. } | Target::Process { .. } => {
+                let window = choose_window(&capture.target, &self.engine.windows(&displays)?)?;
+                let frame = self.engine.window_frame(&window)?;
+                let mut described = json!(window);
+                described["kind"] = json!("window");
+                (frame, described)
+            }
+            target => {
+                let plan = plan_capture(target, &displays, || (self.pointer)(&displays))?;
+                let frame = self.engine.frame(plan.source.clone())?;
+                let frame = match plan.crop {
+                    Some(area) => frame.crop(area).map_err(|error| {
+                        Failure::new(
+                            Reason::CaptureFailed,
+                            format!("the capture could not be cropped to the rectangle: {error}"),
+                        )
+                    })?,
+                    None => frame,
+                };
+                (frame, plan.described)
+            }
         };
         let format = capture.format.unwrap_or(self.output.format);
         let path = self.write(&frame, format, capture.output.as_deref())?;
@@ -116,7 +139,7 @@ impl<E: CommandEngine> Commands<E> {
         fields.insert("format".to_owned(), json!(format));
         fields.insert("width".to_owned(), json!(frame.width()));
         fields.insert("height".to_owned(), json!(frame.height()));
-        fields.insert("captured".to_owned(), plan.described);
+        fields.insert("captured".to_owned(), described);
         fields.insert("taken_by".to_owned(), json!(self.taken_by));
         fields.insert("capture_id".to_owned(), json!(frame.metadata.capture_id.0));
         Ok(fields)
@@ -300,6 +323,62 @@ impl CommandEngine for DaemonEngine {
     fn frame(&self, source: CaptureSource) -> Result<CpuFrame, Failure> {
         self.ask(|reply| EngineRequest::Frame { source, reply })
     }
+
+    fn windows(&self, displays: &[DisplayInfo]) -> Result<Vec<WindowInfo>, Failure> {
+        native_windows(displays)
+    }
+
+    fn window_frame(&self, window: &WindowInfo) -> Result<CpuFrame, Failure> {
+        // The window's display through the capture worker first: it waits behind the user's own
+        // captures, is refused while a recording runs, and gives the window capture the reference
+        // frame the overlay would give it.
+        let reference = self.frame(window_display_source(window))?;
+        capture_native_window(window, &reference)
+    }
+}
+
+/// The windows Win32 lets be captured, as the overlay's chooser finds them, frontmost first.
+pub(crate) fn native_windows(displays: &[DisplayInfo]) -> Result<Vec<WindowInfo>, Failure> {
+    let windows = captastic_windows::capturable_windows(displays).map_err(|error| {
+        Failure::new(
+            Reason::CaptureFailed,
+            format!("the windows could not be listed: {error}"),
+        )
+    })?;
+    Ok(windows
+        .into_iter()
+        .map(|window| WindowInfo {
+            handle: window.handle.raw() as u64,
+            title: window.title,
+            process: window.process,
+            rect: window.frame,
+            display: window.display_id.map(|id| id.0),
+        })
+        .collect())
+}
+
+/// The display a window's reference frame comes from.
+pub(crate) fn window_display_source(window: &WindowInfo) -> CaptureSource {
+    window
+        .display
+        .clone()
+        .map_or(CaptureSource::VirtualDesktop, |id| {
+            CaptureSource::Display(DisplayId(id))
+        })
+}
+
+/// Captures one window as the overlay does, against a frame of its display.
+pub(crate) fn capture_native_window(
+    window: &WindowInfo,
+    reference: &CpuFrame,
+) -> Result<CpuFrame, Failure> {
+    let handle = captastic_windows::NativeWindowHandle::from_raw(window.handle as isize);
+    captastic_windows::capture_window_frame(handle, &reference.metadata).map_err(|error| {
+        Failure::new(
+            Reason::CaptureFailed,
+            format!("the window could not be captured: {error}"),
+        )
+    })
 }
 
 /// The pointer's display, as the daemon finds it.
@@ -347,6 +426,19 @@ mod tests {
             Ok(self.backend.lock().expect("backend").displays().to_vec())
         }
 
+        fn windows(&self, _displays: &[DisplayInfo]) -> Result<Vec<WindowInfo>, Failure> {
+            Ok(fake_windows())
+        }
+
+        fn window_frame(&self, window: &WindowInfo) -> Result<CpuFrame, Failure> {
+            // The fake display, cropped to the window: what a window capture of it would hold.
+            let display = self.displays()?[0].id.clone();
+            let frame = self.frame(CaptureSource::Display(display))?;
+            frame
+                .crop(window.rect)
+                .map_err(|error| Failure::new(Reason::CaptureFailed, error.to_string()))
+        }
+
         fn frame(&self, source: CaptureSource) -> Result<CpuFrame, Failure> {
             if self.recording {
                 return Err(Failure::new(Reason::RecordingRunning, "a recording runs"));
@@ -369,6 +461,27 @@ mod tests {
                 .frame
                 .ok_or_else(|| Failure::new(Reason::CaptureFailed, "no frame"))
         }
+    }
+
+    /// Three windows on the fake 320x200 display, frontmost first: two of them Notepad's.
+    fn fake_windows() -> Vec<WindowInfo> {
+        let window = |handle, title: &str, process: &str, x| WindowInfo {
+            handle,
+            title: title.to_owned(),
+            process: Some(process.to_owned()),
+            rect: Rect {
+                x,
+                y: 10,
+                width: 60,
+                height: 40,
+            },
+            display: None,
+        };
+        vec![
+            window(0x10, "notes.txt - Notepad", "Notepad.exe", 0),
+            window(0x20, "Build log - Terminal", "WindowsTerminal.exe", 100),
+            window(0x30, "todo.txt - Notepad", "notepad.exe", 200),
+        ]
     }
 
     /// A directory of its own for one test, removed afterwards.
@@ -521,6 +634,14 @@ mod tests {
         );
         assert_eq!(
             reason(&idle, json!({ "kind": "window", "handle": 42 })),
+            Reason::NoWindow
+        );
+        assert_eq!(
+            reason(&idle, json!({ "kind": "window_title", "title": "Notepad" })),
+            Reason::AmbiguousWindow
+        );
+        assert_eq!(
+            reason(&idle, json!({ "kind": "last_region" })),
             Reason::Unsupported
         );
         let recording = commands(directory.path(), true);
@@ -532,9 +653,69 @@ mod tests {
             Reason::RecordingRunning
         );
         assert_eq!(
+            reason(&recording, json!({ "kind": "window", "handle": 0x20 })),
+            Reason::RecordingRunning
+        );
+        assert_eq!(
             std::fs::read_dir(directory.path()).expect("list").count(),
             0,
             "nothing was written"
+        );
+    }
+
+    #[test]
+    fn windows_are_listed_and_one_is_captured_by_handle_title_or_process() {
+        let directory = Scratch::new();
+        let name = test_pipe_name();
+        let server = captastic_windows::RequestPipeServer::create_named(&name).expect("server");
+        let _listener =
+            CommandListener::start(server, commands(directory.path(), false)).expect("listener");
+
+        let listed = ask(&name, r#"{"version":1,"command":"windows"}"#);
+        assert_eq!(listed["status"], "ok", "{listed}");
+        assert_eq!(listed["windows"].as_array().expect("windows").len(), 3);
+        assert_eq!(listed["windows"][1]["title"], "Build log - Terminal");
+        assert_eq!(listed["windows"][1]["handle"], 0x20);
+
+        for target in [
+            json!({ "kind": "window", "handle": 0x20 }),
+            json!({ "kind": "window_title", "title": "build LOG" }),
+            json!({ "kind": "process", "name": "windowsterminal" }),
+        ] {
+            let request = json!({ "version": 1, "command": "capture", "target": target });
+            let captured = ask(&name, &request.to_string());
+            assert_eq!(captured["status"], "ok", "{captured}");
+            assert_eq!(
+                (captured["width"].clone(), captured["height"].clone()),
+                (json!(60), json!(40))
+            );
+            assert_eq!(captured["captured"]["kind"], "window");
+            assert_eq!(captured["captured"]["handle"], 0x20);
+            assert_eq!(captured["captured"]["process"], "WindowsTerminal.exe");
+            let path = PathBuf::from(captured["path"].as_str().expect("path"));
+            assert_eq!(&std::fs::read(&path).expect("written")[1..4], b"PNG");
+        }
+
+        // Two Notepads: refused with both listed, and nothing written for it.
+        let written = std::fs::read_dir(directory.path()).expect("list").count();
+        let request = json!({
+            "version": 1, "command": "capture",
+            "target": { "kind": "process", "name": "notepad.exe" },
+        });
+        let ambiguous = ask(&name, &request.to_string());
+        assert_eq!(ambiguous["status"], "refused", "{ambiguous}");
+        assert_eq!(ambiguous["reason"], "ambiguous_window");
+        let matches = ambiguous["matches"].as_array().expect("matches");
+        assert_eq!(
+            matches
+                .iter()
+                .map(|m| m["handle"].clone())
+                .collect::<Vec<_>>(),
+            vec![json!(0x10), json!(0x30)]
+        );
+        assert_eq!(
+            std::fs::read_dir(directory.path()).expect("list").count(),
+            written
         );
     }
 

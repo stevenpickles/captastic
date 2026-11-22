@@ -40,6 +40,8 @@ pub enum Command {
     Status,
     /// The displays, with the ids a display target takes.
     Displays,
+    /// The windows that may be captured, frontmost first, with the handles a window target takes.
+    Windows,
     Capture(CaptureCommand),
 }
 
@@ -110,6 +112,10 @@ pub enum Reason {
     UntrustedPipe,
     /// The request was sent and no answer came back.
     RequestFailed,
+    /// No window that may be captured matches the target.
+    NoWindow,
+    /// More than one window matches; the refusal lists them in `matches`, and none is guessed.
+    AmbiguousWindow,
 }
 
 impl Reason {
@@ -124,6 +130,8 @@ impl Reason {
                 | Self::BadRequest
                 | Self::UnsupportedVersion
                 | Self::ShuttingDown
+                | Self::NoWindow
+                | Self::AmbiguousWindow
         )
     }
 }
@@ -133,6 +141,9 @@ impl Reason {
 pub struct Failure {
     pub reason: Reason,
     pub message: String,
+    /// Fields the answer carries beside the reason, such as the windows an ambiguous target
+    /// matched.
+    pub details: Map<String, Value>,
 }
 
 impl Failure {
@@ -140,8 +151,84 @@ impl Failure {
         Self {
             reason,
             message: message.into(),
+            details: Map::new(),
         }
     }
+
+    pub fn with_detail(mut self, key: &str, value: Value) -> Self {
+        self.details.insert(key.to_owned(), value);
+        self
+    }
+}
+
+/// A window that may be captured, as `windows` lists it and a window capture describes it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WindowInfo {
+    pub handle: u64,
+    /// Set by the window's own application: untrusted text.
+    pub title: String,
+    /// The owning executable's file name, where its process lets it be read.
+    pub process: Option<String>,
+    /// The window as the user sees it, in desktop pixels.
+    pub rect: Rect,
+    /// The display that owns most of it.
+    pub display: Option<String>,
+}
+
+/// Finds the one window a window target names among `windows`, frontmost first. A title matches
+/// when it contains the text and a process when its name is the one given, `.exe` or not, both
+/// ignoring case. More than one match is refused with the list, never guessed (ADR 0014).
+pub fn choose_window(target: &Target, windows: &[WindowInfo]) -> Result<WindowInfo, Failure> {
+    let matches: Vec<&WindowInfo> = match target {
+        Target::Window { handle } => windows.iter().filter(|w| w.handle == *handle).collect(),
+        Target::WindowTitle { title } => {
+            let wanted = title.to_lowercase();
+            if wanted.trim().is_empty() {
+                return Err(Failure::new(
+                    Reason::BadRequest,
+                    "the title to look for is empty",
+                ));
+            }
+            windows
+                .iter()
+                .filter(|w| w.title.to_lowercase().contains(&wanted))
+                .collect()
+        }
+        Target::Process { name } => {
+            let wanted = process_stem(name);
+            if wanted.is_empty() {
+                return Err(Failure::new(
+                    Reason::BadRequest,
+                    "the process name is empty",
+                ));
+            }
+            windows
+                .iter()
+                .filter(|w| w.process.as_deref().map(process_stem) == Some(wanted.clone()))
+                .collect()
+        }
+        _ => return Err(Failure::new(Reason::BadRequest, "not a window target")),
+    };
+    match matches.as_slice() {
+        [one] => Ok((*one).clone()),
+        [] => Err(Failure::new(
+            Reason::NoWindow,
+            "no window that can be captured matches; `windows` lists them",
+        )),
+        several => Err(Failure::new(
+            Reason::AmbiguousWindow,
+            format!(
+                "{} windows match; name one by its handle with --window",
+                several.len()
+            ),
+        )
+        .with_detail("matches", json!(several))),
+    }
+}
+
+fn process_stem(name: &str) -> String {
+    let name = name.trim().to_lowercase();
+    name.strip_suffix(".exe").map(str::to_owned).unwrap_or(name)
 }
 
 /// An answer: the result's fields, or why there is none.
@@ -165,6 +252,7 @@ pub fn answer_line(answer: &Answer) -> Vec<u8> {
                 "failed"
             };
             line.insert("status".to_owned(), json!(status));
+            line.extend(failure.details.clone());
             line.insert("reason".to_owned(), json!(failure.reason));
             line.insert("message".to_owned(), json!(failure.message));
         }
@@ -292,13 +380,12 @@ pub fn plan_capture(
                 "the rectangle reaches outside every display",
             ))
         }
-        Target::Window { .. }
-        | Target::WindowTitle { .. }
-        | Target::Process { .. }
-        | Target::LastRegion
-        | Target::Interactive => Err(Failure::new(
+        Target::Window { .. } | Target::WindowTitle { .. } | Target::Process { .. } => Err(
+            Failure::new(Reason::BadRequest, "a window target is chosen, not planned"),
+        ),
+        Target::LastRegion | Target::Interactive => Err(Failure::new(
             Reason::Unsupported,
-            "this Captastic captures displays and rectangles from the command line; windows, the \
+            "this Captastic captures displays, rectangles and windows from the command line; the \
              last region and the overlay come later",
         )),
     }
@@ -307,6 +394,99 @@ pub fn plan_capture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn window(handle: u64, title: &str, process: Option<&str>) -> WindowInfo {
+        WindowInfo {
+            handle,
+            title: title.to_owned(),
+            process: process.map(str::to_owned),
+            rect: Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+            display: None,
+        }
+    }
+
+    #[test]
+    fn a_window_is_chosen_by_handle_title_or_process_and_never_guessed() {
+        let windows = [
+            window(1, "Report.docx - Word", Some("WINWORD.EXE")),
+            window(2, "notes.txt - Notepad", Some("notepad.exe")),
+            window(3, "todo.txt - Notepad", Some("Notepad.exe")),
+            window(4, "Settings", None),
+        ];
+        let chosen = |target: Target| choose_window(&target, &windows);
+        assert_eq!(
+            chosen(Target::Window { handle: 4 })
+                .expect("by handle")
+                .title,
+            "Settings"
+        );
+        assert_eq!(
+            chosen(Target::WindowTitle {
+                title: "report".to_owned()
+            })
+            .expect("by title")
+            .handle,
+            1
+        );
+        assert_eq!(
+            chosen(Target::Process {
+                name: "winword".to_owned()
+            })
+            .expect("by process")
+            .handle,
+            1
+        );
+        let several = chosen(Target::Process {
+            name: "NOTEPAD.exe".to_owned(),
+        })
+        .expect_err("two");
+        assert_eq!(several.reason, Reason::AmbiguousWindow);
+        assert_eq!(
+            several.details["matches"]
+                .as_array()
+                .expect("matches")
+                .len(),
+            2
+        );
+        assert_eq!(
+            chosen(Target::WindowTitle {
+                title: "Notepad".to_owned()
+            })
+            .expect_err("two")
+            .reason,
+            Reason::AmbiguousWindow
+        );
+        assert_eq!(
+            chosen(Target::Window { handle: 9 })
+                .expect_err("none")
+                .reason,
+            Reason::NoWindow
+        );
+        assert_eq!(
+            chosen(Target::WindowTitle {
+                title: " ".to_owned()
+            })
+            .expect_err("empty")
+            .reason,
+            Reason::BadRequest
+        );
+    }
+
+    #[test]
+    fn a_refusal_carries_its_details() {
+        let answer: Answer =
+            Err(Failure::new(Reason::AmbiguousWindow, "two").with_detail("matches", json!([1, 2])));
+        let line: Value = serde_json::from_slice(&answer_line(&answer)).expect("json");
+        assert_eq!(line["status"], "refused");
+        assert_eq!(line["reason"], "ambiguous_window");
+        assert_eq!(line["matches"], json!([1, 2]));
+        assert_eq!(line["version"], 1);
+    }
 
     fn display(id: &str, x: i32, primary: bool) -> DisplayInfo {
         DisplayInfo {

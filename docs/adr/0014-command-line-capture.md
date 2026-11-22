@@ -134,6 +134,14 @@ would wrap, so it can follow without changing them.
 - **The one-shot engine runs the daemon's own request handler** in the command line's process,
   over the DXGI backend for the whole desktop, with the user's configuration, output folder and
   filename template. Its answers say `"taken_by":"one_shot"`.
+- **Window targets match without guessing (slice 3c).** `windows` lists what the overlay's chooser
+  would offer on every display, frontmost first. `--window-title` matches a title that contains
+  the text and `--process` an executable of that name, with or without `.exe`, both ignoring case.
+  The ADR's "the one frontmost window" and "more than one match is a refusal" disagree; the
+  refusal wins: two matches are refused as `ambiguous_window` with both listed under `matches`,
+  and none as `no_window`, both exit code 2. A window is captured with the overlay's own code,
+  against a frame of its display taken through the capture worker, so it waits behind the user's
+  captures and is refused while a recording runs.
 
 ## Slices
 
