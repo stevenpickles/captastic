@@ -143,11 +143,12 @@ pub type Answer = Result<Map<String, Value>, Failure>;
 /// or `failed` with its `reason` and `message`.
 pub fn answer_line(answer: &Answer) -> Vec<u8> {
     let mut line = Map::new();
-    line.insert("version".to_owned(), json!(PROTOCOL_VERSION));
     match answer {
         Ok(fields) => {
-            line.insert("status".to_owned(), json!("ok"));
+            // The answer's own fields go in first, so none of them can take the place of the
+            // protocol version or the status a client reads before anything else.
             line.extend(fields.clone());
+            line.insert("status".to_owned(), json!("ok"));
         }
         Err(failure) => {
             let status = if failure.reason.is_refusal() {
@@ -160,6 +161,7 @@ pub fn answer_line(answer: &Answer) -> Vec<u8> {
             line.insert("message".to_owned(), json!(failure.message));
         }
     }
+    line.insert("version".to_owned(), json!(PROTOCOL_VERSION));
     serde_json::to_vec(&Value::Object(line)).unwrap_or_else(|_| b"{}".to_vec())
 }
 

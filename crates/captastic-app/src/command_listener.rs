@@ -57,7 +57,7 @@ impl<E: CommandEngine> Commands<E> {
                 let mut fields = Map::new();
                 fields.insert("running".to_owned(), json!(true));
                 fields.insert(
-                    "version".to_owned(),
+                    "captastic_version".to_owned(),
                     json!(crate::build_info::BUILD_VERSION),
                 );
                 fields.insert("pid".to_owned(), json!(std::process::id()));
@@ -446,6 +446,11 @@ mod tests {
         let status = ask(&name, r#"{"version":1,"command":"status"}"#);
         assert_eq!(status["status"], "ok");
         assert_eq!(status["pid"], std::process::id());
+        assert_eq!(status["version"], 1);
+        assert_eq!(
+            status["captastic_version"],
+            crate::build_info::BUILD_VERSION
+        );
 
         let displays = ask(&name, r#"{"version":1,"command":"displays"}"#);
         assert_eq!(displays["displays"][0]["bounds"]["width"], bounds.width);
