@@ -19,8 +19,13 @@ this desktop while it runs, so run it when nobody is working at it:
   them through the icon's own window message, which opens an Explorer window on the temporary
   folder that the script then closes.
 
+- For `--interactive` it works the overlay as a person would, with the mouse and keyboard: it
+  drags a region inside B and confirms it with Enter, Shift+Enter (Pin) and Ctrl+Enter then
+  Enter (Edit, then Done), and it cancels one with Esc. Keep your hands off the mouse meanwhile.
+
 It does not check what only a person can: how a notification looks. A still capture refused
-during a recording needs a recording, which needs the overlay; that one stays a manual step.
+during a recording needs a recording, and the overlay's two-minute limit needs two minutes; both
+stay manual.
 
 Exit code 0 when every check passed, 1 otherwise.
 
@@ -60,7 +65,19 @@ Add-Type -Namespace CaptasticCheck -Name Native -MemberDefinition @'
 public static extern IntPtr FindWindow(string className, string windowName);
 [DllImport("user32.dll")]
 public static extern bool PostMessage(IntPtr hwnd, uint message, IntPtr wparam, IntPtr lparam);
+[DllImport("user32.dll")]
+public static extern bool SetCursorPos(int x, int y);
+[DllImport("user32.dll")]
+public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
+[DllImport("user32.dll")]
+public static extern void keybd_event(byte key, byte scan, uint flags, UIntPtr extra);
+[DllImport("user32.dll")]
+public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+[DllImport("user32.dll", EntryPoint = "FindWindowW", CharSet = CharSet.Unicode)]
+public static extern IntPtr FindWindowOfClass(string className, IntPtr anyTitle);
 '@
+# Desktop pixels, as captastic-cli reports them, for the cursor this script moves.
+[void][CaptasticCheck.Native]::SetThreadDpiAwarenessContext([IntPtr]-4)
 
 $controlEventName = 'Local\CaptasticDaemonControl-v1'
 $run = [Guid]::NewGuid().ToString('N').Substring(0, 8)
@@ -148,6 +165,46 @@ function Measure-Colours([string]$Path) {
     }
 }
 
+# The overlay, worked as a person would: a drag, then keys.
+function Invoke-Drag([int]$FromX, [int]$FromY, [int]$ToX, [int]$ToY) {
+    [void][CaptasticCheck.Native]::SetCursorPos($FromX, $FromY)
+    Start-Sleep -Milliseconds 150
+    [CaptasticCheck.Native]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+    foreach ($step in 1..10) {
+        Start-Sleep -Milliseconds 30
+        [void][CaptasticCheck.Native]::SetCursorPos(
+            $FromX + [int](($ToX - $FromX) * $step / 10),
+            $FromY + [int](($ToY - $FromY) * $step / 10))
+    }
+    Start-Sleep -Milliseconds 100
+    [CaptasticCheck.Native]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 300
+}
+
+function Send-Keys([byte[]]$Modifiers, [byte]$Key) {
+    foreach ($modifier in $Modifiers) { [CaptasticCheck.Native]::keybd_event($modifier, 0, 0, [UIntPtr]::Zero) }
+    [CaptasticCheck.Native]::keybd_event($Key, 0, 0, [UIntPtr]::Zero)
+    [CaptasticCheck.Native]::keybd_event($Key, 0, 2, [UIntPtr]::Zero)
+    foreach ($modifier in $Modifiers) { [CaptasticCheck.Native]::keybd_event($modifier, 0, 2, [UIntPtr]::Zero) }
+}
+
+# Runs `capture --interactive`, does what `$Act` does on the overlay, and returns the answer.
+function Invoke-Interactive([string]$Output, [scriptblock]$Act) {
+    $answerFile = Join-Path $workDirectory ("interactive-{0}.json" -f [Guid]::NewGuid().ToString('N').Substring(0, 6))
+    $process = Start-Process -FilePath $cli -PassThru -WindowStyle Hidden -RedirectStandardOutput $answerFile `
+        -ArgumentList @('capture', '--interactive', '--output', $Output)
+    [void](Wait-Until { [CaptasticCheck.Native]::FindWindowOfClass('CaptasticFrozenSelectionOverlay', [IntPtr]::Zero) -ne [IntPtr]::Zero } 10)
+    Start-Sleep -Milliseconds 600
+    & $Act
+    if (-not $process.WaitForExit(20000)) {
+        $process.Kill()
+        Send-Keys @() 0x1B
+        return [pscustomobject]@{ Json = $null; Code = -1; Line = 'no answer within 20 s' }
+    }
+    $line = @(Get-Content -LiteralPath $answerFile | Where-Object { $_ -match '^\s*\{' }) | Select-Object -Last 1
+    [pscustomobject]@{ Json = $(if ($line) { $line | ConvertFrom-Json }); Code = $process.ExitCode; Line = $line }
+}
+
 function Get-Announcers {
     @(Get-CimInstance Win32_Process -Filter "Name = 'captastic.exe'" |
         Where-Object { $_.CommandLine -like '*--announce-command-line-capture*' })
@@ -220,6 +277,9 @@ try {
     $status = Invoke-Cli @('status')
     Add-Result 'status without a daemon says it is not running' (
         $status.Code -eq 0 -and $status.Json.running -eq $false) $status.Line
+    $interactive = Invoke-Cli @('capture', '--interactive')
+    Add-Result '--interactive without a daemon is refused' (
+        $interactive.Code -eq 2 -and $interactive.Json.reason -eq 'unsupported')
 
     $listed = Invoke-Cli @('windows')
     $titleA = "Captastic check A $run"
@@ -282,8 +342,9 @@ try {
         $capture.Code -eq 0 -and $stillThere -and $afterFive -and $gone)
 
     # ---- With the daemon from this build ----------------------------------------------------
-    # Its own configuration, output folder and state: a remembered region over the middle of B,
-    # on B's display, for --last-region to repeat.
+    # Its own configuration, output folder and state: a confirmed region over the middle of B, on
+    # B's display, for --last-region to repeat. Only the confirmed one: the overlay opens with the
+    # other one selected, and the drags below would move it instead of drawing.
     $configDirectory = Join-Path $workDirectory 'config'
     $captureDirectory = Join-Path $workDirectory 'captures'
     New-Item -ItemType Directory -Path $configDirectory, $captureDirectory | Out-Null
@@ -305,14 +366,9 @@ directory = '$captureDirectory'
     }
     $regionToml = "x = $($region.x)`ny = $($region.y)`nwidth = $($region.width)`nheight = $($region.height)"
     $sourceToml = "width = $($displayB.bounds.width)`nheight = $($displayB.bounds.height)`nrotation_degrees = $($displayB.rotation_degrees)"
-    Set-Content -LiteralPath (Join-Path $configDirectory 'state.toml') -Encoding utf8 -Value @"
+    $stateFile = Join-Path $configDirectory 'state.toml'
+    Set-Content -LiteralPath $stateFile -Encoding utf8 -Value @"
 schema_version = 1
-
-[displays.'$($displayB.id)'.last_region]
-$regionToml
-
-[displays.'$($displayB.id)'.last_region_source]
-$sourceToml
 
 [displays.'$($displayB.id)'.last_confirmed_region]
 $regionToml
@@ -320,6 +376,13 @@ $regionToml
 [displays.'$($displayB.id)'.last_confirmed_region_source]
 $sourceToml
 "@
+    $stateText = Get-Content -LiteralPath $stateFile -Raw
+    function Restart-DevDaemon {
+        if (Test-DaemonRunning) { Stop-Daemon }
+        Set-Content -LiteralPath $stateFile -Encoding utf8 -NoNewline -Value $stateText
+        $script:devDaemon = Start-Process -FilePath $daemonExecutable -PassThru -ArgumentList @('--config', $configFile)
+        [void](Wait-Until { (Invoke-Cli @('status')).Json.running -eq $true } 20)
+    }
     $devDaemon = Start-Process -FilePath $daemonExecutable -PassThru -ArgumentList @('--config', $configFile)
     $running = Wait-Until { (Invoke-Cli @('status')).Json.running -eq $true } 20
     $status = Invoke-Cli @('status')
@@ -421,9 +484,44 @@ $sourceToml
     $restored = [System.Windows.Forms.Clipboard]::GetText([System.Windows.Forms.TextDataFormat]::UnicodeText)
     Add-Result 'the clipboard is put back as it was' ($restored -eq $savedText)
 
-    $interactive = Invoke-Cli @('capture', '--interactive')
-    Add-Result '--interactive is refused as unsupported (until it is built)' (
-        $interactive.Code -eq 2 -and $interactive.Json.reason -eq 'unsupported')
+    # The overlay, for the command line: a drag inside B confirmed three ways, and an Esc.
+    $dragInsideB = {
+        Invoke-Drag ($rect.x + [int]($rect.width * 0.3)) ($rect.y + [int]($rect.height * 0.35)) `
+            ($rect.x + [int]($rect.width * 0.7)) ($rect.y + [int]($rect.height * 0.75))
+    }
+    $dragWidth = [int]($rect.width * 0.4)
+    foreach ($case in @(
+        @{ Name = 'Capture (Enter)'; Intent = 'capture'; Modifiers = [byte[]]@(); File = 'interactive-capture.png' },
+        @{ Name = 'Edit (Ctrl+Enter, then Done)'; Intent = 'edit'; Modifiers = [byte[]]@(0x11); File = 'interactive-edit.png' },
+        @{ Name = 'Pin (Shift+Enter)'; Intent = 'pin'; Modifiers = [byte[]]@(0x10); File = 'interactive-pin.png' }
+    )) {
+        # Each from a fresh daemon and state: a selection confirmed by the leg before would open
+        # selected, with the toolbar beside it, under where this leg's drag starts.
+        Restart-DevDaemon
+        $output = Join-Path $workDirectory $case.File
+        $intent = $case.Intent
+        $modifiers = $case.Modifiers
+        $chosen = Invoke-Interactive $output {
+            & $dragInsideB
+            Send-Keys $modifiers 0x0D
+            if ($intent -eq 'edit') {
+                [void](Wait-Until { [CaptasticCheck.Native]::FindWindowOfClass('CaptasticEditor-v1', [IntPtr]::Zero) -ne [IntPtr]::Zero } 10)
+                Start-Sleep -Milliseconds 600
+                Send-Keys @() 0x0D
+            }
+        }
+        $colours = if ($chosen.Code -eq 0 -and (Test-Path $output)) { Measure-Colours $output } else { $null }
+        Add-Result "--interactive answers what was chosen: $($case.Name)" (
+            $chosen.Code -eq 0 -and $chosen.Json.captured.kind -eq 'interactive' -and
+            $chosen.Json.captured.chosen.intent -eq $intent -and $colours -and
+            [Math]::Abs($colours.Width - $dragWidth) -le 12 -and
+            $colours.Blue -gt 0.9 -and $colours.Green -eq 0) "exit $($chosen.Code) $($chosen.Line)"
+    }
+    $cancelled = Invoke-Interactive (Join-Path $workDirectory 'interactive-cancelled.png') { Send-Keys @() 0x1B }
+    Add-Result '--interactive closed with Esc is refused as cancelled' (
+        $cancelled.Code -eq 2 -and $cancelled.Json.reason -eq 'cancelled' -and
+        -not (Test-Path (Join-Path $workDirectory 'interactive-cancelled.png'))) "exit $($cancelled.Code)"
+    Add-Skip '--interactive closes the overlay after two minutes' 'takes two minutes; manual'
 
     $usage = Invoke-Cli @('capture', '--rect', '1,2,3')
     Add-Result 'a wrong command line is a usage answer' ($usage.Code -eq 64 -and $usage.Json.status -eq 'usage')

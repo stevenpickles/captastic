@@ -479,11 +479,20 @@ fn run_capture_worker(context: CaptureWorkerContext) {
             }
         };
         match command {
-            CaptureCommand::Trigger(_) if recording_active.load(Ordering::Acquire) => {
+            CaptureCommand::Trigger(trigger) if recording_active.load(Ordering::Acquire) => {
                 // One recording at a time and no stills beside it, so the two never compete for
                 // the engine's readback buffers. Not an attempt: nothing was captured or dropped.
                 log::info!("a capture was refused because a recording is running");
-                let _ = capture_notices.try_send(DaemonNotice::RecordingInProgress);
+                match &trigger.command_line {
+                    Some(command_line) => {
+                        let _ = command_line
+                            .reply
+                            .try_send(crate::selection::CommandLineOutcome::RecordingRunning);
+                    }
+                    None => {
+                        let _ = capture_notices.try_send(DaemonNotice::RecordingInProgress);
+                    }
+                }
             }
             CaptureCommand::CommandLine(request) => {
                 answer_command_line(
@@ -534,7 +543,11 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                 }
                 let _ = request.reply.try_send(result);
             }
-            CaptureCommand::Trigger(trigger) => {
+            CaptureCommand::Trigger(mut trigger) => {
+                // Taken out so the capture closures below can borrow the rest of the press. Every
+                // path that drops the press drops this too, which the waiting request reads as an
+                // overlay that closed without an answer.
+                let command_line = trigger.command_line.take();
                 if capture_budget_exhausted(max_captures, attempts) {
                     // Only reachable while an earlier attempt is still selecting; the loop
                     // stops as soon as that attempt reports back.
@@ -715,6 +728,7 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                                 outcome.frame,
                                 outcome.native_frame,
                                 recorder,
+                                command_line,
                             ),
                         ) {
                             Ok(status) => status,
@@ -1224,6 +1238,9 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                     commands: command_sender.clone(),
                     confirmed_regions: confirmed_regions.clone(),
                     clipboard_retention: args.clipboard_retention,
+                    overlay: selection_worker
+                        .as_ref()
+                        .and_then(crate::selection::SelectionWorker::overlay_controller),
                 },
                 output: crate::command_listener::CommandOutput {
                     directory: args.output_directory.clone(),
@@ -1269,6 +1286,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                 source: "hotkey",
                 action,
                 chord: Some(chord),
+                command_line: None,
             };
             if callback_sender
                 .try_send(CaptureCommand::Trigger(trigger))
@@ -1429,6 +1447,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                 source: "self_test",
                 action: HotkeyAction::LastWorkflow,
                 chord: None,
+                command_line: None,
             }))
             .map_err(|error| AppError::InvalidArgument(error.to_string()))?;
     }
@@ -1602,6 +1621,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                     source: "tray",
                                     action: HotkeyAction::LastWorkflow,
                                     chord: None,
+                                    command_line: None,
                                 };
                                 if command_sender
                                     .try_send(CaptureCommand::Trigger(trigger))
@@ -1697,6 +1717,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                             source: "self_test",
                             action: HotkeyAction::LastWorkflow,
                             chord: None,
+                            command_line: None,
                         })) {
                             Ok(()) => self_triggers_sent = self_triggers_sent.saturating_add(1),
                             // Counted rather than retried or ignored. A soak that quietly lost
@@ -2902,6 +2923,7 @@ fn dispatch_output(
     frame: Option<CpuFrame>,
     native_frame: Option<Arc<dyn NativeFrame>>,
     recorder: EventRecorder,
+    command_line: Option<crate::selection::CommandLineSelection>,
 ) -> Result<&'static str, AppError> {
     let route = action_route(action);
     if let ActionRoute::Overlay(initial_tool) = route {
@@ -2923,6 +2945,7 @@ fn dispatch_output(
                 native_frame,
                 recorder,
                 preview_mode,
+                command_line,
             );
         }
         if action != HotkeyAction::LastWorkflow {
@@ -3004,6 +3027,7 @@ fn dispatch_output(
                     // opens in, and a user who has asked for live selections should not get a
                     // frozen one because their remembered region happened to be stale.
                     preview_mode,
+                    None,
                 );
             }
         }
@@ -3038,6 +3062,7 @@ fn dispatch_selection(
     native_frame: Option<Arc<dyn NativeFrame>>,
     recorder: EventRecorder,
     preview_mode: PreviewMode,
+    command_line: Option<crate::selection::CommandLineSelection>,
 ) -> Result<&'static str, AppError> {
     let frame = frame.ok_or_else(|| {
         AppError::BackendUnavailable(
@@ -3067,6 +3092,7 @@ fn dispatch_selection(
         selection_offset_ns: None,
         confirmation_anchored: false,
         preview_mode,
+        command_line,
     };
     match crate::selection::try_submit(sender, job) {
         Ok(()) => Ok("selection_queued"),
@@ -3499,6 +3525,25 @@ pub(crate) struct TriggerEvent {
     source: &'static str,
     action: HotkeyAction,
     chord: Option<HotkeyChord>,
+    /// A command-line request waiting on the overlay this press opens (ADR 0014).
+    command_line: Option<crate::selection::CommandLineSelection>,
+}
+
+/// The press a `--interactive` command-line request makes: the overlay, opened on the Region tool
+/// so the user starts from a selection rather than whatever they last did, answered back to
+/// `selection` instead of the destinations.
+#[cfg(windows)]
+pub(crate) fn command_line_trigger(
+    selection: crate::selection::CommandLineSelection,
+) -> CaptureCommand {
+    CaptureCommand::Trigger(TriggerEvent {
+        received_at: Instant::now(),
+        enqueued_at: Instant::now(),
+        source: "command_line",
+        action: HotkeyAction::Region,
+        chord: None,
+        command_line: Some(selection),
+    })
 }
 
 #[cfg(windows)]
@@ -3775,6 +3820,7 @@ mod tests {
             selection_offset_ns: None,
             confirmation_anchored: true,
             preview_mode: PreviewMode::Live,
+            command_line: None,
         })
     }
 

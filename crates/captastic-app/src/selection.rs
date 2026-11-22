@@ -269,6 +269,19 @@ impl SelectionWorker {
                     );
                     continue;
                 }
+                if let Some(command_line) = &job.command_line {
+                    command_line.state.showing.store(true, Ordering::SeqCst);
+                    if command_line.state.abandoned.load(Ordering::SeqCst) {
+                        command_line.state.showing.store(false, Ordering::SeqCst);
+                        finish_without_clipboard(
+                            &mut job,
+                            json_output,
+                            "selection_abandoned",
+                            "the command line stopped waiting before the overlay opened",
+                        );
+                        continue;
+                    }
+                }
                 let remembered_ui = worker_controller.remembered_ui(
                     &job.metadata.display_id.0,
                     job.remembered_ui.unwrap_or_default(),
@@ -318,6 +331,12 @@ impl SelectionWorker {
                     )
                 };
 
+                if let Some(command_line) = &job.command_line {
+                    command_line.state.showing.store(false, Ordering::SeqCst);
+                    if matches!(selection, Ok(captastic_windows::SelectionOutcome::Selected(_))) {
+                        command_line.state.confirmed.store(true, Ordering::SeqCst);
+                    }
+                }
                 match selection {
                     Ok(captastic_windows::SelectionOutcome::Selected(selection)) => {
                         let selection = *selection;
@@ -607,6 +626,19 @@ impl SelectionWorker {
                         let cpu_ready_offset_ns = job
                             .cpu_ready_offset_ns
                             .unwrap_or_else(|| duration_ns(job.triggered_at.elapsed()));
+                        // A command-line request is answered with what the user chose, instead of
+                        // the capture going to the destinations: the command line writes its own
+                        // file, and the clipboard only when it asked (ADR 0014).
+                        let command_line = job.command_line.take().map(|command_line| {
+                            let described = json!({
+                                "kind": selection_kind(selection.kind),
+                                "rect": selection.rect,
+                                "title": selection.window_title,
+                                "process": selection.window_application,
+                                "intent": confirm_intent(selection.intent),
+                            });
+                            (command_line, described)
+                        });
                         let publication = Publication {
                             capture_id: job.capture_id,
                             triggered_at: job.triggered_at,
@@ -619,6 +651,16 @@ impl SelectionWorker {
                             window_application: selection.window_application.clone(),
                         };
                         match selection.intent {
+                            captastic_windows::ConfirmIntent::Record if command_line.is_some() => {
+                                drop(selected_frame);
+                                if let Some((command_line, _)) = command_line {
+                                    log::info!(
+                                        "capture {}: Record was chosen for a command-line request; nothing was recorded",
+                                        publication.capture_id.0
+                                    );
+                                    command_line.answer(CommandLineOutcome::RecordingRefused);
+                                }
+                            }
                             captastic_windows::ConfirmIntent::Record => {
                                 // Recorded over time instead of captured now (ADR 0011): the area
                                 // the overlay confirmed, on the display it was confirmed on. The
@@ -655,6 +697,7 @@ impl SelectionWorker {
                                         destinations: destinations.clone(),
                                         notices: notices.clone(),
                                         json_output,
+                                        command_line,
                                     },
                                     &selected_frame,
                                     selection.rect,
@@ -668,7 +711,17 @@ impl SelectionWorker {
                                 // time a capture takes to reach the clipboard.
                                 let pin_frame = matches!(intent, captastic_windows::ConfirmIntent::Pin)
                                     .then(|| selected_frame.clone());
-                                publication.publish(&destinations, selected_frame, json_output);
+                                match command_line {
+                                    Some((command_line, described)) => {
+                                        command_line.answer(CommandLineOutcome::Selected {
+                                            frame: Box::new(selected_frame),
+                                            described,
+                                        });
+                                    }
+                                    None => {
+                                        publication.publish(&destinations, selected_frame, json_output);
+                                    }
+                                }
                                 if let Some(frame) = pin_frame {
                                     pin_capture(
                                         &worker_desktop_ui,
@@ -681,6 +734,9 @@ impl SelectionWorker {
                         }
                     }
                     Ok(captastic_windows::SelectionOutcome::Cancelled) => {
+                        if let Some(command_line) = job.command_line.take() {
+                            command_line.answer(CommandLineOutcome::Cancelled);
+                        }
                         if !selection_was_confirmed {
                             job.recorder.record(
                                 job.capture_id,
@@ -767,6 +823,11 @@ impl SelectionWorker {
             join: Some(join),
             ui_join: Some(ui_join),
         })
+    }
+
+    /// The overlay's controller, for a command-line request to close an overlay nobody answered.
+    pub fn overlay_controller(&self) -> Option<captastic_windows::OverlayController> {
+        self.controller.clone()
     }
 
     pub fn submitter(&self) -> mpsc::SyncSender<SelectionJob> {
@@ -907,6 +968,56 @@ pub struct SelectionJob {
     pub selection_offset_ns: Option<u64>,
     pub confirmation_anchored: bool,
     pub preview_mode: PreviewMode,
+    /// A command-line request waiting on this overlay (ADR 0014), answered instead of the
+    /// destinations. `None` for every capture the user starts.
+    pub command_line: Option<CommandLineSelection>,
+}
+
+/// A command-line request waiting on the overlay: where its answer goes, and what the request and
+/// the worker tell each other while it waits.
+pub struct CommandLineSelection {
+    pub reply: mpsc::SyncSender<CommandLineOutcome>,
+    pub state: Arc<CommandLineSelectionState>,
+}
+
+impl std::fmt::Debug for CommandLineSelection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CommandLineSelection")
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CommandLineSelection {
+    fn answer(&self, outcome: CommandLineOutcome) {
+        let _ = self.reply.try_send(outcome);
+    }
+}
+
+/// Set by the worker: `showing` while this request's overlay is up, `confirmed` once the user has
+/// confirmed it. Set by the request: `abandoned` once it has stopped waiting, so an overlay still
+/// queued behind the user's own is never opened for nobody.
+#[derive(Debug, Default)]
+pub struct CommandLineSelectionState {
+    pub showing: AtomicBool,
+    pub confirmed: AtomicBool,
+    pub abandoned: AtomicBool,
+}
+
+/// How a command-line request's overlay ended.
+pub enum CommandLineOutcome {
+    /// The pixels the user confirmed (edited, if they chose Edit), and what they chose.
+    Selected {
+        frame: Box<CpuFrame>,
+        described: serde_json::Value,
+    },
+    Cancelled,
+    /// The user chose Record, which the command line does not do in 0.5.0.
+    RecordingRefused,
+    /// A recording was running, and still captures wait for it.
+    RecordingRunning,
+    Failed(String),
 }
 
 pub struct LiveSelectionRequest {
@@ -1258,6 +1369,8 @@ struct EditContext {
     destinations: crate::output::OutputDestinations,
     notices: mpsc::SyncSender<crate::daemon::DaemonNotice>,
     json_output: bool,
+    /// A command-line request answered with the edited image instead of the destinations.
+    command_line: Option<(CommandLineSelection, serde_json::Value)>,
 }
 
 const EDITOR_UNAVAILABLE_REASON: &str = "the editor could not be opened";
@@ -1313,12 +1426,22 @@ fn finish_edit(outcome: captastic_windows::EditOutcome, context: EditContext) {
                 frame.width(),
                 frame.height()
             );
-            context
-                .publication
-                .publish(&context.destinations, *frame, context.json_output);
+            match context.command_line {
+                Some((command_line, described)) => {
+                    command_line.answer(CommandLineOutcome::Selected { frame, described });
+                }
+                None => {
+                    context
+                        .publication
+                        .publish(&context.destinations, *frame, context.json_output);
+                }
+            }
             "done"
         }
         captastic_windows::EditOutcome::Cancelled => {
+            if let Some((command_line, _)) = &context.command_line {
+                command_line.answer(CommandLineOutcome::Cancelled);
+            }
             log::info!(
                 "capture {}: editing was cancelled; nothing was published",
                 capture_id.0
@@ -1333,6 +1456,11 @@ fn finish_edit(outcome: captastic_windows::EditOutcome, context: EditContext) {
             "discarded"
         }
         captastic_windows::EditOutcome::Failed(message) => {
+            if let Some((command_line, _)) = &context.command_line {
+                command_line.answer(CommandLineOutcome::Failed(format!(
+                    "the editor failed: {message}"
+                )));
+            }
             crate::logging::warn(format_args!(
                 "capture {}: the editor failed and nothing was published: {message}",
                 capture_id.0
@@ -1710,6 +1838,7 @@ mod tests {
             selection_offset_ns: None,
             confirmation_anchored: false,
             preview_mode: PreviewMode::Auto,
+            command_line: None,
         }
     }
 

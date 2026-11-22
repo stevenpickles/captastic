@@ -328,6 +328,13 @@ fn usage(error: &clap::Error) -> Option<Outcome> {
 /// worker, behind any capture the user started.
 #[cfg(windows)]
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// For `--interactive`, as long as the daemon waits on the overlay and the editor, and a margin.
+#[cfg(windows)]
+const INTERACTIVE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
+    crate::command_listener::INTERACTIVE_CHOICE_TIMEOUT.as_secs()
+        + crate::command_listener::INTERACTIVE_EDIT_TIMEOUT.as_secs()
+        + 30,
+);
 
 #[cfg(windows)]
 fn send_to_daemon(line: &[u8]) -> Result<Vec<u8>, TransportError> {
@@ -336,7 +343,21 @@ fn send_to_daemon(line: &[u8]) -> Result<Vec<u8>, TransportError> {
     let name = request_pipe_name().map_err(|error| TransportError::Failed(error.to_string()))?;
     let mut request = line.to_vec();
     request.push(b'\n');
-    send_request(&name, &request, MAX_ANSWER_BYTES, REQUEST_TIMEOUT).map_err(|error| match error {
+    let interactive = serde_json::from_slice::<Request>(line).is_ok_and(|request| {
+        matches!(
+            request.command,
+            Command::Capture(CaptureCommand {
+                target: Target::Interactive,
+                ..
+            })
+        )
+    });
+    let timeout = if interactive {
+        INTERACTIVE_REQUEST_TIMEOUT
+    } else {
+        REQUEST_TIMEOUT
+    };
+    send_request(&name, &request, MAX_ANSWER_BYTES, timeout).map_err(|error| match error {
         RequestError::NotRunning => TransportError::NotRunning,
         RequestError::Busy => TransportError::Busy,
         RequestError::Untrusted(error) => {
@@ -484,6 +505,16 @@ impl crate::command_listener::CommandEngine for OneShotEngine {
 
     fn publish_clipboard(&self, frame: &captastic_core::CpuFrame) -> Result<(), String> {
         crate::command_listener::publish_to_clipboard(frame, self.clipboard_retention)
+    }
+
+    fn interactive(
+        &self,
+    ) -> Result<(captastic_core::CpuFrame, serde_json::Value), crate::command_channel::Failure>
+    {
+        Err(crate::command_channel::Failure::new(
+            Reason::Unsupported,
+            "--interactive needs Captastic running to open its overlay; start it and ask again",
+        ))
     }
 
     fn window_frame(
