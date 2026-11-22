@@ -43,6 +43,8 @@ enum Subcommands {
     Status,
     /// List the displays, with the ids `capture --display` takes.
     Displays,
+    /// List the windows that can be captured, frontmost first, with the handles `--window` takes.
+    Windows,
     /// Take a still capture and print where it went.
     Capture(CaptureArgs),
 }
@@ -182,6 +184,7 @@ fn run(
         command: match command {
             Subcommands::Status => Command::Status,
             Subcommands::Displays => Command::Displays,
+            Subcommands::Windows => Command::Windows,
             Subcommands::Capture(args) => Command::Capture(capture_command(args, current_dir)),
         },
     };
@@ -458,6 +461,22 @@ impl crate::command_listener::CommandEngine for OneShotEngine {
             .map_err(|error| Failure::new(Reason::CaptureFailed, error.to_string()))?
             .frame
             .ok_or_else(|| Failure::new(Reason::CaptureFailed, "the backend returned no frame"))
+    }
+
+    fn windows(
+        &self,
+        displays: &[captastic_core::DisplayInfo],
+    ) -> Result<Vec<crate::command_channel::WindowInfo>, crate::command_channel::Failure> {
+        crate::command_listener::native_windows(displays)
+    }
+
+    fn window_frame(
+        &self,
+        window: &crate::command_channel::WindowInfo,
+    ) -> Result<captastic_core::CpuFrame, crate::command_channel::Failure> {
+        use crate::command_listener::{capture_native_window, window_display_source};
+        let reference = self.frame(window_display_source(window))?;
+        capture_native_window(window, &reference)
     }
 }
 

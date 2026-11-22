@@ -963,7 +963,8 @@ the running daemon, and the daemon's only control channel is the named stop even
      The command line returns at once and a hidden `captastic.exe` holds the notification
      (ADR 0014, As built).
    - **3c**: window targets and `windows`, then `--last-region`, `--clipboard` and
-     `--interactive`, which the daemon refuses as `unsupported` until then.
+     `--interactive`, which the daemon refuses as `unsupported` until then. Window targets land
+     first, on their own.
 4. **Agent documentation and the visibility rule**: the notification and history marking ADR 0014
    chooses, a usage page, and the README.
 

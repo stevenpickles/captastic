@@ -67,12 +67,14 @@ pub use hotkey::{HotkeyListener, HotkeySpec};
 pub use known_folders::known_pictures_folder;
 #[cfg(windows)]
 pub use overlay::{
-    flush_desktop_composition, select_from_frozen_frame, select_from_frozen_frame_with_controller,
-    select_from_frozen_frame_with_initial_tool, select_from_frozen_frame_with_initial_tool_and_ui,
-    select_from_preview_source_with_initial_tool_and_ui, ConfirmIntent, DesktopUi, EditOutcome,
-    InitialSelectionTool, NativeWindowHandle, OverlayController, OverlayDestinations,
-    OverlayResources, OverlaySelection, OverlayUiUpdate, PreviewView, ReviewOutcome, SelectionKind,
-    SelectionOutcome, SelectionPreviewSource, DISPLAY_CHANGE_MONITORS,
+    capturable_windows, flush_desktop_composition, select_from_frozen_frame,
+    select_from_frozen_frame_with_controller, select_from_frozen_frame_with_initial_tool,
+    select_from_frozen_frame_with_initial_tool_and_ui,
+    select_from_preview_source_with_initial_tool_and_ui, CapturableWindow, ConfirmIntent,
+    DesktopUi, EditOutcome, InitialSelectionTool, NativeWindowHandle, OverlayController,
+    OverlayDestinations, OverlayResources, OverlaySelection, OverlayUiUpdate, PreviewView,
+    ReviewOutcome, SelectionKind, SelectionOutcome, SelectionPreviewSource,
+    DISPLAY_CHANGE_MONITORS,
 };
 #[cfg(windows)]
 pub use request_pipe::{
@@ -92,6 +94,6 @@ pub use video::{mp4_frame_size, Mp4Writer, VideoSummary, MP4_MAXIMUM_SIZE};
 #[cfg(windows)]
 pub use video_reader::Mp4Reader;
 #[cfg(windows)]
-pub use window_capture::{captured_window_frame, materialize_selection};
+pub use window_capture::{capture_window_frame, captured_window_frame, materialize_selection};
 #[cfg(windows)]
 pub use window_session_wgc::{WgcWindowSession, WindowFrame};

@@ -94,6 +94,16 @@ pub fn captured_window_frame(selection: &OverlaySelection) -> Option<CpuFrame> {
         .flatten()
 }
 
+/// Captures one window as the overlay would on confirming it, WGC first and `PrintWindow` where
+/// WGC cannot, for a command-line request (ADR 0014). `reference_metadata` is a frame of the
+/// window's display, as the overlay passes its frozen desktop.
+pub fn capture_window_frame(
+    handle: NativeWindowHandle,
+    reference_metadata: &FrameMetadata,
+) -> Result<CpuFrame, CaptureError> {
+    capture_window(handle, reference_metadata)
+}
+
 pub(crate) fn capture_window(
     handle: NativeWindowHandle,
     reference_metadata: &FrameMetadata,

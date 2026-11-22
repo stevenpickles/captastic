@@ -91,9 +91,57 @@ unsafe extern "system" fn enum_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
 }
 
 fn collect_window(hwnd: HWND, collector: &mut WindowCollector) {
+    let Some(eligible) = eligible_window(hwnd) else {
+        return;
+    };
+    let window_bounds = eligible.bounds;
+    let native_display_id = native_window_display_id(hwnd, &collector.displays);
+    if owning_display_id(
+        window_bounds,
+        native_display_id.as_ref(),
+        &collector.displays,
+    ) != Some(&collector.target_display_id)
+    {
+        return;
+    }
+    let Some(visible_bounds) = intersect_with_source(eligible.native, collector.source) else {
+        return;
+    };
+    if visible_bounds.width >= 16 && visible_bounds.height >= 16 {
+        log_window_candidate(
+            hwnd,
+            "accepted",
+            &eligible.title,
+            eligible.class_name.as_deref(),
+            eligible.extended_style,
+            eligible.display_affinity,
+        );
+        // The extended-frame query is a DWM attribute read against a foreign window: it reads
+        // compositor state and sends no message, so it cannot wait on that window's thread and
+        // cannot re-enter the overlay's window procedure the way a title query would (H3).
+        collector.windows.push(WindowCandidate {
+            handle: NativeWindowHandle(hwnd.0),
+            frame: crate::window_capture::window_geometry(hwnd, window_bounds).frame,
+        });
+    }
+}
+
+/// What the eligibility checks learned about a window they let through.
+struct EligibleWindow {
+    title: String,
+    class_name: Option<String>,
+    extended_style: u32,
+    display_affinity: Option<u32>,
+    native: RECT,
+    bounds: Rect,
+}
+
+/// The rules every window chooser applies, the overlay's and the command line's alike: a visible,
+/// unminimised, uncloaked, titled task window of another process that Windows lets be captured.
+fn eligible_window(hwnd: HWND) -> Option<EligibleWindow> {
     // SAFETY: Returns the shell desktop window for identity comparison only.
     if hwnd == unsafe { GetShellWindow() } {
-        return;
+        return None;
     }
     // Reject Captastic's own windows before anything queries them. Captastic never offers them as
     // capture targets, and a title query against a same-process window on another thread is a
@@ -101,7 +149,7 @@ fn collect_window(hwnd: HWND, collector: &mut WindowCollector) {
     // which can re-enter the window procedure and re-borrow the overlay state that enumeration
     // already holds mutably further down the stack.
     if is_own_process_window(hwnd) {
-        return;
+        return None;
     }
     // Everything below this point is a foreign window, and every filter here reads window state
     // directly instead of sending a message, so none of them can block on another thread.
@@ -120,14 +168,12 @@ fn collect_window(hwnd: HWND, collector: &mut WindowCollector) {
         || !window_styles_allow_task_switcher(extended_style)
         || (!forced_taskbar_window && !is_root_owner_task_window(hwnd))
     {
-        return;
+        return None;
     }
     // Only already-eligible foreign windows are titled. Across a process boundary GetWindowText
     // copies the cached title instead of sending WM_GETTEXT, so it cannot wait on that window's
     // thread; untitled windows stay excluded exactly as before.
-    let Some(title) = window_text(hwnd) else {
-        return;
-    };
+    let title = window_text(hwnd)?;
     let display_affinity = window_display_affinity(hwnd);
     if !display_affinity_allows_capture(display_affinity) {
         log_window_candidate(
@@ -138,44 +184,107 @@ fn collect_window(hwnd: HWND, collector: &mut WindowCollector) {
             extended_style,
             display_affinity,
         );
-        return;
+        return None;
     }
     let mut native = RECT::default();
     // SAFETY: native is writable storage and hwnd is the enumerated top-level window.
     if unsafe { GetWindowRect(hwnd, &mut native) }.is_err() {
+        return None;
+    }
+    let bounds = rect_from_native(native)?;
+    Some(EligibleWindow {
+        title,
+        class_name,
+        extended_style,
+        display_affinity,
+        native,
+        bounds,
+    })
+}
+
+/// A window the command line can capture (ADR 0014): what `captastic-cli windows` lists.
+#[derive(Clone, Debug)]
+pub struct CapturableWindow {
+    pub handle: NativeWindowHandle,
+    /// Set by whichever application owns the window: untrusted text.
+    pub title: String,
+    /// The owning executable's file name, such as `notepad.exe`, where the process lets it be read.
+    pub process: Option<String>,
+    /// The window as the user sees it, without the invisible resize border, in desktop pixels.
+    pub frame: Rect,
+    /// The display that owns most of it.
+    pub display_id: Option<DisplayId>,
+}
+
+struct Listing<'a> {
+    displays: &'a [DisplayInfo],
+    windows: Vec<CapturableWindow>,
+    callback_failed: bool,
+}
+
+unsafe extern "system" fn list_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    // SAFETY: EnumWindows passes back the live Listing pointer capturable_windows supplied.
+    let listing = unsafe { &mut *(lparam.0 as *mut Listing<'_>) };
+    match catch_unwind(AssertUnwindSafe(|| list_one_window(hwnd, listing))) {
+        Ok(()) => BOOL(1),
+        Err(_) => {
+            listing.callback_failed = true;
+            BOOL(0)
+        }
+    }
+}
+
+fn list_one_window(hwnd: HWND, listing: &mut Listing<'_>) {
+    let Some(eligible) = eligible_window(hwnd) else {
+        return;
+    };
+    let native_display_id = native_window_display_id(hwnd, listing.displays);
+    let display_id = owning_display_id(
+        eligible.bounds,
+        native_display_id.as_ref(),
+        listing.displays,
+    )
+    .cloned();
+    let frame = crate::window_capture::window_geometry(hwnd, eligible.bounds).frame;
+    if frame.width < 16 || frame.height < 16 {
         return;
     }
-    if let Some(window_bounds) = rect_from_native(native) {
-        let native_display_id = native_window_display_id(hwnd, &collector.displays);
-        if owning_display_id(
-            window_bounds,
-            native_display_id.as_ref(),
-            &collector.displays,
-        ) != Some(&collector.target_display_id)
-        {
-            return;
-        }
-        let Some(visible_bounds) = intersect_with_source(native, collector.source) else {
-            return;
-        };
-        if visible_bounds.width >= 16 && visible_bounds.height >= 16 {
-            log_window_candidate(
-                hwnd,
-                "accepted",
-                &title,
-                class_name.as_deref(),
-                extended_style,
-                display_affinity,
-            );
-            // The extended-frame query is a DWM attribute read against a foreign window: it reads
-            // compositor state and sends no message, so it cannot wait on that window's thread and
-            // cannot re-enter the overlay's window procedure the way a title query would (H3).
-            collector.windows.push(WindowCandidate {
-                handle: NativeWindowHandle(hwnd.0),
-                frame: crate::window_capture::window_geometry(hwnd, window_bounds).frame,
-            });
-        }
+    listing.windows.push(CapturableWindow {
+        handle: NativeWindowHandle(hwnd.0),
+        title: eligible.title,
+        process: window_process_name(hwnd),
+        frame,
+        display_id,
+    });
+}
+
+/// Every window the overlay's chooser would offer on any display, frontmost first.
+pub fn capturable_windows(displays: &[DisplayInfo]) -> Result<Vec<CapturableWindow>, CaptureError> {
+    let mut listing = Listing {
+        displays,
+        windows: Vec::with_capacity(32),
+        callback_failed: false,
+    };
+    // SAFETY: listing stays alive and uniquely borrowed for the synchronous enumeration, which
+    // visits top-level windows in Z order, frontmost first.
+    unsafe {
+        EnumWindows(
+            Some(list_window),
+            LPARAM((&mut listing as *mut Listing<'_>) as isize),
+        )
     }
+    .map_err(|error| overlay_error("enumerate_capturable_windows", error))?;
+    if listing.callback_failed {
+        return Err(CaptureError {
+            kind: CaptureErrorKind::NativeFailure,
+            backend: "windows-overlay",
+            operation: "enumerate_capturable_windows",
+            message: "window enumeration callback failed".to_owned(),
+            retryable: true,
+            native_code: None,
+        });
+    }
+    Ok(listing.windows)
 }
 
 fn owning_display_id<'a>(
