@@ -3,11 +3,14 @@ $ErrorActionPreference = 'Stop'
 $toolsDirectory = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $applicationDirectory = Join-Path $toolsDirectory 'captastic'
 $executable = Join-Path $applicationDirectory 'captastic.exe'
+$commandLine = Join-Path $applicationDirectory 'captastic-cli.exe'
 
-if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
-    throw "The Captastic Chocolatey package is incomplete: $executable is missing."
+foreach ($binary in @($executable, $commandLine)) {
+    if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
+        throw "The Captastic Chocolatey package is incomplete: $binary is missing."
+    }
+    Unblock-File -LiteralPath $binary
 }
-Unblock-File -LiteralPath $executable
 
 # A user moving from the portable installer should not be left with an old daemon
 # holding Captastic's session control event. Its uninstaller preserves ~/.captastic.
@@ -30,10 +33,13 @@ if ((Test-Path -LiteralPath $legacyCli -PathType Leaf) -and
     }
 }
 
-# A suppression file in the generated package prevents Chocolatey's automatic shim so the one
-# command is exposed explicitly. -UseStart makes it a GUI shim: captastic.exe is a windowless
+# Suppression files in the generated package prevent Chocolatey's automatic shims so each command
+# is exposed explicitly. -UseStart makes captastic a GUI shim: captastic.exe is a windowless
 # program, and a console shim would hold a console open for as long as Captastic runs.
 Install-BinFile -Name 'captastic' -Path $executable -UseStart
+# captastic-cli is the opposite: a console program whose output and exit code are the point, so its
+# shim waits for it and passes both through (ADR 0014).
+Install-BinFile -Name 'captastic-cli' -Path $commandLine
 # 0.2 and earlier shipped a separate launcher with a shim of its own.
 Uninstall-BinFile -Name 'captastic-desktop'
 
@@ -87,4 +93,5 @@ if (Test-Path -LiteralPath $relaunchMarker -PathType Leaf) {
 
 
 Write-Host 'Captastic is installed. Start it from the Start Menu if it is not already running.'
+Write-Host 'captastic-cli asks the running Captastic for captures from a terminal; see captastic-cli --help.'
 Write-Host 'Configuration and logs are stored under ~/.captastic.'

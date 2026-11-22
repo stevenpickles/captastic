@@ -66,6 +66,7 @@ if (Test-Path -LiteralPath $legacyLauncher -PathType Leaf) {
 }
 foreach ($name in @(
     'captastic.exe',
+    'captastic-cli.exe',
     'captastic.example.toml',
     'README.md',
     'LICENSE-MIT',
@@ -108,3 +109,4 @@ if (-not $NoLaunch) {
 
 Write-Host "Captastic installed to $InstallDirectory"
 Write-Host "Start Menu shortcut: $shortcutPath"
+Write-Host "Command line for scripts and agents: $(Join-Path $InstallDirectory 'captastic-cli.exe')"

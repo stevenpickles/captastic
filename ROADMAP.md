@@ -954,6 +954,14 @@ the running daemon, and the daemon's only control channel is the named stop even
    last region, `--interactive` and `--clipboard` are refused as `unsupported` until slice 3.
 3. **The shipped command**: the executable or console mode ADR 0014 chooses, its capture command,
    JSON output and exit codes, packaged in the ZIP and the Chocolatey package (shim included).
+   It lands in three parts:
+   - **3a**: `captastic-cli.exe` with `status`, `displays` and `capture`, through the running
+     daemon; JSON and exit codes; packaged with a console shim. Without a daemon, `status` says
+     so and the others fail as `not_running`.
+   - **3b**: the one-shot engine, so a capture works when Captastic is not running, with its own
+     short-lived notification-area icon for the announcement.
+   - **3c**: window targets and `windows`, then `--last-region`, `--clipboard` and
+     `--interactive`, which the daemon refuses as `unsupported` until then.
 4. **Agent documentation and the visibility rule**: the notification and history marking ADR 0014
    chooses, a usage page, and the README.
 

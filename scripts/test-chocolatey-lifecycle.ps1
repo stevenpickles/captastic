@@ -79,8 +79,16 @@ try {
         '--source', $initial.Directory,
         '--yes', '--pre', '--no-progress', '--limit-output'
     )
-    if (-not (Test-Path -LiteralPath (Join-Path $chocolateyBin 'captastic.exe') -PathType Leaf)) {
-        throw 'Chocolatey install did not create shim captastic.exe.'
+    foreach ($shim in @('captastic.exe', 'captastic-cli.exe')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $chocolateyBin $shim) -PathType Leaf)) {
+            throw "Chocolatey install did not create shim $shim."
+        }
+    }
+    # The console shim passes the command line's output and exit code through. Nothing is running
+    # here, so status answers that, as JSON, with exit code 0.
+    $statusLine = & (Join-Path $chocolateyBin 'captastic-cli.exe') status
+    if ($LASTEXITCODE -ne 0 -or ($statusLine | ConvertFrom-Json).running -ne $false) {
+        throw "captastic-cli status through its shim answered '$statusLine' with exit code $LASTEXITCODE."
     }
     if (Test-Path -LiteralPath (Join-Path $chocolateyBin 'captastic-desktop.exe')) {
         throw 'Chocolatey install created the retired captastic-desktop.exe shim.'
@@ -112,7 +120,7 @@ try {
     Invoke-Choco @('uninstall', 'captastic', '--yes', '--no-progress', '--limit-output')
     $installed = $false
 
-    foreach ($shim in @('captastic.exe', 'captastic-desktop.exe')) {
+    foreach ($shim in @('captastic.exe', 'captastic-cli.exe', 'captastic-desktop.exe')) {
         if (Test-Path -LiteralPath (Join-Path $chocolateyBin $shim)) {
             throw "Chocolatey uninstall did not remove shim $shim."
         }

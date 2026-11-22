@@ -23,6 +23,9 @@ function New-TestBinaries([string]$Name, [uint16]$Machine) {
     $directory = Join-Path $testRoot $Name
     New-Item -ItemType Directory -Path $directory -Force | Out-Null
     Write-TestPe (Join-Path $directory 'captastic.exe') $Machine
+    # A different size, so the two executables have different hashes in VERIFICATION.txt.
+    Write-TestPe (Join-Path $directory 'captastic-cli.exe') $Machine
+    [System.IO.File]::AppendAllText((Join-Path $directory 'captastic-cli.exe'), 'cli')
     return $directory
 }
 
@@ -136,6 +139,8 @@ try {
         'tools/chocolateyUninstall.ps1',
         'tools/captastic/captastic.exe',
         'tools/captastic/captastic.exe.ignore',
+        'tools/captastic/captastic-cli.exe',
+        'tools/captastic/captastic-cli.exe.ignore',
         'tools/captastic/LICENSE-MIT',
         'tools/captastic/LICENSE-APACHE',
         'tools/captastic/README.md',
@@ -151,7 +156,7 @@ try {
         '^_rels/\.rels$',
         '^captastic\.nuspec$',
         '^tools/(LICENSE\.txt|VERIFICATION\.txt|chocolatey(?:Install|BeforeModify|Uninstall)\.ps1)$',
-        '^tools/captastic/(captastic\.exe(?:\.ignore)?|captastic\.example\.toml|LICENSE-(?:MIT|APACHE)|README\.md)$',
+        '^tools/captastic/(captastic(?:-cli)?\.exe(?:\.ignore)?|captastic\.example\.toml|LICENSE-(?:MIT|APACHE)|README\.md)$',
         '^\[Content_Types\]\.xml$',
         '^package/services/metadata/core-properties/[0-9a-f]+\.psmdcp$'
     )
@@ -167,7 +172,8 @@ try {
         'Chocolatey verification file does not contain the source URL.'
     $archiveHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $chocolateyArchive).Hash.ToLowerInvariant()
     $executableHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $x64 'captastic.exe')).Hash.ToLowerInvariant()
-    foreach ($hash in @($archiveHash, $executableHash)) {
+    $commandLineHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $x64 'captastic-cli.exe')).Hash.ToLowerInvariant()
+    foreach ($hash in @($archiveHash, $executableHash, $commandLineHash)) {
         Assert-True ($verification -match $hash) "Chocolatey verification file does not contain hash $hash."
     }
 
