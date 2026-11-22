@@ -122,6 +122,19 @@ would wrap, so it can follow without changing them.
 - A capture refused while a recording runs, as stills already are (ADR 0011), is exit code 2 with a
   `recording_running` reason.
 
+## As built
+
+- **The one-shot announcement is handed off (slice 3b, maintainer's choice of 2026-11-22).**
+  `captastic-cli` prints its answer and exits as soon as the file is written. It starts a hidden
+  `captastic.exe --announce-command-line-capture <file>`, which shows the notification from an
+  icon of its own, shows the file in its folder when it is clicked, and removes the icon after 10
+  seconds. So an agent never waits on the notification. If that process cannot start, the
+  command line shows the notification itself and waits instead, so the capture is still
+  announced.
+- **The one-shot engine runs the daemon's own request handler** in the command line's process,
+  over the DXGI backend for the whole desktop, with the user's configuration, output folder and
+  filename template. Its answers say `"taken_by":"one_shot"`.
+
 ## Slices
 
 As listed under Milestone 10 in `ROADMAP.md`:
