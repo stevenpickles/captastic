@@ -147,8 +147,10 @@ fn parse_handle(text: &str) -> Result<u64, String> {
     parsed.map_err(|_| format!("not a window handle: {text}"))
 }
 
-/// Why the request never got an answer from a daemon.
+/// Why the request never got an answer from a daemon. Only the Windows pipe transport reports
+/// most of these; elsewhere there is no daemon to ask.
 #[derive(Debug)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) enum TransportError {
     /// No Captastic is listening in this session.
     NotRunning,
@@ -509,6 +511,17 @@ mod tests {
         let busy = ask(&["displays"], Err(TransportError::Busy)).1;
         assert_eq!(busy.code, EXIT_FAILED);
         assert!(busy.line.contains(r#""reason":"busy""#), "{}", busy.line);
+        let untrusted = ask(
+            &["status"],
+            Err(TransportError::Untrusted("someone else's pipe".to_owned())),
+        )
+        .1;
+        assert_eq!(untrusted.code, EXIT_FAILED);
+        assert!(
+            untrusted.line.contains(r#""reason":"untrusted_pipe""#),
+            "{}",
+            untrusted.line
+        );
     }
 
     #[test]
