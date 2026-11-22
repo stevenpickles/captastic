@@ -79,6 +79,8 @@ pub struct RecordingSettings {
     pub format: RecordingFormat,
     pub max_duration: Duration,
     pub gif_max_dimension: u32,
+    /// Record the computer's sound into an MP4 (ADR 0015).
+    pub audio: bool,
 }
 
 impl RecordingSettings {
@@ -87,6 +89,7 @@ impl RecordingSettings {
             format: config.format,
             max_duration: config.max_duration(),
             gif_max_dimension: config.gif_max_dimension,
+            audio: config.audio,
         }
     }
 }
@@ -119,7 +122,44 @@ pub struct RecordingReport {
     /// Frames dropped because the encoder was behind.
     pub frames_dropped: u64,
     pub ended: RecordingEnd,
+    /// What happened to the sound, for a recording asked to carry it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sound: Option<RecordingSound>,
 }
+
+/// The sound of a recording that was asked to carry it (ADR 0015).
+#[derive(Clone, Debug, Serialize)]
+pub struct RecordingSound {
+    /// Whether any output device was read. When not, the track is silent and `error` says why.
+    pub recorded: bool,
+    pub error: Option<String>,
+    /// How much of the track is silence put in to fill gaps.
+    #[serde(serialize_with = "serialize_millis")]
+    pub silence_filled: Duration,
+    pub device_changes: u32,
+    /// Stretches of sound the encoder was too far behind to take.
+    pub packets_dropped: u64,
+}
+
+impl From<captastic_windows::LoopbackSummary> for RecordingSound {
+    fn from(summary: captastic_windows::LoopbackSummary) -> Self {
+        Self {
+            recorded: summary.device_opened,
+            error: summary.error,
+            silence_filled: Duration::from_nanos(
+                (u128::from(summary.silent_frames) * 1_000_000_000
+                    / u128::from(captastic_windows::AUDIO_SAMPLE_RATE)) as u64,
+            ),
+            device_changes: summary.device_changes,
+            packets_dropped: summary.packets_dropped,
+        }
+    }
+}
+
+/// How many stretches of sound may wait for the encoder: about five seconds of 10 ms packets. The
+/// encoder takes them between frames, so it is never more than a frame behind unless it is
+/// falling behind the frames too.
+const AUDIO_QUEUE_PACKETS: usize = 512;
 
 fn serialize_millis<S: serde::Serializer>(
     duration: &Duration,
@@ -199,13 +239,15 @@ fn record_into(
     let queue = Arc::new(FrameQueue::with_capacity(queue_capacity(
         width as usize * height as usize * 4,
     )));
+    // The computer's sound, on the same clock as the frames, for an MP4 asked to carry it.
+    let (loopback, audio) = start_sound(settings, started);
     let encoder = {
         let queue = queue.clone();
         let path = path.map(Path::to_owned);
         let format = settings.format;
         thread::Builder::new()
             .name("captastic-recording-encoder".to_owned())
-            .spawn(move || encode(&queue, format, path.as_deref(), width, height))
+            .spawn(move || encode(&queue, format, path.as_deref(), width, height, audio))
             .map_err(|error| RecordingError::Encode(error.to_string()))?
     };
     queue.push(
@@ -262,6 +304,8 @@ fn record_into(
                     "a recording frame could not be captured ({failures} in a row): {error}"
                 );
                 if failures > SOURCE_FAILURES_TOLERATED {
+                    // The sound stops first: the encoder takes the last of it after the frames.
+                    drop(loopback);
                     queue.close(started.elapsed());
                     let _ = encoder.join();
                     return Err(RecordingError::Source(error));
@@ -270,6 +314,9 @@ fn record_into(
         }
     };
     let duration = started.elapsed().min(settings.max_duration);
+    // The sound stops first, filling silence to this moment, so the encoder can take the last of
+    // it once the frames are done.
+    let sound = stop_sound(loopback);
     queue.close(duration);
     let (written, data) = encoder
         .join()
@@ -292,6 +339,7 @@ fn record_into(
         frames_written: written,
         frames_dropped: queue.dropped(),
         ended,
+        sound,
     };
     Ok((report, data))
 }
@@ -415,6 +463,34 @@ fn frame_pixels(
     ))
 }
 
+type Loopback = Option<captastic_windows::LoopbackCapture>;
+type SoundPackets = Option<std::sync::mpsc::Receiver<captastic_windows::AudioPacket>>;
+
+/// Starts reading the computer's sound for an MP4 that is to carry it, timed from `started`.
+fn start_sound(settings: RecordingSettings, started: Instant) -> (Loopback, SoundPackets) {
+    if !settings.audio || settings.format != RecordingFormat::Mp4 {
+        return (None, None);
+    }
+    let (sender, receiver) = std::sync::mpsc::sync_channel(AUDIO_QUEUE_PACKETS);
+    match captastic_windows::LoopbackCapture::start(started, sender) {
+        Ok(loopback) => (Some(loopback), Some(receiver)),
+        Err(error) => {
+            crate::logging::warn(format_args!(
+                "the recording's sound could not be started, so it is recorded without: {error}"
+            ));
+            (None, None)
+        }
+    }
+}
+
+fn stop_sound(loopback: Loopback) -> Option<RecordingSound> {
+    let summary = loopback?.stop();
+    if let Some(error) = &summary.error {
+        crate::logging::warn(format_args!("the recording has no sound: {error}"));
+    }
+    Some(RecordingSound::from(summary))
+}
+
 /// The encoder thread: everything the queue hands it, into `path` or into memory without one,
 /// until the queue closes. Returns how many frames the recording holds, and its bytes when they
 /// are in memory.
@@ -424,10 +500,11 @@ fn encode(
     path: Option<&Path>,
     width: u32,
     height: u32,
+    sound: SoundPackets,
 ) -> Result<(u64, Option<Vec<u8>>), RecordingError> {
     let result = match format {
         RecordingFormat::Gif => encode_gif(queue, path, width, height),
-        RecordingFormat::Mp4 => encode_mp4(queue, path, width, height),
+        RecordingFormat::Mp4 => encode_mp4(queue, path, width, height, sound),
     };
     if result.is_err() {
         queue.fail();
@@ -492,16 +569,31 @@ fn encode_mp4(
     path: Option<&Path>,
     width: u32,
     height: u32,
+    sound: SoundPackets,
 ) -> Result<(u64, Option<Vec<u8>>), RecordingError> {
     let rate = RecordingFormat::Mp4.frame_rate();
-    let mut writer = match path {
-        Some(path) => captastic_windows::Mp4Writer::create(path, width, height, rate),
-        None => captastic_windows::Mp4Writer::create_in_memory(width, height, rate),
-    }
-    .map_err(|error| RecordingError::Encode(error.to_string()))?;
+    let mut writer =
+        captastic_windows::Mp4Writer::create_recording(path, width, height, rate, sound.is_some())
+            .map_err(|error| RecordingError::Encode(error.to_string()))?;
+    // Sound is taken between frames, so the one writer is only ever used from this thread.
     let end = queued_frames(queue, |pixels, at| {
+        if let Some(sound) = &sound {
+            for packet in sound.try_iter() {
+                writer
+                    .push_audio(&packet, None)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
         writer.push(pixels, at).map_err(|error| error.to_string())
     })?;
+    // The rest of the sound, which ends when the reader has stopped, cut at the picture's end.
+    if let Some(sound) = &sound {
+        for packet in sound.iter() {
+            writer
+                .push_audio(&packet, Some(end))
+                .map_err(|error| RecordingError::Encode(error.to_string()))?;
+        }
+    }
     if path.is_some() {
         let summary = writer
             .finish(end)
@@ -1738,6 +1830,48 @@ mod tests {
             format,
             max_duration: Duration::from_secs_f64(seconds),
             gif_max_dimension: 64,
+            audio: false,
+        }
+    }
+
+    #[test]
+    #[ignore = "needs an audio output device and Media Foundation's encoders"]
+    fn an_mp4_with_sound_carries_the_computers_sound_for_as_long_as_the_picture() {
+        let mut source = Changing {
+            bounds: rect(0, 0, 160, 96),
+            count: 0,
+            fail_after: None,
+        };
+        let stop = AtomicBool::new(false);
+        let mut settings = settings(RecordingFormat::Mp4, 3.0);
+        settings.audio = true;
+        let (report, bytes) =
+            record_in_memory(&mut source, rect(0, 0, 160, 96), settings, &stop).expect("record");
+        let sound = report.sound.clone().expect("a sound report");
+        let samples = captastic_windows::mp4_sound(&bytes)
+            .expect("decoded")
+            .expect("the MP4 has a sound stream");
+        let rate = captastic_windows::AUDIO_SAMPLE_RATE as f64;
+        let seconds = samples.len() as f64 / 2.0 / rate;
+        eprintln!("{report:?}, {seconds:.3} s of sound");
+        assert!(
+            (seconds - report.duration.as_secs_f64()).abs() < 0.1,
+            "{seconds} s of sound for {:?} of picture",
+            report.duration
+        );
+        // With CAPTASTIC_EXPECT_SOUND set, scripts/check-recording-audio.ps1 plays a tone
+        // meanwhile, and it must be in the file.
+        if std::env::var_os("CAPTASTIC_EXPECT_SOUND").is_some() {
+            assert!(sound.recorded, "{sound:?}");
+            let loudest = samples
+                .chunks(960)
+                .map(|chunk| {
+                    (chunk.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>() / chunk.len() as f64)
+                        .sqrt()
+                })
+                .fold(0.0, f64::max);
+            eprintln!("loudest 10 ms RMS {loudest:.0}");
+            assert!(loudest > 300.0, "no sound in the recording");
         }
     }
 
@@ -1975,6 +2109,7 @@ mod tests {
                 max_seconds: 30,
                 gif_max_dimension: 1280,
                 review: false,
+                audio: false,
             },
             directory.join("captures"),
             "{timestamp}".to_owned(),
@@ -2163,6 +2298,7 @@ mod tests {
                 frames_written: 20,
                 frames_dropped: 0,
                 ended: RecordingEnd::Stopped,
+                sound: None,
             },
             recording: recording.into(),
             stem: name.to_owned(),

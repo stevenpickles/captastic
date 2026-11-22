@@ -11,6 +11,10 @@
 //!
 //! An MP4 is written into a file or, for a recording that is reviewed before it is saved, into
 //! memory (ADR 0012), from where [`Mp4Writer::finish_in_memory`] hands back its bytes.
+//!
+//! A writer made with sound also carries an AAC stream beside the H.264 one (ADR 0015): the
+//! computer's sound as [`crate::LoopbackCapture`] reads it, 48 kHz stereo at 160 kbit/s, on the
+//! same clock as the frames. A writer without sound writes exactly what it always has.
 
 use std::path::Path;
 use std::time::Duration;
@@ -27,6 +31,11 @@ use windows::Win32::Media::MediaFoundation::{
     MF_MT_MAX_KEYFRAME_SPACING, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
     MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_TRANSCODE_CONTAINERTYPE, MF_VERSION,
 };
+use windows::Win32::Media::MediaFoundation::{
+    MFAudioFormat_AAC, MFAudioFormat_PCM, MFMediaType_Audio, MF_MT_AAC_PAYLOAD_TYPE,
+    MF_MT_AUDIO_AVG_BYTES_PER_SECOND, MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_BLOCK_ALIGNMENT,
+    MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND,
+};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::UI::Shell::SHCreateMemStream;
 
@@ -42,6 +51,8 @@ const MAXIMUM_BITRATE: u32 = 40_000_000;
 const TICKS_PER_SECOND: u128 = 10_000_000;
 /// The most copied into or out of a byte stream in one call.
 const BYTE_STREAM_CHUNK: usize = 16 * 1024 * 1024;
+/// AAC at 160 kbit/s: 20,000 bytes a second, one of the four rates Windows' encoder takes.
+const AAC_BYTES_PER_SECOND: u32 = 20_000;
 
 /// The size a `width` by `height` recording is encoded at: scaled down, keeping its shape, to fit
 /// [`MP4_MAXIMUM_SIZE`], then rounded down to even sides, which H.264's 4:2:0 sampling needs.
@@ -61,6 +72,8 @@ pub struct VideoSummary {
     /// Frames encoded; the rest repeated the frame before and lengthened it.
     pub frames_written: u64,
     pub duration: Duration,
+    /// How much sound was written, when the MP4 has a sound stream.
+    pub audio_duration: Duration,
 }
 
 /// Media Foundation and COM, started for this thread and stopped when dropped.
@@ -114,6 +127,12 @@ pub struct Mp4Writer {
     width: u32,
     height: u32,
     stream: u32,
+    /// The sound stream, for a writer made with sound.
+    audio_stream: Option<u32>,
+    /// Sound that arrived before the first frame, which the timeline starts at.
+    early_audio: Vec<crate::AudioPacket>,
+    /// Sound frames written, at [`crate::AUDIO_SAMPLE_RATE`].
+    audio_frames: u64,
     first_at: Option<Duration>,
     summary: VideoSummary,
     /// Where the MP4 is written when it is written into memory.
@@ -131,7 +150,19 @@ impl Mp4Writer {
         height: u32,
         frame_rate: u32,
     ) -> Result<Self, CaptureError> {
-        Self::create_into(Some(path), width, height, frame_rate)
+        Self::create_into(Some(path), width, height, frame_rate, false)
+    }
+
+    /// As [`create`](Self::create) or [`create_in_memory`](Self::create_in_memory) (`path`
+    /// `None`), with a sound stream when `sound` is set, for [`push_audio`](Self::push_audio).
+    pub fn create_recording(
+        path: Option<&Path>,
+        width: u32,
+        height: u32,
+        frame_rate: u32,
+        sound: bool,
+    ) -> Result<Self, CaptureError> {
+        Self::create_into(path, width, height, frame_rate, sound)
     }
 
     /// As [`create`](Self::create), but writes the MP4 into memory, for
@@ -141,7 +172,7 @@ impl Mp4Writer {
         height: u32,
         frame_rate: u32,
     ) -> Result<Self, CaptureError> {
-        Self::create_into(None, width, height, frame_rate)
+        Self::create_into(None, width, height, frame_rate, false)
     }
 
     fn create_into(
@@ -149,6 +180,7 @@ impl Mp4Writer {
         width: u32,
         height: u32,
         frame_rate: u32,
+        sound: bool,
     ) -> Result<Self, CaptureError> {
         if (width, height) != mp4_frame_size(width, height) {
             return Err(video_failure(
@@ -217,14 +249,22 @@ impl Mp4Writer {
             writer
                 .SetInputMediaType(stream, &input, None)
                 .map_err(|error| video_error("set_input_type", error))?;
+            let audio_stream = if sound {
+                Some(add_audio_stream(&writer)?)
+            } else {
+                None
+            };
             writer
                 .BeginWriting()
                 .map_err(|error| video_error("begin_writing", error))?;
-            (writer, stream)
+            (writer, stream, audio_stream)
         };
         Ok(Self {
             writer: writer.0,
             stream: writer.1,
+            audio_stream: writer.2,
+            early_audio: Vec::new(),
+            audio_frames: 0,
             pending: None,
             previous: None,
             width,
@@ -247,7 +287,13 @@ impl Mp4Writer {
             ));
         }
         self.summary.frames_received += 1;
+        let first = self.first_at.is_none();
         let first_at = *self.first_at.get_or_insert(at);
+        if first {
+            for packet in std::mem::take(&mut self.early_audio) {
+                self.push_audio(&packet, None)?;
+            }
+        }
         let at = ticks(at.saturating_sub(first_at));
         if self.previous.as_deref() == Some(bgra) {
             return Ok(());
@@ -281,6 +327,58 @@ impl Mp4Writer {
         Ok((bytes, summary))
     }
 
+    /// Adds a stretch of sound, timed from the recording's start as the frames are. Sound before
+    /// the first frame is cut, as is sound past `end` once the recording's end is known. A writer
+    /// made without sound ignores it.
+    pub fn push_audio(
+        &mut self,
+        packet: &crate::AudioPacket,
+        end: Option<Duration>,
+    ) -> Result<(), CaptureError> {
+        let Some(stream) = self.audio_stream else {
+            return Ok(());
+        };
+        let Some(first_at) = self.first_at else {
+            self.early_audio.push(packet.clone());
+            return Ok(());
+        };
+        let channels = usize::from(crate::AUDIO_CHANNELS);
+        let rate = u64::from(crate::AUDIO_SAMPLE_RATE);
+        let frames_at = |at: Duration| (at.as_nanos() * u128::from(rate) / 1_000_000_000) as u64;
+        let packet_start = frames_at(packet.start);
+        let packet_end = packet_start + packet.frames() as u64;
+        let from = packet_start.max(frames_at(first_at));
+        let until = end.map_or(packet_end, |end| packet_end.min(frames_at(end)));
+        if until <= from {
+            return Ok(());
+        }
+        let samples = &packet.samples
+            [(from - packet_start) as usize * channels..(until - packet_start) as usize * channels];
+        let bytes: Vec<u8> = samples
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect();
+        let sample = self.sample(&bytes)?;
+        let start = ticks(Duration::from_nanos(
+            ((from as u128 * 1_000_000_000) / u128::from(rate)) as u64,
+        )) - ticks(first_at);
+        let length = ((until - from) as u128 * TICKS_PER_SECOND / u128::from(rate)) as i64;
+        // SAFETY: The sample and writer are this thread's; times are in 100-ns units.
+        unsafe {
+            sample
+                .SetSampleTime(start.max(0))
+                .map_err(|error| video_error("set_audio_time", error))?;
+            sample
+                .SetSampleDuration(length.max(1))
+                .map_err(|error| video_error("set_audio_duration", error))?;
+            self.writer
+                .WriteSample(stream, &sample)
+                .map_err(|error| video_error("write_audio", error))?;
+        }
+        self.audio_frames += until - from;
+        Ok(())
+    }
+
     fn finalize(&mut self, end: Duration) -> Result<VideoSummary, CaptureError> {
         let first_at = self.first_at.unwrap_or(end);
         let end_duration = end.saturating_sub(first_at);
@@ -291,6 +389,10 @@ impl Mp4Writer {
         // SAFETY: The writer is this thread's, and every sample has been written.
         unsafe { self.writer.Finalize() }.map_err(|error| video_error("finalize_mp4", error))?;
         self.summary.duration = end_duration;
+        self.summary.audio_duration = Duration::from_nanos(
+            (u128::from(self.audio_frames) * 1_000_000_000 / u128::from(crate::AUDIO_SAMPLE_RATE))
+                as u64,
+        );
         Ok(self.summary)
     }
 
@@ -338,6 +440,62 @@ impl Mp4Writer {
         }
         self.summary.frames_written += 1;
         Ok(())
+    }
+}
+
+/// Adds the AAC stream, fed 16-bit PCM at the loopback's rate and channels, to `writer`.
+///
+/// # Safety
+/// `writer` must be a live sink writer on this thread that has not begun writing.
+unsafe fn add_audio_stream(writer: &IMFSinkWriter) -> Result<u32, CaptureError> {
+    let rate = crate::AUDIO_SAMPLE_RATE;
+    let channels = u32::from(crate::AUDIO_CHANNELS);
+    // SAFETY: Per this function's contract; the types are created here and the GUIDs are statics.
+    unsafe {
+        let set = |media_type: &IMFMediaType, subtype| -> Result<(), CaptureError> {
+            media_type
+                .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)
+                .map_err(|error| video_error("set_audio_major_type", error))?;
+            media_type
+                .SetGUID(&MF_MT_SUBTYPE, subtype)
+                .map_err(|error| video_error("set_audio_subtype", error))?;
+            media_type
+                .SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)
+                .map_err(|error| video_error("set_audio_bits", error))?;
+            media_type
+                .SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, rate)
+                .map_err(|error| video_error("set_audio_rate", error))?;
+            media_type
+                .SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, channels)
+                .map_err(|error| video_error("set_audio_channels", error))?;
+            Ok(())
+        };
+        let output =
+            MFCreateMediaType().map_err(|error| video_error("create_audio_output_type", error))?;
+        set(&output, &MFAudioFormat_AAC)?;
+        output
+            .SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, AAC_BYTES_PER_SECOND)
+            .map_err(|error| video_error("set_audio_bitrate", error))?;
+        // Raw AAC, as MP4 carries it.
+        output
+            .SetUINT32(&MF_MT_AAC_PAYLOAD_TYPE, 0)
+            .map_err(|error| video_error("set_aac_payload", error))?;
+        let stream = writer
+            .AddStream(&output)
+            .map_err(|error| video_error("add_audio_stream", error))?;
+        let input =
+            MFCreateMediaType().map_err(|error| video_error("create_audio_input_type", error))?;
+        set(&input, &MFAudioFormat_PCM)?;
+        input
+            .SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, channels * 2)
+            .map_err(|error| video_error("set_audio_block_alignment", error))?;
+        input
+            .SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, rate * channels * 2)
+            .map_err(|error| video_error("set_audio_input_rate", error))?;
+        writer
+            .SetInputMediaType(stream, &input, None)
+            .map_err(|error| video_error("set_audio_input_type", error))?;
+        Ok(stream)
     }
 }
 
@@ -587,5 +745,87 @@ mod tests {
     fn capture_time_becomes_media_foundation_ticks() {
         assert_eq!(ticks(Duration::from_millis(1)), 10_000);
         assert_eq!(ticks(Duration::from_secs(2)), 20_000_000);
+    }
+
+    #[test]
+    #[ignore = "needs Media Foundation's H.264 and AAC encoders, which a Windows Server CI image may lack"]
+    fn an_mp4_with_sound_carries_it_in_step_with_the_frames() {
+        let (width, height) = (160_u32, 96_u32);
+        let mut writer =
+            Mp4Writer::create_recording(None, width, height, 30, true).expect("writer");
+        let frame = vec![128_u8; (width * height * 4) as usize];
+        // A second of silence, then a second of a 440 Hz tone, in 10 ms packets; the frames
+        // arrive with them, as a recording's do.
+        let rate = crate::AUDIO_SAMPLE_RATE as usize;
+        let packet_frames = rate / 100;
+        for packet in 0..200 {
+            let start = Duration::from_millis(packet as u64 * 10);
+            let samples: Vec<i16> = (0..packet_frames)
+                .flat_map(|i| {
+                    let n = packet * packet_frames + i;
+                    let value = if packet >= 100 {
+                        (12_000.0
+                            * (2.0 * std::f64::consts::PI * 440.0 * n as f64 / rate as f64).sin())
+                            as i16
+                    } else {
+                        0
+                    };
+                    [value, value]
+                })
+                .collect();
+            if packet % 3 == 0 {
+                writer.push(&frame, start).expect("frame");
+            }
+            writer
+                .push_audio(&crate::AudioPacket { start, samples }, None)
+                .expect("sound");
+        }
+        let (bytes, summary) = writer
+            .finish_in_memory(Duration::from_secs(2))
+            .expect("finish");
+        assert!(
+            summary.audio_duration.abs_diff(Duration::from_secs(2)) < Duration::from_millis(15),
+            "{summary:?}"
+        );
+        let sound = crate::mp4_sound(&bytes)
+            .expect("decoded")
+            .expect("the MP4 has a sound stream");
+        let seconds = sound.len() as f64 / 2.0 / rate as f64;
+        assert!((seconds - 2.0).abs() < 0.1, "{seconds} s of sound decoded");
+        let rms = |part: &[i16]| {
+            (part.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>() / part.len().max(1) as f64)
+                .sqrt()
+        };
+        // The first second stays quiet and the second carries the tone, at about its level.
+        let half = sound.len() / 2;
+        let quiet = rms(&sound[rate / 10 * 2..half - rate / 10 * 2]);
+        let tone = rms(&sound[half + rate / 10 * 2..sound.len() - rate / 10 * 2]);
+        assert!(quiet < 100.0, "silence decoded at RMS {quiet}");
+        assert!(
+            (tone - 8_485.0).abs() < 1_500.0,
+            "tone decoded at RMS {tone}"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs Media Foundation's H.264 encoder, which a Windows Server CI image may lack"]
+    fn sound_is_ignored_by_a_writer_made_without_it() {
+        let mut writer = Mp4Writer::create_in_memory(160, 96, 30).expect("writer");
+        writer
+            .push(&vec![0_u8; 160 * 96 * 4], Duration::ZERO)
+            .expect("frame");
+        writer
+            .push_audio(
+                &crate::AudioPacket {
+                    start: Duration::ZERO,
+                    samples: vec![1_000; 960],
+                },
+                None,
+            )
+            .expect("ignored");
+        let (_, summary) = writer
+            .finish_in_memory(Duration::from_millis(100))
+            .expect("finish");
+        assert_eq!(summary.audio_duration, Duration::ZERO);
     }
 }

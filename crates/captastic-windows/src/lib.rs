@@ -98,7 +98,7 @@ pub use tray::{
 #[cfg(windows)]
 pub use video::{mp4_frame_size, Mp4Writer, VideoSummary, MP4_MAXIMUM_SIZE};
 #[cfg(windows)]
-pub use video_reader::Mp4Reader;
+pub use video_reader::{mp4_sound, Mp4Reader};
 #[cfg(windows)]
 pub use window_capture::{capture_window_frame, captured_window_frame, materialize_selection};
 #[cfg(windows)]
