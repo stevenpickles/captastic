@@ -14,6 +14,9 @@
 use std::path::PathBuf;
 
 use captastic_core::{CaptureSource, DisplayId, DisplayInfo, OutputFormat, Rect};
+use std::collections::BTreeMap;
+
+use captastic_config::ConfirmedRegion;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
@@ -116,6 +119,10 @@ pub enum Reason {
     NoWindow,
     /// More than one window matches; the refusal lists them in `matches`, and none is guessed.
     AmbiguousWindow,
+    /// No region has been confirmed on the display, or the display has changed shape since.
+    NoLastRegion,
+    /// The capture was written, and could not be put on the clipboard; `path` says where it is.
+    ClipboardFailed,
 }
 
 impl Reason {
@@ -132,6 +139,7 @@ impl Reason {
                 | Self::ShuttingDown
                 | Self::NoWindow
                 | Self::AmbiguousWindow
+                | Self::NoLastRegion
         )
     }
 }
@@ -224,6 +232,76 @@ pub fn choose_window(target: &Target, windows: &[WindowInfo]) -> Result<WindowIn
         )
         .with_detail("matches", json!(several))),
     }
+}
+
+/// Plans a `last_region` target: the region last confirmed on the overlay, as the repeat-last-region
+/// hotkey repeats it, on a display that still has the shape it had then. With remembered regions
+/// on several displays, the one on the pointer's display.
+pub fn plan_last_region(
+    regions: &BTreeMap<String, ConfirmedRegion>,
+    displays: &[DisplayInfo],
+    pointer: impl FnOnce() -> Result<DisplayId, Failure>,
+) -> Result<CapturePlan, Failure> {
+    let usable: Vec<(&DisplayInfo, Rect)> = displays
+        .iter()
+        .filter_map(|display| {
+            let confirmed = regions.get(&display.id.0)?;
+            last_region_on(confirmed, display).map(|rect| (display, rect))
+        })
+        .collect();
+    let chosen = match usable.as_slice() {
+        [] => {
+            return Err(Failure::new(
+                Reason::NoLastRegion,
+                "no region has been captured on a display that still has the shape it had then",
+            ))
+        }
+        [only] => *only,
+        several => {
+            let pointer = pointer()?;
+            *several
+                .iter()
+                .find(|(display, _)| display.id == pointer)
+                .ok_or_else(|| {
+                    Failure::new(
+                        Reason::NoLastRegion,
+                        "regions are remembered on several displays, and not on the pointer's",
+                    )
+                })?
+        }
+    };
+    let (display, rect) = chosen;
+    Ok(CapturePlan {
+        source: CaptureSource::Display(display.id.clone()),
+        crop: Some(rect),
+        described: json!({ "kind": "last_region", "display": display.id.0, "rect": rect }),
+    })
+}
+
+/// The remembered region in desktop pixels, if `display` is still the shape it was remembered on.
+fn last_region_on(confirmed: &ConfirmedRegion, display: &DisplayInfo) -> Option<Rect> {
+    let source = confirmed.source;
+    if source.width != display.bounds.width
+        || source.height != display.bounds.height
+        || source.rotation_degrees != display.rotation_degrees
+    {
+        return None;
+    }
+    let region = confirmed.region;
+    if region.x < 0 || region.y < 0 || region.width == 0 || region.height == 0 {
+        return None;
+    }
+    let right = i64::from(region.x) + i64::from(region.width);
+    let bottom = i64::from(region.y) + i64::from(region.height);
+    if right > i64::from(source.width) || bottom > i64::from(source.height) {
+        return None;
+    }
+    Some(Rect {
+        x: display.bounds.x.checked_add(region.x)?,
+        y: display.bounds.y.checked_add(region.y)?,
+        width: region.width,
+        height: region.height,
+    })
 }
 
 fn process_stem(name: &str) -> String {
@@ -383,10 +461,13 @@ pub fn plan_capture(
         Target::Window { .. } | Target::WindowTitle { .. } | Target::Process { .. } => Err(
             Failure::new(Reason::BadRequest, "a window target is chosen, not planned"),
         ),
-        Target::LastRegion | Target::Interactive => Err(Failure::new(
+        Target::LastRegion => Err(Failure::new(
+            Reason::BadRequest,
+            "the last region is planned against the remembered regions",
+        )),
+        Target::Interactive => Err(Failure::new(
             Reason::Unsupported,
-            "this Captastic captures displays, rectangles and windows from the command line; the \
-             last region and the overlay come later",
+            "this Captastic cannot open the overlay for the command line yet",
         )),
     }
 }
@@ -654,8 +735,71 @@ mod tests {
     #[test]
     fn targets_not_built_yet_are_refused_as_unsupported() {
         let failure =
-            plan_capture(&Target::LastRegion, &two_displays(), no_pointer).expect_err("not yet");
+            plan_capture(&Target::Interactive, &two_displays(), no_pointer).expect_err("not yet");
         assert_eq!(failure.reason, Reason::Unsupported);
         assert!(failure.reason.is_refusal());
+    }
+
+    fn remembered(x: i32, y: i32, width: u32, height: u32) -> ConfirmedRegion {
+        ConfirmedRegion {
+            region: captastic_config::CaptureRegion {
+                x,
+                y,
+                width,
+                height,
+            },
+            source: captastic_config::CaptureRegionSource {
+                width: 1920,
+                height: 1080,
+                rotation_degrees: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn the_last_region_is_repeated_where_it_was_confirmed() {
+        let displays = two_displays();
+        let mut regions = BTreeMap::new();
+        regions.insert("right".to_owned(), remembered(100, 50, 400, 300));
+        let plan = plan_last_region(&regions, &displays, no_pointer).expect("one region");
+        assert_eq!(
+            plan.source,
+            CaptureSource::Display(DisplayId("right".to_owned()))
+        );
+        // In desktop pixels: the right display starts at x 1920.
+        assert_eq!(plan.crop, Some(rect(2020, 50, 400, 300)));
+        assert_eq!(plan.described["kind"], "last_region");
+
+        // A region on both: the pointer's display decides, and a pointer on neither refuses.
+        regions.insert("left".to_owned(), remembered(0, 0, 10, 10));
+        let on_left = plan_last_region(&regions, &displays, || Ok(DisplayId("left".to_owned())))
+            .expect("the pointer's");
+        assert_eq!(on_left.crop, Some(rect(0, 0, 10, 10)));
+        assert_eq!(
+            plan_last_region(&regions, &displays, || Ok(DisplayId("gone".to_owned())))
+                .expect_err("neither")
+                .reason,
+            Reason::NoLastRegion
+        );
+    }
+
+    #[test]
+    fn no_last_region_or_a_display_that_changed_shape_is_refused() {
+        let displays = two_displays();
+        assert_eq!(
+            plan_last_region(&BTreeMap::new(), &displays, no_pointer)
+                .expect_err("nothing remembered")
+                .reason,
+            Reason::NoLastRegion
+        );
+        let mut regions = BTreeMap::new();
+        let mut rotated = remembered(0, 0, 100, 100);
+        rotated.source.width = 1080;
+        rotated.source.height = 1920;
+        regions.insert("left".to_owned(), rotated);
+        regions.insert("right".to_owned(), remembered(1900, 0, 100, 100));
+        let refused = plan_last_region(&regions, &displays, no_pointer).expect_err("stale");
+        assert_eq!(refused.reason, Reason::NoLastRegion);
+        assert!(refused.reason.is_refusal());
     }
 }

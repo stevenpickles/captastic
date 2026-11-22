@@ -5,8 +5,11 @@
 //! this thread a timeout and nobody else anything, and a capture it asks for waits in the capture
 //! worker's queue behind the user's own, as a hotkey press would.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+
+use captastic_config::ConfirmedRegion;
 use std::thread;
 use std::time::Duration;
 
@@ -16,8 +19,8 @@ use captastic_core::{
 use serde_json::{json, Map};
 
 use crate::command_channel::{
-    answer_line, choose_window, parse_request, plan_capture, Answer, CaptureCommand, Command,
-    Failure, Reason, Target, WindowInfo, MAX_REQUEST_BYTES,
+    answer_line, choose_window, parse_request, plan_capture, plan_last_region, Answer,
+    CaptureCommand, Command, Failure, Reason, Target, WindowInfo, MAX_REQUEST_BYTES,
 };
 
 /// How long a client has to send its request, and to read its answer.
@@ -34,6 +37,10 @@ pub(crate) trait CommandEngine {
     fn windows(&self, displays: &[DisplayInfo]) -> Result<Vec<WindowInfo>, Failure>;
     /// One window, captured as the overlay captures a window it is given.
     fn window_frame(&self, window: &WindowInfo) -> Result<CpuFrame, Failure>;
+    /// The regions last confirmed on the overlay, by display id.
+    fn last_regions(&self) -> BTreeMap<String, ConfirmedRegion>;
+    /// Puts a capture on the clipboard, under the user's `[clipboard]` settings.
+    fn publish_clipboard(&self, frame: &CpuFrame) -> Result<(), String>;
 }
 
 /// Where a capture is written when the request names no path.
@@ -87,12 +94,6 @@ impl<E: CommandEngine> Commands<E> {
     }
 
     fn capture(&self, capture: CaptureCommand) -> Answer {
-        if capture.clipboard {
-            return Err(Failure::new(
-                Reason::Unsupported,
-                "this Captastic does not put command-line captures on the clipboard yet",
-            ));
-        }
         let displays = self.engine.displays()?;
         let (frame, described) = match &capture.target {
             Target::Window { .. } | Target::WindowTitle { .. } | Target::Process { .. } => {
@@ -103,7 +104,14 @@ impl<E: CommandEngine> Commands<E> {
                 (frame, described)
             }
             target => {
-                let plan = plan_capture(target, &displays, || (self.pointer)(&displays))?;
+                let plan = match target {
+                    Target::LastRegion => {
+                        plan_last_region(&self.engine.last_regions(), &displays, || {
+                            (self.pointer)(&displays)
+                        })?
+                    }
+                    _ => plan_capture(target, &displays, || (self.pointer)(&displays))?,
+                };
                 let frame = self.engine.frame(plan.source.clone())?;
                 let frame = match plan.crop {
                     Some(area) => frame.crop(area).map_err(|error| {
@@ -119,6 +127,16 @@ impl<E: CommandEngine> Commands<E> {
         };
         let format = capture.format.unwrap_or(self.output.format);
         let path = self.write(&frame, format, capture.output.as_deref())?;
+        // Only when asked: a capture the user did not start must not replace what they copied.
+        if capture.clipboard {
+            self.engine.publish_clipboard(&frame).map_err(|error| {
+                Failure::new(
+                    Reason::ClipboardFailed,
+                    format!("the capture was saved and could not be put on the clipboard: {error}"),
+                )
+                .with_detail("path", json!(path.display().to_string()))
+            })?;
+        }
         log::info!(
             "a command-line request captured {}x{} to {}",
             frame.width(),
@@ -141,6 +159,7 @@ impl<E: CommandEngine> Commands<E> {
         fields.insert("height".to_owned(), json!(frame.height()));
         fields.insert("captured".to_owned(), described);
         fields.insert("taken_by".to_owned(), json!(self.taken_by));
+        fields.insert("clipboard".to_owned(), json!(capture.clipboard));
         fields.insert("capture_id".to_owned(), json!(frame.metadata.capture_id.0));
         Ok(fields)
     }
@@ -274,6 +293,9 @@ fn serve<E: CommandEngine>(
 /// The daemon's capture worker, asked through its command queue.
 pub(crate) struct DaemonEngine {
     pub(crate) commands: mpsc::SyncSender<crate::daemon::CaptureCommand>,
+    /// The regions the overlay last confirmed, shared with the repeat-last-region hotkey.
+    pub(crate) confirmed_regions: crate::selection::ConfirmedRegionCache,
+    pub(crate) clipboard_retention: captastic_windows::ClipboardRetention,
 }
 
 /// What the capture worker is asked for on a command-line request's behalf.
@@ -328,6 +350,17 @@ impl CommandEngine for DaemonEngine {
         native_windows(displays)
     }
 
+    fn last_regions(&self) -> BTreeMap<String, ConfirmedRegion> {
+        self.confirmed_regions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn publish_clipboard(&self, frame: &CpuFrame) -> Result<(), String> {
+        publish_to_clipboard(frame, self.clipboard_retention)
+    }
+
     fn window_frame(&self, window: &WindowInfo) -> Result<CpuFrame, Failure> {
         // The window's display through the capture worker first: it waits behind the user's own
         // captures, is refused while a recording runs, and gives the window capture the reference
@@ -335,6 +368,21 @@ impl CommandEngine for DaemonEngine {
         let reference = self.frame(window_display_source(window))?;
         capture_native_window(window, &reference)
     }
+}
+
+/// Puts a capture on the clipboard as the daemon's clipboard destination does, keeping it out of
+/// clipboard history and cloud sync unless the user's `[clipboard]` settings allow them.
+pub(crate) fn publish_to_clipboard(
+    frame: &CpuFrame,
+    retention: captastic_windows::ClipboardRetention,
+) -> Result<(), String> {
+    let payload = captastic_windows::ClipboardPayload::prepare(frame).map_err(|e| e.to_string())?;
+    let mut publisher =
+        captastic_windows::ClipboardPublisher::new(retention).map_err(|e| e.to_string())?;
+    publisher
+        .publish(&payload)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// The windows Win32 lets be captured, as the overlay's chooser finds them, frontmost first.
@@ -404,6 +452,9 @@ mod tests {
     struct FakeEngine {
         backend: Mutex<captastic_core::FakeBackend>,
         recording: bool,
+        last_regions: BTreeMap<String, ConfirmedRegion>,
+        /// The size of every capture put on the clipboard.
+        clipboard: Mutex<Vec<(u32, u32)>>,
     }
 
     impl FakeEngine {
@@ -417,6 +468,8 @@ mod tests {
                     },
                 )),
                 recording,
+                last_regions: BTreeMap::new(),
+                clipboard: Mutex::new(Vec::new()),
             }
         }
     }
@@ -428,6 +481,18 @@ mod tests {
 
         fn windows(&self, _displays: &[DisplayInfo]) -> Result<Vec<WindowInfo>, Failure> {
             Ok(fake_windows())
+        }
+
+        fn last_regions(&self) -> BTreeMap<String, ConfirmedRegion> {
+            self.last_regions.clone()
+        }
+
+        fn publish_clipboard(&self, frame: &CpuFrame) -> Result<(), String> {
+            self.clipboard
+                .lock()
+                .expect("clipboard")
+                .push((frame.width(), frame.height()));
+            Ok(())
         }
 
         fn window_frame(&self, window: &WindowInfo) -> Result<CpuFrame, Failure> {
@@ -642,6 +707,10 @@ mod tests {
         );
         assert_eq!(
             reason(&idle, json!({ "kind": "last_region" })),
+            Reason::NoLastRegion
+        );
+        assert_eq!(
+            reason(&idle, json!({ "kind": "interactive" })),
             Reason::Unsupported
         );
         let recording = commands(directory.path(), true);
@@ -716,6 +785,62 @@ mod tests {
         assert_eq!(
             std::fs::read_dir(directory.path()).expect("list").count(),
             written
+        );
+    }
+
+    #[test]
+    fn the_last_region_is_captured_and_the_clipboard_only_when_asked() {
+        let directory = Scratch::new();
+        let mut commands = commands(directory.path(), false);
+        let display = commands.engine.displays().expect("displays")[0].clone();
+        commands.engine.last_regions.insert(
+            display.id.0.clone(),
+            ConfirmedRegion {
+                region: captastic_config::CaptureRegion {
+                    x: 20,
+                    y: 10,
+                    width: 50,
+                    height: 30,
+                },
+                source: captastic_config::CaptureRegionSource {
+                    width: display.bounds.width,
+                    height: display.bounds.height,
+                    rotation_degrees: display.rotation_degrees,
+                },
+            },
+        );
+        let answer = |request: Value| {
+            let request: crate::command_channel::Request =
+                serde_json::from_value(request).expect("request");
+            commands.answer(request.command)
+        };
+        let repeated = answer(json!({
+            "version": 1, "command": "capture", "target": { "kind": "last_region" },
+        }))
+        .expect("the last region");
+        assert_eq!(
+            (repeated["width"].clone(), repeated["height"].clone()),
+            (json!(50), json!(30))
+        );
+        assert_eq!(repeated["captured"]["kind"], "last_region");
+        assert_eq!(repeated["clipboard"], false);
+        assert!(commands
+            .engine
+            .clipboard
+            .lock()
+            .expect("clipboard")
+            .is_empty());
+
+        let copied = answer(json!({
+            "version": 1, "command": "capture", "target": { "kind": "last_region" },
+            "clipboard": true,
+        }))
+        .expect("to the clipboard too");
+        assert_eq!(copied["clipboard"], true);
+        assert!(PathBuf::from(copied["path"].as_str().expect("path")).exists());
+        assert_eq!(
+            *commands.engine.clipboard.lock().expect("clipboard"),
+            vec![(50, 30)]
         );
     }
 

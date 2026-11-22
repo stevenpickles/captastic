@@ -398,6 +398,7 @@ fn without_daemon(command: Command) -> Outcome {
             backend: std::cell::RefCell::new(backend),
             cursor: crate::configured_cursor_mode(&config),
             next_id: std::cell::Cell::new(1),
+            clipboard_retention: crate::one_shot_clipboard_retention(&config),
         },
         output: CommandOutput {
             directory,
@@ -428,6 +429,7 @@ struct OneShotEngine {
     backend: std::cell::RefCell<Box<dyn captastic_core::CaptureBackend>>,
     cursor: captastic_core::CursorMode,
     next_id: std::cell::Cell<u64>,
+    clipboard_retention: captastic_windows::ClipboardRetention,
 }
 
 #[cfg(windows)]
@@ -468,6 +470,20 @@ impl crate::command_listener::CommandEngine for OneShotEngine {
         displays: &[captastic_core::DisplayInfo],
     ) -> Result<Vec<crate::command_channel::WindowInfo>, crate::command_channel::Failure> {
         crate::command_listener::native_windows(displays)
+    }
+
+    fn last_regions(
+        &self,
+    ) -> std::collections::BTreeMap<String, captastic_config::ConfirmedRegion> {
+        // What the overlay last saved; without a daemon there is nothing newer in memory.
+        captastic_config::UiStateStore::for_default_storage()
+            .load()
+            .map(|state| state.confirmed_regions())
+            .unwrap_or_default()
+    }
+
+    fn publish_clipboard(&self, frame: &captastic_core::CpuFrame) -> Result<(), String> {
+        crate::command_listener::publish_to_clipboard(frame, self.clipboard_retention)
     }
 
     fn window_frame(

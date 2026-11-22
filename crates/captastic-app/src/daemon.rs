@@ -1222,6 +1222,8 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             crate::command_listener::Commands {
                 engine: crate::command_listener::DaemonEngine {
                     commands: command_sender.clone(),
+                    confirmed_regions: confirmed_regions.clone(),
+                    clipboard_retention: args.clipboard_retention,
                 },
                 output: crate::command_listener::CommandOutput {
                     directory: args.output_directory.clone(),
