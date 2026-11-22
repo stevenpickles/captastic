@@ -466,17 +466,11 @@ impl crate::command_listener::CommandEngine for OneShotEngine {
 /// capture the user did not start is never left unannounced.
 #[cfg(windows)]
 fn announce(path: &Path) {
-    use std::process::Stdio;
     let started = std::env::current_exe()
-        .map(|exe| exe.with_file_name("captastic.exe"))
-        .and_then(|desktop| {
-            std::process::Command::new(desktop)
-                .arg("--announce-command-line-capture")
-                .arg(path)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
+        .map_err(|error| error.to_string())
+        .and_then(|exe| {
+            captastic_windows::start_announcer(&exe.with_file_name("captastic.exe"), path)
+                .map_err(|error| error.to_string())
         });
     if started.is_err() {
         crate::desktop::announce(path);

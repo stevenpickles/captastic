@@ -42,7 +42,7 @@ mod window_capture_wgc;
 mod window_session_wgc;
 
 #[cfg(windows)]
-pub use announce::announce_capture;
+pub use announce::{announce_capture, start_announcer};
 #[cfg(windows)]
 pub use clipboard::{
     ClipboardPayload, ClipboardPublishError, ClipboardPublishReport, ClipboardPublisher,

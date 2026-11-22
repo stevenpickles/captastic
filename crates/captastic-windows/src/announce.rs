@@ -6,6 +6,7 @@
 //! no other input: it is not Captastic running, only the receipt for a capture.
 
 use std::cell::RefCell;
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -36,6 +37,62 @@ const AFTER_CLICK: Duration = Duration::from_millis(500);
 thread_local! {
     /// The file a click shows. One announcement per thread, set before the window exists.
     static REVEAL: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+/// Starts `desktop` (`captastic.exe`) to announce `file`, and returns without waiting for it.
+///
+/// It inherits no handles. `std::process::Command` lets a child inherit every inheritable handle,
+/// and the caller's standard output is one when a shell or an agent reads it through a pipe: the
+/// pipe would then stay open, and the reader waiting, for as long as the announcement lingers.
+pub fn start_announcer(desktop: &Path, file: &Path) -> Result<(), CaptureError> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        CreateProcessW, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS, PROCESS_INFORMATION,
+        STARTUPINFOW,
+    };
+    let application: Vec<u16> = desktop
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // Neither path can contain a quote, which Windows forbids in file names, so quoting each
+    // whole is enough. A path never ends in a backslash here: both name files.
+    let mut command_line: Vec<u16> = format!(
+        "\"{}\" --announce-command-line-capture \"{}\"",
+        desktop.display(),
+        file.display()
+    )
+    .encode_utf16()
+    .chain(std::iter::once(0))
+    .collect();
+    let startup = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut process = PROCESS_INFORMATION::default();
+    // SAFETY: Both strings are null-terminated and outlive the call; the command line buffer is
+    // writable, as CreateProcessW requires. No handles are inherited.
+    unsafe {
+        CreateProcessW(
+            PCWSTR(application.as_ptr()),
+            windows::core::PWSTR(command_line.as_mut_ptr()),
+            None,
+            None,
+            false,
+            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            None,
+            PCWSTR::null(),
+            &startup,
+            &mut process,
+        )
+    }
+    .map_err(|error| native("start_announcer", error))?;
+    // SAFETY: Closes the handles CreateProcessW returned; the process runs on without them.
+    unsafe {
+        let _ = CloseHandle(process.hThread);
+        let _ = CloseHandle(process.hProcess);
+    }
+    Ok(())
 }
 
 /// Shows `title` and `message` from an icon of its own, for `linger`, and shows `file` in its
