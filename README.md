@@ -552,6 +552,22 @@ cargo run -p captastic-app -- daemon --backend dxgi --mode latest --cpu-frame tr
 
 Ctrl+C on a foreground daemon, **Exit** in the notification-area menu, or `captastic-dev stop` requests an orderly shutdown, stops admitting capture triggers, and gives the daemon three seconds to drain before overdue workers are detached. Windows close, logoff, and shutdown notifications request the same bounded teardown; the native handler waits up to four seconds for its completion signal, while a canceled shutdown query leaves the daemon running. Configuration recovery, persistence failures, clipboard failures, and Open Config errors detected during normal operation are reported through context-specific notification-area messages. The persistent log is authoritative for failures and timeouts detected during final teardown because the notification icon is being removed. `captastic-dev status` reports whether the per-session daemon is running on Windows and reports `unsupported` on platforms without a native daemon. DXGI access/device loss drops the abandoned session before replacement construction and retries the same capture up to three times with bounded backoff. If those attempts fail, background reinitialization continues without acquiring another frame until the next capture.
 
+### Captures from the command line
+
+`captastic-cli`, installed beside `captastic.exe`, lets a script or an agent take a capture and
+read back where it went, as one line of JSON with exit codes that tell success, refusal and failure
+apart:
+
+```powershell
+captastic-cli capture --window-title "Visual Studio Code" --output C:\temp\editor.png
+```
+
+It captures a display, a rectangle, a window by handle, title or process, the last region, or a
+region the user chooses on the overlay, with Captastic running or not. Every such capture is
+announced by a notification the user can always see, and is marked in history.
+[docs/command-line.md](docs/command-line.md) has every command, its JSON and its exit codes, written
+to be pasted into an agent's instructions.
+
 ## Known limitations
 
 - **Multi-adapter virtual desktops are not composed.** `daemon.display = "virtual_desktop"` composes

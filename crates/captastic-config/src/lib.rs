@@ -26,8 +26,8 @@ pub use config_edit::{set_output_enabled, set_recording_format, set_recording_re
 pub use filename_template::{validate_template, TOKENS as FILENAME_TEMPLATE_TOKENS};
 pub use fsio::{atomic_write, finalize_new, replace_file};
 pub use history::{
-    CaptureHistory, HistoryEntry, HistoryStore, RetentionPolicy, HISTORY_FILE_NAME,
-    HISTORY_SCHEMA_VERSION,
+    CaptureHistory, HistoryEntry, HistoryStore, RetentionPolicy, COMMAND_LINE_ORIGIN,
+    HISTORY_FILE_NAME, HISTORY_SCHEMA_VERSION,
 };
 pub use ui_state::{
     resolve_display_ui_state, UiState, UiStateStore, STATE_FILE_NAME, STATE_SCHEMA_VERSION,

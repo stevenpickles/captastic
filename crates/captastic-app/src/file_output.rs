@@ -365,6 +365,7 @@ impl HistoryRecorder {
                 height: job.frame.height(),
                 display: job.frame.metadata.display_id.0.clone(),
                 mode: job.action.as_str().to_owned(),
+                origin: String::new(),
             },
             job.capture_id,
         );
@@ -384,8 +385,37 @@ impl HistoryRecorder {
                 height: report.height,
                 display: display.to_owned(),
                 mode: "recording".to_owned(),
+                origin: String::new(),
             },
             captastic_core::CaptureId(0),
+        );
+    }
+
+    /// Remembers a capture `captastic-cli` asked for, marked as such (ADR 0014). `kind` is what
+    /// was captured: `display`, `rect`, `window`, `last_region` or `interactive`.
+    pub fn record_command_line(
+        &self,
+        path: &std::path::Path,
+        frame: &captastic_core::CpuFrame,
+        kind: &str,
+    ) {
+        let bytes = std::fs::metadata(path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        self.remember(
+            captastic_config::HistoryEntry {
+                path: path.to_path_buf(),
+                captured_at_micros: captastic_config::HistoryEntry::micros_since_epoch(
+                    SystemTime::now(),
+                ),
+                bytes,
+                width: frame.width(),
+                height: frame.height(),
+                display: frame.metadata.display_id.0.clone(),
+                mode: kind.to_owned(),
+                origin: captastic_config::COMMAND_LINE_ORIGIN.to_owned(),
+            },
+            frame.metadata.capture_id,
         );
     }
 

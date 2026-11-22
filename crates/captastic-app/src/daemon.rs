@@ -1251,6 +1251,10 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                 notices: Some(notice_sender.clone()),
                 pointer: crate::command_listener::pointer_display,
                 taken_by: "daemon",
+                history: Some(crate::file_output::HistoryRecorder::new(
+                    args.history_store.clone(),
+                    args.history_retention,
+                )),
             },
         )
         .map_err(|error| {

@@ -40,7 +40,14 @@ pub struct HistoryEntry {
     pub display: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub mode: String,
+    /// Who asked for it: empty for a capture the user started, `command-line` for one
+    /// `captastic-cli` asked for (ADR 0014).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub origin: String,
 }
+
+/// The `origin` of a capture `captastic-cli` asked for.
+pub const COMMAND_LINE_ORIGIN: &str = "command-line";
 
 impl HistoryEntry {
     fn age(&self, now: SystemTime) -> Duration {
@@ -287,7 +294,30 @@ mod tests {
             height: 1080,
             display: "primary".to_owned(),
             mode: "region".to_owned(),
+            origin: String::new(),
         }
+    }
+
+    #[test]
+    fn an_entry_says_who_asked_for_it_and_older_entries_are_the_users() {
+        let older: CaptureHistory = toml::from_str(
+            "schema_version = 1\n\n[[entries]]\npath = 'C:/captures/a.png'\n\
+             captured_at_micros = 1\nbytes = 2\nwidth = 3\nheight = 4\n",
+        )
+        .expect("history written before origin existed");
+        assert_eq!(older.entries[0].origin, "");
+
+        let mut asked = entry("asked", 5, 6);
+        asked.origin = COMMAND_LINE_ORIGIN.to_owned();
+        let history = CaptureHistory {
+            entries: vec![asked.clone(), entry("pressed", 7, 8)],
+            ..CaptureHistory::default()
+        };
+        let text = toml::to_string(&history).expect("serialize");
+        assert_eq!(text.matches("origin").count(), 1, "{text}");
+        let read: CaptureHistory = toml::from_str(&text).expect("read back");
+        assert_eq!(read.entries[0], asked);
+        assert_eq!(read.entries[1].origin, "");
     }
 
     fn now() -> SystemTime {

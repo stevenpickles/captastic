@@ -163,6 +163,11 @@ would wrap, so it can follow without changing them.
   Once the user confirms Edit, the request waits up to ten more minutes for the editor. Without
   a daemon, `--interactive` is refused as `unsupported`. While it waits, other command-line
   requests wait behind it, since the daemon answers one at a time.
+- **History marks the command line's captures (slice 4).** Entries gain `origin`, empty for the
+  user's own and `command-line` for these, with `mode` set to what was captured. The daemon and
+  the one-shot path both write the user's history file, under its lock. An older Captastic cannot
+  read an entry that has `origin`, since history entries refuse unknown fields; going back to 0.4
+  after using the command line means clearing history.
 
 ## Slices
 
