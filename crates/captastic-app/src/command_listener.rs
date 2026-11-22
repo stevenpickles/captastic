@@ -69,6 +69,9 @@ pub(crate) struct Commands<E> {
     pub(crate) pointer: fn(&[DisplayInfo]) -> Result<DisplayId, Failure>,
     /// Who took a capture, as the answer reports it: `daemon` or `one_shot`.
     pub(crate) taken_by: &'static str,
+    /// Where every capture is remembered, marked as the command line's. `None` only in tests
+    /// that do not look at history.
+    pub(crate) history: Option<crate::file_output::HistoryRecorder>,
 }
 
 impl<E: CommandEngine> Commands<E> {
@@ -148,6 +151,13 @@ impl<E: CommandEngine> Commands<E> {
                 )
                 .with_detail("path", json!(path.display().to_string()))
             })?;
+        }
+        if let Some(history) = &self.history {
+            history.record_command_line(
+                &path,
+                &frame,
+                described["kind"].as_str().unwrap_or("command_line"),
+            );
         }
         log::info!(
             "a command-line request captured {}x{} to {}",
@@ -708,6 +718,7 @@ mod tests {
             notices: None,
             pointer: |_| panic!("the pointer was asked for"),
             taken_by: "daemon",
+            history: None,
         }
     }
 
@@ -1026,6 +1037,39 @@ mod tests {
             reason(CommandLineOutcome::Failed("gone".to_owned())),
             Reason::CaptureFailed
         );
+    }
+
+    #[test]
+    fn a_command_line_capture_is_remembered_as_the_command_lines() {
+        let directory = Scratch::new();
+        let mut commands = commands(directory.path(), false);
+        let store =
+            captastic_config::HistoryStore::for_config(directory.path().join("captastic.toml"));
+        commands.history = Some(crate::file_output::HistoryRecorder::new(
+            store.clone(),
+            captastic_config::RetentionPolicy {
+                max_items: 10,
+                max_age: None,
+                max_total_bytes: None,
+            },
+        ));
+        let bounds = primary_bounds(&commands);
+        let request: crate::command_channel::Request = serde_json::from_value(json!({
+            "version": 1, "command": "capture",
+            "target": { "kind": "rect", "rect": { "x": bounds.x, "y": bounds.y, "width": 40, "height": 30 } },
+        }))
+        .expect("request");
+        let captured = commands.answer(request.command).expect("captured");
+        let history = store.load().expect("history");
+        let entry = &history.entries[0];
+        assert_eq!(entry.origin, captastic_config::COMMAND_LINE_ORIGIN);
+        assert_eq!(entry.mode, "rect");
+        assert_eq!((entry.width, entry.height), (40, 30));
+        assert_eq!(
+            entry.path,
+            PathBuf::from(captured["path"].as_str().expect("path"))
+        );
+        assert!(entry.bytes > 0);
     }
 
     #[test]

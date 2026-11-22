@@ -433,6 +433,12 @@ fn without_daemon(command: Command) -> Outcome {
         notices: Some(notice_sender),
         pointer: pointer_display,
         taken_by: "one_shot",
+        // The same history the daemon keeps, locked against it, so a capture taken without
+        // Captastic running is still found and still marked as the command line's.
+        history: Some(crate::file_output::HistoryRecorder::new(
+            captastic_config::HistoryStore::for_default_storage(),
+            config.history.retention(),
+        )),
     };
     let outcome = from_answer(&answer_line(&commands.answer(command)));
     drop(commands);

@@ -868,6 +868,7 @@ fn write_one_shot_file_output(
             height: frame.height(),
             display: frame.metadata.display_id.0.clone(),
             mode: "full_display".to_owned(),
+            origin: String::new(),
         };
         if let Err(error) = captastic_config::HistoryStore::for_default_storage().record(
             entry,

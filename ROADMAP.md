@@ -967,7 +967,8 @@ the running daemon, and the daemon's only control channel is the named stop even
      first, on their own; then `--last-region` and `--clipboard`; then `--interactive`, which
      brings the overlay's answer back to the request (ADR 0014, As built).
 4. **Agent documentation and the visibility rule**: the notification and history marking ADR 0014
-   chooses, a usage page, and the README.
+   chooses, a usage page, and the README. The notification landed with slices 2 and 3; history's
+   `origin` and [docs/command-line.md](docs/command-line.md) complete it.
 
 **0.5.0 exit criteria:**
 

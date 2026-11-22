@@ -15,6 +15,9 @@ this desktop while it runs, so run it when nobody is working at it:
   in the temporary folder, and when it is done starts the executable that was running before.
 - For the clipboard check it saves the clipboard's text and HTML immediately before, and puts
   them back immediately after, whatever happens in between.
+- Captures taken without a daemon are remembered in the default history, so it copies
+  ~/.captastic/history.toml first and puts that copy back, byte for byte, before it restarts the
+  Captastic that was running.
 - One-shot captures raise their notification from a short-lived icon; the script clicks one of
   them through the icon's own window message, which opens an Explorer window on the temporary
   folder that the script then closes.
@@ -256,6 +259,27 @@ $previous = Get-Process captastic -ErrorAction SilentlyContinue |
 $previousPath = if ($previous) { $previous.Path } else { $null }
 $helper = $null
 $devDaemon = $null
+$userHistory = Join-Path $env:USERPROFILE '.captastic\history.toml'
+$userHistoryCopy = Join-Path $workDirectory 'history.toml.saved'
+$userHistoryExisted = Test-Path -LiteralPath $userHistory -PathType Leaf
+
+function Get-NewestHistoryEntry([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    # The newest entry is the first [[entries]] table: its keys, up to the next table.
+    $entry = @{}
+    $inFirst = $false
+    foreach ($line in Get-Content -LiteralPath $Path) {
+        if ($line -match '^\s*\[\[entries\]\]') {
+            if ($inFirst) { break }
+            $inFirst = $true
+            continue
+        }
+        if ($inFirst -and $line -match '^\s*(\w+)\s*=\s*(.+?)\s*$') {
+            $entry[$Matches[1]] = $Matches[2].Trim('"', "'")
+        }
+    }
+    if ($inFirst) { [pscustomobject]$entry } else { $null }
+}
 
 try {
     Write-Host "Test windows and captures: $workDirectory"
@@ -270,6 +294,9 @@ try {
     if (Test-DaemonRunning) {
         Write-Host "Stopping the running Captastic$(if ($previousPath) { " ($previousPath)" })."
         Stop-Daemon
+    }
+    if ($userHistoryExisted) {
+        Copy-Item -LiteralPath $userHistory -Destination $userHistoryCopy
     }
     $expectedVersion = ((& $cli --version) -split ' ')[-1]
 
@@ -304,6 +331,11 @@ try {
         $colours.Red -gt 0.6 -and $colours.Green -eq 0) (
         "exit $($capture.Code), red $([Math]::Round($colours.Red, 2)), green $([Math]::Round($colours.Green, 2))")
     Add-Result 'one-shot returns without waiting for the announcement' ($elapsed -lt 3) ("{0:N2} s" -f $elapsed)
+    $remembered = Get-NewestHistoryEntry $userHistory
+    Add-Result 'a one-shot capture is remembered as the command line''s' (
+        $remembered -and $remembered.origin -eq 'command-line' -and $remembered.mode -eq 'window' -and
+        $remembered.path.EndsWith('one-shot-a.png')) (
+        "origin $($remembered.origin), mode $($remembered.mode)")
 
     $announcerShown = Wait-Until { (Get-Announcers).Count -gt 0 } 3
     $announcerWindow = [IntPtr]::Zero
@@ -449,6 +481,10 @@ $sourceToml
         $default.Json.path.StartsWith($captureDirectory, [System.StringComparison]::OrdinalIgnoreCase)
     Add-Result 'without --output the capture goes to the configured output folder' (
         $default.Code -eq 0 -and $defaultWritten) "$($default.Json.path)"
+    $remembered = Get-NewestHistoryEntry (Join-Path $configDirectory 'history.toml')
+    Add-Result 'a daemon capture is remembered as the command line''s' (
+        $remembered -and $remembered.origin -eq 'command-line' -and $remembered.mode -eq 'rect') (
+        "origin $($remembered.origin), mode $($remembered.mode)")
 
     $lastRegion = Invoke-Cli @('capture', '--last-region', '--output', (Join-Path $workDirectory 'last-region.png'))
     $colours = if ($lastRegion.Code -eq 0) { Measure-Colours $lastRegion.Json.path } else { $null }
@@ -537,6 +573,11 @@ $sourceToml
 } finally {
     if ($devDaemon -and (Test-DaemonRunning)) {
         Stop-Daemon
+    }
+    if ($userHistoryExisted -and (Test-Path -LiteralPath $userHistoryCopy)) {
+        Copy-Item -LiteralPath $userHistoryCopy -Destination $userHistory -Force
+    } elseif (-not $userHistoryExisted -and (Test-Path -LiteralPath $userHistory)) {
+        Remove-Item -LiteralPath $userHistory -Force
     }
     Set-Content -LiteralPath "$readyFile.done" -Value 'done'
     if ($helper) {
