@@ -1,6 +1,8 @@
 #[cfg(windows)]
 mod announce;
 #[cfg(windows)]
+mod audio_loopback;
+#[cfg(windows)]
 mod clipboard;
 #[cfg(windows)]
 mod console;
@@ -43,6 +45,10 @@ mod window_session_wgc;
 
 #[cfg(windows)]
 pub use announce::{announce_capture, start_announcer};
+#[cfg(windows)]
+pub use audio_loopback::{
+    AudioPacket, LoopbackCapture, LoopbackSummary, AUDIO_CHANNELS, AUDIO_SAMPLE_RATE,
+};
 #[cfg(windows)]
 pub use clipboard::{
     ClipboardPayload, ClipboardPublishError, ClipboardPublishReport, ClipboardPublisher,
