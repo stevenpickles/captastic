@@ -70,6 +70,16 @@ scrubbed, and it has a mute button. Saved unchanged, the recording's bytes are w
 sound included. Saved trimmed, the kept span's sound is decoded and encoded again, cut at the same
 millisecond as the picture. A crop changes nothing about the sound.
 
+## As built
+
+- **Slice 2 (loopback capture).** The capture thread polls the loopback client every 10 ms rather
+  than waiting on WASAPI's event, and notices a new default device by checking for one twice a
+  second rather than through `IMMNotificationClient`. The effect is what this ADR asks for, with
+  one thread, no COM callback object, and at most half a second of silence at a changeover.
+  Every packet is resampled to a single 48 kHz track, so a device change from 48 kHz to 44.1 kHz
+  partway cannot change the track's rate. `scripts/check-recording-audio.ps1` plays a tone and
+  checks it is heard.
+
 ## Consequences
 
 - `[recording] audio` joins the configuration, and **Record Sound** joins the remembered UI state and
