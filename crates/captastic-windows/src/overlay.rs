@@ -374,6 +374,9 @@ pub struct OverlayDestinations {
     /// What **Record** records into, or `None` when this run cannot record: a recording outlives
     /// the overlay, so only a daemon can run one (ADR 0011).
     pub record_format: Option<captastic_config::RecordingFormat>,
+    /// Whether an MP4 recording records the computer's sound, as **Record Sound** shows it
+    /// (ADR 0015). Meaningless when `record_format` is `None`.
+    pub record_sound: bool,
 }
 
 impl OverlayDestinations {
@@ -385,6 +388,7 @@ impl OverlayDestinations {
         pin_available: false,
         edit_available: false,
         record_format: None,
+        record_sound: false,
     };
 }
 
@@ -420,6 +424,9 @@ pub enum OverlayUiUpdate {
     RecordingFormat {
         format: captastic_config::RecordingFormat,
     },
+    /// The user switched **Record Sound** in the Options menu. Handed to the daemon, which uses it
+    /// for this and later MP4 recordings and writes it back as `recording.audio` (ADR 0015).
+    RecordingSound { enabled: bool },
 }
 
 #[derive(Clone, Default)]
@@ -798,6 +805,7 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
             pin_available: destinations.pin_available,
             edit_available: destinations.edit_available,
             record_format: destinations.record_format,
+            record_sound: destinations.record_sound,
             record_armed: false,
             hovered_control: None,
             pointer_local: None,
@@ -1261,7 +1269,9 @@ fn apply_overlay_ui_update(state: &mut LiveUiState, update: &OverlayUiUpdate) {
         OverlayUiUpdate::RegionZoom { mode } => state.region_zoom = Some(*mode),
         // Not UI state: the daemon owns the answer, and every run is told it afresh from the
         // destination set rather than from what an earlier run asked for.
-        OverlayUiUpdate::FileOutput { .. } | OverlayUiUpdate::RecordingFormat { .. } => {}
+        OverlayUiUpdate::FileOutput { .. }
+        | OverlayUiUpdate::RecordingFormat { .. }
+        | OverlayUiUpdate::RecordingSound { .. } => {}
         OverlayUiUpdate::Interaction {
             display_id,
             tool,
@@ -2115,6 +2125,13 @@ fn apply_overlay_effects(
                 let state = unsafe { &*state_pointer };
                 if let Some(sink) = state.ui_updates.as_ref() {
                     sink.submit(OverlayUiUpdate::RecordingFormat { format });
+                }
+            }
+            OverlayEffect::RequestRecordingSound { enabled } => {
+                // SAFETY: Shared borrow released at the block's end.
+                let state = unsafe { &*state_pointer };
+                if let Some(sink) = state.ui_updates.as_ref() {
+                    sink.submit(OverlayUiUpdate::RecordingSound { enabled });
                 }
             }
             OverlayEffect::RequestFileOutput { enabled } => {
@@ -4347,6 +4364,11 @@ fn draw_view_tag(state: &OverlayState, layout: ToolbarLayout) {
     );
 }
 
+/// The Record Sound row's label, and what it says while **Record As** is GIF: the row is greyed
+/// then, and a menu row has no tooltip to say why.
+const RECORD_SOUND_LABEL: &str = "Record Sound";
+const RECORD_SOUND_MP4_ONLY_LABEL: &str = "Record Sound (MP4 only)";
+
 /// The Record As row's label.
 const fn record_format_label(format: Option<captastic_config::RecordingFormat>) -> &'static str {
     match format {
@@ -4379,6 +4401,7 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
             layout.file_output_destination,
         ),
         (ToolbarControl::RecordFormat, layout.record_format),
+        (ToolbarControl::RecordSound, layout.record_sound),
         (ToolbarControl::Cancel, layout.cancel),
     ];
     for (control, row) in rows {
@@ -4536,6 +4559,39 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
         },
         record_format_label(state.model.record_format),
         if state.model.record_format.is_some() {
+            rgb(245, 245, 247)
+        } else {
+            rgb(130, 130, 136)
+        },
+        TextAlignment::Left,
+        tokens.font_height,
+    );
+    // A checkmark row, like the disk row. Only an MP4 carries sound, so with GIF chosen (or no
+    // recording possible) it is greyed, says why, and shows no checkmark.
+    let sound_available = state.model.record_format == Some(captastic_config::RecordingFormat::Mp4);
+    if sound_available && state.model.record_sound {
+        draw_checkmark(
+            device,
+            layout.record_sound.left + tokens.menu_check_offset,
+            (layout.record_sound.top + layout.record_sound.bottom) / 2,
+            rgb(86, 156, 255),
+            metrics,
+        );
+    }
+    draw_text(
+        device,
+        UiRect {
+            left: layout.record_sound.left + tokens.menu_text_offset,
+            top: layout.record_sound.top,
+            right: layout.record_sound.right - tokens.text_padding,
+            bottom: layout.record_sound.bottom,
+        },
+        if sound_available || state.model.record_format.is_none() {
+            RECORD_SOUND_LABEL
+        } else {
+            RECORD_SOUND_MP4_ONLY_LABEL
+        },
+        if sound_available {
             rgb(245, 245, 247)
         } else {
             rgb(130, 130, 136)

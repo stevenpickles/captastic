@@ -566,6 +566,7 @@ fn capture(args: cli::CaptureArgs) -> Result<(), AppError> {
                     edit_available: false,
                     // A recording outlives the overlay; only a daemon can run one.
                     record_format: None,
+                    record_sound: false,
                 },
                 &mut overlay_resources,
             )?;

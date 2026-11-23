@@ -320,6 +320,9 @@ impl SelectionWorker {
                         worker_recordings
                             .as_ref()
                             .map(crate::recording::RecordingHost::format),
+                        worker_recordings
+                            .as_ref()
+                            .is_some_and(crate::recording::RecordingHost::audio_enabled),
                     );
                     captastic_windows::select_from_preview_source_with_initial_tool_and_ui(
                         preview_source,
@@ -1286,9 +1289,11 @@ fn remember_confirmed_region(
 fn overlay_destinations(
     names: &[&'static str],
     record_format: Option<captastic_config::RecordingFormat>,
+    record_sound: bool,
 ) -> captastic_windows::OverlayDestinations {
     captastic_windows::OverlayDestinations {
         record_format,
+        record_sound,
         clipboard: names.contains(&crate::clipboard::DESTINATION_NAME),
         file_output: names.contains(&crate::file_output::DESTINATION_NAME),
         file_output_switchable: true,
@@ -1581,6 +1586,7 @@ fn persist_ui_state(
                 // started become a request it can see is already satisfied.
                 captastic_windows::OverlayUiUpdate::FileOutput { .. } => (String::new(), 5),
                 captastic_windows::OverlayUiUpdate::RecordingFormat { .. } => (String::new(), 6),
+                captastic_windows::OverlayUiUpdate::RecordingSound { .. } => (String::new(), 7),
             };
             coalesce_ui_update(&mut latest, key, update);
         }
@@ -1622,6 +1628,14 @@ fn persist_ui_state(
                     // and writes it back as `recording.format`.
                     if let Some(recordings) = recordings.as_ref() {
                         recordings.set_format(format);
+                    }
+                    Ok(())
+                }
+                captastic_windows::OverlayUiUpdate::RecordingSound { enabled } => {
+                    // As the format: applied to the next MP4 recording and written back as
+                    // `recording.audio`.
+                    if let Some(recordings) = recordings.as_ref() {
+                        recordings.set_audio(enabled);
                     }
                     Ok(())
                 }
@@ -2048,13 +2062,16 @@ mod tests {
                 crate::file_output::DESTINATION_NAME,
             ],
             Some(captastic_config::RecordingFormat::Gif),
+            false,
         );
         assert!(both.clipboard);
         assert!(both.file_output);
-        let clipboard_only = overlay_destinations(&[crate::clipboard::DESTINATION_NAME], None);
+        let clipboard_only =
+            overlay_destinations(&[crate::clipboard::DESTINATION_NAME], None, false);
         assert!(clipboard_only.clipboard);
         assert!(!clipboard_only.file_output);
-        let nothing = overlay_destinations(&[], Some(captastic_config::RecordingFormat::Mp4));
+        let nothing = overlay_destinations(&[], Some(captastic_config::RecordingFormat::Mp4), true);
+        assert!(nothing.record_sound);
         assert!(!nothing.clipboard);
         assert!(!nothing.file_output);
         for destinations in [both, clipboard_only, nothing] {
