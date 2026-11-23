@@ -2,12 +2,15 @@
 
 Captastic now has a fast Windows-native DXGI capture engine, clipboard and file output, region and
 window selection, persistent UI state, a notification-area desktop experience, current-user
-installation, and release packaging. v0.1.0 through v0.4.0 have shipped: v0.3.0 made Captastic one
-windowless executable and added pinning and the editor (Milestone 6), and v0.4.0 added recording to
-GIF and MP4 with a review window (Milestone 9), while keeping the low-latency, native capture path
-untouched when they are not used. `dev` is now 0.5.0, which records a window through Windows
-Graphics Capture, so that a window recording holds the window itself rather than its area on the
-screen, and lets an agent or script start a capture from the command line.
+installation, and release packaging. v0.1.0 through v0.5.0 have shipped, keeping the low-latency,
+native capture path untouched when their features are not used:
+
+- v0.3.0 made Captastic one windowless executable and added pinning and the editor (Milestone 6).
+- v0.4.0 added recording to GIF and MP4 with a review window (Milestone 9).
+- v0.5.0 records a window as itself through Windows Graphics Capture, records the computer's sound
+  into MP4, and lets an agent or a script start a capture from the command line (Milestone 10).
+
+`dev` is now 0.6.0, whose theme is not yet chosen.
 
 This roadmap is ordered by user impact and architectural dependency, with release readiness placed
 first because it is the only time-bound section. Closed investigations have moved to
@@ -68,6 +71,7 @@ public release, but it gates neither a release nor the milestones below.
 | v0.2.0 | 2026-09-17 | Output formats, region precision, the frozen view, the file-output toggle, benchmark evidence | [notes](docs/release-notes-v0.2.0.md) |
 | v0.3.0 | 2026-10-15 | Pinning; the editor with crop, redaction, boxes, pen, marker and highlighter; one windowless executable; relaunch after an upgrade | [notes](docs/release-notes-v0.3.0.md) |
 | v0.4.0 | 2026-10-21 | Recording a region, window or display to GIF or MP4, reviewed, trimmed and cropped before saving; arrows and text in the editor | [notes](docs/release-notes-v0.4.0.md) |
+| v0.5.0 | 2026-11-23 | Recording a window as itself through WGC; the computer's sound in MP4 recordings; `captastic-cli` captures for scripts and agents | [notes](docs/release-notes-v0.5.0.md) |
 
 The v0.2.0 manual checklists found two defects that nothing else had (#94, the frozen view presented
 with `ULW_OPAQUE` was not opaque; #95, the default output directory ignored a redirected Pictures
@@ -79,7 +83,11 @@ submitted to the Chocolatey community repository; the submission is made by hand
 validation and moderation before `choco install captastic` resolves against the default source, and
 it was approved on 2026-10-19. The v0.4.0 walk-throughs found two defects in recording a window
 (#124, #130) and changed the review to hold recordings in memory (#131); v0.4.0 was the first
-release tagged after the disposable-VM checklist passed.
+release tagged after the disposable-VM checklist passed, and its submission was approved. Before
+v0.5.0, an adversarial review of the whole code base and two re-reviews found defects that the
+checklists had not, all fixed before the tag (#156-#164). v0.5.0 is the first release pushed to
+Chocolatey by the release workflow rather than by hand
+([docs/chocolatey.md](docs/chocolatey.md#pushing-to-the-chocolatey-community-repository)).
 
 **Branch model for every formal release.** Cut a `release/v<version>` branch from `dev`, merge it
 to `main` by pull request, tag `v<version>` on `main`, and then merge the release branch back to
@@ -97,13 +105,18 @@ Milestone 5's criterion vacuously and on purpose.
 
 ## Release readiness — v0.5.0
 
-**Status:** gates met on 2026-11-23, ready to tag. Every slice merged (#134-#155). An adversarial
-review of the whole code base and two re-reviews were fixed (#156-#164). On the installed build
-`0.5.0-dev.661`, the desktop checklists and `scripts/check-command-line.ps1` (34 passed) and
-`scripts/check-recording-audio.ps1` passed, as did the disposable-VM checklist. Two items of the
-window-recording checklist were not observed and are listed as such in the release notes: a window
-spanning two displays, and a GPU-rendered window recorded for long. Release notes:
-[docs/release-notes-v0.5.0.md](docs/release-notes-v0.5.0.md). Decided on 2026-10-21:
+**Status:** shipped 2026-11-23. The tag `v0.5.0` is on `main` at 0bdc884, published with its
+archive, checksum, Chocolatey package and manifest, all hashes verified, and the release workflow
+pushed the package to Chocolatey for moderation. Before the tag:
+
+- every slice merged (#134-#155);
+- an adversarial review of the whole code base and two re-reviews were fixed (#156-#164);
+- on the installed build `0.5.0-dev.661`, the desktop checklists, `scripts/check-command-line.ps1`
+  (34 passed) and `scripts/check-recording-audio.ps1` passed, as did the disposable-VM checklist.
+
+Two items of the window-recording checklist were not observed, and the release notes list them as
+such: a window spanning two displays, and a GPU-rendered window recorded for long. The workspace is
+now 0.6.0. Kept below as the record of what 0.5.0 was planned around. Decided on 2026-10-21:
 
 - **Theme: recording a window itself.** 0.4.0 records a window as the rectangle it occupied when
   **Record** was pressed, so anything moved over it, always-on-top windows, and the desktop behind a
@@ -1072,28 +1085,26 @@ disposition are recorded in
 [docs/investigations.md](docs/investigations.md#the-2026-08-code-architecture-and-roadmap-review).
 The order below reflects what remains.
 
-1. See the 0.4.0 Chocolatey submission through validation and moderation; a defect found after
-   the tag is a 0.4.x patch.
-2. 0.5.0: recording a window through Windows Graphics Capture
-   ([Milestone 9's 0.5.0 section](#050-recording-a-window-itself-adr-0013)), ADR 0013 first; and
-   captures started from the command line
-   ([Milestone 10](#milestone-10--captures-started-from-the-command-line)), ADR 0014 first. The two
-   share no code and can proceed side by side.
-3. Milestone 6's last slice, reopening a capture from history in the editor, and Milestone 7's
-   first cross-platform proof, as candidates for the release after 0.5.0.
-4. Finish Milestone 5's evidence work, which is now measurement rather than code: the operator
+1. See the 0.5.0 Chocolatey submission through validation and moderation; a defect found after
+   the tag is a 0.5.x patch.
+2. Choose 0.6.0's theme. Candidates already on this roadmap:
+   - Milestone 6's last slice, reopening a capture from history in the editor;
+   - Milestone 7's first cross-platform proof;
+   - the known limitations in the
+     [v0.5.0 release notes](docs/release-notes-v0.5.0.md#known-limitations).
+3. Finish Milestone 5's evidence work, which is now measurement rather than code: the operator
    claim runs from [benchmarks/README.md](benchmarks/README.md), after which the absolute budget
    ceilings can be set and a figure can be published. The sequence-marker workload and Milestone 3's
    window-capture backend trait stay deferred — the first needs a desk, a mouse and a rotatable
    display and gates no release claim; the second changes no user-visible contract.
-5. Complete Milestone 1 (multi-adapter composition and the hardware validation matrix) when the
+4. Complete Milestone 1 (multi-adapter composition and the hardware validation matrix) when the
    hardware is available; it needs a second adapter, not design.
-6. Settle the outstanding design decisions — latest-mode currency on an idle desktop,
+5. Settle the outstanding design decisions — latest-mode currency on an idle desktop,
    `fresh` + `virtual_desktop`, and control-event hardening. Milestone 4's two product questions are
    answered (ADR 0008), and the mouse-capture/software-KVM contract is settled in ADR 0009: each use
    takes the pointer source that answers its own question, and Captastic promises nothing about
    where a foreign owner has put the mouse.
-7. Cross-platform work (Milestone 7), the decision gate's other candidate (item 3).
+6. Cross-platform work (Milestone 7), the decision gate's other candidate, if 0.6.0 does not take it.
 
 ### Lifecycle recovery: what the investigation settled
 
@@ -1109,10 +1120,8 @@ not reproduced on demand, is in
 
 ## Recommended next branch
 
-`docs/adr-0013-window-recording` and `docs/adr-0014-command-line-capture`: the two ADRs, each
-settling the questions its section lists before any code, as ADR 0011 did for 0.4.0. Meanwhile,
-whatever the Chocolatey moderators ask of the 0.4.0 submission, and any 0.4.x patch it or use turns
-up.
+None yet: the next branch follows from the choice of 0.6.0's theme (above). Meanwhile, whatever
+the Chocolatey moderators ask of the 0.5.0 submission, and any 0.5.x patch it or use turns up.
 
 FakeBackend fidelity keeps its leverage and is worth extending as gaps appear: much of Milestone 4
 shipped with daemon-side behaviour verified only by unit tests, because a second daemon cannot start
