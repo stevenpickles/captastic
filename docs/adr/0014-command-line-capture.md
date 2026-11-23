@@ -162,7 +162,15 @@ would wrap, so it can follow without changing them.
   never opened once the request has given up, so the user's own overlay is never closed by it.
   Once the user confirms Edit, the request waits up to ten more minutes for the editor. Without
   a daemon, `--interactive` is refused as `unsupported`. While it waits, other command-line
-  requests wait behind it, since the daemon answers one at a time.
+  requests wait behind it for up to 30 seconds each, since the daemon answers one at a time.
+- **Fixes from the review of 0.5.0 (before the tag).** A timed-out `--interactive` closes only its
+  own overlay (`OverlayController::close_current`), where it had used shutdown's cancel and left
+  every later overlay refused. A client that gave up while queued no longer breaks the listener
+  (`ERROR_NO_DATA` is disconnected and the instance reused). The server waits for the client to
+  close after its answer within the timeout, not without limit. The server refuses a client from
+  another session. A capture whose clipboard fails is still announced and remembered. A choice or
+  edit that outlives the request goes to the user's own destinations. `--output C:shot.png` is
+  resolved against that drive's current directory.
 - **History marks the command line's captures (slice 4).** Entries gain `origin`, empty for the
   user's own and `command-line` for these, with `mode` set to what was captured. The daemon and
   the one-shot path both write the user's history file, under its lock. An older Captastic cannot

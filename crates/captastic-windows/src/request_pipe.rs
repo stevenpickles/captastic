@@ -17,8 +17,8 @@ use captastic_core::{CaptureError, CaptureErrorKind};
 use windows::core::{Error as WindowsError, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, LocalFree, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING,
-    ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL, PSID,
-    WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE,
+    HLOCAL, PSID, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
@@ -29,14 +29,14 @@ use windows::Win32::Security::{
     SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FlushFileBuffers, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE,
-    FILE_FLAG_OVERLAPPED, FILE_SHARE_NONE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
-    SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
+    CreateFileW, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
+    FILE_SHARE_NONE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, SECURITY_IDENTIFICATION,
+    SECURITY_SQOS_PRESENT,
 };
 use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeServerSessionId,
-    WaitNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
-    PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientSessionId,
+    GetNamedPipeServerSessionId, WaitNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+    PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows::Win32::System::Threading::{
@@ -128,6 +128,13 @@ impl RequestPipeServer {
             Ok(()) => true,
             // A client connected between creating the instance and this call.
             Err(error) if error.code() == ERROR_PIPE_CONNECTED.to_hresult() => true,
+            // A client connected and gave up before this call: the instance is left half-closed
+            // until it is disconnected, and every later connect on it would fail the same way.
+            Err(error) if error.code() == ERROR_NO_DATA.to_hresult() => {
+                // SAFETY: The instance is this server's own.
+                let _ = unsafe { DisconnectNamedPipe(self.pipe.0) };
+                return self.accept();
+            }
             Err(error) if error.code() == ERROR_IO_PENDING.to_hresult() => {
                 match overlapped.wait(self.pipe.0, Some(&self.stop), None)? {
                     Waited::Done(_) => true,
@@ -139,6 +146,14 @@ impl RequestPipeServer {
         };
         if !connected {
             return Ok(None);
+        }
+        // The DACL admits this user from any session; the boundary is the session (ADR 0014), so a
+        // client from another one, the same user over RDP say, is turned away unanswered.
+        if !client_is_in_this_session(self.pipe.0) {
+            // SAFETY: The instance is this server's own.
+            let _ = unsafe { DisconnectNamedPipe(self.pipe.0) };
+            log::warn!("a command-line request from another session was refused");
+            return self.accept();
         }
         // The next client gets a fresh instance; this one is the connection's until it drops.
         let next = create_instance(&self.name, &self.security, false)?;
@@ -158,12 +173,21 @@ impl RequestPipeConnection<'_> {
         read_line(self.pipe.0, Some(&self.server.stop), limit, timeout)
     }
 
-    /// Writes the answer and a newline, within `timeout`.
+    /// Writes the answer and a newline, within `timeout`, then waits, within `timeout` again, for
+    /// the client to close its end after reading it: disconnecting sooner would discard an answer
+    /// not yet read. Never longer, and never past a stop, so a client that does not read costs
+    /// this connection a timeout and the listener nothing more.
     pub fn write_line(&mut self, line: &[u8], timeout: Duration) -> Result<(), CaptureError> {
         write_all(self.pipe.0, Some(&self.server.stop), line, timeout)?;
-        // SAFETY: Waits until the client has read what was written, so disconnecting below does
-        // not discard it.
-        let _ = unsafe { FlushFileBuffers(self.pipe.0) };
+        let deadline = Instant::now() + timeout;
+        // Anything more the client sends is read and ignored; it closing, the stop, an error or
+        // the deadline ends the wait.
+        while let Ok(Some(_)) = read_line(
+            self.pipe.0,
+            Some(&self.server.stop),
+            MAX_TRAILING_BYTES,
+            deadline.saturating_duration_since(Instant::now()),
+        ) {}
         Ok(())
     }
 }
@@ -251,6 +275,17 @@ impl std::fmt::Display for RequestError {
 }
 
 impl std::error::Error for RequestError {}
+
+/// How many bytes a client may send after its request; more is read and dropped.
+const MAX_TRAILING_BYTES: usize = 64;
+
+/// Whether the client on `pipe` runs in this process's session.
+fn client_is_in_this_session(pipe: HANDLE) -> bool {
+    let mut session = 0_u32;
+    // SAFETY: Reads the connected client's session id into a local.
+    let known = unsafe { GetNamedPipeClientSessionId(pipe, &mut session) }.is_ok();
+    known && current_session().is_ok_and(|ours| ours == session)
+}
 
 /// Refuses a pipe that is not owned by this user or not served from this session: the name is
 /// machine-wide, so anyone could have created it first.
@@ -737,6 +772,108 @@ mod tests {
             .expect("write");
         drop(connection);
         assert_eq!(client.join().expect("client").expect("answer"), b"ok");
+    }
+
+    /// Opens the test pipe as a client would, without the server checks, and holds it.
+    fn raw_client(name: &str) -> OwnedHandle {
+        // SAFETY: Opens the test pipe for reading and writing.
+        let pipe = unsafe {
+            CreateFileW(
+                &HSTRING::from(name),
+                (GENERIC_READ | GENERIC_WRITE).0,
+                FILE_SHARE_NONE,
+                None,
+                OPEN_EXISTING,
+                Default::default(),
+                None,
+            )
+        }
+        .expect("open");
+        OwnedHandle(pipe)
+    }
+
+    #[test]
+    fn a_client_that_gives_up_before_it_is_taken_does_not_break_the_next() {
+        let name = test_pipe_name();
+        let mut server = RequestPipeServer::create_named(&name).expect("server");
+        // Connects and gives up while the server is busy elsewhere: before `accept`.
+        drop(raw_client(&name));
+        let client_name = name.clone();
+        let next = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            send_request(
+                &client_name,
+                b"hello
+",
+                1024,
+                Duration::from_secs(5),
+            )
+        });
+        let mut connection = server
+            .accept()
+            .expect("the abandoned client does not fail the accept")
+            .expect("a client");
+        let request = connection
+            .read_line(1024, Duration::from_secs(5))
+            .expect("read")
+            .expect("a line");
+        assert_eq!(request, b"hello");
+        connection
+            .write_line(
+                b"answer
+",
+                Duration::from_secs(5),
+            )
+            .expect("write");
+        drop(connection);
+        assert_eq!(next.join().expect("client").expect("answer"), b"answer");
+    }
+
+    #[test]
+    fn a_client_that_never_reads_its_answer_costs_a_timeout_and_no_more() {
+        let name = test_pipe_name();
+        let mut server = RequestPipeServer::create_named(&name).expect("server");
+        let client_name = name.clone();
+        // Sends a request, then holds its end open and never reads.
+        let holder = thread::spawn(move || {
+            let pipe = raw_client(&client_name);
+            let mut written = 0_u32;
+            // SAFETY: Writes a short request on the pipe this thread opened.
+            unsafe {
+                WriteFile(
+                    pipe.0,
+                    Some(
+                        b"status
+",
+                    ),
+                    Some(&mut written),
+                    None,
+                )
+            }
+            .expect("write");
+            thread::sleep(Duration::from_secs(3));
+            drop(pipe);
+        });
+        let mut connection = server.accept().expect("accept").expect("a client");
+        connection
+            .read_line(1024, Duration::from_secs(5))
+            .expect("read")
+            .expect("a line");
+        let started = Instant::now();
+        connection
+            .write_line(
+                b"answer
+",
+                Duration::from_millis(300),
+            )
+            .expect("written");
+        assert!(
+            started.elapsed() < Duration::from_millis(1_000),
+            "waited {:?} for a client that never reads",
+            started.elapsed()
+        );
+        drop(connection);
+        holder.join().expect("holder");
     }
 
     #[test]

@@ -86,8 +86,11 @@ more than one window is refused with the matches listed, never guessed: pick one
 `--interactive` opens the overlay on the region tool. **Capture** answers with the selection,
 **Pin** answers and pins it on screen, **Edit** answers with the edited image when the user
 presses Done, **Record** is refused, and Esc is refused as `cancelled`. If nobody chooses within
-two minutes, the overlay closes and the request is refused as `timed_out`. While it waits, other
-`captastic-cli` requests wait behind it.
+two minutes, the overlay closes and the request is refused as `timed_out`; overlays opened
+afterwards are unaffected. Captastic answers one request at a time, so while it waits, another
+`captastic-cli` request waits up to 30 seconds for its turn and then fails as `request_failed`:
+ask again once the interactive request has its answer. If the user is editing when a request
+stops waiting, the edit is kept and goes where the user's own captures go.
 
 A capture answers:
 
