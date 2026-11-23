@@ -45,11 +45,13 @@ if ($InstallDirectory.TrimEnd('\') -eq $installRoot.TrimEnd('\')) {
     throw 'The installation directory cannot be a filesystem root.'
 }
 # The folder is deleted with everything in it, so it must be a Captastic installation: one that
-# install.ps1 made holds captastic.exe (0.2 and earlier also captastic-desktop.exe). Another
-# program's folder, even one with an uninstall.ps1 of its own, is refused, so a mistyped
-# -InstallDirectory deletes nothing.
-$isInstallation = (Test-Path -LiteralPath (Join-Path $InstallDirectory 'captastic.exe') -PathType Leaf) -or
-    (Test-Path -LiteralPath (Join-Path $InstallDirectory 'captastic-desktop.exe') -PathType Leaf)
+# install.ps1 made holds captastic.exe (0.2 and earlier also captastic-desktop.exe), and one an
+# earlier run of this script stopped part way through, on a file in use, may still hold
+# captastic-cli.exe or captastic.example.toml. Another program's folder, even one with an
+# uninstall.ps1 of its own, is refused, so a mistyped -InstallDirectory deletes nothing.
+$isInstallation = @('captastic.exe', 'captastic-desktop.exe', 'captastic-cli.exe', 'captastic.example.toml') |
+    Where-Object { Test-Path -LiteralPath (Join-Path $InstallDirectory $_) -PathType Leaf } |
+    Select-Object -First 1
 if ((Test-Path -LiteralPath $InstallDirectory -PathType Container) -and -not $isInstallation) {
     throw "$InstallDirectory does not hold a Captastic installation, so nothing was removed."
 }

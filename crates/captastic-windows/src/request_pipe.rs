@@ -301,11 +301,11 @@ impl std::fmt::Display for RequestError {
 
 impl std::error::Error for RequestError {}
 
-/// How many bytes a client may send after its request; more is read and dropped.
 /// How many clients in a row may give up before they are taken before `accept` stops trying.
 const MAX_ABANDONED_CONNECTS: u32 = 1_000;
 /// How many lines sent after the request are read and ignored before the connection is let go.
 const MAX_TRAILING_LINES: usize = 16;
+/// How many bytes a client may send after its request; more is read and dropped.
 const MAX_TRAILING_BYTES: usize = 64;
 
 /// Whether the client on `pipe` runs in this process's session.
