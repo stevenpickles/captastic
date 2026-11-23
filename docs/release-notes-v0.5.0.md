@@ -96,7 +96,7 @@ three features touches the still-capture path: a capture confirmed with **Captur
 - **A window that Windows scales for display** (one that is not per-monitor DPI aware, on a display
   at 125% or more) was captured at its unscaled size in the top-left corner of a larger black image.
   It is now captured whole, on the overlay and from the command line (PR #146).
-- **From an adversarial review of the whole code base** before the tag (PRs #156 to #162):
+- **From an adversarial review of the whole code base** before the tag (PRs #156 to #163):
   - **Recordings are not lost.** A recording running when Captastic exits gets up to 15 seconds
     to finish writing; a reviewed recording that cannot be saved in the output folder is saved in
     `~/.captastic/recordings` instead; an MP4 with sound no longer grows without limit in memory
@@ -167,6 +167,9 @@ and a status answer whose daemon version overwrote the protocol version (PR #143
   - a worker thread that panics is not restarted, so the hotkey can stop working silently until
     Captastic is restarted;
   - a file name template that is not unique stops saving after 100 files of the same name.
+  - at sign-out or shutdown Windows gives Captastic about 4 seconds, so a recording that needs
+    longer than that to finish writing can still be cut off there; exiting from the notification
+    area gives it up to 15 seconds.
 - The v0.4.0 limitations otherwise stand: a crash during a review loses that recording, an HDR
   display cannot be recorded, no hotkey starts or stops a recording, and a trimmed or cropped
   recording is compressed twice.
