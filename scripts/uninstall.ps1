@@ -42,13 +42,27 @@ $installRoot = [System.IO.Path]::GetPathRoot($InstallDirectory)
 if ($InstallDirectory.TrimEnd('\') -eq $installRoot.TrimEnd('\')) {
     throw 'The installation directory cannot be a filesystem root.'
 }
+# The folder is deleted with everything in it, so it must be a Captastic installation: one that
+# install.ps1 made holds captastic.exe and this script. A mistyped -InstallDirectory must not
+# delete some other folder.
+$isInstallation = (Test-Path -LiteralPath (Join-Path $InstallDirectory 'captastic.exe') -PathType Leaf) -or
+    (Test-Path -LiteralPath (Join-Path $InstallDirectory 'uninstall.ps1') -PathType Leaf)
+if ((Test-Path -LiteralPath $InstallDirectory -PathType Container) -and -not $isInstallation) {
+    throw "$InstallDirectory does not hold a Captastic installation, so nothing was removed."
+}
 if (Test-Path -LiteralPath (Join-Path $InstallDirectory 'captastic.exe') -PathType Leaf) {
     Stop-Captastic
 }
 
+# Only a login entry that starts this installation: one that starts another copy, the Chocolatey
+# package say, is that copy's to keep.
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-if ($null -ne (Get-ItemProperty -LiteralPath $runKey -Name 'Captastic' -ErrorAction SilentlyContinue)) {
-    Remove-ItemProperty -LiteralPath $runKey -Name 'Captastic'
+$startup = (Get-ItemProperty -LiteralPath $runKey -Name 'Captastic' -ErrorAction SilentlyContinue).Captastic
+if ($startup) {
+    $installPrefix = $InstallDirectory.TrimEnd('\') + '\'
+    if ($startup.Trim().Trim('"').StartsWith($installPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Remove-ItemProperty -LiteralPath $runKey -Name 'Captastic'
+    }
 }
 
 $shortcutPath = Join-Path ([Environment]::GetFolderPath('Programs')) 'Captastic.lnk'

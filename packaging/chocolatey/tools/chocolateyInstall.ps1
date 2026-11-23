@@ -12,25 +12,54 @@ foreach ($binary in @($executable, $commandLine)) {
     Unblock-File -LiteralPath $binary
 }
 
-# A user moving from the portable installer should not be left with an old daemon
-# holding Captastic's session control event. Its uninstaller preserves ~/.captastic.
+# A user moving from the portable installer should not be left with an old daemon holding
+# Captastic's session control event, or a login entry and shortcut that start the old copy.
+#
+# The portable copy's own uninstall.ps1 is not run: this hook runs elevated, and that script sits
+# in a folder the user's unelevated programs can write, so running it would hand any of them
+# administrator rights. Its steps are done here instead, and its folder, which holds no settings
+# (those are in ~/.captastic), is left for the user to delete.
 $legacyDirectory = Join-Path $env:LOCALAPPDATA 'Programs\Captastic'
-$legacyCli = Join-Path $legacyDirectory 'captastic.exe'
-$legacyUninstaller = Join-Path $legacyDirectory 'uninstall.ps1'
-if ((Test-Path -LiteralPath $legacyCli -PathType Leaf) -and
-    -not [System.IO.Path]::GetFullPath($legacyCli).Equals(
+$legacyExecutable = Join-Path $legacyDirectory 'captastic.exe'
+if ((Test-Path -LiteralPath $legacyExecutable -PathType Leaf) -and
+    -not [System.IO.Path]::GetFullPath($legacyExecutable).Equals(
         [System.IO.Path]::GetFullPath($executable),
         [System.StringComparison]::OrdinalIgnoreCase
     )) {
-    if (Test-Path -LiteralPath $legacyUninstaller -PathType Leaf) {
-        Write-Host 'Migrating the existing per-user Captastic installation.'
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $legacyUninstaller
-        if ($LASTEXITCODE -ne 0) {
-            throw "The existing Captastic uninstaller failed with exit code $LASTEXITCODE."
+    Write-Host 'Moving from the existing per-user Captastic installation.'
+    $controlEventName = 'Local\CaptasticDaemonControl-v1'
+    $controlEvent = $null
+    if ([System.Threading.EventWaitHandle]::TryOpenExisting($controlEventName, [ref]$controlEvent)) {
+        try {
+            [void]$controlEvent.Set()
+        } finally {
+            $controlEvent.Dispose()
         }
-    } else {
-        Write-Warning "An older Captastic installation remains at $legacyDirectory. Uninstall it before launching this package."
+        $deadline = [DateTime]::UtcNow.AddSeconds(30)
+        do {
+            Start-Sleep -Milliseconds 100
+            $controlEvent = $null
+            $running = [System.Threading.EventWaitHandle]::TryOpenExisting($controlEventName, [ref]$controlEvent)
+            if ($running) {
+                $controlEvent.Dispose()
+            }
+        } while ($running -and [DateTime]::UtcNow -lt $deadline)
+        if ($running) {
+            throw 'The running per-user Captastic did not stop within thirty seconds.'
+        }
     }
+    # Launch at login that started the old copy starts this one instead, rather than being lost.
+    $legacyRunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    $legacyStartup = (Get-ItemProperty -LiteralPath $legacyRunKey -Name 'Captastic' -ErrorAction SilentlyContinue).Captastic
+    if ($legacyStartup -and $legacyStartup.Trim().Trim('"').Equals($legacyExecutable, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Set-ItemProperty -LiteralPath $legacyRunKey -Name 'Captastic' -Value ('"{0}"' -f $executable)
+        Write-Host 'Launch at login now starts the Chocolatey copy of Captastic.'
+    }
+    $legacyShortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'Captastic.lnk'
+    if (Test-Path -LiteralPath $legacyShortcut -PathType Leaf) {
+        Remove-Item -LiteralPath $legacyShortcut -Force
+    }
+    Write-Warning "The older per-user Captastic in $legacyDirectory is stopped and no longer starts. Delete that folder when convenient; your settings in ~/.captastic are not in it."
 }
 
 # Suppression files in the generated package prevent Chocolatey's automatic shims so each command

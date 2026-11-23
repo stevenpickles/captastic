@@ -299,6 +299,18 @@ try {
     } '*binaries were built from*current source is*'
     $env:CAPTASTIC_GIT_COMMIT = $previousGitCommit
 
+    # The portable uninstaller deletes its folder with everything in it, so a folder that is not a
+    # Captastic installation is refused before anything is touched.
+    $notAnInstallation = Join-Path $testRoot 'not-an-installation'
+    New-Item -ItemType Directory -Path $notAnInstallation | Out-Null
+    $keepsake = Join-Path $notAnInstallation 'keep-me.txt'
+    Set-Content -LiteralPath $keepsake -Value 'not Captastic'
+    Assert-ThrowsLike {
+        & (Join-Path $repositoryRoot 'scripts\uninstall.ps1') -InstallDirectory $notAnInstallation
+    } '*does not hold a Captastic installation*'
+    Assert-True (Test-Path -LiteralPath $keepsake -PathType Leaf) `
+        'The portable uninstaller deleted a folder that was not a Captastic installation.'
+
     Write-Host 'PowerShell packaging tests passed.'
 } finally {
     Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
