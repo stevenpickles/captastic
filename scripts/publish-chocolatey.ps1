@@ -5,7 +5,7 @@ Pushes a tagged release's Chocolatey package to the community repository, after 
 published release it came from.
 
 .DESCRIPTION
-Run by the release workflow's Chocolatey job, once the GitHub release for the tag is published.
+Run by .github/workflows/packages.yml, once the GitHub release for the tag is published.
 Nothing is built here: the package pushed is the one attached to the release, downloaded through
 the same direct URLs that VERIFICATION.txt names and that `choco install` will fetch from. Before
 pushing, it checks that:
@@ -14,7 +14,7 @@ pushing, it checks that:
 - the release's artifacts.json is publishable and is for that version;
 - every file it lists downloads from its direct release URL with the SHA-256 it records.
 
-The API key is read from the CHOCOLATEY_API_KEY environment variable, never from a parameter, so it
+The API key is read from the CHOCO_API_KEY environment variable, never from a parameter, so it
 does not appear in a command line or a log. -DryRun does every check and stops short of the push;
 it needs no key.
 
@@ -26,6 +26,9 @@ The GitHub repository as owner/name.
 
 .PARAMETER DryRun
 Check the release and stop before pushing.
+
+.PARAMETER OutputDirectory
+Where to keep the checked package, so a workflow can attach it to its run.
 #>
 [CmdletBinding()]
 param(
@@ -33,7 +36,8 @@ param(
     [string]$Tag,
     [Parameter(Mandatory)]
     [string]$Repository,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [string]$OutputDirectory
 )
 
 $ErrorActionPreference = 'Stop'
@@ -83,14 +87,18 @@ try {
         throw "The $Tag release's package is $(Split-Path -Leaf $package), not $expected."
     }
 
+    if ($OutputDirectory) {
+        New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
+        Copy-Item -LiteralPath $package -Destination (Join-Path $OutputDirectory $expected) -Force
+    }
     if ($DryRun) {
         Write-Host "Dry run: $expected from the $Tag release passed every check; not pushed."
         return
     }
-    if ([string]::IsNullOrWhiteSpace($env:CHOCOLATEY_API_KEY)) {
-        throw 'CHOCOLATEY_API_KEY is not set, so nothing was pushed.'
+    if ([string]::IsNullOrWhiteSpace($env:CHOCO_API_KEY)) {
+        throw 'CHOCO_API_KEY is not set, so nothing was pushed.'
     }
-    & choco push $package --source https://push.chocolatey.org/ --api-key $env:CHOCOLATEY_API_KEY --no-progress
+    & choco push $package --source https://push.chocolatey.org/ --api-key $env:CHOCO_API_KEY --no-progress
     if ($LASTEXITCODE -ne 0) {
         throw "choco push failed with exit code $LASTEXITCODE."
     }

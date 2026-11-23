@@ -173,38 +173,54 @@ archive and both executables. A tagged package build fails if given an indirect 
 
 ### Pushing to the Chocolatey community repository
 
-For a release tag (`vX.Y.Z`, no prerelease label), the release workflow's **Push to the Chocolatey
-community repository** job runs after the GitHub release is published. It waits on the
-`chocolatey` environment, which requires the maintainer's approval. Approve it only once the
-disposable-VM checklist has passed for this build and the published release looks right.
+The package is pushed by
+[.github/workflows/packages.yml](../.github/workflows/packages.yml) (Actions → **Packages**). For a
+release tag (`vX.Y.Z`, no prerelease label), `release.yml` calls it once the GitHub release is
+published, so the disposable-VM checklist must pass before the tag. A failure there leaves the
+published release as it is.
 
-The job runs [scripts/publish-chocolatey.ps1](../scripts/publish-chocolatey.ps1), which builds
-nothing:
+The workflow builds nothing. It runs
+[scripts/publish-chocolatey.ps1](../scripts/publish-chocolatey.ps1), which:
 
-1. It downloads the release's `artifacts.json` and every file it lists, through the direct release
-   URLs that `VERIFICATION.txt` names and `choco install` fetches from.
-2. It checks that the manifest is publishable and for the tag's version, and that each file has
-   the SHA-256 the manifest records.
-3. It pushes the `.nupkg` attached to the release, with the key from the environment's
-   `CHOCOLATEY_API_KEY` secret.
+1. downloads the release's `artifacts.json` and every file it lists, through the direct release
+   URLs that `VERIFICATION.txt` names and `choco install` fetches from;
+2. checks that the manifest is publishable and for the tag's version, and that each file has the
+   SHA-256 the manifest records.
 
-One-time setup, in the repository's **Settings → Environments**:
+The workflow then attaches that `.nupkg` to its run and pushes it with the `CHOCO_API_KEY` secret.
+Without the secret it skips the push with a notice, and the package stays attached to the run. On
+a pull request that touches the workflow or the script, it checks the latest published release's
+package and never pushes.
 
-1. Create an environment named `chocolatey`.
-2. Add yourself under **Required reviewers**.
-3. Limit its **Deployment branches and tags** to tags matching `v*`.
-4. Add the secret `CHOCOLATEY_API_KEY`, holding the API key from your chocolatey.org account.
+**One-time setup:**
 
-Without required reviewers the job pushes as soon as the release is published. Without the secret
-it fails and pushes nothing.
+1. Create an account on [community.chocolatey.org](https://community.chocolatey.org/) and confirm
+   its email address.
+2. Copy the API key from the account page.
+3. Store it as the repository secret; the command prompts for the value, so the key never appears
+   in a command line or in shell history:
 
-To check a published release without pushing, or to push by hand if the job cannot run:
+   ```powershell
+   gh secret set CHOCO_API_KEY --repo stevenpickles/captastic
+   ```
+
+**To retry** an already published release, use Actions → **Packages** → **Run workflow**, with its
+version (`X.Y.Z`). To check or push from a machine instead:
 
 ```powershell
 ./scripts/publish-chocolatey.ps1 -Tag v<version> -Repository stevenpickles/captastic -DryRun
-$env:CHOCOLATEY_API_KEY = '<key>'   # then without -DryRun, to push
+$env:CHOCO_API_KEY = '<key>'   # then without -DryRun, to push
 ./scripts/publish-chocolatey.ps1 -Tag v<version> -Repository stevenpickles/captastic
 ```
+
+**Caveats:**
+
+- **Versions are never reused.** Chocolatey never accepts the same version twice. Fix forward with
+  a new version; never delete or move a published tag.
+- **Every version is checked.** Each one goes through Chocolatey's automated checks and possibly a
+  human moderator, with the results emailed. The queue:
+  [ch0.co/moderation](https://ch0.co/moderation).
+- **The key's reach.** The API key can publish any package on the account.
 
 The first package submission must pass Chocolatey community validation and moderation before
 `choco install captastic` works against the default community source. Keep the package ID,

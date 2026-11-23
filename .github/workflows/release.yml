@@ -93,23 +93,16 @@ jobs:
             ${{ steps.packages.outputs.chocolatey }}
             ${{ steps.packages.outputs.manifest }}
 
-  chocolatey-push:
-    name: Push to the Chocolatey community repository
-    # Only a release tag (vX.Y.Z), once its GitHub release is published. The `chocolatey`
-    # environment holds the API key and requires the maintainer's approval, given once the
-    # published release has been looked at; see docs/chocolatey.md.
+  chocolatey:
+    name: Chocolatey package
+    # Only a release tag (vX.Y.Z), once its GitHub release is published. It is a job of its own,
+    # so a failure here leaves the published release as it is; retry it from Actions -> Packages.
     needs: windows-package
     if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
-    runs-on: windows-latest
-    environment: chocolatey
     permissions:
       contents: read
-    steps:
-      - name: Check out source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-
-      - name: Check the published release and push its package
-        shell: pwsh
-        env:
-          CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
-        run: ./scripts/publish-chocolatey.ps1 -Tag $env:GITHUB_REF_NAME -Repository $env:GITHUB_REPOSITORY
+    uses: ./.github/workflows/packages.yml
+    with:
+      version: ${{ github.ref_name }}
+    secrets:
+      CHOCO_API_KEY: ${{ secrets.CHOCO_API_KEY }}
