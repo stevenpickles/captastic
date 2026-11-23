@@ -99,6 +99,15 @@ millisecond as the picture. A crop changes nothing about the sound.
   recording's sound, keeps the samples between the trim's start and end, and writes them from zero
   beside the re-encoded picture, a little ahead of each frame so the sink writer interleaves the
   two. A crop leaves the sound as it is. A recording without a sound stream is saved without one.
+- **Slice 4, second part (sound in the review).** The review decodes the recording's sound once
+  when it opens. `SoundPlayer` plays a span of it on a WASAPI shared-mode render client of its own
+  thread, with Windows converting 48 kHz 16-bit stereo to the device's format. **Play** starts it
+  at the playhead, to the end of the span kept; the loop back to the span's start starts it again.
+  Every pause, step and drag already goes through the review's pause, which stops it, so the review
+  is silent while the playhead is stepped or scrubbed. **Mute** sits beside **Play** (and M), only
+  for a recording with sound; without sound the toolbar is laid out as before. The picture keeps
+  time by the clock and the sound by the device; over the at most ten minutes a recording lasts
+  they drift apart by far less than a frame.
 
 ## Consequences
 
