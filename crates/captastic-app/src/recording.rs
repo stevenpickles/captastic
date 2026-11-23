@@ -1259,6 +1259,17 @@ impl RecordingHost {
     /// Records a saved recording in history and says so. `ended` is how the recording ended, for
     /// one saved straight away; a reviewed recording's ending is old news by the time it is saved.
     /// `window_area` is whether a window was recorded as its area on the screen instead of itself.
+    /// Says, before the saved notice, that a recording went to `~/.captastic/recordings` because
+    /// the output folder could not take it, and why.
+    fn announce_saved_elsewhere(&self, elsewhere: Option<String>) {
+        if let Some(reason) = elsewhere {
+            let _ = self
+                .inner
+                .notices
+                .try_send(crate::daemon::DaemonNotice::RecordingSavedElsewhere { reason });
+        }
+    }
+
     fn announce_saved(
         &self,
         capture_id: CaptureId,
@@ -1436,17 +1447,18 @@ impl RecordingHost {
     /// Saves a draft into the output directory as it was recorded.
     fn save_unchanged(&self, draft: Draft) {
         let extension = draft.report.format.extension();
-        match write_new(
+        match write_kept(
             &self.inner.output_directory,
             &draft.stem,
             extension,
             &draft.recording,
         ) {
-            Ok(path) => {
+            Ok((path, elsewhere)) => {
                 let report = RecordingReport {
                     path,
                     ..draft.report
                 };
+                self.announce_saved_elsewhere(elsewhere);
                 self.announce_saved(
                     draft.capture_id,
                     &draft.display,
@@ -1478,13 +1490,14 @@ impl RecordingHost {
                 return;
             }
         };
-        match write_new(
+        match write_kept(
             &self.inner.output_directory,
             &draft.stem,
             format.extension(),
             &bytes,
         ) {
-            Ok(path) => {
+            Ok((path, elsewhere)) => {
+                self.announce_saved_elsewhere(elsewhere);
                 let report = RecordingReport {
                     path,
                     bytes: bytes.len() as u64,
@@ -1512,13 +1525,14 @@ impl RecordingHost {
             draft.capture_id.0
         ));
         let extension = draft.report.format.extension();
-        match write_new(
+        match write_kept(
             &self.inner.output_directory,
             &draft.stem,
             extension,
             &draft.recording,
         ) {
-            Ok(path) => {
+            Ok((path, elsewhere)) => {
+                self.announce_saved_elsewhere(elsewhere);
                 let report = RecordingReport {
                     path,
                     ..draft.report
@@ -1641,6 +1655,45 @@ fn size_of(report: &RecordingReport) -> (u32, u32) {
 
 /// Writes `bytes` into `directory` as `stem.extension`, or the next unused name like it, and
 /// returns where they went. Leaves nothing behind if the write fails.
+/// Writes a recording into `directory` or, when that fails (a full disk, a drive or share gone, a
+/// folder that cannot be written), into `~/.captastic/recordings`, so a reviewed recording, whose
+/// only copy is in memory, is never lost to a failed save. Returns where it went, and why it is not
+/// in `directory` when it is not.
+fn write_kept(
+    directory: &Path,
+    stem: &str,
+    extension: &str,
+    bytes: &[u8],
+) -> Result<(PathBuf, Option<String>), RecordingError> {
+    let fallback = captastic_config::storage_directory().map(|root| root.join("recordings"));
+    write_kept_in(directory, fallback.as_deref(), stem, extension, bytes)
+}
+
+/// [`write_kept`] with the fallback folder given, for tests.
+fn write_kept_in(
+    directory: &Path,
+    fallback: Option<&Path>,
+    stem: &str,
+    extension: &str,
+    bytes: &[u8],
+) -> Result<(PathBuf, Option<String>), RecordingError> {
+    match write_new(directory, stem, extension, bytes) {
+        Ok(path) => Ok((path, None)),
+        Err(error) => {
+            let Some(fallback) = fallback else {
+                return Err(error);
+            };
+            crate::logging::warn(format_args!(
+                "a recording could not be saved in {}, so it is saved in {} instead: {error}",
+                directory.display(),
+                fallback.display()
+            ));
+            let path = write_new(fallback, stem, extension, bytes)?;
+            Ok((path, Some(error.to_string())))
+        }
+    }
+}
+
 fn write_new(
     directory: &Path,
     stem: &str,
@@ -1701,6 +1754,18 @@ pub fn encode_edited(
             height: height.min(crop.height),
             ..crop
         });
+    }
+    if let Some(crop) = edit.crop {
+        let fits = crop.width > 0
+            && crop.height > 0
+            && u64::from(crop.x) + u64::from(crop.width) <= u64::from(size.0)
+            && u64::from(crop.y) + u64::from(crop.height) <= u64::from(size.1);
+        if !fits {
+            return Err(RecordingError::Encode(format!(
+                "the crop {}x{} at ({}, {}) does not fit the {}x{} recording",
+                crop.width, crop.height, crop.x, crop.y, size.0, size.1
+            )));
+        }
     }
     let (width, height) = edit.output_size(size);
     let timeline = reader.timeline().clone();
@@ -2442,6 +2507,44 @@ mod tests {
         assert_eq!(white_count(reader.frame(0).expect("first")), 4);
         let last = timeline.len() - 1;
         assert_eq!(white_count(reader.frame(last).expect("last")), 11);
+    }
+
+    #[test]
+    fn an_edit_whose_crop_does_not_fit_is_refused_rather_than_a_panic() {
+        let source = counting_gif(4);
+        let edit = RecordingEdit {
+            start: Duration::ZERO,
+            end: Duration::from_millis(300),
+            crop: Some(PixelRect {
+                x: 0,
+                y: 0,
+                width: 10_000,
+                height: 2,
+            }),
+        };
+        let refused = encode_edited(&source, RecordingFormat::Gif, edit).expect_err("refused");
+        assert!(refused.to_string().contains("does not fit"), "{refused}");
+    }
+
+    #[test]
+    fn a_recording_that_cannot_be_saved_where_asked_is_saved_in_the_fallback() {
+        let directory = directory("fallback");
+        std::fs::create_dir_all(&directory).expect("directory");
+        // A file where the output folder should be: nothing can be written inside it.
+        let blocked = directory.join("not-a-folder");
+        std::fs::write(&blocked, b"x").expect("file");
+        let fallback = directory.join("fallback");
+        let (path, elsewhere) =
+            write_kept_in(&blocked, Some(&fallback), "clip", "gif", b"GIF89a").expect("kept");
+        assert!(path.starts_with(&fallback), "{}", path.display());
+        assert_eq!(std::fs::read(&path).expect("written"), b"GIF89a");
+        assert!(elsewhere.is_some());
+        // Where the output folder works, nothing goes to the fallback.
+        let (path, elsewhere) =
+            write_kept_in(&directory, Some(&fallback), "clip", "gif", b"GIF89a").expect("kept");
+        assert!(path.starts_with(&directory) && !path.starts_with(&fallback));
+        assert!(elsewhere.is_none());
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     /// A host that reviews, with its notices, and the history it remembers into.

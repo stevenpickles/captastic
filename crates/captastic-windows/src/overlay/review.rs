@@ -33,7 +33,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, KillTimer, LoadCursorW,
     MessageBoxW, SetCursor, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, HTCLIENT,
-    IDC_ARROW, IDC_CROSS, IDC_SIZEWE, IDOK, MB_ICONWARNING, MB_OKCANCEL, MINMAXINFO,
+    IDC_ARROW, IDC_CROSS, IDC_SIZEWE, IDOK, MB_DEFBUTTON2, MB_ICONWARNING, MB_OKCANCEL, MINMAXINFO,
     SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
     WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
     WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_TIMER, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
@@ -158,7 +158,11 @@ impl Trim {
 
     /// Moves the end of the span kept to `at`, leaving at least [`MINIMUM_SPAN`] after the start.
     fn set_end(&mut self, at: Duration) {
-        self.end = at.clamp(self.start + MINIMUM_SPAN, self.duration);
+        // `min` before `max`, not `clamp`: a recording shorter than the minimum span has no valid
+        // range, and `clamp` panics on one, inside a window procedure.
+        self.end = at
+            .min(self.duration)
+            .max((self.start + MINIMUM_SPAN).min(self.duration));
     }
 
     fn edit(&self) -> RecordingEdit {
@@ -426,12 +430,23 @@ enum CropDrag {
     },
 }
 
-/// `crop` with its sides rounded down to even numbers, never below two.
-fn even(crop: Rect) -> Rect {
+/// `crop` with its sides rounded down to even numbers, never below two, and kept inside `bounds`:
+/// a one-pixel side rounded up to two at the picture's last row or column moves in by one, rather
+/// than reaching outside the picture.
+fn even(crop: Rect, bounds: Rect) -> Rect {
+    let side = |length: u32, limit: u32| (length & !1).max(2).min(limit & !1).max(1);
+    let width = side(crop.width, bounds.width);
+    let height = side(crop.height, bounds.height);
+    let right = i64::from(bounds.x) + i64::from(bounds.width);
+    let bottom = i64::from(bounds.y) + i64::from(bounds.height);
     Rect {
-        width: (crop.width & !1).max(2),
-        height: (crop.height & !1).max(2),
-        ..crop
+        x: crop.x.min((right - i64::from(width)) as i32).max(bounds.x),
+        y: crop
+            .y
+            .min((bottom - i64::from(height)) as i32)
+            .max(bounds.y),
+        width,
+        height,
     }
 }
 
@@ -504,7 +519,11 @@ impl ReviewState {
                 adjust_crop(*start, *grip, dx, dy, bounds)
             }
         };
-        Some(if self.even_crop { even(crop) } else { crop })
+        Some(if self.even_crop {
+            even(crop, bounds)
+        } else {
+            crop
+        })
     }
 
     fn edit(&self) -> RecordingEdit {
@@ -1196,7 +1215,8 @@ fn request_discard(hwnd: HWND, state_pointer: *mut ReviewState) {
             hwnd,
             w!("Discard this recording? It will be deleted."),
             w!("Captastic"),
-            MB_OKCANCEL | MB_ICONWARNING,
+            // Cancel is the default: Esc then Enter must not delete the only copy.
+            MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2,
         )
     };
     if answer == IDOK {
@@ -1558,6 +1578,56 @@ fn draw_tooltip(device: windows::Win32::Graphics::Gdi::HDC, state: &ReviewState)
 mod tests {
     use super::*;
 
+    #[test]
+    fn an_even_crop_stays_inside_the_picture() {
+        let picture = Rect {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 180,
+        };
+        // A one-pixel strip on the last row and the last column, as dragging an edge past the
+        // opposite one leaves it: rounded up to two, it moves in rather than out.
+        for crop in [
+            Rect {
+                x: 10,
+                y: 179,
+                width: 50,
+                height: 1,
+            },
+            Rect {
+                x: 319,
+                y: 10,
+                width: 1,
+                height: 50,
+            },
+            Rect {
+                x: 319,
+                y: 179,
+                width: 1,
+                height: 1,
+            },
+        ] {
+            let even = even(crop, picture);
+            assert!(
+                even.width.is_multiple_of(2) && even.height.is_multiple_of(2),
+                "{even:?}"
+            );
+            assert!(even.x >= 0 && even.y >= 0, "{even:?}");
+            assert!(even.x as u32 + even.width <= picture.width, "{even:?}");
+            assert!(even.y as u32 + even.height <= picture.height, "{even:?}");
+        }
+    }
+
+    #[test]
+    fn a_recording_shorter_than_the_minimum_span_can_still_be_trimmed() {
+        let mut trim = Trim::new(Duration::from_millis(4), 30);
+        trim.set_end(Duration::from_millis(2));
+        assert!(trim.end <= trim.duration);
+        trim.set_end(Duration::ZERO);
+        assert!(trim.end <= trim.duration);
+    }
+
     fn ms(millis: u64) -> Duration {
         Duration::from_millis(millis)
     }
@@ -1618,7 +1688,15 @@ mod tests {
             height: 1,
         };
         assert_eq!(
-            even(crop),
+            even(
+                crop,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 320,
+                    height: 180
+                }
+            ),
             Rect {
                 x: 3,
                 y: 5,

@@ -3401,6 +3401,9 @@ pub(crate) enum DaemonNotice {
     },
     /// A recording failed, and nothing was saved.
     RecordingFailed { message: String },
+    /// A recording could not be saved in the output folder, and was saved in
+    /// `~/.captastic/recordings` instead; the saved notice that follows names the file.
+    RecordingSavedElsewhere { reason: String },
     /// A reviewed recording could not be trimmed or cropped, so it was saved as recorded.
     RecordingEditFailed {
         file_name: String,
@@ -3425,6 +3428,7 @@ impl DaemonNotice {
             Self::RecordingInProgress => "Captastic is recording",
             Self::RecordingSaved { .. } => "Recording saved",
             Self::RecordingFailed { .. } => "Captastic could not save the recording",
+            Self::RecordingSavedElsewhere { .. } => "Recording saved somewhere else",
             Self::RecordingEditFailed { .. } => "Captastic could not trim the recording",
             Self::CommandLineCapture { .. } => "Captured by a command-line request",
         }
@@ -3496,6 +3500,10 @@ impl DaemonNotice {
                 }
             }
             Self::RecordingFailed { message } => format!("Nothing was saved: {message}."),
+            Self::RecordingSavedElsewhere { reason } => format!(
+                "The recording could not be saved in the output folder ({reason}), so it was saved \
+                 in .captastic\\recordings in your user folder instead."
+            ),
             Self::RecordingEditFailed {
                 file_name, message, ..
             } => format!(

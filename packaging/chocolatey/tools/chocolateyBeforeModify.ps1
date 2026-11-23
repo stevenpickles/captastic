@@ -31,14 +31,16 @@ try {
     $controlEvent.Dispose()
 }
 
-$deadline = [DateTime]::UtcNow.AddSeconds(5)
+# Long enough for a recording running at the upgrade to finish writing: Captastic gives it up to
+# fifteen seconds before it exits.
+$deadline = [DateTime]::UtcNow.AddSeconds(30)
 do {
     Start-Sleep -Milliseconds 100
     $running = Test-CaptasticRunning
 } while ($running -and [DateTime]::UtcNow -lt $deadline)
 
 if ($running) {
-    throw 'The running Captastic daemon did not stop within five seconds.'
+    throw 'The running Captastic daemon did not stop within thirty seconds.'
 }
 
 # Left for chocolateyInstall.ps1, which runs next in an upgrade, so it can start Captastic again for
