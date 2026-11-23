@@ -1148,8 +1148,11 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     // Both workers can be forced to abandon work the user asked for; the main thread owns the
     // notification area, so notices travel to it on their own bounded channel rather than through
     // the capture command queue that is already full or stalled whenever this happens.
-    let (notice_sender, notice_receiver) =
-        mpsc::sync_channel::<DaemonNotice>(args.selection_queue_capacity.max(1));
+    // Room for a burst: notices are sent with `try_send`, and one that finds the channel full is
+    // lost, which for a command-line capture breaks the promise that it is always announced.
+    let (notice_sender, notice_receiver) = mpsc::sync_channel::<DaemonNotice>(
+        args.selection_queue_capacity.max(NOTICE_QUEUE_CAPACITY),
+    );
     let confirmed_regions = Arc::new(Mutex::new(args.confirmed_regions.clone()));
     // Recordings are saved where captures are, named by the same template, and recorded in the
     // same history - whether or not still captures are being saved (ADR 0011).
@@ -1469,7 +1472,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let mut self_triggers_dropped = 0_u64;
     let mut tray_shutdown_requested = false;
     let mut last_persistence_notification: Option<String> = None;
-    let mut last_notice_message: Option<String> = None;
+    let mut last_notice_message: Option<(String, Instant)> = None;
     let mut daemon_result = Ok(());
     loop {
         let session_shutdown_requested = tray
@@ -1586,10 +1589,37 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                 }
                 while let Ok(notice) = notice_receiver.try_recv() {
                     let message = notice.message();
-                    if last_notice_message.as_deref() == Some(message.as_str()) {
+                    // The same error raised again within a short while (the engine still down,
+                    // press after press) is shown once. A notice about a file is never folded
+                    // away: each one is a capture or a recording of its own, even with the same
+                    // name, and a command-line capture must always be announced (ADR 0014).
+                    if !notice_is_shown(
+                        &mut last_notice_message,
+                        notice.names_a_file(),
+                        &message,
+                        Instant::now(),
+                    ) {
+                        log::info!("a repeated notice was not shown again: {message}");
                         continue;
                     }
-                    last_notice_message = Some(message.clone());
+                    if tray.is_none() {
+                        log::warn!("no notification area icon to show a notice: {message}");
+                        // A command-line capture is announced from an icon of its own instead,
+                        // as a one-shot capture is.
+                        if let DaemonNotice::CommandLineCapture { path, .. } = &notice {
+                            let started = crate::desktop_executable()
+                                .map_err(|error| error.to_string())
+                                .and_then(|desktop| {
+                                    captastic_windows::start_announcer(&desktop, path)
+                                        .map_err(|error| error.to_string())
+                                });
+                            if let Err(error) = started {
+                                log::warn!(
+                                    "a command-line capture could not be announced: {error}"
+                                );
+                            }
+                        }
+                    }
                     if let Some(tray) = tray.as_ref() {
                         let revealing = match &notice {
                             DaemonNotice::RecordingSaved { path, .. }
@@ -3416,7 +3446,42 @@ pub(crate) enum DaemonNotice {
 }
 
 #[cfg(windows)]
+/// Whether a notice is shown, or folded into the same error shown less than
+/// [`NOTICE_REPEAT_WINDOW`] ago. A notice about a file is always shown.
+fn notice_is_shown(
+    last: &mut Option<(String, Instant)>,
+    names_a_file: bool,
+    message: &str,
+    now: Instant,
+) -> bool {
+    if names_a_file {
+        return true;
+    }
+    let repeated = last.as_ref().is_some_and(|(previous, at)| {
+        previous == message && now.saturating_duration_since(*at) < NOTICE_REPEAT_WINDOW
+    });
+    if !repeated {
+        *last = Some((message.to_owned(), now));
+    }
+    !repeated
+}
+
+/// How long the same error notice is folded into the one already shown.
+const NOTICE_REPEAT_WINDOW: Duration = Duration::from_secs(30);
+/// The least room the notice channel has, whatever the selection queue's capacity.
+const NOTICE_QUEUE_CAPACITY: usize = 16;
+
 impl DaemonNotice {
+    /// Whether the notice is about one saved file, which is never folded into another notice.
+    fn names_a_file(&self) -> bool {
+        matches!(
+            self,
+            Self::RecordingSaved { .. }
+                | Self::RecordingEditFailed { .. }
+                | Self::CommandLineCapture { .. }
+        )
+    }
+
     pub(crate) fn title(&self) -> &'static str {
         match self {
             Self::DroppedSelection { .. } => "Captastic could not finish a capture",
@@ -3657,6 +3722,40 @@ mod tests {
     use captastic_core::DisplayInfo;
 
     use super::*;
+
+    #[test]
+    fn a_notice_about_a_file_is_never_folded_and_an_error_only_briefly() {
+        let mut last = None;
+        let now = Instant::now();
+        // The same file captured twice from the command line: both announced.
+        let capture = DaemonNotice::CommandLineCapture {
+            file_name: "shot.png".to_owned(),
+            path: PathBuf::from(r"C:\temp\shot.png"),
+        };
+        assert!(capture.names_a_file());
+        assert!(notice_is_shown(&mut last, true, &capture.message(), now));
+        assert!(notice_is_shown(&mut last, true, &capture.message(), now));
+        // The same error twice in a row is shown once, and again once the window has passed.
+        assert!(notice_is_shown(&mut last, false, "down", now));
+        assert!(!notice_is_shown(
+            &mut last,
+            false,
+            "down",
+            now + Duration::from_secs(1)
+        ));
+        assert!(notice_is_shown(
+            &mut last,
+            false,
+            "down",
+            now + NOTICE_REPEAT_WINDOW * 2
+        ));
+        assert!(notice_is_shown(
+            &mut last,
+            false,
+            "other",
+            now + NOTICE_REPEAT_WINDOW * 2
+        ));
+    }
 
     struct TempConfig {
         directory: PathBuf,

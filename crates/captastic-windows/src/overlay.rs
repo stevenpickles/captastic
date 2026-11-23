@@ -429,6 +429,15 @@ pub enum OverlayUiUpdate {
     RecordingSound { enabled: bool },
 }
 
+/// Clears a run's [`OverlayController::close_current`] when the run ends, on every path out.
+struct CloseScope<'a>(&'a OverlayControllerInner);
+
+impl Drop for CloseScope<'_> {
+    fn drop(&mut self) {
+        self.0.close_requested.store(false, Ordering::SeqCst);
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct OverlayController {
     inner: Arc<OverlayControllerInner>,
@@ -701,6 +710,9 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
     {
         return Ok(SelectionOutcome::Cancelled);
     }
+    // However the run ends, an error return before the window exists included, a close meant
+    // for it ends with it and cannot reach the next overlay.
+    let _close_scope = CloseScope(&controller.inner);
     let _dpi_context = ThreadDpiContext::enter_per_monitor_v2()?;
     if let Some(frame) = preview_source.snapshot {
         validate_frame(frame)?;
@@ -1433,10 +1445,6 @@ fn run_overlay(
             // SAFETY: The callback will no longer access state after DestroyWindow returns.
             let state = unsafe { Box::from_raw(state_pointer) };
             controller.inner.hwnd.store(0, Ordering::SeqCst);
-            controller
-                .inner
-                .close_requested
-                .store(false, Ordering::SeqCst);
             let previous_foreground = state.previous_foreground;
             let _ = cache_overlay_state(state, resources);
             restore_input_context(previous_foreground);
@@ -1454,10 +1462,6 @@ fn run_overlay(
     // SAFETY: WM_NCDESTROY cleared the window user-data pointer and the loop has ended.
     let state = unsafe { Box::from_raw(state_pointer) };
     controller.inner.hwnd.store(0, Ordering::SeqCst);
-    controller
-        .inner
-        .close_requested
-        .store(false, Ordering::SeqCst);
     let previous_foreground = state.previous_foreground;
     let outcome = cache_overlay_state(state, resources);
     restore_input_context(focus_after_run(&outcome).unwrap_or(previous_foreground));
@@ -1621,11 +1625,9 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             // returns the value can be recycled, and cancel() must not be able to load it.
             // run_overlay's later store(0) remains as belt and braces for non-window paths.
             state.controller.inner.hwnd.store(0, Ordering::SeqCst);
-            state
-                .controller
-                .inner
-                .close_requested
-                .store(false, Ordering::SeqCst);
+            // The close flag is left alone: when the layered presenter falls back, this is the
+            // first window of a run that goes on, and a close sent meanwhile is for that run.
+            // The run clears it when it ends.
         }
         // SAFETY: Prevents any later callback from observing the state pointer.
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
@@ -4768,6 +4770,23 @@ mod tests {
         assert!(!controller.inner.close_requested.load(Ordering::SeqCst));
         // Neither touches shutdown's cancel, which no overlay ever comes back from.
         assert!(!controller.inner.cancelled.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_close_sent_during_a_run_ends_with_that_run_however_it_ends() {
+        use std::sync::atomic::Ordering;
+        let controller = super::OverlayController::new();
+        let failed_run = || -> Result<(), ()> {
+            let _close_scope = super::CloseScope(&controller.inner);
+            // The close arrives while the run is setting up, and the setup then fails.
+            controller.close_current();
+            Err(())
+        };
+        assert!(failed_run().is_err());
+        assert!(
+            !controller.inner.close_requested.load(Ordering::SeqCst),
+            "the next overlay is not closed by a close meant for the run that failed"
+        );
     }
 
     use captastic_core::PixelFormat;
