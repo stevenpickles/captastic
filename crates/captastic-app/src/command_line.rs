@@ -809,6 +809,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn an_output_relative_to_a_drive_is_resolved_not_refused() {
         let current = Path::new(r"C:\work");
         let resolved = absolute_output(Path::new("C:shot.png"), current);
