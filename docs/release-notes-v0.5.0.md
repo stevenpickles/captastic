@@ -96,6 +96,20 @@ three features touches the still-capture path: a capture confirmed with **Captur
 - **A window that Windows scales for display** (one that is not per-monitor DPI aware, on a display
   at 125% or more) was captured at its unscaled size in the top-left corner of a larger black image.
   It is now captured whole, on the overlay and from the command line (PR #146).
+- **From an adversarial review of the whole code base** before the tag (PRs #156 to #162):
+  - **Recordings are not lost.** A recording running when Captastic exits gets up to 15 seconds
+    to finish writing; a reviewed recording that cannot be saved in the output folder is saved in
+    `~/.captastic/recordings` instead; an MP4 with sound no longer grows without limit in memory
+    when the encoder falls behind; and a crop dragged to the picture's last row no longer loses
+    the recording on **Save**.
+  - **Every command-line capture is announced**, including a second one to the same file name.
+  - **`fresh` capture mode** no longer returns the screen as it was at the previous capture when
+    something was drawn just before the hotkey.
+  - **The window chooser** no longer re-renders a window it cannot capture for as long as it is
+    open.
+  - **Delete-recording and discard-edits confirmations** default to the safe button.
+  - **Chocolatey install** no longer runs the old per-user copy's uninstaller with administrator
+    rights; the portable uninstaller refuses a folder that holds no Captastic.
 
 ## What was observed
 
@@ -143,6 +157,16 @@ and a status answer whose daemon version overwrote the protocol version (PR #143
   waits for the user, other requests wait behind it.
 - **A protected window cannot be captured from the command line**, as on the overlay; it is not
   listed by `windows`.
+- **Left from the adversarial review, each with an unusual trigger:**
+  - in `latest` mode the pointer can be drawn where it was at the last repaint, and twice on a
+    virtual desktop;
+  - opening a review of a long GIF, or jumping to its end, decodes on the window thread, which
+    can hold up a running recording's **Stop** for a few seconds;
+  - a GIF of fast-changing content can show ghosting in its darkest areas;
+  - a pen stroke or crop drag is dropped if another window takes the mouse mid-drag;
+  - a worker thread that panics is not restarted, so the hotkey can stop working silently until
+    Captastic is restarted;
+  - a file name template that is not unique stops saving after 100 files of the same name.
 - The v0.4.0 limitations otherwise stand: a crash during a review loses that recording, an HDR
   display cannot be recorded, no hotkey starts or stops a recording, and a trimmed or cropped
   recording is compressed twice.
