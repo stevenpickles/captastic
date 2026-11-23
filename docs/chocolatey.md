@@ -171,15 +171,39 @@ exact archive's contents in `captastic.<version>.nupkg`. The ZIP, checksum, Choc
 `VERIFICATION.txt` records the direct tagged GitHub release archive URL and SHA-256 hashes for the
 archive and both executables. A tagged package build fails if given an indirect or non-release URL.
 
-The workflow does not publish to the Chocolatey community repository automatically. Do not push a
-package until the tagged GitHub release exists, its direct download URLs work, its manifest hashes
-match, and the disposable-VM checklist passes. Then publish manually with an API key kept outside
-the repository:
+### Pushing to the Chocolatey community repository
+
+For a release tag (`vX.Y.Z`, no prerelease label), the release workflow's **Push to the Chocolatey
+community repository** job runs after the GitHub release is published. It waits on the
+`chocolatey` environment, which requires the maintainer's approval. Approve it only once the
+disposable-VM checklist has passed for this build and the published release looks right.
+
+The job runs [scripts/publish-chocolatey.ps1](../scripts/publish-chocolatey.ps1), which builds
+nothing:
+
+1. It downloads the release's `artifacts.json` and every file it lists, through the direct release
+   URLs that `VERIFICATION.txt` names and `choco install` fetches from.
+2. It checks that the manifest is publishable and for the tag's version, and that each file has
+   the SHA-256 the manifest records.
+3. It pushes the `.nupkg` attached to the release, with the key from the environment's
+   `CHOCOLATEY_API_KEY` secret.
+
+One-time setup, in the repository's **Settings → Environments**:
+
+1. Create an environment named `chocolatey`.
+2. Add yourself under **Required reviewers**.
+3. Limit its **Deployment branches and tags** to tags matching `v*`.
+4. Add the secret `CHOCOLATEY_API_KEY`, holding the API key from your chocolatey.org account.
+
+Without required reviewers the job pushes as soon as the release is published. Without the secret
+it fails and pushes nothing.
+
+To check a published release without pushing, or to push by hand if the job cannot run:
 
 ```powershell
-choco push ./dist/captastic.<version>.nupkg `
-    --source https://push.chocolatey.org/ `
-    --api-key $env:CHOCOLATEY_API_KEY
+./scripts/publish-chocolatey.ps1 -Tag v<version> -Repository stevenpickles/captastic -DryRun
+$env:CHOCOLATEY_API_KEY = '<key>'   # then without -DryRun, to push
+./scripts/publish-chocolatey.ps1 -Tag v<version> -Repository stevenpickles/captastic
 ```
 
 The first package submission must pass Chocolatey community validation and moderation before
