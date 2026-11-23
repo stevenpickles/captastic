@@ -872,6 +872,7 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
         window_preview: None,
         window_thumbnails: Vec::new(),
         live_window_thumbnails: Vec::new(),
+        unrenderable_windows: Vec::new(),
         // A previous run's chooser surface is only ever an allocation to draw into, never
         // presentable content: the cache starts empty so the first Window-mode compose is
         // forced to rebuild, and the rebuild reclaims the spare buffer below.
@@ -939,6 +940,9 @@ struct OverlayState {
     window_preview: Option<WindowPreviewState>,
     window_thumbnails: Vec<WindowThumbnail>,
     live_window_thumbnails: Vec<LiveWindowThumbnail>,
+    /// Windows whose tile render failed for good in this chooser: never queued again, or the
+    /// chooser would render the same window, fail, and queue it once more for as long as it is open.
+    unrenderable_windows: Vec<NativeWindowHandle>,
     window_overview_cache: Option<WindowOverviewCache>,
     /// The in-flight incremental thumbnail build, if any. Shell inventory work, not product
     /// state: it survives a tool switch away (frozen; its posted messages are ignored) and
@@ -2986,6 +2990,7 @@ fn start_window_overview_build(hwnd: HWND, state: &mut OverlayState) {
         // Every window gets a tile immediately, shaped from what DWM already knows. Only the
         // windows DWM cannot draw are queued for a render, because rendering one it *can* draw
         // costs tens of milliseconds to produce pixels the compositor covers a moment later.
+        state.unrenderable_windows.clear();
         let needs_render = seed_window_tiles(state, &handles);
         if !needs_render.is_empty() {
             state.overview_build_generation = state.overview_build_generation.wrapping_add(1);
@@ -3048,6 +3053,7 @@ fn render_overview_batch(hwnd: HWND, state: &mut OverlayState, generation: usize
         .as_mut()
         .expect("the build is untouched while its batch renders");
     let mut new_thumbnails = Vec::new();
+    let mut failed = Vec::new();
     for (handle, attempt, capture) in rendered {
         let capture = match capture {
             Ok(capture) => capture,
@@ -3057,6 +3063,7 @@ fn render_overview_batch(hwnd: HWND, state: &mut OverlayState, generation: usize
                     "window handle=0x{:X} omitted from overview after render failure: {error}",
                     handle.raw()
                 );
+                failed.push(handle);
                 continue;
             }
         };
@@ -3065,6 +3072,7 @@ fn render_overview_batch(hwnd: HWND, state: &mut OverlayState, generation: usize
             capture.frame.height(),
             capture.frame.pixels(),
         ) else {
+            failed.push(handle);
             continue;
         };
         new_thumbnails.push(WindowThumbnail {
@@ -3077,6 +3085,7 @@ fn render_overview_batch(hwnd: HWND, state: &mut OverlayState, generation: usize
     }
     let finished = build.queue.is_done();
     let started = build.started;
+    state.unrenderable_windows.extend(failed);
     // A render either fills in a tile DWM could not draw, or adds one in frozen mode. Replacing
     // in place keeps the chooser's ordering stable while tiles arrive.
     for rendered in new_thumbnails {
@@ -3259,19 +3268,28 @@ fn refresh_live_window_thumbnails(state: &mut OverlayState) {
 /// how it was built: the toolbar is dragged over it, a menu opens above it, or DWM stops drawing
 /// it. Seeding decided which tiles needed rendering *at the time*; this is what keeps that
 /// decision honest afterwards.
-fn queue_uncovered_window_tiles(state: &mut OverlayState) {
-    let uncovered: Vec<NativeWindowHandle> = state
-        .window_thumbnails
+/// The tiles that still need a render: no pixels, no live preview drawing them, and not a window
+/// whose render already failed for good in this chooser.
+fn tiles_to_render(
+    tiles: &[WindowThumbnail],
+    live: &[NativeWindowHandle],
+    unrenderable: &[NativeWindowHandle],
+) -> Vec<NativeWindowHandle> {
+    tiles
         .iter()
         .filter(|tile| tile.surface.is_none())
         .map(|tile| tile.handle)
-        .filter(|handle| {
-            !state
-                .live_window_thumbnails
-                .iter()
-                .any(|preview| preview.handle == *handle)
-        })
+        .filter(|handle| !unrenderable.contains(handle) && !live.contains(handle))
+        .collect()
+}
+
+fn queue_uncovered_window_tiles(state: &mut OverlayState) {
+    let live: Vec<NativeWindowHandle> = state
+        .live_window_thumbnails
+        .iter()
+        .map(|preview| preview.handle)
         .collect();
+    let uncovered = tiles_to_render(&state.window_thumbnails, &live, &state.unrenderable_windows);
     if uncovered.is_empty() {
         return;
     }
@@ -4748,6 +4766,31 @@ fn validate_frame(frame: &CpuFrame) -> Result<(), CaptureError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_window_whose_tile_cannot_be_rendered_is_not_queued_again() {
+        use super::NativeWindowHandle as Handle;
+        let tile = |raw| super::WindowThumbnail {
+            handle: Handle::from_raw(raw),
+            source_width: 100,
+            source_height: 100,
+            corner_radius_px: 0.0,
+            surface: None,
+        };
+        let tiles = [tile(1), tile(2), tile(3)];
+        let live = [Handle::from_raw(2)];
+        // Windows 1 and 3 have nothing drawing them, so they are queued; 2 has a live preview.
+        assert_eq!(
+            super::tiles_to_render(&tiles, &live, &[]),
+            vec![Handle::from_raw(1), Handle::from_raw(3)]
+        );
+        // Once 1's render has failed for good, it is not queued again, or the chooser would
+        // render, fail and queue it for as long as it is open.
+        assert_eq!(
+            super::tiles_to_render(&tiles, &live, &[Handle::from_raw(1)]),
+            vec![Handle::from_raw(3)]
+        );
+    }
+
     #[test]
     fn closing_the_current_overlay_reaches_that_run_only() {
         use std::sync::atomic::Ordering;
