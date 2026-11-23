@@ -29,6 +29,8 @@ mod request_pipe;
 #[cfg(windows)]
 mod session;
 #[cfg(windows)]
+mod sound_player;
+#[cfg(windows)]
 mod startup;
 #[cfg(windows)]
 mod tray;
@@ -89,6 +91,8 @@ pub use request_pipe::{
 };
 #[cfg(windows)]
 pub use session::{desktop_state, DesktopState};
+#[cfg(windows)]
+pub use sound_player::SoundPlayer;
 #[cfg(windows)]
 pub use startup::{disable_startup, enable_startup, startup_command};
 #[cfg(windows)]

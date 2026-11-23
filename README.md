@@ -492,6 +492,14 @@ capturing). **Options -> Record As** chooses the format, and the choice is kept:
 - **MP4**: H.264 video at 30 frames a second and the recorded size, encoded by Windows on the GPU
   where it can be. Far smaller and smoother for anything long or large.
 
+**Options -> Record Sound** adds the computer's sound to an MP4 (ADR 0015): everything sent to the
+default output device, as you hear it, and never the microphone. It is off by default, since that
+includes any chime, notification or call the computer plays, and it is kept like **Record As**
+(`recording.audio`). GIF has no sound, so the row is greyed and reads **Record Sound (MP4 only)**
+while GIF is chosen. While sound is recorded the bar shows a speaker beside the time. Switching the
+output device during a recording, plugging in headphones say, carries on with the new device; with
+no output device the recording is silent, and the notification says it was recorded without sound.
+
 A window is recorded as itself, through Windows Graphics Capture (ADR 0013): another window moved
 over it, or moving it, changes nothing in the recording, and the border and its bar follow it
 around. The recording keeps the size the window had when it started; a window resized during it is
@@ -509,9 +517,10 @@ and with **Ctrl** to the previous or next change on screen; **I** and **O** put 
 of the span at the playhead, and the times read to the millisecond. Drag on the picture to crop it,
 then move the rectangle or pull its edges and corners as in the image editor; **Reset Crop** (R)
 keeps the whole picture again, and an MP4's crop keeps even sides, as H.264 needs. **Space** plays the span kept,
-**Save** (Enter) saves it, and **Discard**, Escape or the close button ask before deleting the
+with its sound for a recording that has it (silent while stepping or dragging the playhead, and
+**Mute** (M) silences it), **Save** (Enter) saves it, and **Discard**, Escape or the close button ask before deleting the
 recording. Saved without trimming or cropping, the recording is kept exactly as recorded; otherwise
-what is kept is encoded again. Until it is saved a recording is held in memory and nothing is
+what is kept is encoded again, its sound cut at the same moments as the picture. Until it is saved a recording is held in memory and nothing is
 written to disk, so **Discard** leaves no trace; Captastic exiting during a review saves it as it
 is, but a recording in review is lost if Captastic crashes. `recording.review = false`, or **Review Recordings**
 in the notification-area menu, saves recordings as soon as they end instead.
@@ -519,7 +528,7 @@ in the notification-area menu, saves recordings as soon as they end instead.
 A recording is always saved to the output directory, named by the same template as stills and
 remembered in capture history, whether or not still captures are being saved; a notification names
 the file, and clicking it shows the file selected in its folder. It never goes to the clipboard. It records the pointer if `[capture] cursor` includes it
-for stills, and never audio. One recording runs at a time, and the capture hotkey does nothing while
+for stills, and sound only as above. One recording runs at a time, and the capture hotkey does nothing while
 it runs except say so. Captastic exiting finishes a recording rather than discarding it. Recording
 needs Captastic running in the notification area; the developer command line's one-shot capture
 greys **Record**, and `captastic-dev record` records a display or region from the command line
