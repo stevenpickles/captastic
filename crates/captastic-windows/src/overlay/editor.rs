@@ -35,10 +35,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, LoadCursorW, MessageBoxW,
     SetCursor, SetForegroundWindow, SetWindowPos, ShowWindow, HTCLIENT, IDC_ARROW, IDC_CROSS,
     IDC_IBEAM, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, IDYES,
-    MB_ICONWARNING, MB_YESNO, MINMAXINFO, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WM_CAPTURECHANGED,
-    WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SIZE,
-    WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
+    MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO, MINMAXINFO, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW,
+    WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
+    WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY,
+    WM_PAINT, WM_SETCURSOR, WM_SIZE, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
 };
 
 use super::desktop_ui::{desktop_error, forget_window, release_window_state, window_state};
@@ -1808,7 +1808,8 @@ fn request_cancel(hwnd: HWND, state_pointer: *mut EditorState) {
                 hwnd,
                 w!("Discard your edits? Nothing from this capture has been copied or saved."),
                 w!("Captastic"),
-                MB_YESNO | MB_ICONWARNING,
+                // No is the default: a stray Enter must not throw the edits away.
+                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
             )
         };
         if answer != IDYES {

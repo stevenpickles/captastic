@@ -180,6 +180,10 @@ fn notify_dropped_selection(
     let _ = notices.try_send(crate::daemon::DaemonNotice::DroppedSelection { capture_id, reason });
 }
 
+/// How long a recording running at exit is given to finish writing, whatever the rest of
+/// shutdown's deadline.
+const RECORDING_SHUTDOWN_GRACE: Duration = Duration::from_secs(15);
+
 pub struct SelectionWorker {
     sender: Option<mpsc::SyncSender<SelectionJob>>,
     controller: Option<captastic_windows::OverlayController>,
@@ -910,9 +914,11 @@ impl SelectionWorker {
     fn stop_inner(&mut self, deadline: Instant) {
         self.request_stop();
         // A recording running when Captastic exits is finished, not discarded: stopped first, so
-        // it needs no more frames, and given the deadline to write its file.
+        // it needs no more frames, and given longer than the rest of shutdown to write its file. The
+        // shared deadline is seconds; encoding the frames still queued for a busy GIF or a large
+        // MP4 can take longer, and a recording cut off there is lost.
         if let Some(recordings) = self.recordings.as_ref() {
-            recordings.stop_before(deadline);
+            recordings.stop_before(deadline.max(Instant::now() + RECORDING_SHUTDOWN_GRACE));
         }
         // `request_stop` already dropped this side's update sender, so the UI-state thread is
         // winding down in parallel and only needs a moment to write once the selection thread

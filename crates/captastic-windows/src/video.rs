@@ -54,6 +54,9 @@ const TICKS_PER_SECOND: u128 = 10_000_000;
 const BYTE_STREAM_CHUNK: usize = 16 * 1024 * 1024;
 /// AAC at 160 kbit/s: 20,000 bytes a second, one of the four rates Windows' encoder takes.
 const AAC_BYTES_PER_SECOND: u32 = 20_000;
+/// How many frames may wait on the H.264 encoder in an unthrottled writer before new ones are
+/// skipped: a second at 30 frames a second, at most about a gigabyte at 4K.
+const MAXIMUM_ENCODER_BACKLOG: u64 = 30;
 
 /// The size a `width` by `height` recording is encoded at: scaled down, keeping its shape, to fit
 /// [`MP4_MAXIMUM_SIZE`], then rounded down to even sides, which H.264's 4:2:0 sampling needs.
@@ -75,6 +78,8 @@ pub struct VideoSummary {
     pub duration: Duration,
     /// How much sound was written, when the MP4 has a sound stream.
     pub audio_duration: Duration,
+    /// Frames skipped because the encoder was a second behind; the frame before lasted longer.
+    pub frames_skipped: u64,
 }
 
 /// Media Foundation and COM, started for this thread and stopped when dropped.
@@ -308,6 +313,13 @@ impl Mp4Writer {
         if self.previous.as_deref() == Some(bgra) {
             return Ok(());
         }
+        // An unthrottled writer (one with sound) never pushes back, so a slow encoder would queue
+        // uncompressed frames inside Media Foundation without limit. Past a second of backlog the
+        // frame is skipped, as the recording's own queue drops frames when the encoder is behind.
+        if self.audio_stream.is_some() && self.encoder_backlog() > MAXIMUM_ENCODER_BACKLOG {
+            self.summary.frames_skipped += 1;
+            return Ok(());
+        }
         let sample = self.sample(bgra)?;
         if let Some(pending) = self.pending.take() {
             self.write(pending, at)?;
@@ -315,6 +327,22 @@ impl Mp4Writer {
         self.pending = Some(Pending { sample, at });
         self.previous = Some(bgra.to_vec());
         Ok(())
+    }
+
+    /// Frames handed to the sink writer that its encoder has not yet encoded.
+    fn encoder_backlog(&self) -> u64 {
+        let mut statistics = windows::Win32::Media::MediaFoundation::MF_SINK_WRITER_STATISTICS {
+            cb: std::mem::size_of::<windows::Win32::Media::MediaFoundation::MF_SINK_WRITER_STATISTICS>(
+            ) as u32,
+            ..Default::default()
+        };
+        // SAFETY: The writer is this thread's and the statistics are a local of the size given.
+        match unsafe { self.writer.GetStatistics(self.stream, &mut statistics) } {
+            Ok(()) => statistics
+                .qwNumSamplesReceived
+                .saturating_sub(statistics.qwNumSamplesEncoded),
+            Err(_) => 0,
+        }
     }
 
     /// Writes the last frame, shown until `end` after the recording started, and finalizes the
@@ -815,6 +843,38 @@ mod tests {
             (tone - 8_485.0).abs() < 1_500.0,
             "tone decoded at RMS {tone}"
         );
+    }
+
+    #[test]
+    #[ignore = "needs Media Foundation's H.264 and AAC encoders, which a Windows Server CI image may lack"]
+    fn a_writer_with_sound_bounds_what_waits_on_its_encoder() {
+        // 4K frames that all differ, pushed far faster than real time, with sound: the writer
+        // asks how far its encoder is behind and skips frames past a second of backlog.
+        let (width, height) = (3840_u32, 2160_u32);
+        let mut writer =
+            Mp4Writer::create_recording(None, width, height, 30, true).expect("writer");
+        let rate = crate::AUDIO_SAMPLE_RATE as usize;
+        for index in 0..240_u64 {
+            let at = Duration::from_millis(index * 33);
+            let frame = vec![(index % 250) as u8; (width * height * 4) as usize];
+            writer.push(&frame, at).expect("frame");
+            assert!(writer.encoder_backlog() <= MAXIMUM_ENCODER_BACKLOG + 1);
+            writer
+                .push_audio(
+                    &crate::AudioPacket {
+                        start: at,
+                        samples: vec![0; rate / 30 * 2],
+                    },
+                    None,
+                )
+                .expect("sound");
+        }
+        let (_, summary) = writer
+            .finish_in_memory(Duration::from_millis(240 * 33))
+            .expect("finish");
+        eprintln!("{summary:?}");
+        assert_eq!(summary.frames_received, 240);
+        assert_eq!(summary.frames_written + summary.frames_skipped, 240);
     }
 
     #[test]
