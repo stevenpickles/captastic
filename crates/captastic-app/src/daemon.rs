@@ -3396,6 +3396,8 @@ pub(crate) enum DaemonNotice {
         /// Whether a window was recorded as its area on the screen, since Windows would not let it
         /// be captured itself (ADR 0013).
         window_area: bool,
+        /// Why a recording that was to carry the computer's sound has none (ADR 0015).
+        without_sound: Option<String>,
     },
     /// A recording failed, and nothing was saved.
     RecordingFailed { message: String },
@@ -3460,6 +3462,7 @@ impl DaemonNotice {
                 file_name,
                 ended,
                 window_area,
+                without_sound,
                 ..
             } => {
                 let saved = match ended {
@@ -3474,6 +3477,10 @@ impl DaemonNotice {
                     Some(crate::recording::RecordingEnd::Stopped) | None => {
                         format!("{file_name} was saved. Click to show it in its folder.")
                     }
+                };
+                let saved = match without_sound {
+                    Some(reason) => format!("Recorded without sound: {reason}. {saved}"),
+                    None => saved,
                 };
                 if *window_area {
                     format!(
@@ -4023,12 +4030,29 @@ mod tests {
     }
 
     #[test]
+    fn a_recording_that_was_to_have_sound_says_when_it_has_none() {
+        let notice = DaemonNotice::RecordingSaved {
+            file_name: "clip.mp4".to_owned(),
+            path: std::path::PathBuf::from("clip.mp4"),
+            ended: None,
+            window_area: false,
+            without_sound: Some("there is no output device".to_owned()),
+        };
+        assert_eq!(
+            notice.message(),
+            "Recorded without sound: there is no output device. clip.mp4 was saved. Click to show \
+             it in its folder."
+        );
+    }
+
+    #[test]
     fn a_window_recorded_as_its_area_says_so_when_it_is_saved() {
         let saved = |window_area| DaemonNotice::RecordingSaved {
             file_name: "clip.gif".to_owned(),
             path: std::path::PathBuf::from("clip.gif"),
             ended: Some(crate::recording::RecordingEnd::WindowClosed),
             window_area,
+            without_sound: None,
         };
         assert_eq!(
             saved(false).message(),

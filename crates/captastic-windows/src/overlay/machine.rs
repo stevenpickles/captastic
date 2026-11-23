@@ -260,6 +260,10 @@ pub(super) struct OverlayModel {
     /// What **Record** records into, or `None` when this run cannot record; see
     /// `OverlayDestinations::record_format`.
     pub(super) record_format: Option<captastic_config::RecordingFormat>,
+    /// Whether an MP4 recording records the computer's sound; see
+    /// `OverlayDestinations::record_sound`. Kept while **Record As** says GIF, when the row is
+    /// greyed and the recording has no sound whatever this says.
+    pub(super) record_sound: bool,
     /// Whether **Record** was pressed under the Window tool before a window was chosen, so the
     /// next window clicked is recorded rather than captured. A window click confirms at once,
     /// which leaves no chosen window waiting for the button the way a region does.
@@ -474,6 +478,10 @@ pub(super) enum OverlayEffect {
     /// The user chose, from the Options menu, what **Record** records into.
     RequestRecordingFormat {
         format: captastic_config::RecordingFormat,
+    },
+    /// The user switched **Record Sound** in the Options menu (ADR 0015).
+    RequestRecordingSound {
+        enabled: bool,
     },
     RequestFileOutput {
         enabled: bool,
@@ -865,6 +873,15 @@ fn toolbar_control_pressed(
                 };
                 model.record_format = Some(next);
                 effects.push(OverlayEffect::RequestRecordingFormat { format: next });
+            }
+        }
+        ToolbarControl::RecordSound => {
+            // Only an MP4 carries sound, so the row does nothing while Record As says GIF.
+            if model.record_format == Some(captastic_config::RecordingFormat::Mp4) {
+                model.record_sound = !model.record_sound;
+                effects.push(OverlayEffect::RequestRecordingSound {
+                    enabled: model.record_sound,
+                });
             }
         }
         ToolbarControl::Cancel => return cancel(model),
@@ -1790,6 +1807,7 @@ mod tests {
             pin_available: true,
             edit_available: false,
             record_format: None,
+            record_sound: false,
             record_armed: false,
             hovered_control: None,
             pointer_local: None,
@@ -2884,6 +2902,45 @@ mod tests {
         assert!(!effects
             .iter()
             .any(|effect| matches!(effect, OverlayEffect::RequestRecordingFormat { .. })));
+    }
+
+    #[test]
+    fn the_record_sound_row_switches_only_for_an_mp4_and_tells_the_daemon() {
+        let press = |layout: ToolbarLayout| OverlayInput::PointerDown {
+            point: center(layout.record_sound),
+            window_slot: None,
+            time_ms: 0,
+            modifiers: Modifiers::default(),
+        };
+        let mut model = region_model_with_selection();
+        model.record_format = Some(captastic_config::RecordingFormat::Mp4);
+        model.options_open = true;
+        let layout = layout_for(&model);
+        let effects = transition(&mut model, press(layout));
+        assert!(model.record_sound);
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            OverlayEffect::RequestRecordingSound { enabled: true }
+        )));
+        assert!(
+            model.options_open,
+            "the menu stays open, as for every toggle row"
+        );
+        transition(&mut model, press(layout));
+        assert!(!model.record_sound);
+
+        // GIF has no sound: the row is greyed and does nothing, and keeps what was chosen.
+        for format in [Some(captastic_config::RecordingFormat::Gif), None] {
+            let mut model = region_model_with_selection();
+            model.record_format = format;
+            model.record_sound = true;
+            model.options_open = true;
+            let effects = transition(&mut model, press(layout));
+            assert!(model.record_sound, "{format:?}");
+            assert!(!effects
+                .iter()
+                .any(|effect| matches!(effect, OverlayEffect::RequestRecordingSound { .. })));
+        }
     }
 
     #[test]

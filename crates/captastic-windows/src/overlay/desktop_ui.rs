@@ -64,6 +64,7 @@ enum UiCommand {
         area: Rect,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
         limit: Duration,
+        sound: bool,
     },
     FollowRecording {
         window: crate::NativeWindowHandle,
@@ -139,14 +140,21 @@ impl DesktopUi {
     }
 
     /// Shows the recording indicator around `area`: a red border and a bar with the elapsed time
-    /// and a **Stop** button that sets `stop`. Replaces an indicator already showing.
+    /// and a **Stop** button that sets `stop`, and a speaker beside the time while `sound` is
+    /// recorded (ADR 0015). Replaces an indicator already showing.
     pub fn show_recording(
         &self,
         area: Rect,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
         limit: Duration,
+        sound: bool,
     ) -> Result<(), CaptureError> {
-        self.request(UiCommand::ShowRecording { area, stop, limit })
+        self.request(UiCommand::ShowRecording {
+            area,
+            stop,
+            limit,
+            sound,
+        })
     }
 
     /// Makes the recording indicator follow `window` as it moves and is resized, for a window
@@ -504,12 +512,17 @@ unsafe fn apply(state: *mut HostState, command: UiCommand) {
                 unsafe { (*state).editors.push(editor) };
             }
         }
-        UiCommand::ShowRecording { area, stop, limit } => {
+        UiCommand::ShowRecording {
+            area,
+            stop,
+            limit,
+            sound,
+        } => {
             // SAFETY: Per this function's contract; the borrow ends before the window is made.
             unsafe { close_recording(state) };
             // SAFETY: As above.
             let instance = unsafe { (*state).instance };
-            match create_recording_frame(instance, area, stop, limit) {
+            match create_recording_frame(instance, area, stop, limit, sound) {
                 // SAFETY: As above.
                 Ok(frame) => unsafe { (*state).recording = Some(frame) },
                 Err(error) => log::warn!("could not show the recording border: {error}"),

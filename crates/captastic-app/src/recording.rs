@@ -970,6 +970,29 @@ impl RecordingHost {
         }
     }
 
+    /// Whether an MP4 recording records the computer's sound (ADR 0015).
+    pub fn audio_enabled(&self) -> bool {
+        lock(&self.inner.config).audio
+    }
+
+    /// Applies **Record Sound**: later MP4 recordings carry the computer's sound, or do not, and
+    /// it is written back to the configuration as `recording.audio`.
+    pub fn set_audio(&self, enabled: bool) {
+        lock(&self.inner.config).audio = enabled;
+        log::info!(
+            "MP4 recordings will be made {} the computer's sound",
+            if enabled { "with" } else { "without" }
+        );
+        if let Some(path) = self.inner.config_path.as_deref() {
+            if let Err(error) = captastic_config::set_recording_audio(path, enabled) {
+                crate::logging::warn(format_args!(
+                    "the sound setting could not be saved to {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
     /// Whether recordings are reviewed before they are saved.
     pub fn review_enabled(&self) -> bool {
         self.inner.review.load(Ordering::Acquire)
@@ -1044,7 +1067,13 @@ impl RecordingHost {
         };
         let stop = Arc::new(AtomicBool::new(false));
         *lock(&inner.stop) = Some(stop.clone());
-        show_indicator(desktop_ui, request.area, &stop, settings.max_duration);
+        show_indicator(
+            desktop_ui,
+            request.area,
+            &stop,
+            settings.max_duration,
+            settings.audio && settings.format == RecordingFormat::Mp4,
+        );
         log::info!(
             "recording {} started: {}x{} at {},{} as {} for at most {} s",
             request.capture_id.0,
@@ -1239,14 +1268,23 @@ impl RecordingHost {
                 })
             );
         }
-        let _ = inner
-            .notices
-            .try_send(crate::daemon::DaemonNotice::RecordingSaved {
-                file_name: file_name(&report.path),
-                path: report.path.clone(),
-                ended,
-                window_area,
-            });
+        let _ =
+            inner
+                .notices
+                .try_send(crate::daemon::DaemonNotice::RecordingSaved {
+                    file_name: file_name(&report.path),
+                    path: report.path.clone(),
+                    ended,
+                    window_area,
+                    without_sound: report.sound.as_ref().filter(|sound| !sound.recorded).map(
+                        |sound| {
+                            sound
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "no output device could be read".to_owned())
+                        },
+                    ),
+                });
     }
 
     /// Opens `draft`'s review, or queues it behind the one open.
@@ -1427,6 +1465,14 @@ impl RecordingHost {
             &bytes,
         ) {
             Ok(path) => {
+                // A trimmed or cropped save encodes the picture again and, until ADR 0015's
+                // fourth slice, not the sound: the notification says so rather than lose it
+                // quietly.
+                let sound = draft.report.sound.clone().map(|sound| RecordingSound {
+                    recorded: false,
+                    error: Some("trimming or cropping does not keep the sound yet".to_owned()),
+                    ..sound
+                });
                 let report = RecordingReport {
                     path,
                     bytes: bytes.len() as u64,
@@ -1434,6 +1480,7 @@ impl RecordingHost {
                     height: summary.height,
                     duration: edit.length(),
                     frames_written: summary.frames_written,
+                    sound,
                     ..draft.report
                 };
                 self.announce_saved(
@@ -1703,6 +1750,7 @@ fn show_indicator(
     area: Rect,
     stop: &Arc<AtomicBool>,
     limit: Duration,
+    sound: bool,
 ) {
     let mut host = lock(desktop_ui);
     if host.is_none() {
@@ -1720,7 +1768,7 @@ fn show_indicator(
         }
     }
     if let Some(host) = host.as_ref() {
-        if let Err(error) = host.show_recording(area, stop.clone(), limit) {
+        if let Err(error) = host.show_recording(area, stop.clone(), limit, sound) {
             crate::logging::warn(format_args!(
                 "the recording border could not be shown, so the recording is stopped: {error}"
             ));
