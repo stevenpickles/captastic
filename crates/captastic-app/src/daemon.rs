@@ -3474,6 +3474,10 @@ impl DaemonNotice {
                         "{file_name} was saved when the recorded window closed. Click to show it \
                          in its folder."
                     ),
+                    Some(crate::recording::RecordingEnd::SourceFailed) => format!(
+                        "{file_name} was saved when the recording could no longer be captured. \
+                         Click to show it in its folder."
+                    ),
                     Some(crate::recording::RecordingEnd::Stopped) | None => {
                         format!("{file_name} was saved. Click to show it in its folder.")
                     }

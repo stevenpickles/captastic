@@ -216,6 +216,12 @@ fn run(
             Some(ready) => {
                 let _ = ready.send(Err(error));
             }
+            // A window being destroyed can fail the session before its close is seen: that is the
+            // window closing, which ends a recording and keeps it, not the session failing.
+            // SAFETY: IsWindow only reads whether the handle still names a window.
+            None if !unsafe { IsWindow(hwnd) }.as_bool() => {
+                shared.closed.store(true, Ordering::Release);
+            }
             None => {
                 log::warn!("window session ended early: {error}");
                 *lock(&shared.failure) = Some(error);
@@ -688,6 +694,30 @@ mod tests {
         }
         assert!(session.is_closed());
         assert!(session.latest().is_err());
+    }
+
+    #[test]
+    #[ignore = "requires an interactive desktop with Windows Graphics Capture"]
+    fn a_window_dragged_larger_keeps_its_session() {
+        let _desktop = desktop();
+        let window = TestWindow::open(320, 240);
+        thread::sleep(Duration::from_millis(300));
+        let session = WgcWindowSession::start(window.handle(), false).expect("session");
+        let first = frame_where(&session, |frame| centre(frame)[..3] == PAINT_BGRA)
+            .expect("a frame showing the window's colour");
+        // Grown a few pixels at a time, as a corner dragged outwards grows it, for two seconds.
+        let mut failures = 0;
+        for step in 1..=120 {
+            window.resize(320 + step * 4, 240 + step * 3);
+            thread::sleep(Duration::from_millis(16));
+            if session.latest().is_err() {
+                failures += 1;
+            }
+        }
+        assert_eq!(failures, 0, "the session failed while the window grew");
+        let grown = frame_where(&session, |frame| frame.width > first.width + 300)
+            .expect("a frame at the grown size");
+        assert_eq!(centre(&grown)[..3], PAINT_BGRA);
     }
 
     #[test]
