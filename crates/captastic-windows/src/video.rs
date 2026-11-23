@@ -29,7 +29,8 @@ use windows::Win32::Media::MediaFoundation::{
     MFVideoInterlace_Progressive, MFSTARTUP_FULL, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE,
     MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
     MF_MT_MAX_KEYFRAME_SPACING, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
-    MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_TRANSCODE_CONTAINERTYPE, MF_VERSION,
+    MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_SINK_WRITER_DISABLE_THROTTLING,
+    MF_TRANSCODE_CONTAINERTYPE, MF_VERSION,
 };
 use windows::Win32::Media::MediaFoundation::{
     MFAudioFormat_AAC, MFAudioFormat_PCM, MFMediaType_Audio, MF_MT_AAC_PAYLOAD_TYPE,
@@ -204,12 +205,21 @@ impl Mp4Writer {
         // and values that outlive the call.
         let writer = unsafe {
             let mut attributes: Option<IMFAttributes> = None;
-            MFCreateAttributes(&mut attributes, 2)
+            MFCreateAttributes(&mut attributes, 3)
                 .map_err(|error| video_error("create_attributes", error))?;
             let attributes = attributes.expect("MFCreateAttributes returns attributes on success");
             attributes
                 .SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)
                 .map_err(|error| video_error("enable_hardware_transforms", error))?;
+            // While the picture is still, no frame reaches the sink writer, but sound does, from
+            // this same thread. Throttled, the writer would block the sound waiting for a frame
+            // that only this thread could write, and the recording would never stop. Unthrottled,
+            // it holds the sound until the next frame: about 20 KB a second.
+            if sound {
+                attributes
+                    .SetUINT32(&MF_SINK_WRITER_DISABLE_THROTTLING, 1)
+                    .map_err(|error| video_error("disable_throttling", error))?;
+            }
             // MP4 whatever the file is called.
             attributes
                 .SetGUID(&MF_TRANSCODE_CONTAINERTYPE, &MFTranscodeContainerType_MPEG4)
@@ -827,5 +837,43 @@ mod tests {
             .finish_in_memory(Duration::from_millis(100))
             .expect("finish");
         assert_eq!(summary.audio_duration, Duration::ZERO);
+    }
+
+    #[test]
+    #[ignore = "needs Media Foundation's H.264 and AAC encoders, which a Windows Server CI image may lack"]
+    fn a_still_picture_with_long_sound_does_not_block_and_keeps_its_sound() {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (width, height) = (640_u32, 360_u32);
+            let mut writer =
+                Mp4Writer::create_recording(None, width, height, 30, true).expect("writer");
+            let frame = vec![90_u8; (width * height * 4) as usize];
+            let rate = crate::AUDIO_SAMPLE_RATE as usize;
+            // 90 s: a frame every 33 ms (all identical), sound every 10 ms.
+            for tick in 0..9_000_u64 {
+                let at = Duration::from_millis(tick * 10);
+                if tick % 3 == 0 {
+                    writer.push(&frame, at).expect("frame");
+                }
+                let samples = vec![500_i16; rate / 100 * 2];
+                writer
+                    .push_audio(&crate::AudioPacket { start: at, samples }, None)
+                    .expect("sound");
+            }
+            let (bytes, summary) = writer
+                .finish_in_memory(Duration::from_secs(90))
+                .expect("finish");
+            let _ = done.send((bytes, summary));
+        });
+        // Before the fix the writer blocked within the first ten seconds of sound.
+        let (bytes, summary) = finished
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the writer blocked on a still picture with sound");
+        assert_eq!(summary.frames_written, 1, "{summary:?}");
+        let sound = crate::mp4_sound(&bytes)
+            .expect("decoded")
+            .expect("a sound stream");
+        let seconds = sound.len() as f64 / 2.0 / f64::from(crate::AUDIO_SAMPLE_RATE);
+        assert!((seconds - 90.0).abs() < 0.2, "{seconds} s of sound");
     }
 }
