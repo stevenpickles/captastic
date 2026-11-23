@@ -148,7 +148,11 @@ Chocolatey package, from an elevated prompt, after restoring the snapshot:
    Quit Captastic from the tray and run the same capture again: it prints `"taken_by":"one_shot"`
    with exit code 0 straight away, and the same notification appears from an icon that goes away
    about ten seconds later.
-7. Repeat steps 2 and 3.
+7. Repeat steps 2 and 3. Then, with a video or any sound playing, choose **Options -> Record As:
+   MP4** and **Record Sound**, record a few seconds: the bar shows a speaker beside the time, and
+   the review plays the sound with **Play** and silences it with **Mute**. Saved, the MP4 plays with
+   sound in another player. (A VM with no audio device records silence, and the notification says
+   it was recorded without sound: that is the expected result there.)
 8. With Captastic running, `choco upgrade captastic --version <version> --source <folder>` to the
    release package: it stops, and comes back on its own within a few seconds. Task Manager's
    **Details** tab, with the **Elevated** column shown, reports `captastic.exe` as **No**, and the
