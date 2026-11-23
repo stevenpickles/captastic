@@ -3466,11 +3466,14 @@ fn notice_is_shown(
     !repeated
 }
 
+#[cfg(windows)]
 /// How long the same error notice is folded into the one already shown.
 const NOTICE_REPEAT_WINDOW: Duration = Duration::from_secs(30);
+#[cfg(windows)]
 /// The least room the notice channel has, whatever the selection queue's capacity.
 const NOTICE_QUEUE_CAPACITY: usize = 16;
 
+#[cfg(windows)]
 impl DaemonNotice {
     /// Whether the notice is about one saved file, which is never folded into another notice.
     fn names_a_file(&self) -> bool {
@@ -3723,6 +3726,7 @@ mod tests {
 
     use super::*;
 
+    #[cfg(windows)]
     #[test]
     fn a_notice_about_a_file_is_never_folded_and_an_error_only_briefly() {
         let mut last = None;
