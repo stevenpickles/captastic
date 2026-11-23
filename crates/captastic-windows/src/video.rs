@@ -11,9 +11,13 @@
 //!
 //! An MP4 is written into a file or, for a recording that is reviewed before it is saved, into
 //! memory (ADR 0012), from where [`Mp4Writer::finish_in_memory`] hands back its bytes.
+//!
+//! A writer made with sound also carries an AAC stream beside the H.264 one (ADR 0015): the
+//! computer's sound as [`crate::LoopbackCapture`] reads it, 48 kHz stereo at 160 kbit/s, on the
+//! same clock as the frames. A writer without sound writes exactly what it always has.
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use captastic_core::{CaptureError, CaptureErrorKind};
 use windows::core::{HSTRING, PCWSTR};
@@ -25,7 +29,13 @@ use windows::Win32::Media::MediaFoundation::{
     MFVideoInterlace_Progressive, MFSTARTUP_FULL, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE,
     MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
     MF_MT_MAX_KEYFRAME_SPACING, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
-    MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_TRANSCODE_CONTAINERTYPE, MF_VERSION,
+    MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_SINK_WRITER_DISABLE_THROTTLING,
+    MF_TRANSCODE_CONTAINERTYPE, MF_VERSION,
+};
+use windows::Win32::Media::MediaFoundation::{
+    MFAudioFormat_AAC, MFAudioFormat_PCM, MFMediaType_Audio, MF_MT_AAC_PAYLOAD_TYPE,
+    MF_MT_AUDIO_AVG_BYTES_PER_SECOND, MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_BLOCK_ALIGNMENT,
+    MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND,
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::UI::Shell::SHCreateMemStream;
@@ -42,6 +52,55 @@ const MAXIMUM_BITRATE: u32 = 40_000_000;
 const TICKS_PER_SECOND: u128 = 10_000_000;
 /// The most copied into or out of a byte stream in one call.
 const BYTE_STREAM_CHUNK: usize = 16 * 1024 * 1024;
+/// AAC at 160 kbit/s: 20,000 bytes a second, one of the four rates Windows' encoder takes.
+const AAC_BYTES_PER_SECOND: u32 = 20_000;
+/// How many frames may wait on the H.264 encoder in an unthrottled writer before new ones are
+/// skipped: a second at 30 frames a second, at most about a gigabyte at 4K.
+const MAXIMUM_ENCODER_BACKLOG: u64 = 30;
+/// How long the encoder may encode nothing while frames are held back before it is taken to be
+/// waiting for more input (a lookahead holding frames in flight) rather than falling behind.
+const ENCODER_STALL: Duration = Duration::from_millis(250);
+
+/// Decides whether an unthrottled writer's encoder is behind. Past [`MAXIMUM_ENCODER_BACKLOG`]
+/// frames waiting it is, while it keeps encoding. One that encodes nothing for [`ENCODER_STALL`]
+/// while frames are held back is waiting for input instead: frames it holds in flight (a
+/// lookahead) that only more input releases. That many become its depth, the backlog it is allowed
+/// on top of the maximum from then on, so it is not held back again a frame at a time.
+#[derive(Debug, Default)]
+struct EncoderPacer {
+    /// Frames the encoder holds in flight, learned from a stall.
+    depth: u64,
+    /// While frames are held back: the encoder's count of encoded frames, and when it last moved.
+    holding_back: Option<(u64, Instant)>,
+}
+
+impl EncoderPacer {
+    /// Whether to hold back a frame, given `backlog` frames waiting and `encoded` encoded so far.
+    fn is_behind(&mut self, backlog: u64, encoded: u64, now: Instant) -> bool {
+        if backlog <= self.depth.saturating_add(MAXIMUM_ENCODER_BACKLOG) {
+            return false;
+        }
+        match self.holding_back {
+            Some((last, since)) if last == encoded => {
+                if now.saturating_duration_since(since) < ENCODER_STALL {
+                    return true;
+                }
+                self.depth = backlog.saturating_sub(MAXIMUM_ENCODER_BACKLOG);
+                self.holding_back = None;
+                false
+            }
+            _ => {
+                self.holding_back = Some((encoded, now));
+                true
+            }
+        }
+    }
+
+    /// A frame went to the encoder.
+    fn fed(&mut self) {
+        self.holding_back = None;
+    }
+}
 
 /// The size a `width` by `height` recording is encoded at: scaled down, keeping its shape, to fit
 /// [`MP4_MAXIMUM_SIZE`], then rounded down to even sides, which H.264's 4:2:0 sampling needs.
@@ -61,6 +120,10 @@ pub struct VideoSummary {
     /// Frames encoded; the rest repeated the frame before and lengthened it.
     pub frames_written: u64,
     pub duration: Duration,
+    /// How much sound was written, when the MP4 has a sound stream.
+    pub audio_duration: Duration,
+    /// Frames skipped because the encoder was a second behind; the frame before lasted longer.
+    pub frames_skipped: u64,
 }
 
 /// Media Foundation and COM, started for this thread and stopped when dropped.
@@ -114,10 +177,20 @@ pub struct Mp4Writer {
     width: u32,
     height: u32,
     stream: u32,
+    /// The sound stream, for a writer made with sound.
+    audio_stream: Option<u32>,
+    /// Sound that arrived before the first frame, which the timeline starts at.
+    early_audio: Vec<crate::AudioPacket>,
+    /// Sound frames written, at [`crate::AUDIO_SAMPLE_RATE`].
+    audio_frames: u64,
     first_at: Option<Duration>,
     summary: VideoSummary,
     /// Where the MP4 is written when it is written into memory.
     memory: Option<IMFByteStream>,
+    /// Waits for a behind encoder instead of skipping frames: for re-encoding a recording, where
+    /// every frame is already there and none may be lost, rather than capturing one live.
+    paced: bool,
+    pacer: EncoderPacer,
     _media_foundation: MediaFoundation,
 }
 
@@ -131,7 +204,19 @@ impl Mp4Writer {
         height: u32,
         frame_rate: u32,
     ) -> Result<Self, CaptureError> {
-        Self::create_into(Some(path), width, height, frame_rate)
+        Self::create_into(Some(path), width, height, frame_rate, false)
+    }
+
+    /// As [`create`](Self::create) or [`create_in_memory`](Self::create_in_memory) (`path`
+    /// `None`), with a sound stream when `sound` is set, for [`push_audio`](Self::push_audio).
+    pub fn create_recording(
+        path: Option<&Path>,
+        width: u32,
+        height: u32,
+        frame_rate: u32,
+        sound: bool,
+    ) -> Result<Self, CaptureError> {
+        Self::create_into(path, width, height, frame_rate, sound)
     }
 
     /// As [`create`](Self::create), but writes the MP4 into memory, for
@@ -141,7 +226,7 @@ impl Mp4Writer {
         height: u32,
         frame_rate: u32,
     ) -> Result<Self, CaptureError> {
-        Self::create_into(None, width, height, frame_rate)
+        Self::create_into(None, width, height, frame_rate, false)
     }
 
     fn create_into(
@@ -149,6 +234,7 @@ impl Mp4Writer {
         width: u32,
         height: u32,
         frame_rate: u32,
+        sound: bool,
     ) -> Result<Self, CaptureError> {
         if (width, height) != mp4_frame_size(width, height) {
             return Err(video_failure(
@@ -172,12 +258,21 @@ impl Mp4Writer {
         // and values that outlive the call.
         let writer = unsafe {
             let mut attributes: Option<IMFAttributes> = None;
-            MFCreateAttributes(&mut attributes, 2)
+            MFCreateAttributes(&mut attributes, 3)
                 .map_err(|error| video_error("create_attributes", error))?;
             let attributes = attributes.expect("MFCreateAttributes returns attributes on success");
             attributes
                 .SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)
                 .map_err(|error| video_error("enable_hardware_transforms", error))?;
+            // While the picture is still, no frame reaches the sink writer, but sound does, from
+            // this same thread. Throttled, the writer would block the sound waiting for a frame
+            // that only this thread could write, and the recording would never stop. Unthrottled,
+            // it holds the sound until the next frame: about 20 KB a second.
+            if sound {
+                attributes
+                    .SetUINT32(&MF_SINK_WRITER_DISABLE_THROTTLING, 1)
+                    .map_err(|error| video_error("disable_throttling", error))?;
+            }
             // MP4 whatever the file is called.
             attributes
                 .SetGUID(&MF_TRANSCODE_CONTAINERTYPE, &MFTranscodeContainerType_MPEG4)
@@ -217,14 +312,22 @@ impl Mp4Writer {
             writer
                 .SetInputMediaType(stream, &input, None)
                 .map_err(|error| video_error("set_input_type", error))?;
+            let audio_stream = if sound {
+                Some(add_audio_stream(&writer)?)
+            } else {
+                None
+            };
             writer
                 .BeginWriting()
                 .map_err(|error| video_error("begin_writing", error))?;
-            (writer, stream)
+            (writer, stream, audio_stream)
         };
         Ok(Self {
             writer: writer.0,
             stream: writer.1,
+            audio_stream: writer.2,
+            early_audio: Vec::new(),
+            audio_frames: 0,
             pending: None,
             previous: None,
             width,
@@ -232,6 +335,8 @@ impl Mp4Writer {
             first_at: None,
             summary: VideoSummary::default(),
             memory,
+            paced: false,
+            pacer: EncoderPacer::default(),
             _media_foundation: media_foundation,
         })
     }
@@ -247,11 +352,31 @@ impl Mp4Writer {
             ));
         }
         self.summary.frames_received += 1;
+        let first = self.first_at.is_none();
         let first_at = *self.first_at.get_or_insert(at);
+        if first {
+            for packet in std::mem::take(&mut self.early_audio) {
+                self.push_audio(&packet, None)?;
+            }
+        }
         let at = ticks(at.saturating_sub(first_at));
         if self.previous.as_deref() == Some(bgra) {
             return Ok(());
         }
+        // An unthrottled writer (one with sound) never pushes back, so a slow encoder would queue
+        // uncompressed frames inside Media Foundation without limit. Past a second of backlog a
+        // live recording skips the frame, as its own queue drops frames when the encoder is
+        // behind; a paced writer waits instead.
+        if self.audio_stream.is_some() && self.encoder_is_behind() {
+            if !self.paced {
+                self.summary.frames_skipped += 1;
+                return Ok(());
+            }
+            while self.encoder_is_behind() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        self.pacer.fed();
         let sample = self.sample(bgra)?;
         if let Some(pending) = self.pending.take() {
             self.write(pending, at)?;
@@ -259,6 +384,43 @@ impl Mp4Writer {
         self.pending = Some(Pending { sample, at });
         self.previous = Some(bgra.to_vec());
         Ok(())
+    }
+
+    /// Makes the writer wait for a behind encoder rather than skip frames, for re-encoding a
+    /// recording that is already whole.
+    pub fn pace_to_encoder(&mut self) {
+        self.paced = true;
+    }
+
+    /// Whether the encoder is behind, as [`EncoderPacer`] decides.
+    fn encoder_is_behind(&mut self) -> bool {
+        let (backlog, encoded) = self.encoder_progress();
+        self.pacer.is_behind(backlog, encoded, Instant::now())
+    }
+
+    /// Frames handed to the sink writer that its encoder has not yet encoded.
+    #[cfg(test)]
+    fn encoder_backlog(&self) -> u64 {
+        self.encoder_progress().0
+    }
+
+    /// Frames waiting on the encoder, and frames it has encoded.
+    fn encoder_progress(&self) -> (u64, u64) {
+        let mut statistics = windows::Win32::Media::MediaFoundation::MF_SINK_WRITER_STATISTICS {
+            cb: std::mem::size_of::<windows::Win32::Media::MediaFoundation::MF_SINK_WRITER_STATISTICS>(
+            ) as u32,
+            ..Default::default()
+        };
+        // SAFETY: The writer is this thread's and the statistics are a local of the size given.
+        match unsafe { self.writer.GetStatistics(self.stream, &mut statistics) } {
+            Ok(()) => (
+                statistics
+                    .qwNumSamplesReceived
+                    .saturating_sub(statistics.qwNumSamplesEncoded),
+                statistics.qwNumSamplesEncoded,
+            ),
+            Err(_) => (0, 0),
+        }
     }
 
     /// Writes the last frame, shown until `end` after the recording started, and finalizes the
@@ -281,6 +443,58 @@ impl Mp4Writer {
         Ok((bytes, summary))
     }
 
+    /// Adds a stretch of sound, timed from the recording's start as the frames are. Sound before
+    /// the first frame is cut, as is sound past `end` once the recording's end is known. A writer
+    /// made without sound ignores it.
+    pub fn push_audio(
+        &mut self,
+        packet: &crate::AudioPacket,
+        end: Option<Duration>,
+    ) -> Result<(), CaptureError> {
+        let Some(stream) = self.audio_stream else {
+            return Ok(());
+        };
+        let Some(first_at) = self.first_at else {
+            self.early_audio.push(packet.clone());
+            return Ok(());
+        };
+        let channels = usize::from(crate::AUDIO_CHANNELS);
+        let rate = u64::from(crate::AUDIO_SAMPLE_RATE);
+        let frames_at = |at: Duration| (at.as_nanos() * u128::from(rate) / 1_000_000_000) as u64;
+        let packet_start = frames_at(packet.start);
+        let packet_end = packet_start + packet.frames() as u64;
+        let from = packet_start.max(frames_at(first_at));
+        let until = end.map_or(packet_end, |end| packet_end.min(frames_at(end)));
+        if until <= from {
+            return Ok(());
+        }
+        let samples = &packet.samples
+            [(from - packet_start) as usize * channels..(until - packet_start) as usize * channels];
+        let bytes: Vec<u8> = samples
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect();
+        let sample = self.sample(&bytes)?;
+        let start = ticks(Duration::from_nanos(
+            ((from as u128 * 1_000_000_000) / u128::from(rate)) as u64,
+        )) - ticks(first_at);
+        let length = ((until - from) as u128 * TICKS_PER_SECOND / u128::from(rate)) as i64;
+        // SAFETY: The sample and writer are this thread's; times are in 100-ns units.
+        unsafe {
+            sample
+                .SetSampleTime(start.max(0))
+                .map_err(|error| video_error("set_audio_time", error))?;
+            sample
+                .SetSampleDuration(length.max(1))
+                .map_err(|error| video_error("set_audio_duration", error))?;
+            self.writer
+                .WriteSample(stream, &sample)
+                .map_err(|error| video_error("write_audio", error))?;
+        }
+        self.audio_frames += until - from;
+        Ok(())
+    }
+
     fn finalize(&mut self, end: Duration) -> Result<VideoSummary, CaptureError> {
         let first_at = self.first_at.unwrap_or(end);
         let end_duration = end.saturating_sub(first_at);
@@ -291,6 +505,10 @@ impl Mp4Writer {
         // SAFETY: The writer is this thread's, and every sample has been written.
         unsafe { self.writer.Finalize() }.map_err(|error| video_error("finalize_mp4", error))?;
         self.summary.duration = end_duration;
+        self.summary.audio_duration = Duration::from_nanos(
+            (u128::from(self.audio_frames) * 1_000_000_000 / u128::from(crate::AUDIO_SAMPLE_RATE))
+                as u64,
+        );
         Ok(self.summary)
     }
 
@@ -338,6 +556,62 @@ impl Mp4Writer {
         }
         self.summary.frames_written += 1;
         Ok(())
+    }
+}
+
+/// Adds the AAC stream, fed 16-bit PCM at the loopback's rate and channels, to `writer`.
+///
+/// # Safety
+/// `writer` must be a live sink writer on this thread that has not begun writing.
+unsafe fn add_audio_stream(writer: &IMFSinkWriter) -> Result<u32, CaptureError> {
+    let rate = crate::AUDIO_SAMPLE_RATE;
+    let channels = u32::from(crate::AUDIO_CHANNELS);
+    // SAFETY: Per this function's contract; the types are created here and the GUIDs are statics.
+    unsafe {
+        let set = |media_type: &IMFMediaType, subtype| -> Result<(), CaptureError> {
+            media_type
+                .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)
+                .map_err(|error| video_error("set_audio_major_type", error))?;
+            media_type
+                .SetGUID(&MF_MT_SUBTYPE, subtype)
+                .map_err(|error| video_error("set_audio_subtype", error))?;
+            media_type
+                .SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)
+                .map_err(|error| video_error("set_audio_bits", error))?;
+            media_type
+                .SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, rate)
+                .map_err(|error| video_error("set_audio_rate", error))?;
+            media_type
+                .SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, channels)
+                .map_err(|error| video_error("set_audio_channels", error))?;
+            Ok(())
+        };
+        let output =
+            MFCreateMediaType().map_err(|error| video_error("create_audio_output_type", error))?;
+        set(&output, &MFAudioFormat_AAC)?;
+        output
+            .SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, AAC_BYTES_PER_SECOND)
+            .map_err(|error| video_error("set_audio_bitrate", error))?;
+        // Raw AAC, as MP4 carries it.
+        output
+            .SetUINT32(&MF_MT_AAC_PAYLOAD_TYPE, 0)
+            .map_err(|error| video_error("set_aac_payload", error))?;
+        let stream = writer
+            .AddStream(&output)
+            .map_err(|error| video_error("add_audio_stream", error))?;
+        let input =
+            MFCreateMediaType().map_err(|error| video_error("create_audio_input_type", error))?;
+        set(&input, &MFAudioFormat_PCM)?;
+        input
+            .SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, channels * 2)
+            .map_err(|error| video_error("set_audio_block_alignment", error))?;
+        input
+            .SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, rate * channels * 2)
+            .map_err(|error| video_error("set_audio_input_rate", error))?;
+        writer
+            .SetInputMediaType(stream, &input, None)
+            .map_err(|error| video_error("set_audio_input_type", error))?;
+        Ok(stream)
     }
 }
 
@@ -441,6 +715,31 @@ fn video_failure(operation: &'static str, message: String) -> CaptureError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_encoder_that_holds_frames_in_flight_is_held_back_once_not_a_frame_at_a_time() {
+        let start = Instant::now();
+        let later = |ms| start + Duration::from_millis(ms);
+        let mut pacer = EncoderPacer::default();
+        let deep = MAXIMUM_ENCODER_BACKLOG + 10;
+        assert!(!pacer.is_behind(MAXIMUM_ENCODER_BACKLOG, 0, start));
+        // Behind, and nothing encoded meanwhile: held back until the stall, then let through.
+        assert!(pacer.is_behind(deep, 0, start));
+        assert!(pacer.is_behind(deep, 0, later(100)));
+        assert!(!pacer.is_behind(deep, 0, later(250)));
+        pacer.fed();
+        // From then on its depth is allowed: as it gives back a frame for each one fed, none is
+        // held back again.
+        for frame in 1..=MAXIMUM_ENCODER_BACKLOG {
+            assert!(!pacer.is_behind(deep, frame, later(260 + frame)), "{frame}");
+            pacer.fed();
+        }
+        // But a backlog beyond its depth and the maximum still is, while it keeps encoding.
+        let behind = deep + MAXIMUM_ENCODER_BACKLOG;
+        assert!(pacer.is_behind(behind, 40, later(400)));
+        assert!(pacer.is_behind(behind, 41, later(500)));
+        assert!(pacer.is_behind(behind, 42, later(900)));
+    }
 
     #[test]
     fn sizes_are_even_and_fit_the_encoder() {
@@ -587,5 +886,178 @@ mod tests {
     fn capture_time_becomes_media_foundation_ticks() {
         assert_eq!(ticks(Duration::from_millis(1)), 10_000);
         assert_eq!(ticks(Duration::from_secs(2)), 20_000_000);
+    }
+
+    #[test]
+    #[ignore = "needs Media Foundation's H.264 and AAC encoders, which a Windows Server CI image may lack"]
+    fn an_mp4_with_sound_carries_it_in_step_with_the_frames() {
+        let (width, height) = (160_u32, 96_u32);
+        let mut writer =
+            Mp4Writer::create_recording(None, width, height, 30, true).expect("writer");
+        let frame = vec![128_u8; (width * height * 4) as usize];
+        // A second of silence, then a second of a 440 Hz tone, in 10 ms packets; the frames
+        // arrive with them, as a recording's do.
+        let rate = crate::AUDIO_SAMPLE_RATE as usize;
+        let packet_frames = rate / 100;
+        for packet in 0..200 {
+            let start = Duration::from_millis(packet as u64 * 10);
+            let samples: Vec<i16> = (0..packet_frames)
+                .flat_map(|i| {
+                    let n = packet * packet_frames + i;
+                    let value = if packet >= 100 {
+                        (12_000.0
+                            * (2.0 * std::f64::consts::PI * 440.0 * n as f64 / rate as f64).sin())
+                            as i16
+                    } else {
+                        0
+                    };
+                    [value, value]
+                })
+                .collect();
+            if packet % 3 == 0 {
+                writer.push(&frame, start).expect("frame");
+            }
+            writer
+                .push_audio(&crate::AudioPacket { start, samples }, None)
+                .expect("sound");
+        }
+        let (bytes, summary) = writer
+            .finish_in_memory(Duration::from_secs(2))
+            .expect("finish");
+        assert!(
+            summary.audio_duration.abs_diff(Duration::from_secs(2)) < Duration::from_millis(15),
+            "{summary:?}"
+        );
+        let sound = crate::mp4_sound(&bytes)
+            .expect("decoded")
+            .expect("the MP4 has a sound stream");
+        let seconds = sound.len() as f64 / 2.0 / rate as f64;
+        assert!((seconds - 2.0).abs() < 0.1, "{seconds} s of sound decoded");
+        let rms = |part: &[i16]| {
+            (part.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>() / part.len().max(1) as f64)
+                .sqrt()
+        };
+        // The first second stays quiet and the second carries the tone, at about its level.
+        let half = sound.len() / 2;
+        let quiet = rms(&sound[rate / 10 * 2..half - rate / 10 * 2]);
+        let tone = rms(&sound[half + rate / 10 * 2..sound.len() - rate / 10 * 2]);
+        assert!(quiet < 100.0, "silence decoded at RMS {quiet}");
+        assert!(
+            (tone - 8_485.0).abs() < 1_500.0,
+            "tone decoded at RMS {tone}"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs Media Foundation's H.264 and AAC encoders, which a Windows Server CI image may lack"]
+    fn a_writer_with_sound_bounds_what_waits_on_its_encoder() {
+        // 4K frames that all differ, pushed far faster than real time, with sound: the writer
+        // asks how far its encoder is behind and skips frames past a second of backlog.
+        let (width, height) = (3840_u32, 2160_u32);
+        let mut writer =
+            Mp4Writer::create_recording(None, width, height, 30, true).expect("writer");
+        let rate = crate::AUDIO_SAMPLE_RATE as usize;
+        for index in 0..240_u64 {
+            let at = Duration::from_millis(index * 33);
+            let frame = vec![(index % 250) as u8; (width * height * 4) as usize];
+            writer.push(&frame, at).expect("frame");
+            assert!(writer.encoder_backlog() <= MAXIMUM_ENCODER_BACKLOG + 1);
+            writer
+                .push_audio(
+                    &crate::AudioPacket {
+                        start: at,
+                        samples: vec![0; rate / 30 * 2],
+                    },
+                    None,
+                )
+                .expect("sound");
+        }
+        let (_, summary) = writer
+            .finish_in_memory(Duration::from_millis(240 * 33))
+            .expect("finish");
+        eprintln!("{summary:?}");
+        assert_eq!(summary.frames_received, 240);
+        assert_eq!(summary.frames_written + summary.frames_skipped, 240);
+    }
+
+    #[test]
+    #[ignore = "needs Media Foundation's H.264 and AAC encoders, which a Windows Server CI image may lack"]
+    fn a_paced_writer_with_sound_keeps_every_frame() {
+        // As re-encoding an edited recording does: frames far faster than real time, none skipped.
+        let (width, height) = (1920_u32, 1080_u32);
+        let mut writer =
+            Mp4Writer::create_recording(None, width, height, 30, true).expect("writer");
+        writer.pace_to_encoder();
+        for index in 0..120_u64 {
+            let frame = vec![(index % 250) as u8; (width * height * 4) as usize];
+            writer
+                .push(&frame, Duration::from_millis(index * 33))
+                .expect("frame");
+        }
+        let (_, summary) = writer
+            .finish_in_memory(Duration::from_millis(120 * 33))
+            .expect("finish");
+        assert_eq!(summary.frames_skipped, 0, "{summary:?}");
+        assert_eq!(summary.frames_written, 120, "{summary:?}");
+    }
+
+    #[test]
+    #[ignore = "needs Media Foundation's H.264 encoder, which a Windows Server CI image may lack"]
+    fn sound_is_ignored_by_a_writer_made_without_it() {
+        let mut writer = Mp4Writer::create_in_memory(160, 96, 30).expect("writer");
+        writer
+            .push(&vec![0_u8; 160 * 96 * 4], Duration::ZERO)
+            .expect("frame");
+        writer
+            .push_audio(
+                &crate::AudioPacket {
+                    start: Duration::ZERO,
+                    samples: vec![1_000; 960],
+                },
+                None,
+            )
+            .expect("ignored");
+        let (_, summary) = writer
+            .finish_in_memory(Duration::from_millis(100))
+            .expect("finish");
+        assert_eq!(summary.audio_duration, Duration::ZERO);
+    }
+
+    #[test]
+    #[ignore = "needs Media Foundation's H.264 and AAC encoders, which a Windows Server CI image may lack"]
+    fn a_still_picture_with_long_sound_does_not_block_and_keeps_its_sound() {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (width, height) = (640_u32, 360_u32);
+            let mut writer =
+                Mp4Writer::create_recording(None, width, height, 30, true).expect("writer");
+            let frame = vec![90_u8; (width * height * 4) as usize];
+            let rate = crate::AUDIO_SAMPLE_RATE as usize;
+            // 90 s: a frame every 33 ms (all identical), sound every 10 ms.
+            for tick in 0..9_000_u64 {
+                let at = Duration::from_millis(tick * 10);
+                if tick % 3 == 0 {
+                    writer.push(&frame, at).expect("frame");
+                }
+                let samples = vec![500_i16; rate / 100 * 2];
+                writer
+                    .push_audio(&crate::AudioPacket { start: at, samples }, None)
+                    .expect("sound");
+            }
+            let (bytes, summary) = writer
+                .finish_in_memory(Duration::from_secs(90))
+                .expect("finish");
+            let _ = done.send((bytes, summary));
+        });
+        // Before the fix the writer blocked within the first ten seconds of sound.
+        let (bytes, summary) = finished
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the writer blocked on a still picture with sound");
+        assert_eq!(summary.frames_written, 1, "{summary:?}");
+        let sound = crate::mp4_sound(&bytes)
+            .expect("decoded")
+            .expect("a sound stream");
+        let seconds = sound.len() as f64 / 2.0 / f64::from(crate::AUDIO_SAMPLE_RATE);
+        assert!((seconds - 90.0).abs() < 0.2, "{seconds} s of sound");
     }
 }

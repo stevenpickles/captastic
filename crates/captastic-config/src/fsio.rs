@@ -73,7 +73,14 @@ impl FileLock {
                         ErrorKind::AlreadyExists | ErrorKind::PermissionDenied
                     ) =>
                 {
-                    if break_stale_lock(&path) {
+                    // The deadline first, every turn: a folder where the lock cannot be created
+                    // fails with `PermissionDenied` and leaves no file, which the stale check
+                    // reads as "already gone", and continuing on that without the deadline spun
+                    // forever at full speed.
+                    if Instant::now() < deadline && break_stale_lock(&path) {
+                        // Paced: in a folder where the lock cannot be created this comes round
+                        // every turn until the deadline, and must not spin a core meanwhile.
+                        thread::sleep(LOCK_RETRY_DELAY);
                         continue;
                     }
                     if Instant::now() >= deadline {
@@ -515,6 +522,32 @@ mod windows_file_move {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_that_cannot_be_created_times_out_rather_than_spinning() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = std::env::temp_dir().join(format!(
+            "captastic-lock-denied-{}-{}",
+            std::process::id(),
+            TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).expect("directory");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o555)).expect("read-only");
+        let started = Instant::now();
+        let result = FileLock::acquire(&directory.join("state.json"));
+        let _ = fs::set_permissions(&directory, fs::Permissions::from_mode(0o755));
+        let _ = fs::remove_dir_all(&directory);
+        // Running as root ignores the mode, and then the lock is simply taken.
+        if result.is_ok() {
+            return;
+        }
+        assert!(
+            started.elapsed() < LOCK_TIMEOUT * 3,
+            "{:?}",
+            started.elapsed()
+        );
+    }
     use crate::{AppConfig, CONFIG_FILE_NAME};
 
     /// Mirrors the configuration crate's test directory: created on construction, removed on drop.

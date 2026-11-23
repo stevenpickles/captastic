@@ -101,6 +101,20 @@ pub fn set_recording_review(path: &Path, review: bool) -> Result<(), ConfigError
     )
 }
 
+/// Sets `recording.audio` in the configuration at `path`, preserving everything else in the file,
+/// as the overlay's **Record Sound** row is switched (ADR 0015).
+pub fn set_recording_audio(path: &Path, audio: bool) -> Result<(), ConfigError> {
+    set_setting(
+        path,
+        &Setting {
+            section: "recording",
+            key: "audio",
+            value: Value::from(audio),
+            created_when: "\"Record Sound\" was switched in the overlay's\n# Options menu",
+        },
+    )
+}
+
 fn set_setting(path: &Path, setting: &Setting) -> Result<(), ConfigError> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -259,6 +273,27 @@ mod tests {
         let config: crate::AppConfig =
             toml::from_str(&fs::read_to_string(&fresh).expect("read")).expect("valid");
         assert!(!config.recording.review);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn the_sound_switch_is_written_beside_the_recording_format() {
+        let directory = temporary_directory("recording-audio");
+        let path = directory.join("captastic.toml");
+        fs::write(
+            &path,
+            "schema_version = 1\n\n[recording]\nformat = \"mp4\"\n",
+        )
+        .expect("seed");
+        set_recording_audio(&path, true).expect("turn sound on");
+        let config: crate::AppConfig =
+            toml::from_str(&fs::read_to_string(&path).expect("read")).expect("valid");
+        assert!(config.recording.audio);
+        assert_eq!(config.recording.format, RecordingFormat::Mp4);
+        set_recording_audio(&path, false).expect("turn sound off");
+        let config: crate::AppConfig =
+            toml::from_str(&fs::read_to_string(&path).expect("read")).expect("valid");
+        assert!(!config.recording.audio);
         let _ = fs::remove_dir_all(&directory);
     }
 

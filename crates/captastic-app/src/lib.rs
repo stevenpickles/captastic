@@ -1,10 +1,12 @@
-//! Captastic's application layer, driven by two binaries.
+//! Captastic's application layer, driven by three binaries.
 //!
 //! `captastic` is the shipped program: a Windows-subsystem executable that runs the
 //! notification-area daemon and nothing else, so starting it at login or from the Start Menu opens
-//! no console window. `captastic-dev` is the developer command line - capture, benchmark, status,
-//! doctor and the rest - built from the workspace and never packaged. Both are thin: everything
-//! they do lives here, so the two cannot drift apart in what a daemon run means.
+//! no console window. `captastic-cli` ships beside it: a console program that asks the running
+//! daemon for captures and prints JSON (ADR 0014). `captastic-dev` is the developer command line -
+//! capture, benchmark, status, doctor and the rest - built from the workspace and never packaged.
+//! All three are thin: everything they do lives here, so they cannot drift apart in what a daemon
+//! run means.
 
 #![deny(unsafe_code)]
 
@@ -15,6 +17,10 @@ mod cli;
 #[cfg(windows)]
 mod clipboard;
 mod clock;
+mod command_channel;
+mod command_line;
+#[cfg(windows)]
+mod command_listener;
 mod compare;
 mod daemon;
 #[cfg(windows)]
@@ -75,6 +81,9 @@ impl DisplayPolicy {
 
 #[cfg(windows)]
 pub use desktop::main as desktop_main;
+
+/// The command line that ships: `captastic-cli` (ADR 0014).
+pub use command_line::main as command_line_main;
 
 /// The shipped executable's file name. Launch at login and the Start Menu name this file, never the
 /// developer command line, whichever of the two asked for the registration.
@@ -557,6 +566,7 @@ fn capture(args: cli::CaptureArgs) -> Result<(), AppError> {
                     edit_available: false,
                     // A recording outlives the overlay; only a daemon can run one.
                     record_format: None,
+                    record_sound: false,
                 },
                 &mut overlay_resources,
             )?;
@@ -859,6 +869,7 @@ fn write_one_shot_file_output(
             height: frame.height(),
             display: frame.metadata.display_id.0.clone(),
             mode: "full_display".to_owned(),
+            origin: String::new(),
         };
         if let Err(error) = captastic_config::HistoryStore::for_default_storage().record(
             entry,

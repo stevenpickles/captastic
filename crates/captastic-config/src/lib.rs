@@ -22,12 +22,14 @@ mod ui_state;
 use fsio::{maintain_config_artifacts, quarantine_config};
 
 pub use captastic_core::OutputFormat;
-pub use config_edit::{set_output_enabled, set_recording_format, set_recording_review};
+pub use config_edit::{
+    set_output_enabled, set_recording_audio, set_recording_format, set_recording_review,
+};
 pub use filename_template::{validate_template, TOKENS as FILENAME_TEMPLATE_TOKENS};
 pub use fsio::{atomic_write, finalize_new, replace_file};
 pub use history::{
-    CaptureHistory, HistoryEntry, HistoryStore, RetentionPolicy, HISTORY_FILE_NAME,
-    HISTORY_SCHEMA_VERSION,
+    CaptureHistory, HistoryEntry, HistoryStore, RetentionPolicy, COMMAND_LINE_ORIGIN,
+    HISTORY_FILE_NAME, HISTORY_SCHEMA_VERSION,
 };
 pub use ui_state::{
     resolve_display_ui_state, UiState, UiStateStore, STATE_FILE_NAME, STATE_SCHEMA_VERSION,
@@ -1148,6 +1150,10 @@ pub struct RecordingConfig {
     /// Whether a finished recording opens in the review window, to be trimmed and cropped, before
     /// it is saved (ADR 0012). Off, it is saved as soon as it ends.
     pub review: bool,
+    /// Whether an MP4 recording carries the computer's sound: the whole mix sent to the default
+    /// output device, never the microphone (ADR 0015). Off by default, since that mix holds
+    /// everything the computer plays. GIF has no sound, whatever this says.
+    pub audio: bool,
 }
 
 impl RecordingConfig {
@@ -1182,6 +1188,7 @@ impl Default for RecordingConfig {
             max_seconds: 60,
             gif_max_dimension: 1280,
             review: true,
+            audio: false,
         }
     }
 }

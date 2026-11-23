@@ -6,6 +6,10 @@
 //! recording and never in it. Everything but the bar is fully transparent, so clicks go through the
 //! border and the recorded area to whatever is beneath; the bar takes clicks for its button. It
 //! never takes focus: a recording of a window being typed into must not steal the typing.
+//!
+//! A window recorded through Windows Graphics Capture is recorded wherever it goes, so its
+//! indicator follows it (ADR 0013): the window's frame is read again at the recording's rate and the
+//! indicator laid out afresh around it whenever it has moved or changed size.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -29,6 +33,8 @@ use super::layout::{UiMetrics, UiRect};
 use super::raster::{draw_round_box, draw_text, rgb, TextAlignment};
 use super::shell::{query_display_environment, FrozenSurface};
 use super::vector::{bgr, Painter};
+use crate::window_capture::visible_window_frame;
+use crate::NativeWindowHandle;
 
 pub(super) const RECORDING_FRAME_CLASS_NAME: PCWSTR = w!("CaptasticRecordingFrame-v1");
 const RECORDING_FRAME_WINDOW_NAME: PCWSTR = w!("Captastic recording");
@@ -41,6 +47,9 @@ const BAR_GAP_DIP: i32 = 8;
 const BUTTON_SIZE_DIP: (i32, i32) = (72, 28);
 const TICK_ID: usize = 1;
 const TICK_MS: u32 = 250;
+const FOLLOW_ID: usize = 2;
+/// How often a followed window's frame is read: the faster of the two recording rates.
+const FOLLOW_MS: u32 = 33;
 /// The border and the dot: a recording red, not the accent blue of a selection.
 const RECORD_RED: (u8, u8, u8) = (232, 64, 56);
 
@@ -131,6 +140,54 @@ fn frame_geometry(area: Rect, work: UiRect, metrics: UiMetrics) -> FrameGeometry
     }
 }
 
+/// How wide the speaker glyph is, in DIPs.
+const SPEAKER_DIP: i32 = 18;
+
+/// A speaker with two waves, `size` wide, its left edge at `left` and centred on `middle`.
+fn draw_speaker(
+    device: windows::Win32::Graphics::Gdi::HDC,
+    left: i32,
+    middle: i32,
+    size: i32,
+    pen: i32,
+) {
+    let at = |x: f32, y: f32| {
+        (
+            left + (x * size as f32 / 18.0).round() as i32,
+            middle + (y * size as f32 / 18.0).round() as i32,
+        )
+    };
+    let colour = rgb(245, 245, 247);
+    // The body and its cone, closed.
+    super::raster::draw_lines(
+        device,
+        &[
+            at(1.0, -3.0),
+            at(5.0, -3.0),
+            at(10.0, -7.0),
+            at(10.0, 7.0),
+            at(5.0, 3.0),
+            at(1.0, 3.0),
+            at(1.0, -3.0),
+        ],
+        colour,
+        pen,
+    );
+    // Two waves.
+    super::raster::draw_lines(
+        device,
+        &[at(13.0, -3.0), at(14.5, 0.0), at(13.0, 3.0)],
+        colour,
+        pen,
+    );
+    super::raster::draw_lines(
+        device,
+        &[at(15.5, -6.0), at(17.5, 0.0), at(15.5, 6.0)],
+        colour,
+        pen,
+    );
+}
+
 /// `elapsed / limit` as minutes and seconds.
 fn elapsed_label(elapsed: Duration, limit: Duration) -> String {
     let clock = |duration: Duration| {
@@ -141,12 +198,18 @@ fn elapsed_label(elapsed: Duration, limit: Duration) -> String {
 }
 
 struct FrameState {
+    /// The area the indicator is around, in desktop coordinates.
+    area: Rect,
+    /// The window the indicator follows, once the recording records the window itself.
+    follow: Option<NativeWindowHandle>,
     geometry: FrameGeometry,
     metrics: UiMetrics,
     surface: FrozenSurface,
     started: Instant,
     limit: Duration,
     stop: Arc<AtomicBool>,
+    /// Whether the computer's sound is recorded, shown by a speaker beside the time (ADR 0015).
+    sound: bool,
     hovered: bool,
     tracking_leave: bool,
 }
@@ -158,24 +221,20 @@ pub(super) fn create_recording_frame(
     area: Rect,
     stop: Arc<AtomicBool>,
     limit: Duration,
+    sound: bool,
 ) -> Result<HWND, CaptureError> {
-    let environment = query_display_environment(area);
-    let metrics = environment.metrics;
-    let work = UiRect {
-        left: environment.work_area.left + area.x,
-        top: environment.work_area.top + area.y,
-        right: environment.work_area.right + area.x,
-        bottom: environment.work_area.bottom + area.y,
-    };
-    let geometry = frame_geometry(area, work, metrics);
+    let (geometry, metrics) = layout(area);
     let surface = FrozenSurface::empty(geometry.window.width, geometry.window.height)?;
     let state = Box::new(FrameState {
+        area,
+        follow: None,
         geometry,
         metrics,
         surface,
         started: Instant::now(),
         limit,
         stop,
+        sound,
         hovered: false,
         tracking_leave: false,
     });
@@ -220,6 +279,59 @@ pub(super) fn create_recording_frame(
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     }
     Ok(hwnd)
+}
+
+/// The indicator's layout around `area`, on the display it is on.
+fn layout(area: Rect) -> (FrameGeometry, UiMetrics) {
+    let environment = query_display_environment(area);
+    let metrics = environment.metrics;
+    let work = UiRect {
+        left: environment.work_area.left + area.x,
+        top: environment.work_area.top + area.y,
+        right: environment.work_area.right + area.x,
+        bottom: environment.work_area.bottom + area.y,
+    };
+    (frame_geometry(area, work, metrics), metrics)
+}
+
+/// Makes the indicator `frame` follow `window` from now on.
+pub(super) fn follow_window(frame: HWND, window: NativeWindowHandle) {
+    let state_pointer = window_state::<FrameState>(frame, 0, LPARAM(0));
+    if state_pointer.is_null() {
+        return;
+    }
+    // SAFETY: frame is this thread's live indicator, whose state lives until WM_NCDESTROY, and
+    // nothing here dispatches a message.
+    unsafe { (*state_pointer).follow = Some(window) };
+    // SAFETY: frame is live; a null callback posts WM_TIMER to its procedure.
+    unsafe { SetTimer(frame, FOLLOW_ID, FOLLOW_MS, None) };
+}
+
+/// Lays the indicator out around where its window is now, when that has changed. A minimised
+/// window leaves it where it was, so **Stop** stays on the screen.
+fn follow(hwnd: HWND, state: &mut FrameState) {
+    let Some(area) = state.follow.and_then(visible_window_frame) else {
+        return;
+    };
+    if area == state.area {
+        return;
+    }
+    let (geometry, metrics) = layout(area);
+    if (geometry.window.width, geometry.window.height)
+        != (state.geometry.window.width, state.geometry.window.height)
+    {
+        match FrozenSurface::empty(geometry.window.width, geometry.window.height) {
+            Ok(surface) => state.surface = surface,
+            Err(error) => {
+                log::warn!("the recording border could not follow its window: {error}");
+                return;
+            }
+        }
+    }
+    state.area = area;
+    state.geometry = geometry;
+    state.metrics = metrics;
+    present(hwnd, state);
 }
 
 pub(super) unsafe extern "system" fn recording_frame_proc(
@@ -295,9 +407,15 @@ pub(super) unsafe extern "system" fn recording_frame_proc(
             present(hwnd, state);
             LRESULT(0)
         }
+        WM_TIMER if wparam.0 == FOLLOW_ID => {
+            follow(hwnd, state);
+            LRESULT(0)
+        }
         WM_DESTROY => {
             // SAFETY: hwnd is this thread's live window; a missing timer is a harmless failure.
             let _ = unsafe { KillTimer(hwnd, TICK_ID) };
+            // SAFETY: As above.
+            let _ = unsafe { KillTimer(hwnd, FOLLOW_ID) };
             forget_window(hwnd);
             LRESULT(0)
         }
@@ -401,6 +519,25 @@ fn compose(state: &FrameState) {
         "Saving\u{2026}".to_owned()
     } else {
         elapsed_label(state.started.elapsed(), state.limit)
+    };
+    // A speaker at the right of the time while sound is recorded, so the user is never unsure
+    // whether it is on (ADR 0015).
+    let text = if state.sound && !stopping {
+        let size = metrics.px(SPEAKER_DIP);
+        let left = text.right - size - metrics.px(6);
+        draw_speaker(
+            surface.device,
+            left,
+            (geometry.bar.top + geometry.bar.bottom) / 2,
+            size,
+            metrics.px(2).max(1),
+        );
+        UiRect {
+            right: left - metrics.px(4),
+            ..text
+        }
+    } else {
+        text
     };
     draw_text(
         surface.device,
@@ -563,5 +700,59 @@ mod tests {
             elapsed_label(Duration::from_secs(605), Duration::from_secs(600)),
             "10:00 / 10:00"
         );
+    }
+
+    /// Draws the bar, with and without sound, at 150%, into `CAPTASTIC_BAR_PREVIEW` as 32-bit
+    /// BMPs, for a person to look at the speaker.
+    #[test]
+    #[ignore = "writes images for a person to look at"]
+    fn the_bar_with_sound_shows_a_speaker() {
+        let Some(directory) = std::env::var_os("CAPTASTIC_BAR_PREVIEW") else {
+            return;
+        };
+        let metrics = UiMetrics::new(144);
+        let work = UiRect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        for sound in [false, true] {
+            let geometry = frame_geometry(rect(200, 200, 600, 300), work, metrics);
+            let state = FrameState {
+                area: rect(200, 200, 600, 300),
+                follow: None,
+                geometry,
+                metrics,
+                surface: FrozenSurface::empty(geometry.window.width, geometry.window.height)
+                    .expect("surface"),
+                started: Instant::now() - Duration::from_secs(12),
+                limit: Duration::from_secs(60),
+                stop: Arc::new(AtomicBool::new(false)),
+                sound,
+                hovered: false,
+                tracking_leave: false,
+            };
+            compose(&state);
+            // SAFETY: The surface's DIB holds byte_length bytes, drawn by compose above.
+            let pixels = unsafe {
+                std::slice::from_raw_parts(state.surface.bits, state.surface.byte_length)
+            };
+            let (width, height) = (geometry.window.width, geometry.window.height);
+            let mut bmp = Vec::new();
+            bmp.extend_from_slice(b"BM");
+            bmp.extend_from_slice(&(54 + pixels.len() as u32).to_le_bytes());
+            bmp.extend_from_slice(&[0; 4]);
+            bmp.extend_from_slice(&54_u32.to_le_bytes());
+            bmp.extend_from_slice(&40_u32.to_le_bytes());
+            bmp.extend_from_slice(&(width as i32).to_le_bytes());
+            bmp.extend_from_slice(&(-(height as i32)).to_le_bytes());
+            bmp.extend_from_slice(&1_u16.to_le_bytes());
+            bmp.extend_from_slice(&32_u16.to_le_bytes());
+            bmp.extend_from_slice(&[0; 24]);
+            bmp.extend_from_slice(pixels);
+            let name = if sound { "bar-sound.bmp" } else { "bar.bmp" };
+            std::fs::write(std::path::Path::new(&directory).join(name), bmp).expect("write");
+        }
     }
 }

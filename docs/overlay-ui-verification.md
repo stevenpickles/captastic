@@ -55,7 +55,7 @@ resize-handle geometry.
 | Options control | 100 x 44 |
 | Pin and Edit controls | 44 x 44 each |
 | Capture control | 120 x 44 |
-| Options menu | 248 x 332 |
+| Options menu | 248 x 372 |
 | Menu row | 236 x 40 |
 | Toolbar/menu type | 16 |
 | Primary icon | 22 |
@@ -65,10 +65,10 @@ Expected physical sizes are:
 
 | Scaling | DPI | Toolbar (px) | Options menu (px) |
 | --- | ---: | ---: | ---: |
-| 100% | 96 | 558 x 56 | 248 x 332 |
-| 125% | 120 | 698 x 70 | 310 x 415 |
-| 150% | 144 | 837 x 84 | 372 x 498 |
-| 200% | 192 | 1116 x 112 | 496 x 664 |
+| 100% | 96 | 558 x 56 | 248 x 372 |
+| 125% | 120 | 698 x 70 | 310 x 465 |
+| 150% | 144 | 837 x 84 | 372 x 558 |
+| 200% | 192 | 1116 x 112 | 496 x 744 |
 
 The magnifier is a fixed 31 x 31 square of physical pixels, enlarged 6, 8, 9
 and 12 times at 100%, 125%, 150% and 200%. The sampled square is deliberately

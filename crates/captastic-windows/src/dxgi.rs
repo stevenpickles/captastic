@@ -665,7 +665,19 @@ impl CaptureBackend for DxgiBackend {
                 // so it is used rather than refused (ADR 0003, amended 2026-08-17). Without this,
                 // `fresh` fails on any idle desktop, and `fresh` + `virtual_desktop` fails whenever
                 // *any* display is idle - which is most of the time on a real multi-monitor desk.
-                if self.refresh_latest_on_demand().unwrap_or(false) {
+                //
+                // Asked directly, not through `latest`'s probe: a frame that arrives now was
+                // presented after the trigger and is exactly what `fresh` asks for, and a device
+                // lost or removed is reported, so recovery runs, rather than called a timeout.
+                let current = match self.refresh_latest(0) {
+                    // Presented since the trigger.
+                    Ok(true) => true,
+                    // Only the pointer moved: no pixels were presented since the retained frame.
+                    Ok(false) => self.latest.is_some(),
+                    Err(error) if error.kind == CaptureErrorKind::Timeout => self.latest.is_some(),
+                    Err(error) => return Err(error),
+                };
+                if current {
                     return self.capture_latest(request, None, recorder);
                 }
                 return Err(capture_error(
@@ -677,7 +689,14 @@ impl CaptureBackend for DxgiBackend {
                 ));
             }
             let timeout_ms = duration_to_timeout_ms(remaining);
-            let acquired = AcquiredFrame::acquire(&self.duplication, timeout_ms)?;
+            // Nothing presented within the budget goes round to the fallback above, which can
+            // prove the retained frame current on an idle desktop; returned from here, it made
+            // that fallback unreachable for any budget but zero.
+            let acquired = match AcquiredFrame::acquire(&self.duplication, timeout_ms) {
+                Ok(acquired) => acquired,
+                Err(error) if error.kind == CaptureErrorKind::Timeout => continue,
+                Err(error) => return Err(error),
+            };
             self.record_pointer_report(&acquired)?;
             let presentation_offset_ns = if acquired.info.LastPresentTime == 0 {
                 None
@@ -687,6 +706,14 @@ impl CaptureBackend for DxgiBackend {
             };
 
             if presentation_offset_ns.is_none_or(|offset| offset < 0) {
+                // Presented before the trigger: not what `fresh` returns, but the newest picture
+                // of the desktop, so it is retained. Released unretained, the retained frame would
+                // stay an older one, and the timeout fallback below would then find nothing
+                // pending and take that older frame as current. A pointer-only update
+                // (`LastPresentTime` 0) carries no new pixels and is only released.
+                if acquired.info.LastPresentTime != 0 {
+                    self.retain_acquired(&acquired)?;
+                }
                 acquired.release()?;
                 continue;
             }
@@ -913,7 +940,14 @@ impl DxgiBackend {
         match self.refresh_latest(0) {
             // A new frame: current by construction, with nothing to verify.
             Ok(true) => return Ok(false),
-            Ok(false) => {}
+            // Only the pointer moved, so no pixels were presented since the retained frame: the
+            // same evidence as finding nothing pending. Counted as unverified, a moving mouse made
+            // `max_frame_age_ms` refuse a frame that was in fact current.
+            Ok(false) => {
+                if self.latest.is_some() {
+                    return Ok(true);
+                }
+            }
             Err(error) if error.kind == CaptureErrorKind::Timeout => {
                 if self.latest.is_some() {
                     return Ok(true);
@@ -956,6 +990,14 @@ impl DxgiBackend {
             acquired.release()?;
             return Ok(false);
         }
+        self.retain_acquired(&acquired)?;
+        acquired.release()?;
+        Ok(true)
+    }
+
+    /// Retains the pixels of an acquired frame that presented some, as the newest picture of the
+    /// desktop, with the pointer where the cache says it is.
+    fn retain_acquired(&mut self, acquired: &AcquiredFrame) -> Result<(), CaptureError> {
         let texture: ID3D11Texture2D = acquired
             .resource
             .cast()
@@ -966,7 +1008,7 @@ impl DxgiBackend {
         if desc.Width == 0 || desc.Height == 0 {
             return Err(capture_error(
                 CaptureErrorKind::InvalidFrame,
-                "refresh_latest",
+                "retain_acquired",
                 "DXGI returned an empty desktop texture",
                 false,
                 None,
@@ -974,7 +1016,7 @@ impl DxgiBackend {
         }
         // Cached before the frame is retained, so a shape delivered alongside this frame is
         // available when the frame is materialized later.
-        self.refresh_pointer_shape(&acquired)?;
+        self.refresh_pointer_shape(acquired)?;
         // From the cache, not from this frame's raw fields, for the same reason the live path
         // reads the cache: `PointerPosition` is filled in only on a frame carrying a mouse update,
         // and a frame retained on a plain repaint would otherwise record "no pointer" while the
@@ -987,8 +1029,7 @@ impl DxgiBackend {
             .filter(|position| position.visible)
             .map(|position| (position.x, position.y));
         self.retain_frame(&texture, desc, acquired.info.LastPresentTime, pointer_at)?;
-        acquired.release()?;
-        Ok(true)
+        Ok(())
     }
 
     fn retain_frame(

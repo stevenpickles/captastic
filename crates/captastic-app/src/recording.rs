@@ -57,8 +57,21 @@ const MAX_NAME_ATTEMPTS: u32 = 100;
 
 /// Where a recording's frames come from.
 pub trait FrameSource {
-    /// The newest frame of the display the recording is on, whole.
+    /// The newest frame: the whole display the recording is on, or the window being recorded.
     fn next_frame(&mut self) -> Result<CpuFrame, CaptureError>;
+
+    /// Whether each frame is the recorded thing itself - a window recorded through Windows
+    /// Graphics Capture (ADR 0013) - to be fitted to the recording's size, rather than a display
+    /// the recorded area is cropped from.
+    fn frames_are_the_area(&self) -> bool {
+        false
+    }
+
+    /// Whether what is recorded has gone - a window that closed - which ends the recording and
+    /// keeps it.
+    fn has_ended(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -66,6 +79,8 @@ pub struct RecordingSettings {
     pub format: RecordingFormat,
     pub max_duration: Duration,
     pub gif_max_dimension: u32,
+    /// Record the computer's sound into an MP4 (ADR 0015).
+    pub audio: bool,
 }
 
 impl RecordingSettings {
@@ -74,6 +89,7 @@ impl RecordingSettings {
             format: config.format,
             max_duration: config.max_duration(),
             gif_max_dimension: config.gif_max_dimension,
+            audio: config.audio,
         }
     }
 }
@@ -84,6 +100,11 @@ impl RecordingSettings {
 pub enum RecordingEnd {
     Stopped,
     TimeLimit,
+    /// The window being recorded closed.
+    WindowClosed,
+    /// The frames stopped coming: the capture failed partway, and what was recorded until then is
+    /// kept (ADR 0013).
+    SourceFailed,
 }
 
 /// A finished recording.
@@ -104,7 +125,44 @@ pub struct RecordingReport {
     /// Frames dropped because the encoder was behind.
     pub frames_dropped: u64,
     pub ended: RecordingEnd,
+    /// What happened to the sound, for a recording asked to carry it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sound: Option<RecordingSound>,
 }
+
+/// The sound of a recording that was asked to carry it (ADR 0015).
+#[derive(Clone, Debug, Serialize)]
+pub struct RecordingSound {
+    /// Whether any output device was read. When not, the track is silent and `error` says why.
+    pub recorded: bool,
+    pub error: Option<String>,
+    /// How much of the track is silence put in to fill gaps.
+    #[serde(serialize_with = "serialize_millis")]
+    pub silence_filled: Duration,
+    pub device_changes: u32,
+    /// Stretches of sound the encoder was too far behind to take.
+    pub packets_dropped: u64,
+}
+
+impl From<captastic_windows::LoopbackSummary> for RecordingSound {
+    fn from(summary: captastic_windows::LoopbackSummary) -> Self {
+        Self {
+            recorded: summary.device_opened,
+            error: summary.error,
+            silence_filled: Duration::from_nanos(
+                (u128::from(summary.silent_frames) * 1_000_000_000
+                    / u128::from(captastic_windows::AUDIO_SAMPLE_RATE)) as u64,
+            ),
+            device_changes: summary.device_changes,
+            packets_dropped: summary.packets_dropped,
+        }
+    }
+}
+
+/// How many stretches of sound may wait for the encoder: about five seconds of 10 ms packets. The
+/// encoder takes them between frames, so it is never more than a frame behind unless it is
+/// falling behind the frames too.
+const AUDIO_QUEUE_PACKETS: usize = 512;
 
 fn serialize_millis<S: serde::Serializer>(
     duration: &Duration,
@@ -168,21 +226,44 @@ fn record_into(
     let started = Instant::now();
     let interval = Duration::from_secs(1) / settings.format.frame_rate();
     let first = source.next_frame().map_err(RecordingError::Source)?;
-    let area = recorded_area(&first, area)?;
+    let whole = source.frames_are_the_area();
+    let area = if whole {
+        // The recording keeps the window's first size, whatever it is resized to later.
+        Rect {
+            x: 0,
+            y: 0,
+            width: first.width(),
+            height: first.height(),
+        }
+    } else {
+        recorded_area(&first, area)?
+    };
     let (width, height) = output_size(settings, area.width, area.height);
     let queue = Arc::new(FrameQueue::with_capacity(queue_capacity(
         width as usize * height as usize * 4,
     )));
+    // The computer's sound, on the same clock as the frames, for an MP4 asked to carry it.
+    let (loopback, audio) = start_sound(settings, started);
     let encoder = {
         let queue = queue.clone();
         let path = path.map(Path::to_owned);
         let format = settings.format;
         thread::Builder::new()
             .name("captastic-recording-encoder".to_owned())
-            .spawn(move || encode(&queue, format, path.as_deref(), width, height))
+            .spawn(move || encode(&queue, format, path.as_deref(), width, height, audio))
             .map_err(|error| RecordingError::Encode(error.to_string()))?
     };
-    queue.push(frame_pixels(&first, area, width, height)?, Duration::ZERO);
+    let first_pixels = match pixels_for(&first, whole, area, width, height) {
+        Ok(pixels) => pixels,
+        Err(error) => {
+            // Nothing is recorded yet: the encoder and the sound are stopped, not left waiting.
+            drop(loopback);
+            queue.close(Duration::ZERO);
+            let _ = encoder.join();
+            return Err(error);
+        }
+    };
+    queue.push(first_pixels, Duration::ZERO);
     let mut captured = 1_u64;
     let mut failures = 0_u32;
     let mut next = started + interval;
@@ -194,6 +275,9 @@ fn record_into(
             }
             if started.elapsed() >= settings.max_duration {
                 break Some(RecordingEnd::TimeLimit);
+            }
+            if source.has_ended() {
+                break Some(RecordingEnd::WindowClosed);
             }
             let now = Instant::now();
             if now >= next {
@@ -219,22 +303,40 @@ fn record_into(
                 failures = 0;
                 captured += 1;
                 let at = started.elapsed();
-                queue.push(frame_pixels(&frame, area, width, height)?, at);
+                match pixels_for(&frame, whole, area, width, height) {
+                    Ok(pixels) => queue.push(pixels, at),
+                    Err(error) => {
+                        crate::logging::warn(format_args!(
+                            "a recording frame could not be used, so the recording ends here: {error}"
+                        ));
+                        break RecordingEnd::SourceFailed;
+                    }
+                }
             }
+            // The window closed between the check above and this frame: it ends the recording,
+            // as the check would have.
+            Err(_) if source.has_ended() => break RecordingEnd::WindowClosed,
             Err(error) => {
                 failures += 1;
                 log::debug!(
                     "a recording frame could not be captured ({failures} in a row): {error}"
                 );
                 if failures > SOURCE_FAILURES_TOLERATED {
-                    queue.close(started.elapsed());
-                    let _ = encoder.join();
-                    return Err(RecordingError::Source(error));
+                    // The recording ends here and keeps what it has, as ADR 0013 says: a window
+                    // session that fails, a device lost, is not a reason to lose the minutes
+                    // before it.
+                    crate::logging::warn(format_args!(
+                        "the recording's frames stopped coming, so it ends with what it has: {error}"
+                    ));
+                    break RecordingEnd::SourceFailed;
                 }
             }
         }
     };
     let duration = started.elapsed().min(settings.max_duration);
+    // The sound stops first, filling silence to this moment, so the encoder can take the last of
+    // it once the frames are done.
+    let sound = stop_sound(loopback);
     queue.close(duration);
     let (written, data) = encoder
         .join()
@@ -257,6 +359,7 @@ fn record_into(
         frames_written: written,
         frames_dropped: queue.dropped(),
         ended,
+        sound,
     };
     Ok((report, data))
 }
@@ -266,6 +369,50 @@ fn recorded_area(frame: &CpuFrame, area: Rect) -> Result<Rect, RecordingError> {
     let display = frame.metadata.source_rect;
     area.intersection(display)
         .ok_or(RecordingError::OutsideDisplay { area, display })
+}
+
+/// A frame's pixels at the recording's size: the area cropped from a display, or a window that
+/// has been resized since the recording started fitted to it.
+fn pixels_for(
+    frame: &CpuFrame,
+    whole: bool,
+    area: Rect,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, RecordingError> {
+    if whole && (frame.width(), frame.height()) != (area.width, area.height) {
+        return fitted_pixels(frame, width, height);
+    }
+    frame_pixels(frame, area, width, height)
+}
+
+/// A window frame scaled to fit inside `width` by `height` with its proportions kept, centred on
+/// black (ADR 0013): a GIF or MP4 keeps one size, so a resized window is shown whole rather than
+/// cropped.
+fn fitted_pixels(frame: &CpuFrame, width: u32, height: u32) -> Result<Vec<u8>, RecordingError> {
+    let (from_width, from_height) = (frame.width(), frame.height());
+    let scale = (f64::from(width) / f64::from(from_width.max(1)))
+        .min(f64::from(height) / f64::from(from_height.max(1)));
+    let fitted_width = ((f64::from(from_width) * scale).round() as u32).clamp(1, width);
+    let fitted_height = ((f64::from(from_height) * scale).round() as u32).clamp(1, height);
+    let whole = Rect {
+        x: 0,
+        y: 0,
+        width: from_width,
+        height: from_height,
+    };
+    let fitted = frame_pixels(frame, whole, fitted_width, fitted_height)?;
+    let mut canvas = [0, 0, 0, u8::MAX].repeat(width as usize * height as usize);
+    let (left, top) = (
+        ((width - fitted_width) / 2) as usize,
+        ((height - fitted_height) / 2) as usize,
+    );
+    let row = fitted_width as usize * 4;
+    for y in 0..fitted_height as usize {
+        let at = ((top + y) * width as usize + left) * 4;
+        canvas[at..at + row].copy_from_slice(&fitted[y * row..(y + 1) * row]);
+    }
+    Ok(canvas)
 }
 
 /// The size a recording of `width` by `height` is written at.
@@ -336,6 +483,34 @@ fn frame_pixels(
     ))
 }
 
+type Loopback = Option<captastic_windows::LoopbackCapture>;
+type SoundPackets = Option<std::sync::mpsc::Receiver<captastic_windows::AudioPacket>>;
+
+/// Starts reading the computer's sound for an MP4 that is to carry it, timed from `started`.
+fn start_sound(settings: RecordingSettings, started: Instant) -> (Loopback, SoundPackets) {
+    if !settings.audio || settings.format != RecordingFormat::Mp4 {
+        return (None, None);
+    }
+    let (sender, receiver) = std::sync::mpsc::sync_channel(AUDIO_QUEUE_PACKETS);
+    match captastic_windows::LoopbackCapture::start(started, sender) {
+        Ok(loopback) => (Some(loopback), Some(receiver)),
+        Err(error) => {
+            crate::logging::warn(format_args!(
+                "the recording's sound could not be started, so it is recorded without: {error}"
+            ));
+            (None, None)
+        }
+    }
+}
+
+fn stop_sound(loopback: Loopback) -> Option<RecordingSound> {
+    let summary = loopback?.stop();
+    if let Some(error) = &summary.error {
+        crate::logging::warn(format_args!("the recording has no sound: {error}"));
+    }
+    Some(RecordingSound::from(summary))
+}
+
 /// The encoder thread: everything the queue hands it, into `path` or into memory without one,
 /// until the queue closes. Returns how many frames the recording holds, and its bytes when they
 /// are in memory.
@@ -345,10 +520,11 @@ fn encode(
     path: Option<&Path>,
     width: u32,
     height: u32,
+    sound: SoundPackets,
 ) -> Result<(u64, Option<Vec<u8>>), RecordingError> {
     let result = match format {
         RecordingFormat::Gif => encode_gif(queue, path, width, height),
-        RecordingFormat::Mp4 => encode_mp4(queue, path, width, height),
+        RecordingFormat::Mp4 => encode_mp4(queue, path, width, height, sound),
     };
     if result.is_err() {
         queue.fail();
@@ -413,16 +589,31 @@ fn encode_mp4(
     path: Option<&Path>,
     width: u32,
     height: u32,
+    sound: SoundPackets,
 ) -> Result<(u64, Option<Vec<u8>>), RecordingError> {
     let rate = RecordingFormat::Mp4.frame_rate();
-    let mut writer = match path {
-        Some(path) => captastic_windows::Mp4Writer::create(path, width, height, rate),
-        None => captastic_windows::Mp4Writer::create_in_memory(width, height, rate),
-    }
-    .map_err(|error| RecordingError::Encode(error.to_string()))?;
+    let mut writer =
+        captastic_windows::Mp4Writer::create_recording(path, width, height, rate, sound.is_some())
+            .map_err(|error| RecordingError::Encode(error.to_string()))?;
+    // Sound is taken between frames, so the one writer is only ever used from this thread.
     let end = queued_frames(queue, |pixels, at| {
+        if let Some(sound) = &sound {
+            for packet in sound.try_iter() {
+                writer
+                    .push_audio(&packet, None)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
         writer.push(pixels, at).map_err(|error| error.to_string())
     })?;
+    // The rest of the sound, which ends when the reader has stopped, cut at the picture's end.
+    if let Some(sound) = &sound {
+        for packet in sound.iter() {
+            writer
+                .push_audio(&packet, Some(end))
+                .map_err(|error| RecordingError::Encode(error.to_string()))?;
+        }
+    }
     if path.is_some() {
         let summary = writer
             .finish(end)
@@ -593,12 +784,72 @@ impl FrameSource for CaptureThreadFrames {
     }
 }
 
+/// A window recorded through a Windows Graphics Capture session of its own (ADR 0013), so it is
+/// recorded as itself however it is covered or moved, rather than as its area on the screen.
+struct WindowFrames {
+    session: captastic_windows::WgcWindowSession,
+    capture_id: CaptureId,
+    display_id: captastic_core::DisplayId,
+}
+
+impl FrameSource for WindowFrames {
+    fn next_frame(&mut self) -> Result<CpuFrame, CaptureError> {
+        let frame = self.session.latest()?;
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            width: frame.width,
+            height: frame.height,
+        };
+        CpuFrame::new(
+            frame.pixels,
+            frame.width,
+            frame.height,
+            frame.width * 4,
+            captastic_core::PixelFormat::Bgra8Unorm,
+            captastic_core::FrameOrigin::TopLeft,
+            captastic_core::ColorSpace::Srgb,
+            captastic_core::FrameMetadata {
+                capture_id: self.capture_id,
+                backend: "windows-graphics-capture".to_owned(),
+                display_id: self.display_id.clone(),
+                // The window's own surface: the frame is the whole of what is recorded.
+                source_rect: bounds,
+                rotation_degrees: 0,
+                capture_mode: captastic_core::CaptureMode::Latest { max_age_ms: None },
+                presentation_offset_ns: None,
+                timing_provenance: captastic_core::TimingProvenance::ArrivalTime,
+                native_ready_offset_ns: 0,
+                cpu_ready_offset_ns: None,
+                frame_age_ns: None,
+                verified_current_offset_ns: None,
+                frame_generation: Some(frame.sequence),
+                copy_count: 1,
+                pool_slot: None,
+                cursor: None,
+            },
+        )
+        .map_err(|error| CaptureError::synthetic(format!("a window frame was invalid: {error}")))
+    }
+
+    fn frames_are_the_area(&self) -> bool {
+        true
+    }
+
+    fn has_ended(&self) -> bool {
+        self.session.is_closed()
+    }
+}
+
 /// What the overlay confirmed with **Record**.
 pub struct RecordingRequest {
     pub capture_id: captastic_core::CaptureId,
     pub display_id: captastic_core::DisplayId,
     /// The recorded area, in desktop coordinates.
     pub area: Rect,
+    /// The window chosen, when the Window tool was: recorded through Windows Graphics Capture
+    /// where Windows allows it, and as `area` otherwise (ADR 0013).
+    pub window: Option<captastic_windows::NativeWindowHandle>,
     pub window_title: Option<String>,
     pub window_application: Option<String>,
 }
@@ -626,6 +877,9 @@ struct HostInner {
     /// Where `recording.format` is written back when **Record As** changes it.
     config_path: Option<PathBuf>,
     json_output: bool,
+    /// Whether `[capture] cursor` includes the pointer, which a window recorded through Windows
+    /// Graphics Capture asks Windows to draw rather than having it composited.
+    window_cursor: bool,
     /// Whether a recording started now is reviewed before it is saved.
     review: AtomicBool,
     /// The review open, if any, and the drafts waiting for it to end.
@@ -654,6 +908,9 @@ struct Draft {
     capture_id: CaptureId,
     display: String,
     area: Rect,
+    /// Whether a window was recorded as its area on the screen, since Windows would not let it be
+    /// captured itself (ADR 0013).
+    window_area: bool,
 }
 
 /// An edited recording being encoded on a thread of its own.
@@ -683,6 +940,7 @@ impl RecordingHost {
         capture_sender: std::sync::mpsc::SyncSender<crate::daemon::CaptureCommand>,
         config_path: Option<PathBuf>,
         json_output: bool,
+        window_cursor: bool,
     ) -> Self {
         let review = AtomicBool::new(config.review);
         Self {
@@ -702,6 +960,7 @@ impl RecordingHost {
                 capture_sender,
                 config_path,
                 json_output,
+                window_cursor,
             }),
         }
     }
@@ -725,6 +984,29 @@ impl RecordingHost {
             if let Err(error) = captastic_config::set_recording_format(path, format) {
                 crate::logging::warn(format_args!(
                     "the recording format could not be saved to {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    /// Whether an MP4 recording records the computer's sound (ADR 0015).
+    pub fn audio_enabled(&self) -> bool {
+        lock(&self.inner.config).audio
+    }
+
+    /// Applies **Record Sound**: later MP4 recordings carry the computer's sound, or do not, and
+    /// it is written back to the configuration as `recording.audio`.
+    pub fn set_audio(&self, enabled: bool) {
+        lock(&self.inner.config).audio = enabled;
+        log::info!(
+            "MP4 recordings will be made {} the computer's sound",
+            if enabled { "with" } else { "without" }
+        );
+        if let Some(path) = self.inner.config_path.as_deref() {
+            if let Err(error) = captastic_config::set_recording_audio(path, enabled) {
+                crate::logging::warn(format_args!(
+                    "the sound setting could not be saved to {}: {error}",
                     path.display()
                 ));
             }
@@ -805,7 +1087,13 @@ impl RecordingHost {
         };
         let stop = Arc::new(AtomicBool::new(false));
         *lock(&inner.stop) = Some(stop.clone());
-        show_indicator(desktop_ui, request.area, &stop, settings.max_duration);
+        show_indicator(
+            desktop_ui,
+            request.area,
+            &stop,
+            settings.max_duration,
+            settings.audio && settings.format == RecordingFormat::Mp4,
+        );
         log::info!(
             "recording {} started: {}x{} at {},{} as {} for at most {} s",
             request.capture_id.0,
@@ -816,18 +1104,6 @@ impl RecordingHost {
             settings.format,
             settings.max_duration.as_secs()
         );
-        if inner.json_output {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "schema_version": 1,
-                    "event": "recording_started",
-                    "capture_id": request.capture_id,
-                    "format": settings.format,
-                    "area": request.area,
-                })
-            );
-        }
         let host = self.clone();
         let thread_desktop_ui = desktop_ui.clone();
         let spawned = thread::Builder::new()
@@ -858,7 +1134,7 @@ impl RecordingHost {
         desktop_ui: Arc<Mutex<Option<captastic_windows::DesktopUi>>>,
     ) {
         let inner = &self.inner;
-        let mut frames = CaptureThreadFrames {
+        let mut display_frames = CaptureThreadFrames {
             sender: inner.capture_sender.clone(),
             source: if request.display_id == captastic_core::DisplayId::virtual_desktop() {
                 captastic_core::CaptureSource::VirtualDesktop
@@ -866,14 +1142,69 @@ impl RecordingHost {
                 captastic_core::CaptureSource::Display(request.display_id.clone())
             },
         };
-        let result = match destination {
-            Destination::File(path) => record(&mut frames, request.area, settings, &path, &stop)
-                .map(|report| (report, None)),
-            Destination::Review { stem } => {
-                record_in_memory(&mut frames, request.area, settings, &stop)
-                    .map(|(report, recording)| (report, Some((stem, recording))))
+        // Why a window is recorded as its area on the screen rather than as itself, if it is.
+        let mut window_area_reason = None;
+        let mut window_frames = request.window.and_then(|window| {
+            match captastic_windows::WgcWindowSession::start(window, inner.window_cursor) {
+                Ok(session) => {
+                    log::info!(
+                        "recording {} records the window itself, through Windows Graphics Capture",
+                        request.capture_id.0
+                    );
+                    follow_indicator(&desktop_ui, window);
+                    Some(WindowFrames {
+                        session,
+                        capture_id: request.capture_id,
+                        display_id: request.display_id.clone(),
+                    })
+                }
+                Err(error) => {
+                    // ADR 0013: recorded as its area on the screen, as before, rather than not
+                    // at all.
+                    log::info!(
+                        "recording {} records the window's area on the screen: Windows Graphics \
+                         Capture could not capture the window ({error})",
+                        request.capture_id.0
+                    );
+                    window_area_reason = Some(error.to_string());
+                    None
+                }
             }
+        });
+        let window_area = window_area_reason.is_some();
+        if inner.json_output {
+            let mut event = serde_json::json!({
+                "schema_version": 1,
+                "event": "recording_started",
+                "capture_id": request.capture_id,
+                "format": settings.format,
+                "area": request.area,
+            });
+            if request.window.is_some() {
+                // How a window is recorded: as itself, or as its area on the screen and why.
+                event["window_source"] = if window_area {
+                    "screen_area".into()
+                } else {
+                    "windows_graphics_capture".into()
+                };
+                if let Some(reason) = &window_area_reason {
+                    event["fallback_reason"] = reason.as_str().into();
+                }
+            }
+            println!("{event}");
+        }
+        let frames: &mut dyn FrameSource = match window_frames.as_mut() {
+            Some(frames) => frames,
+            None => &mut display_frames,
         };
+        let result = match destination {
+            Destination::File(path) => {
+                record(frames, request.area, settings, &path, &stop).map(|report| (report, None))
+            }
+            Destination::Review { stem } => record_in_memory(frames, request.area, settings, &stop)
+                .map(|(report, recording)| (report, Some((stem, recording)))),
+        };
+        drop(window_frames);
         hide_indicator(Some(&desktop_ui));
         *lock(&inner.stop) = None;
         inner.active.store(false, Ordering::Release);
@@ -900,6 +1231,7 @@ impl RecordingHost {
                             capture_id: request.capture_id,
                             display: request.display_id.0.clone(),
                             area: request.area,
+                            window_area,
                         };
                         if inner.exiting.load(Ordering::Acquire) {
                             // Stopped because Captastic is exiting: there is no one to review it.
@@ -915,6 +1247,7 @@ impl RecordingHost {
                             &request.display_id.0,
                             &report,
                             ended,
+                            window_area,
                         );
                     }
                 }
@@ -925,12 +1258,25 @@ impl RecordingHost {
 
     /// Records a saved recording in history and says so. `ended` is how the recording ended, for
     /// one saved straight away; a reviewed recording's ending is old news by the time it is saved.
+    /// `window_area` is whether a window was recorded as its area on the screen instead of itself.
+    /// Says, before the saved notice, that a recording went to `~/.captastic/recordings` because
+    /// the output folder could not take it, and why.
+    fn announce_saved_elsewhere(&self, elsewhere: Option<String>) {
+        if let Some(reason) = elsewhere {
+            let _ = self
+                .inner
+                .notices
+                .try_send(crate::daemon::DaemonNotice::RecordingSavedElsewhere { reason });
+        }
+    }
+
     fn announce_saved(
         &self,
         capture_id: CaptureId,
         display: &str,
         report: &RecordingReport,
         ended: Option<RecordingEnd>,
+        window_area: bool,
     ) {
         let inner = &self.inner;
         log::info!(
@@ -953,13 +1299,23 @@ impl RecordingHost {
                 })
             );
         }
-        let _ = inner
-            .notices
-            .try_send(crate::daemon::DaemonNotice::RecordingSaved {
-                file_name: file_name(&report.path),
-                path: report.path.clone(),
-                ended,
-            });
+        let _ =
+            inner
+                .notices
+                .try_send(crate::daemon::DaemonNotice::RecordingSaved {
+                    file_name: file_name(&report.path),
+                    path: report.path.clone(),
+                    ended,
+                    window_area,
+                    without_sound: report.sound.as_ref().filter(|sound| !sound.recorded).map(
+                        |sound| {
+                            sound
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "no output device could be read".to_owned())
+                        },
+                    ),
+                });
     }
 
     /// Opens `draft`'s review, or queues it behind the one open.
@@ -1091,18 +1447,25 @@ impl RecordingHost {
     /// Saves a draft into the output directory as it was recorded.
     fn save_unchanged(&self, draft: Draft) {
         let extension = draft.report.format.extension();
-        match write_new(
+        match write_kept(
             &self.inner.output_directory,
             &draft.stem,
             extension,
             &draft.recording,
         ) {
-            Ok(path) => {
+            Ok((path, elsewhere)) => {
                 let report = RecordingReport {
                     path,
                     ..draft.report
                 };
-                self.announce_saved(draft.capture_id, &draft.display, &report, None);
+                self.announce_saved_elsewhere(elsewhere);
+                self.announce_saved(
+                    draft.capture_id,
+                    &draft.display,
+                    &report,
+                    None,
+                    draft.window_area,
+                );
             }
             Err(error) => self.report_failure(draft.capture_id, &error),
         }
@@ -1127,13 +1490,14 @@ impl RecordingHost {
                 return;
             }
         };
-        match write_new(
+        match write_kept(
             &self.inner.output_directory,
             &draft.stem,
             format.extension(),
             &bytes,
         ) {
-            Ok(path) => {
+            Ok((path, elsewhere)) => {
+                self.announce_saved_elsewhere(elsewhere);
                 let report = RecordingReport {
                     path,
                     bytes: bytes.len() as u64,
@@ -1143,7 +1507,13 @@ impl RecordingHost {
                     frames_written: summary.frames_written,
                     ..draft.report
                 };
-                self.announce_saved(draft.capture_id, &draft.display, &report, None);
+                self.announce_saved(
+                    draft.capture_id,
+                    &draft.display,
+                    &report,
+                    None,
+                    draft.window_area,
+                );
             }
             Err(error) => self.edit_failed(draft, &error.to_string()),
         }
@@ -1155,13 +1525,14 @@ impl RecordingHost {
             draft.capture_id.0
         ));
         let extension = draft.report.format.extension();
-        match write_new(
+        match write_kept(
             &self.inner.output_directory,
             &draft.stem,
             extension,
             &draft.recording,
         ) {
-            Ok(path) => {
+            Ok((path, elsewhere)) => {
+                self.announce_saved_elsewhere(elsewhere);
                 let report = RecordingReport {
                     path,
                     ..draft.report
@@ -1284,6 +1655,45 @@ fn size_of(report: &RecordingReport) -> (u32, u32) {
 
 /// Writes `bytes` into `directory` as `stem.extension`, or the next unused name like it, and
 /// returns where they went. Leaves nothing behind if the write fails.
+/// Writes a recording into `directory` or, when that fails (a full disk, a drive or share gone, a
+/// folder that cannot be written), into `~/.captastic/recordings`, so a reviewed recording, whose
+/// only copy is in memory, is never lost to a failed save. Returns where it went, and why it is not
+/// in `directory` when it is not.
+fn write_kept(
+    directory: &Path,
+    stem: &str,
+    extension: &str,
+    bytes: &[u8],
+) -> Result<(PathBuf, Option<String>), RecordingError> {
+    let fallback = captastic_config::storage_directory().map(|root| root.join("recordings"));
+    write_kept_in(directory, fallback.as_deref(), stem, extension, bytes)
+}
+
+/// [`write_kept`] with the fallback folder given, for tests.
+fn write_kept_in(
+    directory: &Path,
+    fallback: Option<&Path>,
+    stem: &str,
+    extension: &str,
+    bytes: &[u8],
+) -> Result<(PathBuf, Option<String>), RecordingError> {
+    match write_new(directory, stem, extension, bytes) {
+        Ok(path) => Ok((path, None)),
+        Err(error) => {
+            let Some(fallback) = fallback else {
+                return Err(error);
+            };
+            crate::logging::warn(format_args!(
+                "a recording could not be saved in {}, so it is saved in {} instead: {error}",
+                directory.display(),
+                fallback.display()
+            ));
+            let path = write_new(fallback, stem, extension, bytes)?;
+            Ok((path, Some(error.to_string())))
+        }
+    }
+}
+
 fn write_new(
     directory: &Path,
     stem: &str,
@@ -1345,6 +1755,18 @@ pub fn encode_edited(
             ..crop
         });
     }
+    if let Some(crop) = edit.crop {
+        let fits = crop.width > 0
+            && crop.height > 0
+            && u64::from(crop.x) + u64::from(crop.width) <= u64::from(size.0)
+            && u64::from(crop.y) + u64::from(crop.height) <= u64::from(size.1);
+        if !fits {
+            return Err(RecordingError::Encode(format!(
+                "the crop {}x{} at ({}, {}) does not fit the {}x{} recording",
+                crop.width, crop.height, crop.x, crop.y, size.0, size.1
+            )));
+        }
+    }
     let (width, height) = edit.output_size(size);
     let timeline = reader.timeline().clone();
     let kept = edit.kept_frames(&timeline);
@@ -1368,13 +1790,44 @@ pub fn encode_edited(
             (bytes, summary.frames_written)
         }
         RecordingFormat::Mp4 => {
-            let mut writer =
-                captastic_windows::Mp4Writer::create_in_memory(width, height, format.frame_rate())
-                    .map_err(|error| encode(error.to_string()))?;
+            // The sound of the kept span, cut at the same moments as the picture and moved to
+            // the start with it (ADR 0015). A crop changes nothing about it.
+            let sound = captastic_windows::mp4_sound(recording)
+                .map_err(playback)?
+                .map(|samples| kept_sound(&samples, edit.start, edit.end));
+            let mut writer = captastic_windows::Mp4Writer::create_recording(
+                None,
+                width,
+                height,
+                format.frame_rate(),
+                sound.is_some(),
+            )
+            .map_err(|error| encode(error.to_string()))?;
+            // Every frame is here already, read as fast as it decodes: the writer waits for the
+            // encoder rather than skipping frames, as it does live.
+            writer.pace_to_encoder();
+            let mut sound_packets = sound.as_deref().map(sound_packets).unwrap_or_default();
+            sound_packets.reverse();
             for frame in &kept {
                 let pixels = reader.frame(frame.index).map_err(playback)?;
                 writer
                     .push(&edit.crop_pixels(pixels, size.0), frame.at)
+                    .map_err(|error| encode(error.to_string()))?;
+                // The sound up to a little past this frame, so the two streams go to the sink
+                // writer in step rather than one after the other.
+                while sound_packets
+                    .last()
+                    .is_some_and(|packet| packet.start <= frame.at + SOUND_LEAD)
+                {
+                    let packet = sound_packets.pop().expect("checked above");
+                    writer
+                        .push_audio(&packet, Some(edit.length()))
+                        .map_err(|error| encode(error.to_string()))?;
+                }
+            }
+            for packet in sound_packets.into_iter().rev() {
+                writer
+                    .push_audio(&packet, Some(edit.length()))
                     .map_err(|error| encode(error.to_string()))?;
             }
             let (bytes, summary) = writer
@@ -1393,6 +1846,35 @@ pub fn encode_edited(
     ))
 }
 
+/// How far ahead of the frame being written an edited save writes its sound.
+const SOUND_LEAD: Duration = Duration::from_millis(200);
+
+/// The samples of `samples` (interleaved stereo at the loopback's rate) from `start` to `end`.
+fn kept_sound(samples: &[i16], start: Duration, end: Duration) -> Vec<i16> {
+    let channels = usize::from(captastic_windows::AUDIO_CHANNELS);
+    let frame = |at: Duration| {
+        let index = (at.as_nanos() * u128::from(captastic_windows::AUDIO_SAMPLE_RATE)
+            / 1_000_000_000) as usize;
+        (index * channels).min(samples.len())
+    };
+    samples[frame(start)..frame(end).max(frame(start))].to_vec()
+}
+
+/// `samples` as packets of a tenth of a second, timed from zero.
+fn sound_packets(samples: &[i16]) -> Vec<captastic_windows::AudioPacket> {
+    let channels = usize::from(captastic_windows::AUDIO_CHANNELS);
+    let rate = captastic_windows::AUDIO_SAMPLE_RATE as usize;
+    let chunk = rate / 10 * channels;
+    samples
+        .chunks(chunk)
+        .enumerate()
+        .map(|(index, part)| captastic_windows::AudioPacket {
+            start: Duration::from_millis(index as u64 * 100),
+            samples: part.to_vec(),
+        })
+        .collect()
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
@@ -1404,6 +1886,7 @@ fn show_indicator(
     area: Rect,
     stop: &Arc<AtomicBool>,
     limit: Duration,
+    sound: bool,
 ) {
     let mut host = lock(desktop_ui);
     if host.is_none() {
@@ -1421,11 +1904,27 @@ fn show_indicator(
         }
     }
     if let Some(host) = host.as_ref() {
-        if let Err(error) = host.show_recording(area, stop.clone(), limit) {
+        if let Err(error) = host.show_recording(area, stop.clone(), limit, sound) {
             crate::logging::warn(format_args!(
                 "the recording border could not be shown, so the recording is stopped: {error}"
             ));
             stop.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// Makes the indicator follow `window`, which is being recorded as itself and so wherever it goes
+/// (ADR 0013). An indicator that cannot follow stays where it is, which is worth a warning but not
+/// worth stopping the recording: **Stop** is still on the screen.
+fn follow_indicator(
+    desktop_ui: &Arc<Mutex<Option<captastic_windows::DesktopUi>>>,
+    window: captastic_windows::NativeWindowHandle,
+) {
+    if let Some(host) = lock(desktop_ui).as_ref() {
+        if let Err(error) = host.follow_recording(window) {
+            crate::logging::warn(format_args!(
+                "the recording border cannot follow its window: {error}"
+            ));
         }
     }
 }
@@ -1515,6 +2014,122 @@ mod tests {
             format,
             max_duration: Duration::from_secs_f64(seconds),
             gif_max_dimension: 64,
+            audio: false,
+        }
+    }
+
+    #[test]
+    #[ignore = "needs Media Foundation's H.264 and AAC encoders"]
+    fn a_trimmed_and_cropped_save_keeps_the_sound_of_the_span_kept() {
+        // Three seconds: silence, then a 440 Hz tone, then silence, a second each.
+        let (width, height) = (160_u32, 96_u32);
+        let mut writer =
+            captastic_windows::Mp4Writer::create_recording(None, width, height, 30, true)
+                .expect("writer");
+        let rate = captastic_windows::AUDIO_SAMPLE_RATE as usize;
+        for packet in 0..300 {
+            let start = Duration::from_millis(packet as u64 * 10);
+            let samples: Vec<i16> = (0..rate / 100)
+                .flat_map(|i| {
+                    let n = packet * rate / 100 + i;
+                    let value = if (100..200).contains(&packet) {
+                        (12_000.0
+                            * (2.0 * std::f64::consts::PI * 440.0 * n as f64 / rate as f64).sin())
+                            as i16
+                    } else {
+                        0
+                    };
+                    [value, value]
+                })
+                .collect();
+            if packet % 3 == 0 {
+                writer
+                    .push(
+                        &vec![(packet % 250) as u8; (width * height * 4) as usize],
+                        start,
+                    )
+                    .expect("frame");
+            }
+            writer
+                .push_audio(&captastic_windows::AudioPacket { start, samples }, None)
+                .expect("sound");
+        }
+        let (recording, _) = writer
+            .finish_in_memory(Duration::from_secs(3))
+            .expect("finish");
+
+        // Keep 0.5 s to 2.5 s, cropped: half a second of silence, the tone, half of silence.
+        let edit = RecordingEdit {
+            start: Duration::from_millis(500),
+            end: Duration::from_millis(2_500),
+            crop: Some(PixelRect {
+                x: 10,
+                y: 10,
+                width: 100,
+                height: 60,
+            }),
+        };
+        let (edited, summary) =
+            encode_edited(&recording, RecordingFormat::Mp4, edit).expect("edited");
+        assert_eq!((summary.width, summary.height), (100, 60));
+        let sound = captastic_windows::mp4_sound(&edited)
+            .expect("decoded")
+            .expect("the edited MP4 keeps a sound stream");
+        let seconds = sound.len() as f64 / 2.0 / rate as f64;
+        assert!((seconds - 2.0).abs() < 0.1, "{seconds} s of sound kept");
+        let rms = |from: f64, to: f64| {
+            let part = &sound[(from * rate as f64) as usize * 2..(to * rate as f64) as usize * 2];
+            (part.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>() / part.len() as f64).sqrt()
+        };
+        assert!(
+            rms(0.05, 0.4) < 100.0,
+            "the start is the silence before the tone"
+        );
+        assert!(
+            (rms(0.65, 1.35) - 8_485.0).abs() < 1_500.0,
+            "the tone in the middle"
+        );
+        assert!(rms(1.6, 1.95) < 100.0, "the end is the silence after it");
+    }
+
+    #[test]
+    #[ignore = "needs an audio output device and Media Foundation's encoders"]
+    fn an_mp4_with_sound_carries_the_computers_sound_for_as_long_as_the_picture() {
+        let mut source = Changing {
+            bounds: rect(0, 0, 160, 96),
+            count: 0,
+            fail_after: None,
+        };
+        let stop = AtomicBool::new(false);
+        let mut settings = settings(RecordingFormat::Mp4, 3.0);
+        settings.audio = true;
+        let (report, bytes) =
+            record_in_memory(&mut source, rect(0, 0, 160, 96), settings, &stop).expect("record");
+        let sound = report.sound.clone().expect("a sound report");
+        let samples = captastic_windows::mp4_sound(&bytes)
+            .expect("decoded")
+            .expect("the MP4 has a sound stream");
+        let rate = captastic_windows::AUDIO_SAMPLE_RATE as f64;
+        let seconds = samples.len() as f64 / 2.0 / rate;
+        eprintln!("{report:?}, {seconds:.3} s of sound");
+        assert!(
+            (seconds - report.duration.as_secs_f64()).abs() < 0.1,
+            "{seconds} s of sound for {:?} of picture",
+            report.duration
+        );
+        // With CAPTASTIC_EXPECT_SOUND set, scripts/check-recording-audio.ps1 plays a tone
+        // meanwhile, and it must be in the file.
+        if std::env::var_os("CAPTASTIC_EXPECT_SOUND").is_some() {
+            assert!(sound.recorded, "{sound:?}");
+            let loudest = samples
+                .chunks(960)
+                .map(|chunk| {
+                    (chunk.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>() / chunk.len() as f64)
+                        .sqrt()
+                })
+                .fold(0.0, f64::max);
+            eprintln!("loudest 10 ms RMS {loudest:.0}");
+            assert!(loudest > 300.0, "no sound in the recording");
         }
     }
 
@@ -1581,8 +2196,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
+    /// A window recorded as itself: 40 by 30 until it is resized to 80 by 20, closing after a
+    /// number of frames.
+    struct Window {
+        served: u32,
+        resize_after: u32,
+        close_after: u32,
+    }
+
+    impl FrameSource for Window {
+        fn next_frame(&mut self) -> Result<CpuFrame, CaptureError> {
+            self.served += 1;
+            let bounds = if self.served > self.resize_after {
+                rect(0, 0, 80, 20)
+            } else {
+                rect(0, 0, 40, 30)
+            };
+            Ok(frame(bounds, 200))
+        }
+
+        fn frames_are_the_area(&self) -> bool {
+            true
+        }
+
+        fn has_ended(&self) -> bool {
+            self.served >= self.close_after
+        }
+    }
+
     #[test]
-    fn a_source_that_keeps_failing_ends_the_recording_and_leaves_no_file() {
+    fn a_resized_window_keeps_the_recording_size_and_a_closed_one_ends_it_kept() {
+        let directory = directory("window");
+        let path = reserve_path(&directory, "clip", "gif").expect("reserve");
+        let mut source = Window {
+            served: 0,
+            resize_after: 3,
+            close_after: 6,
+        };
+        let stop = AtomicBool::new(false);
+        // The area is ignored for a window: the frames are the window.
+        let report = record(
+            &mut source,
+            rect(500, 500, 1, 1),
+            settings(RecordingFormat::Gif, 30.0),
+            &path,
+            &stop,
+        )
+        .expect("record");
+        assert_eq!(report.ended, RecordingEnd::WindowClosed);
+        assert_eq!((report.width, report.height), (40, 30));
+        assert_eq!(report.frames_captured, 6);
+        assert_eq!(&std::fs::read(&path).expect("read")[..6], b"GIF89a");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_resized_window_is_fitted_whole_and_centred_on_black() {
+        let pixel = |pixels: &[u8], width: u32, x: u32, y: u32| -> [u8; 4] {
+            let at = ((y * width + x) * 4) as usize;
+            pixels[at..at + 4].try_into().expect("pixel")
+        };
+        // Wider than the recording: scaled down to 40 by 10, with bands above and below.
+        let wide = fitted_pixels(&frame(rect(0, 0, 80, 20), 200), 40, 30).expect("fit");
+        assert_eq!(wide.len(), 40 * 30 * 4);
+        assert_eq!(pixel(&wide, 40, 20, 5), [0, 0, 0, 255]);
+        assert_eq!(pixel(&wide, 40, 20, 15), [200; 4]);
+        assert_eq!(pixel(&wide, 40, 20, 25), [0, 0, 0, 255]);
+        // Smaller, in the same proportions: scaled up to fill it.
+        let small = fitted_pixels(&frame(rect(0, 0, 20, 15), 200), 40, 30).expect("fit");
+        assert!(small.chunks_exact(4).all(|pixel| pixel == [200; 4]));
+    }
+
+    #[test]
+    fn a_source_that_keeps_failing_ends_the_recording_and_keeps_what_it_has() {
         let directory = directory("fail");
         let path = reserve_path(&directory, "clip", "gif").expect("reserve");
         let mut source = Changing {
@@ -1598,11 +2284,10 @@ mod tests {
             &path,
             &stop,
         );
-        assert!(
-            matches!(result, Err(RecordingError::Source(_))),
-            "{result:?}"
-        );
-        assert!(!path.exists());
+        let report = result.expect("kept");
+        assert_eq!(report.ended, RecordingEnd::SourceFailed);
+        assert!(report.frames_captured >= 2, "{report:?}");
+        assert!(std::fs::metadata(&path).expect("the file is kept").len() > 0);
         let _ = std::fs::remove_dir_all(&directory);
     }
 
@@ -1681,6 +2366,7 @@ mod tests {
                 max_seconds: 30,
                 gif_max_dimension: 1280,
                 review: false,
+                audio: false,
             },
             directory.join("captures"),
             "{timestamp}".to_owned(),
@@ -1692,6 +2378,7 @@ mod tests {
             capture_sender,
             None,
             false,
+            false,
         );
         let desktop_ui = Arc::new(Mutex::new(None));
         host.start(
@@ -1699,6 +2386,7 @@ mod tests {
                 capture_id: captastic_core::CaptureId(5),
                 display_id: DisplayId::primary(),
                 area: rect(20, 10, 100, 80),
+                window: None,
                 window_title: None,
                 window_application: None,
             },
@@ -1711,6 +2399,7 @@ mod tests {
                 capture_id: captastic_core::CaptureId(6),
                 display_id: DisplayId::primary(),
                 area: rect(0, 0, 10, 10),
+                window: None,
                 window_title: None,
                 window_application: None,
             },
@@ -1823,6 +2512,44 @@ mod tests {
         assert_eq!(white_count(reader.frame(last).expect("last")), 11);
     }
 
+    #[test]
+    fn an_edit_whose_crop_does_not_fit_is_refused_rather_than_a_panic() {
+        let source = counting_gif(4);
+        let edit = RecordingEdit {
+            start: Duration::ZERO,
+            end: Duration::from_millis(300),
+            crop: Some(PixelRect {
+                x: 0,
+                y: 0,
+                width: 10_000,
+                height: 2,
+            }),
+        };
+        let refused = encode_edited(&source, RecordingFormat::Gif, edit).expect_err("refused");
+        assert!(refused.to_string().contains("does not fit"), "{refused}");
+    }
+
+    #[test]
+    fn a_recording_that_cannot_be_saved_where_asked_is_saved_in_the_fallback() {
+        let directory = directory("fallback");
+        std::fs::create_dir_all(&directory).expect("directory");
+        // A file where the output folder should be: nothing can be written inside it.
+        let blocked = directory.join("not-a-folder");
+        std::fs::write(&blocked, b"x").expect("file");
+        let fallback = directory.join("fallback");
+        let (path, elsewhere) =
+            write_kept_in(&blocked, Some(&fallback), "clip", "gif", b"GIF89a").expect("kept");
+        assert!(path.starts_with(&fallback), "{}", path.display());
+        assert_eq!(std::fs::read(&path).expect("written"), b"GIF89a");
+        assert!(elsewhere.is_some());
+        // Where the output folder works, nothing goes to the fallback.
+        let (path, elsewhere) =
+            write_kept_in(&directory, Some(&fallback), "clip", "gif", b"GIF89a").expect("kept");
+        assert!(path.starts_with(&directory) && !path.starts_with(&fallback));
+        assert!(elsewhere.is_none());
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
     /// A host that reviews, with its notices, and the history it remembers into.
     fn reviewing_host(
         directory: &Path,
@@ -1846,6 +2573,7 @@ mod tests {
             capture_sender,
             None,
             false,
+            false,
         );
         (host, notices, history)
     }
@@ -1865,12 +2593,14 @@ mod tests {
                 frames_written: 20,
                 frames_dropped: 0,
                 ended: RecordingEnd::Stopped,
+                sound: None,
             },
             recording: recording.into(),
             stem: name.to_owned(),
             capture_id: CaptureId(3),
             display: "primary".to_owned(),
             area: rect(0, 0, 40, 30),
+            window_area: false,
         }
     }
 

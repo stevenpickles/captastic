@@ -46,7 +46,8 @@ function Start-FixtureDaemon([string]$Name, [bool]$StopsWhenAsked) {
             if ($StopsWhenAsked) {
                 [void]$controlEvent.WaitOne(15000)
             } else {
-                Start-Sleep -Seconds 8
+                # Outlasts the hook's thirty-second wait.
+                Start-Sleep -Seconds 35
             }
             $controlEvent.WaitOne(0)
         } finally {
@@ -100,7 +101,7 @@ try {
 
     $job = Start-FixtureDaemon $env:CAPTASTIC_HOOK_TEST_CONTROL_EVENT $false
     $jobs += $job
-    Assert-ThrowsLike { & $hookScript } '*did not stop within five seconds*'
+    Assert-ThrowsLike { & $hookScript } '*did not stop within thirty seconds*'
     Assert-True (-not (Test-Path -LiteralPath $relaunchMarker)) `
         'Chocolatey before-modify hook asked for a relaunch after failing to stop the daemon.'
 

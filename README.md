@@ -478,7 +478,7 @@ one still open when Captastic exits is closed without copying anything.
 ### Screen recordings
 
 **Record**, beside **Edit** on the toolbar, records the selection over time instead of capturing it
-once: a region, a window's area on screen, or a whole display. While it runs, a red border surrounds
+once: a region, a window, or a whole display. While it runs, a red border surrounds
 the recorded area and a bar beside it shows the elapsed time and a **Stop** button; neither ever
 appears in the recording, and the bar never takes focus from what you are working in. A recording
 ends at **Stop** or when it reaches `recording.max_seconds` (60 by default, at most 600), and either
@@ -492,6 +492,23 @@ capturing). **Options -> Record As** chooses the format, and the choice is kept:
 - **MP4**: H.264 video at 30 frames a second and the recorded size, encoded by Windows on the GPU
   where it can be. Far smaller and smoother for anything long or large.
 
+**Options -> Record Sound** adds the computer's sound to an MP4 (ADR 0015): everything sent to the
+default output device, as you hear it, and never the microphone. It is off by default, since that
+includes any chime, notification or call the computer plays, and it is kept like **Record As**
+(`recording.audio`). GIF has no sound, so the row is greyed and reads **Record Sound (MP4 only)**
+while GIF is chosen. While sound is recorded the bar shows a speaker beside the time. Switching the
+output device during a recording, plugging in headphones say, carries on with the new device; with
+no output device the recording is silent, and the notification says it was recorded without sound.
+
+A window is recorded as itself, through Windows Graphics Capture (ADR 0013): another window moved
+over it, or moving it, changes nothing in the recording, and the border and its bar follow it
+around. The recording keeps the size the window had when it started; a window resized during it is
+scaled to fit, its proportions kept, on black where it no longer fills the picture. A minimised
+window holds its last frame until it is restored, and closing the window ends the recording as
+**Stop** would. Where Windows does not let Captastic capture the window itself, it is recorded as its area
+on the screen instead, as 0.4.0 recorded every window: whatever is in that rectangle is recorded,
+including a window moved over it, and the notification says so when the recording is saved.
+
 When a recording ends it opens in a **review window** before it is saved (ADR 0012). It plays the
 recording back, and a timeline under the picture holds a handle for each end of the span to keep and
 a playhead: drag a handle to trim, and the picture shows the first or last frame kept. For finer
@@ -500,9 +517,10 @@ and with **Ctrl** to the previous or next change on screen; **I** and **O** put 
 of the span at the playhead, and the times read to the millisecond. Drag on the picture to crop it,
 then move the rectangle or pull its edges and corners as in the image editor; **Reset Crop** (R)
 keeps the whole picture again, and an MP4's crop keeps even sides, as H.264 needs. **Space** plays the span kept,
-**Save** (Enter) saves it, and **Discard**, Escape or the close button ask before deleting the
+with its sound for a recording that has it (silent while stepping or dragging the playhead, and
+**Mute** (M) silences it), **Save** (Enter) saves it, and **Discard**, Escape or the close button ask before deleting the
 recording. Saved without trimming or cropping, the recording is kept exactly as recorded; otherwise
-what is kept is encoded again. Until it is saved a recording is held in memory and nothing is
+what is kept is encoded again, its sound cut at the same moments as the picture. Until it is saved a recording is held in memory and nothing is
 written to disk, so **Discard** leaves no trace; Captastic exiting during a review saves it as it
 is, but a recording in review is lost if Captastic crashes. `recording.review = false`, or **Review Recordings**
 in the notification-area menu, saves recordings as soon as they end instead.
@@ -510,7 +528,7 @@ in the notification-area menu, saves recordings as soon as they end instead.
 A recording is always saved to the output directory, named by the same template as stills and
 remembered in capture history, whether or not still captures are being saved; a notification names
 the file, and clicking it shows the file selected in its folder. It never goes to the clipboard. It records the pointer if `[capture] cursor` includes it
-for stills, and never audio. One recording runs at a time, and the capture hotkey does nothing while
+for stills, and sound only as above. One recording runs at a time, and the capture hotkey does nothing while
 it runs except say so. Captastic exiting finishes a recording rather than discarding it. Recording
 needs Captastic running in the notification area; the developer command line's one-shot capture
 greys **Record**, and `captastic-dev record` records a display or region from the command line
@@ -542,6 +560,22 @@ cargo run -p captastic-app -- daemon --backend dxgi --mode latest --cpu-frame tr
 `latest` is the product-behavior mode and should also work on a static desktop. A `fresh` DXGI capture needs the desktop image itself to change after the trigger. A static desktop can legitimately time out; pointer-only updates do not count as a fresh desktop image.
 
 Ctrl+C on a foreground daemon, **Exit** in the notification-area menu, or `captastic-dev stop` requests an orderly shutdown, stops admitting capture triggers, and gives the daemon three seconds to drain before overdue workers are detached. Windows close, logoff, and shutdown notifications request the same bounded teardown; the native handler waits up to four seconds for its completion signal, while a canceled shutdown query leaves the daemon running. Configuration recovery, persistence failures, clipboard failures, and Open Config errors detected during normal operation are reported through context-specific notification-area messages. The persistent log is authoritative for failures and timeouts detected during final teardown because the notification icon is being removed. `captastic-dev status` reports whether the per-session daemon is running on Windows and reports `unsupported` on platforms without a native daemon. DXGI access/device loss drops the abandoned session before replacement construction and retries the same capture up to three times with bounded backoff. If those attempts fail, background reinitialization continues without acquiring another frame until the next capture.
+
+### Captures from the command line
+
+`captastic-cli`, installed beside `captastic.exe`, lets a script or an agent take a capture and
+read back where it went, as one line of JSON with exit codes that tell success, refusal and failure
+apart:
+
+```powershell
+captastic-cli capture --window-title "Visual Studio Code" --output C:\temp\editor.png
+```
+
+It captures a display, a rectangle, a window by handle, title or process, the last region, or a
+region the user chooses on the overlay, with Captastic running or not. Every such capture is
+announced by a notification the user can always see, and is marked in history.
+[docs/command-line.md](docs/command-line.md) has every command, its JSON and its exit codes, written
+to be pasted into an agent's instructions.
 
 ## Known limitations
 

@@ -479,11 +479,30 @@ fn run_capture_worker(context: CaptureWorkerContext) {
             }
         };
         match command {
-            CaptureCommand::Trigger(_) if recording_active.load(Ordering::Acquire) => {
+            CaptureCommand::Trigger(trigger) if recording_active.load(Ordering::Acquire) => {
                 // One recording at a time and no stills beside it, so the two never compete for
                 // the engine's readback buffers. Not an attempt: nothing was captured or dropped.
                 log::info!("a capture was refused because a recording is running");
-                let _ = capture_notices.try_send(DaemonNotice::RecordingInProgress);
+                match &trigger.command_line {
+                    Some(command_line) => {
+                        let _ = command_line
+                            .reply
+                            .try_send(crate::selection::CommandLineOutcome::RecordingRunning);
+                    }
+                    None => {
+                        let _ = capture_notices.try_send(DaemonNotice::RecordingInProgress);
+                    }
+                }
+            }
+            CaptureCommand::CommandLine(request) => {
+                answer_command_line(
+                    *request,
+                    backend.as_mut(),
+                    recording_active.load(Ordering::Acquire),
+                    &mut next_capture_id,
+                    cursor,
+                    &mut recovery,
+                );
             }
             CaptureCommand::RecordFrame(request) => {
                 let result = match backend.as_mut() {
@@ -524,7 +543,11 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                 }
                 let _ = request.reply.try_send(result);
             }
-            CaptureCommand::Trigger(trigger) => {
+            CaptureCommand::Trigger(mut trigger) => {
+                // Taken out so the capture closures below can borrow the rest of the press. Every
+                // path that drops the press drops this too, which the waiting request reads as an
+                // overlay that closed without an answer.
+                let command_line = trigger.command_line.take();
                 if capture_budget_exhausted(max_captures, attempts) {
                     // Only reachable while an earlier attempt is still selecting; the loop
                     // stops as soon as that attempt reports back.
@@ -705,6 +728,7 @@ fn run_capture_worker(context: CaptureWorkerContext) {
                                 outcome.frame,
                                 outcome.native_frame,
                                 recorder,
+                                command_line,
                             ),
                         ) {
                             Ok(status) => status,
@@ -959,6 +983,80 @@ fn run_capture_worker(context: CaptureWorkerContext) {
 /// gets the worker detached and leaks the same objects anyway, only later and while also holding a
 /// thread. The kernel reclaims every one of them at process exit regardless, so declining to run
 /// the destructor gives up nothing and takes the driver off the shutdown path.
+/// Answers a command-line request's question of the capture engine on the capture worker, where
+/// the engine lives (ADR 0014). A frame is refused while a recording runs, as a hotkey is.
+#[cfg(windows)]
+fn answer_command_line(
+    request: crate::command_listener::EngineRequest,
+    backend: Option<&mut Box<dyn CaptureBackend>>,
+    recording: bool,
+    next_capture_id: &mut u64,
+    cursor: CursorMode,
+    recovery: &mut Option<BackendRecovery>,
+) {
+    use crate::command_channel::{Failure, Reason};
+    use crate::command_listener::EngineRequest;
+    let unavailable = || {
+        Failure::new(
+            Reason::EngineUnavailable,
+            "the capture engine is recovering or has no display to capture",
+        )
+    };
+    match request {
+        EngineRequest::Displays { reply } => {
+            let displays = backend
+                .map(|backend| backend.displays().to_vec())
+                .ok_or_else(unavailable);
+            let _ = reply.try_send(displays);
+        }
+        EngineRequest::Frame { reply, .. } if recording => {
+            log::info!("a command-line capture was refused because a recording is running");
+            let _ = reply.try_send(Err(Failure::new(
+                Reason::RecordingRunning,
+                "a recording is running; still captures wait until it ends",
+            )));
+        }
+        EngineRequest::Frame { source, reply } => {
+            let Some(backend) = backend else {
+                let _ = reply.try_send(Err(unavailable()));
+                return;
+            };
+            let capture_id = CaptureId(*next_capture_id);
+            *next_capture_id = next_capture_id.saturating_add(1);
+            let request = CaptureRequest {
+                id: capture_id,
+                triggered_at: Instant::now(),
+                source,
+                mode: CaptureMode::Latest { max_age_ms: None },
+                cpu_frame: true,
+                retain_native_frame: false,
+                cursor,
+            };
+            let mut recorder = EventRecorder::with_capacity(16);
+            let result = backend
+                .capture(&request, &mut recorder)
+                .and_then(|outcome| {
+                    outcome.frame.ok_or_else(|| {
+                        captastic_core::CaptureError::synthetic(
+                            "the capture engine returned no frame",
+                        )
+                    })
+                });
+            if let Err(error) = &result {
+                if requires_backend_recovery(error) && recovery.is_none() {
+                    *recovery = Some(BackendRecovery::immediate());
+                }
+            }
+            let _ = reply.try_send(result.map_err(|error| {
+                Failure::new(
+                    Reason::CaptureFailed,
+                    format!("the capture failed: {error}"),
+                )
+            }));
+        }
+    }
+}
+
 #[cfg(windows)]
 fn abandon_backend<B>(backend: Option<B>) {
     std::mem::forget(backend);
@@ -1050,8 +1148,11 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     // Both workers can be forced to abandon work the user asked for; the main thread owns the
     // notification area, so notices travel to it on their own bounded channel rather than through
     // the capture command queue that is already full or stalled whenever this happens.
-    let (notice_sender, notice_receiver) =
-        mpsc::sync_channel::<DaemonNotice>(args.selection_queue_capacity.max(1));
+    // Room for a burst: notices are sent with `try_send`, and one that finds the channel full is
+    // lost, which for a command-line capture breaks the promise that it is always announced.
+    let (notice_sender, notice_receiver) = mpsc::sync_channel::<DaemonNotice>(
+        args.selection_queue_capacity.max(NOTICE_QUEUE_CAPACITY),
+    );
     let confirmed_regions = Arc::new(Mutex::new(args.confirmed_regions.clone()));
     // Recordings are saved where captures are, named by the same template, and recorded in the
     // same history - whether or not still captures are being saved (ADR 0011).
@@ -1069,6 +1170,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
             .config_path()
             .map(std::path::Path::to_path_buf),
         args.json,
+        args.cursor == CursorMode::Include,
     );
     let mut selection_worker = args
         .selection
@@ -1128,6 +1230,49 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let ready = ready_receiver.recv().map_err(|error| {
         AppError::BackendUnavailable(format!("capture worker ended during startup: {error}"))
     })??;
+    // The command line's way in (ADR 0014). A daemon without it still captures for the user, so
+    // a pipe that cannot be had, because something already holds the name, is worth a warning and
+    // not worth refusing to start.
+    let _command_listener = match captastic_windows::RequestPipeServer::create() {
+        Ok(server) => crate::command_listener::CommandListener::start(
+            server,
+            crate::command_listener::Commands {
+                engine: crate::command_listener::DaemonEngine {
+                    commands: command_sender.clone(),
+                    confirmed_regions: confirmed_regions.clone(),
+                    clipboard_retention: args.clipboard_retention,
+                    overlay: selection_worker
+                        .as_ref()
+                        .and_then(crate::selection::SelectionWorker::overlay_controller),
+                },
+                output: crate::command_listener::CommandOutput {
+                    directory: args.output_directory.clone(),
+                    filename_template: args.output_filename_template.clone(),
+                    format: args.output_format,
+                    encode_options: args.output_encode_options,
+                },
+                notices: Some(notice_sender.clone()),
+                pointer: crate::command_listener::pointer_display,
+                taken_by: "daemon",
+                history: Some(crate::file_output::HistoryRecorder::new(
+                    args.history_store.clone(),
+                    args.history_retention,
+                )),
+            },
+        )
+        .map_err(|error| {
+            crate::logging::warn(format_args!(
+                "command-line requests are unavailable: their thread could not start: {error}"
+            ));
+        })
+        .ok(),
+        Err(error) => {
+            crate::logging::warn(format_args!(
+                "command-line requests are unavailable: {error}"
+            ));
+            None
+        }
+    };
     let dropped = Arc::new(AtomicU64::new(0));
     let paused = Arc::new(AtomicBool::new(false));
     let callback_sender = command_sender.clone();
@@ -1148,6 +1293,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                 source: "hotkey",
                 action,
                 chord: Some(chord),
+                command_line: None,
             };
             if callback_sender
                 .try_send(CaptureCommand::Trigger(trigger))
@@ -1308,6 +1454,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                 source: "self_test",
                 action: HotkeyAction::LastWorkflow,
                 chord: None,
+                command_line: None,
             }))
             .map_err(|error| AppError::InvalidArgument(error.to_string()))?;
     }
@@ -1325,7 +1472,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
     let mut self_triggers_dropped = 0_u64;
     let mut tray_shutdown_requested = false;
     let mut last_persistence_notification: Option<String> = None;
-    let mut last_notice_message: Option<String> = None;
+    let mut last_notice_message: Option<(String, Instant)> = None;
     let mut daemon_result = Ok(());
     loop {
         let session_shutdown_requested = tray
@@ -1442,14 +1589,42 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                 }
                 while let Ok(notice) = notice_receiver.try_recv() {
                     let message = notice.message();
-                    if last_notice_message.as_deref() == Some(message.as_str()) {
+                    // The same error raised again within a short while (the engine still down,
+                    // press after press) is shown once. A notice about a file is never folded
+                    // away: each one is a capture or a recording of its own, even with the same
+                    // name, and a command-line capture must always be announced (ADR 0014).
+                    if !notice_is_shown(
+                        &mut last_notice_message,
+                        notice.names_a_file(),
+                        &message,
+                        Instant::now(),
+                    ) {
+                        log::info!("a repeated notice was not shown again: {message}");
                         continue;
                     }
-                    last_notice_message = Some(message.clone());
+                    if tray.is_none() {
+                        log::warn!("no notification area icon to show a notice: {message}");
+                        // A command-line capture is announced from an icon of its own instead,
+                        // as a one-shot capture is.
+                        if let DaemonNotice::CommandLineCapture { path, .. } = &notice {
+                            let started = crate::desktop_executable()
+                                .map_err(|error| error.to_string())
+                                .and_then(|desktop| {
+                                    captastic_windows::start_announcer(&desktop, path)
+                                        .map_err(|error| error.to_string())
+                                });
+                            if let Err(error) = started {
+                                log::warn!(
+                                    "a command-line capture could not be announced: {error}"
+                                );
+                            }
+                        }
+                    }
                     if let Some(tray) = tray.as_ref() {
                         let revealing = match &notice {
                             DaemonNotice::RecordingSaved { path, .. }
-                            | DaemonNotice::RecordingEditFailed { path, .. } => Some(path.clone()),
+                            | DaemonNotice::RecordingEditFailed { path, .. }
+                            | DaemonNotice::CommandLineCapture { path, .. } => Some(path.clone()),
                             _ => None,
                         };
                         let shown = if let Some(path) = revealing {
@@ -1480,6 +1655,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                                     source: "tray",
                                     action: HotkeyAction::LastWorkflow,
                                     chord: None,
+                                    command_line: None,
                                 };
                                 if command_sender
                                     .try_send(CaptureCommand::Trigger(trigger))
@@ -1575,6 +1751,7 @@ pub fn run(args: DaemonArgs) -> Result<(), AppError> {
                             source: "self_test",
                             action: HotkeyAction::LastWorkflow,
                             chord: None,
+                            command_line: None,
                         })) {
                             Ok(()) => self_triggers_sent = self_triggers_sent.saturating_add(1),
                             // Counted rather than retried or ignored. A soak that quietly lost
@@ -2780,6 +2957,7 @@ fn dispatch_output(
     frame: Option<CpuFrame>,
     native_frame: Option<Arc<dyn NativeFrame>>,
     recorder: EventRecorder,
+    command_line: Option<crate::selection::CommandLineSelection>,
 ) -> Result<&'static str, AppError> {
     let route = action_route(action);
     if let ActionRoute::Overlay(initial_tool) = route {
@@ -2801,6 +2979,7 @@ fn dispatch_output(
                 native_frame,
                 recorder,
                 preview_mode,
+                command_line,
             );
         }
         if action != HotkeyAction::LastWorkflow {
@@ -2882,6 +3061,7 @@ fn dispatch_output(
                     // opens in, and a user who has asked for live selections should not get a
                     // frozen one because their remembered region happened to be stale.
                     preview_mode,
+                    None,
                 );
             }
         }
@@ -2916,6 +3096,7 @@ fn dispatch_selection(
     native_frame: Option<Arc<dyn NativeFrame>>,
     recorder: EventRecorder,
     preview_mode: PreviewMode,
+    command_line: Option<crate::selection::CommandLineSelection>,
 ) -> Result<&'static str, AppError> {
     let frame = frame.ok_or_else(|| {
         AppError::BackendUnavailable(
@@ -2945,6 +3126,7 @@ fn dispatch_selection(
         selection_offset_ns: None,
         confirmation_anchored: false,
         preview_mode,
+        command_line,
     };
     match crate::selection::try_submit(sender, job) {
         Ok(()) => Ok("selection_queued"),
@@ -3199,6 +3381,8 @@ pub(crate) enum CaptureCommand {
     SelectionFinished(CaptureId),
     /// A recording asks for the newest frame of its display (ADR 0011).
     RecordFrame(Box<RecordFrameRequest>),
+    /// A command-line request asks for the displays or a frame (ADR 0014).
+    CommandLine(Box<crate::command_listener::EngineRequest>),
     Shutdown,
 }
 
@@ -3239,20 +3423,72 @@ pub(crate) enum DaemonNotice {
         /// How it ended, for a recording saved as soon as it ended; `None` once it has been
         /// reviewed, when that is no longer news.
         ended: Option<crate::recording::RecordingEnd>,
+        /// Whether a window was recorded as its area on the screen, since Windows would not let it
+        /// be captured itself (ADR 0013).
+        window_area: bool,
+        /// Why a recording that was to carry the computer's sound has none (ADR 0015).
+        without_sound: Option<String>,
     },
     /// A recording failed, and nothing was saved.
     RecordingFailed { message: String },
+    /// A recording could not be saved in the output folder, and was saved in
+    /// `~/.captastic/recordings` instead; the saved notice that follows names the file.
+    RecordingSavedElsewhere { reason: String },
     /// A reviewed recording could not be trimmed or cropped, so it was saved as recorded.
     RecordingEditFailed {
         file_name: String,
         path: std::path::PathBuf,
         message: String,
     },
+    /// A command-line request captured the screen. Always raised, and never configurable: a
+    /// capture the user did not start must never be invisible (ADR 0014).
+    CommandLineCapture {
+        file_name: String,
+        path: std::path::PathBuf,
+    },
 }
 
 #[cfg(windows)]
+/// Whether a notice is shown, or folded into the same error shown less than
+/// [`NOTICE_REPEAT_WINDOW`] ago. A notice about a file is always shown.
+fn notice_is_shown(
+    last: &mut Option<(String, Instant)>,
+    names_a_file: bool,
+    message: &str,
+    now: Instant,
+) -> bool {
+    if names_a_file {
+        return true;
+    }
+    let repeated = last.as_ref().is_some_and(|(previous, at)| {
+        previous == message && now.saturating_duration_since(*at) < NOTICE_REPEAT_WINDOW
+    });
+    if !repeated {
+        *last = Some((message.to_owned(), now));
+    }
+    !repeated
+}
+
+#[cfg(windows)]
+/// How long the same error notice is folded into the one already shown.
+const NOTICE_REPEAT_WINDOW: Duration = Duration::from_secs(30);
+#[cfg(windows)]
+/// The least room the notice channel has, whatever the selection queue's capacity.
+const NOTICE_QUEUE_CAPACITY: usize = 16;
+
+#[cfg(windows)]
 impl DaemonNotice {
-    fn title(&self) -> &'static str {
+    /// Whether the notice is about one saved file, which is never folded into another notice.
+    fn names_a_file(&self) -> bool {
+        matches!(
+            self,
+            Self::RecordingSaved { .. }
+                | Self::RecordingEditFailed { .. }
+                | Self::CommandLineCapture { .. }
+        )
+    }
+
+    pub(crate) fn title(&self) -> &'static str {
         match self {
             Self::DroppedSelection { .. } => "Captastic could not finish a capture",
             Self::CaptureEngineUnavailable => "Captastic cannot capture right now",
@@ -3260,7 +3496,9 @@ impl DaemonNotice {
             Self::RecordingInProgress => "Captastic is recording",
             Self::RecordingSaved { .. } => "Recording saved",
             Self::RecordingFailed { .. } => "Captastic could not save the recording",
+            Self::RecordingSavedElsewhere { .. } => "Recording saved somewhere else",
             Self::RecordingEditFailed { .. } => "Captastic could not trim the recording",
+            Self::CommandLineCapture { .. } => "Captured by a command-line request",
         }
     }
 
@@ -3268,11 +3506,14 @@ impl DaemonNotice {
     fn is_informational(&self) -> bool {
         matches!(
             self,
-            Self::CaptureEngineRecovered | Self::RecordingSaved { .. } | Self::RecordingInProgress
+            Self::CaptureEngineRecovered
+                | Self::RecordingSaved { .. }
+                | Self::RecordingInProgress
+                | Self::CommandLineCapture { .. }
         )
     }
 
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         match self {
             Self::DroppedSelection { capture_id, reason } => format!(
                 "Capture {} was not completed because {}.",
@@ -3290,22 +3531,56 @@ impl DaemonNotice {
                 "Stop the recording with its Stop button before capturing again.".to_owned()
             }
             Self::RecordingSaved {
-                file_name, ended, ..
-            } => match ended {
-                Some(crate::recording::RecordingEnd::TimeLimit) => format!(
-                    "{file_name} was saved when the recording reached its time limit. Click to \
-                     show it in its folder."
-                ),
-                Some(crate::recording::RecordingEnd::Stopped) | None => {
-                    format!("{file_name} was saved. Click to show it in its folder.")
+                file_name,
+                ended,
+                window_area,
+                without_sound,
+                ..
+            } => {
+                let saved = match ended {
+                    Some(crate::recording::RecordingEnd::TimeLimit) => format!(
+                        "{file_name} was saved when the recording reached its time limit. Click \
+                         to show it in its folder."
+                    ),
+                    Some(crate::recording::RecordingEnd::WindowClosed) => format!(
+                        "{file_name} was saved when the recorded window closed. Click to show it \
+                         in its folder."
+                    ),
+                    Some(crate::recording::RecordingEnd::SourceFailed) => format!(
+                        "{file_name} was saved when the recording could no longer be captured. \
+                         Click to show it in its folder."
+                    ),
+                    Some(crate::recording::RecordingEnd::Stopped) | None => {
+                        format!("{file_name} was saved. Click to show it in its folder.")
+                    }
+                };
+                let saved = match without_sound {
+                    Some(reason) => format!("Recorded without sound: {reason}. {saved}"),
+                    None => saved,
+                };
+                if *window_area {
+                    format!(
+                        "Recorded the window's area on the screen: Windows did not allow \
+                         capturing the window itself. {saved}"
+                    )
+                } else {
+                    saved
                 }
-            },
+            }
             Self::RecordingFailed { message } => format!("Nothing was saved: {message}."),
+            Self::RecordingSavedElsewhere { reason } => format!(
+                "The recording could not be saved in the output folder ({reason}), so it was saved \
+                 in .captastic\\recordings in your user folder instead."
+            ),
             Self::RecordingEditFailed {
                 file_name, message, ..
             } => format!(
                 "{file_name} was saved as it was recorded instead: {message}. Click to show it in \
                  its folder."
+            ),
+            Self::CommandLineCapture { file_name, .. } => format!(
+                "A program asked Captastic for a capture of your screen, saved as {file_name}. \
+                 Click to show it in its folder."
             ),
         }
     }
@@ -3341,6 +3616,25 @@ pub(crate) struct TriggerEvent {
     source: &'static str,
     action: HotkeyAction,
     chord: Option<HotkeyChord>,
+    /// A command-line request waiting on the overlay this press opens (ADR 0014).
+    command_line: Option<crate::selection::CommandLineSelection>,
+}
+
+/// The press a `--interactive` command-line request makes: the overlay, opened on the Region tool
+/// so the user starts from a selection rather than whatever they last did, answered back to
+/// `selection` instead of the destinations.
+#[cfg(windows)]
+pub(crate) fn command_line_trigger(
+    selection: crate::selection::CommandLineSelection,
+) -> CaptureCommand {
+    CaptureCommand::Trigger(TriggerEvent {
+        received_at: Instant::now(),
+        enqueued_at: Instant::now(),
+        source: "command_line",
+        action: HotkeyAction::Region,
+        chord: None,
+        command_line: Some(selection),
+    })
 }
 
 #[cfg(windows)]
@@ -3439,6 +3733,41 @@ mod tests {
     use captastic_core::DisplayInfo;
 
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn a_notice_about_a_file_is_never_folded_and_an_error_only_briefly() {
+        let mut last = None;
+        let now = Instant::now();
+        // The same file captured twice from the command line: both announced.
+        let capture = DaemonNotice::CommandLineCapture {
+            file_name: "shot.png".to_owned(),
+            path: PathBuf::from(r"C:\temp\shot.png"),
+        };
+        assert!(capture.names_a_file());
+        assert!(notice_is_shown(&mut last, true, &capture.message(), now));
+        assert!(notice_is_shown(&mut last, true, &capture.message(), now));
+        // The same error twice in a row is shown once, and again once the window has passed.
+        assert!(notice_is_shown(&mut last, false, "down", now));
+        assert!(!notice_is_shown(
+            &mut last,
+            false,
+            "down",
+            now + Duration::from_secs(1)
+        ));
+        assert!(notice_is_shown(
+            &mut last,
+            false,
+            "down",
+            now + NOTICE_REPEAT_WINDOW * 2
+        ));
+        assert!(notice_is_shown(
+            &mut last,
+            false,
+            "other",
+            now + NOTICE_REPEAT_WINDOW * 2
+        ));
+    }
 
     struct TempConfig {
         directory: PathBuf,
@@ -3617,6 +3946,7 @@ mod tests {
             selection_offset_ns: None,
             confirmation_anchored: true,
             preview_mode: PreviewMode::Live,
+            command_line: None,
         })
     }
 
@@ -3796,6 +4126,58 @@ mod tests {
         assert_ne!(
             DaemonNotice::CaptureEngineUnavailable.title(),
             DaemonNotice::CaptureEngineRecovered.title()
+        );
+    }
+
+    #[test]
+    fn a_command_line_capture_is_announced_as_news_that_shows_its_file() {
+        let notice = DaemonNotice::CommandLineCapture {
+            file_name: "shot.png".to_owned(),
+            path: std::path::PathBuf::from("shot.png"),
+        };
+        assert_eq!(notice.title(), "Captured by a command-line request");
+        assert!(notice.is_informational());
+        assert_eq!(
+            notice.message(),
+            "A program asked Captastic for a capture of your screen, saved as shot.png. Click to \
+             show it in its folder."
+        );
+    }
+
+    #[test]
+    fn a_recording_that_was_to_have_sound_says_when_it_has_none() {
+        let notice = DaemonNotice::RecordingSaved {
+            file_name: "clip.mp4".to_owned(),
+            path: std::path::PathBuf::from("clip.mp4"),
+            ended: None,
+            window_area: false,
+            without_sound: Some("there is no output device".to_owned()),
+        };
+        assert_eq!(
+            notice.message(),
+            "Recorded without sound: there is no output device. clip.mp4 was saved. Click to show \
+             it in its folder."
+        );
+    }
+
+    #[test]
+    fn a_window_recorded_as_its_area_says_so_when_it_is_saved() {
+        let saved = |window_area| DaemonNotice::RecordingSaved {
+            file_name: "clip.gif".to_owned(),
+            path: std::path::PathBuf::from("clip.gif"),
+            ended: Some(crate::recording::RecordingEnd::WindowClosed),
+            window_area,
+            without_sound: None,
+        };
+        assert_eq!(
+            saved(false).message(),
+            "clip.gif was saved when the recorded window closed. Click to show it in its folder."
+        );
+        assert_eq!(
+            saved(true).message(),
+            "Recorded the window's area on the screen: Windows did not allow capturing the window \
+             itself. clip.gif was saved when the recorded window closed. Click to show it in its \
+             folder."
         );
     }
 

@@ -13,6 +13,7 @@ if ($null -ne (Get-ItemProperty -LiteralPath $runKey -Name 'Captastic' -ErrorAct
 Remove-Item -LiteralPath (Join-Path $env:TEMP 'captastic-relaunch-after-upgrade') -Force -ErrorAction SilentlyContinue
 
 Uninstall-BinFile -Name 'captastic'
+Uninstall-BinFile -Name 'captastic-cli'
 # Created by 0.2 and earlier, and removed here in case an upgrade's own clean-up did not run.
 Uninstall-BinFile -Name 'captastic-desktop'
 

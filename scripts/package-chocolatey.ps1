@@ -96,6 +96,7 @@ try {
     }
     $expectedPayloadNames = @(
         'captastic.exe',
+        'captastic-cli.exe',
         'captastic.example.toml',
         'README.md',
         'LICENSE-MIT',
@@ -119,7 +120,7 @@ try {
     foreach ($portableInstaller in @('install.ps1', 'uninstall.ps1')) {
         Remove-Item -LiteralPath (Join-Path $applicationDirectory $portableInstaller) -Force -ErrorAction SilentlyContinue
     }
-    foreach ($binary in @('captastic.exe')) {
+    foreach ($binary in @('captastic.exe', 'captastic-cli.exe')) {
         $binaryPath = Join-Path $applicationDirectory $binary
         if (-not (Test-Path -LiteralPath $binaryPath -PathType Leaf)) {
             throw "The portable archive is missing $binary."
@@ -152,7 +153,7 @@ try {
             $stream.Dispose()
         }
     }
-    foreach ($binary in @('captastic.exe')) {
+    foreach ($binary in @('captastic.exe', 'captastic-cli.exe')) {
         $binaryPath = Join-Path $applicationDirectory $binary
         $machine = Get-PeMachine $binaryPath
         if ($machine -ne 0x8664) {
@@ -170,6 +171,10 @@ try {
     $verification = $verification.Replace(
         '{{EXECUTABLE_SHA256}}',
         (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $applicationDirectory 'captastic.exe')).Hash.ToLowerInvariant()
+    )
+    $verification = $verification.Replace(
+        '{{CLI_SHA256}}',
+        (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $applicationDirectory 'captastic-cli.exe')).Hash.ToLowerInvariant()
     )
     if ($verification -match '\{\{[^}]+\}\}') {
         throw 'Chocolatey VERIFICATION.txt contains unresolved template placeholders.'
@@ -205,6 +210,8 @@ try {
         'tools/chocolateyUninstall.ps1',
         'tools/captastic/captastic.exe',
         'tools/captastic/captastic.exe.ignore',
+        'tools/captastic/captastic-cli.exe',
+        'tools/captastic/captastic-cli.exe.ignore',
         'tools/captastic/LICENSE-MIT',
         'tools/captastic/LICENSE-APACHE'
     )) {
@@ -224,7 +231,7 @@ try {
         '^_rels/\.rels$',
         '^captastic\.nuspec$',
         '^tools/(LICENSE\.txt|VERIFICATION\.txt|chocolatey(?:Install|BeforeModify|Uninstall)\.ps1)$',
-        '^tools/captastic/(captastic\.exe(?:\.ignore)?|captastic\.example\.toml|LICENSE-(?:MIT|APACHE)|README\.md)$',
+        '^tools/captastic/(captastic(?:-cli)?\.exe(?:\.ignore)?|captastic\.example\.toml|LICENSE-(?:MIT|APACHE)|README\.md)$',
         '^\[Content_Types\]\.xml$',
         '^package/services/metadata/core-properties/[0-9a-f]+\.psmdcp$'
     )

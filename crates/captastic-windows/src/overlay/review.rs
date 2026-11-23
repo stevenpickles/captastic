@@ -33,7 +33,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, KillTimer, LoadCursorW,
     MessageBoxW, SetCursor, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, HTCLIENT,
-    IDC_ARROW, IDC_CROSS, IDC_SIZEWE, IDOK, MB_ICONWARNING, MB_OKCANCEL, MINMAXINFO,
+    IDC_ARROW, IDC_CROSS, IDC_SIZEWE, IDOK, MB_DEFBUTTON2, MB_ICONWARNING, MB_OKCANCEL, MINMAXINFO,
     SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
     WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
     WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_TIMER, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
@@ -158,7 +158,11 @@ impl Trim {
 
     /// Moves the end of the span kept to `at`, leaving at least [`MINIMUM_SPAN`] after the start.
     fn set_end(&mut self, at: Duration) {
-        self.end = at.clamp(self.start + MINIMUM_SPAN, self.duration);
+        // `min` before `max`, not `clamp`: a recording shorter than the minimum span has no valid
+        // range, and `clamp` panics on one, inside a window procedure.
+        self.end = at
+            .min(self.duration)
+            .max((self.start + MINIMUM_SPAN).min(self.duration));
     }
 
     fn edit(&self) -> RecordingEdit {
@@ -184,6 +188,8 @@ fn clock(at: Duration) -> String {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReviewButton {
     Play,
+    /// Shown only for a recording with sound (ADR 0015).
+    Mute,
     ResetCrop,
     Discard,
     Save,
@@ -193,6 +199,7 @@ impl ReviewButton {
     const fn tooltip(self) -> &'static str {
         match self {
             Self::Play => "Play or pause (Space)",
+            Self::Mute => "Mute or unmute the recording's sound (M)",
             Self::ResetCrop => "Keep the whole picture again (R)",
             Self::Discard => "Delete this recording (Esc)",
             Self::Save => "Save the span kept (Enter)",
@@ -205,7 +212,7 @@ impl ReviewButton {
 struct ReviewLayout {
     client: UiRect,
     toolbar: UiRect,
-    buttons: [(ReviewButton, UiRect); 4],
+    buttons: [(ReviewButton, UiRect); 5],
     time_label: UiRect,
     span_label: UiRect,
     image: UiRect,
@@ -217,7 +224,14 @@ struct ReviewLayout {
 }
 
 impl ReviewLayout {
-    fn new(client: UiRect, metrics: UiMetrics, image_width: u32, image_height: u32) -> Self {
+    /// `sound` makes room for **Mute** beside **Play**; without it the toolbar is as it was.
+    fn new(
+        client: UiRect,
+        metrics: UiMetrics,
+        image_width: u32,
+        image_height: u32,
+        sound: bool,
+    ) -> Self {
         let toolbar = UiRect {
             bottom: client.top + metrics.px(TOOLBAR_HEIGHT_DIP),
             ..client
@@ -239,10 +253,20 @@ impl ReviewLayout {
             right: discard.left - metrics.px(GROUP_GAP_DIP),
             ..discard
         };
+        // Without sound, Mute has no area, so nothing can hover over or press it.
+        let mute = if sound {
+            button(play.right + metrics.px(BUTTON_GAP_DIP))
+        } else {
+            UiRect {
+                left: play.right,
+                right: play.right,
+                ..play
+            }
+        };
         let time_label = UiRect {
-            left: play.right + metrics.px(GROUP_GAP_DIP),
+            left: mute.right + metrics.px(GROUP_GAP_DIP),
             top,
-            right: play.right + metrics.px(GROUP_GAP_DIP + TIME_LABEL_WIDTH_DIP),
+            right: mute.right + metrics.px(GROUP_GAP_DIP + TIME_LABEL_WIDTH_DIP),
             bottom,
         };
         let span_label = UiRect {
@@ -290,6 +314,7 @@ impl ReviewLayout {
             toolbar,
             buttons: [
                 (ReviewButton::Play, play),
+                (ReviewButton::Mute, mute),
                 (ReviewButton::ResetCrop, reset_crop),
                 (ReviewButton::Discard, discard),
                 (ReviewButton::Save, save),
@@ -405,12 +430,23 @@ enum CropDrag {
     },
 }
 
-/// `crop` with its sides rounded down to even numbers, never below two.
-fn even(crop: Rect) -> Rect {
+/// `crop` with its sides rounded down to even numbers, never below two, and kept inside `bounds`:
+/// a one-pixel side rounded up to two at the picture's last row or column moves in by one, rather
+/// than reaching outside the picture.
+fn even(crop: Rect, bounds: Rect) -> Rect {
+    let side = |length: u32, limit: u32| (length & !1).max(2).min(limit & !1).max(1);
+    let width = side(crop.width, bounds.width);
+    let height = side(crop.height, bounds.height);
+    let right = i64::from(bounds.x) + i64::from(bounds.width);
+    let bottom = i64::from(bounds.y) + i64::from(bounds.height);
     Rect {
-        width: (crop.width & !1).max(2),
-        height: (crop.height & !1).max(2),
-        ..crop
+        x: crop.x.min((right - i64::from(width)) as i32).max(bounds.x),
+        y: crop
+            .y
+            .min((bottom - i64::from(height)) as i32)
+            .max(bounds.y),
+        width,
+        height,
     }
 }
 
@@ -428,6 +464,10 @@ struct ReviewState {
     back_buffer: Option<FrozenSurface>,
     /// Since when, and from where, the recording is playing.
     playing: Option<(Instant, Duration)>,
+    /// The recording's sound, for one that has it (ADR 0015). Heard while it plays, never while
+    /// it is stepped or scrubbed.
+    sound: Option<crate::SoundPlayer>,
+    muted: bool,
     drag: Option<Drag>,
     /// The rectangle kept, in recording pixels: the whole picture until it is cropped.
     crop: Rect,
@@ -479,7 +519,11 @@ impl ReviewState {
                 adjust_crop(*start, *grip, dx, dy, bounds)
             }
         };
-        Some(if self.even_crop { even(crop) } else { crop })
+        Some(if self.even_crop {
+            even(crop, bounds)
+        } else {
+            crop
+        })
     }
 
     fn edit(&self) -> RecordingEdit {
@@ -557,6 +601,17 @@ fn open_review(
 ) -> Result<(HWND, *mut ReviewState), CaptureError> {
     let reader = open_reader(recording, format)
         .map_err(|error| desktop_error("open_recording_for_review", error.to_string()))?;
+    // Decoded once, so playing from anywhere starts at once.
+    let sound = match format {
+        RecordingFormat::Mp4 => match crate::mp4_sound(recording) {
+            Ok(sound) => sound.map(crate::SoundPlayer::new),
+            Err(error) => {
+                log::warn!("the recording's sound could not be read for its review: {error}");
+                None
+            }
+        },
+        RecordingFormat::Gif => None,
+    };
     let (width, height) = reader.size();
     let timeline = reader.timeline().clone();
     let environment = query_display_environment(at);
@@ -609,12 +664,14 @@ fn open_review(
         timeline,
         size: (width, height),
         reader: Some(reader),
-        layout: ReviewLayout::new(client, metrics, width, height),
+        layout: ReviewLayout::new(client, metrics, width, height, sound.is_some()),
         metrics,
         picture,
         shown: None,
         back_buffer: None,
         playing: None,
+        sound,
+        muted: false,
         drag: None,
         crop: Rect {
             x: 0,
@@ -825,6 +882,7 @@ fn relayout(hwnd: HWND, state: &mut ReviewState) {
         state.metrics,
         state.size.0,
         state.size.1,
+        state.sound.is_some(),
     );
     invalidate(hwnd);
 }
@@ -997,6 +1055,10 @@ fn press_button(hwnd: HWND, state_pointer: *mut ReviewState, button: ReviewButto
             // SAFETY: The review's state lives until WM_NCDESTROY on this thread.
             toggle_playing(hwnd, unsafe { &mut *state_pointer });
         }
+        ReviewButton::Mute => {
+            // SAFETY: As above.
+            toggle_mute(hwnd, unsafe { &mut *state_pointer });
+        }
         ReviewButton::ResetCrop => {
             // SAFETY: As above.
             let state = unsafe { &mut *state_pointer };
@@ -1022,12 +1084,41 @@ fn toggle_playing(hwnd: HWND, state: &mut ReviewState) {
         state.trim.set_playhead(state.trim.start);
     }
     state.playing = Some((Instant::now(), state.trim.playhead));
+    play_sound(state);
     // SAFETY: hwnd is this thread's live review; the timer is killed when it pauses or closes.
     unsafe { SetTimer(hwnd, PLAYBACK_TIMER, PLAYBACK_TICK_MS, None) };
     invalidate(hwnd);
 }
 
+/// Plays the sound from the playhead to the end of the span kept, unless it is muted. Every way
+/// playback stops goes through [`pause`], which stops it again, so stepping and scrubbing are
+/// silent.
+fn play_sound(state: &mut ReviewState) {
+    let (playhead, end, muted) = (state.trim.playhead, state.trim.end, state.muted);
+    if let Some(sound) = state.sound.as_mut() {
+        if muted {
+            sound.stop();
+        } else {
+            sound.play(playhead, end);
+        }
+    }
+}
+
+fn toggle_mute(hwnd: HWND, state: &mut ReviewState) {
+    if state.sound.is_none() {
+        return;
+    }
+    state.muted = !state.muted;
+    if state.playing.is_some() {
+        play_sound(state);
+    }
+    invalidate(hwnd);
+}
+
 fn pause(hwnd: HWND, state: &mut ReviewState) {
+    if let Some(sound) = state.sound.as_mut() {
+        sound.stop();
+    }
     if state.playing.take().is_some() {
         // SAFETY: hwnd is this thread's live review.
         let _ = unsafe { KillTimer(hwnd, PLAYBACK_TIMER) };
@@ -1044,6 +1135,9 @@ fn play_on(hwnd: HWND, state: &mut ReviewState) {
     if at >= state.trim.end {
         at = state.trim.start;
         state.playing = Some((Instant::now(), at));
+        state.trim.set_playhead(at);
+        // Round again from the start of the span, and the sound with it.
+        play_sound(state);
     }
     state.trim.set_playhead(at);
     state.show_playhead();
@@ -1079,6 +1173,10 @@ fn key_pressed(hwnd: HWND, state_pointer: *mut ReviewState, key: u16) {
     }
     if key == 0x52 {
         press_button(hwnd, state_pointer, ReviewButton::ResetCrop);
+        return;
+    }
+    if key == 0x4D {
+        toggle_mute(hwnd, state);
         return;
     }
     let step = if held.ctrl {
@@ -1117,7 +1215,8 @@ fn request_discard(hwnd: HWND, state_pointer: *mut ReviewState) {
             hwnd,
             w!("Discard this recording? It will be deleted."),
             w!("Captastic"),
-            MB_OKCANCEL | MB_ICONWARNING,
+            // Cancel is the default: Esc then Enter must not delete the only copy.
+            MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2,
         )
     };
     if answer == IDOK {
@@ -1250,12 +1349,16 @@ fn compose(state: &ReviewState, surface: &FrozenSurface) {
         rgb(60, 60, 65),
     );
     for (button, bounds) in &layout.buttons {
+        if *button == ReviewButton::Mute && state.sound.is_none() {
+            continue;
+        }
         let enabled = *button != ReviewButton::ResetCrop || state.cropped();
         let hovered = enabled && state.hovered == Some(*button);
         let fill = match button {
             ReviewButton::Save if hovered => Some(rgb(68, 145, 255)),
             ReviewButton::Save => Some(rgb(ACCENT_RGB.0, ACCENT_RGB.1, ACCENT_RGB.2)),
             ReviewButton::Play if state.playing.is_some() => Some(rgb(76, 76, 82)),
+            ReviewButton::Mute if state.muted => Some(rgb(76, 76, 82)),
             _ if hovered => Some(rgb(58, 58, 63)),
             _ => None,
         };
@@ -1265,6 +1368,8 @@ fn compose(state: &ReviewState, surface: &FrozenSurface) {
         let label = match button {
             ReviewButton::Play if state.playing.is_some() => "Pause",
             ReviewButton::Play => "Play",
+            ReviewButton::Mute if state.muted => "Unmute",
+            ReviewButton::Mute => "Mute",
             ReviewButton::ResetCrop => "Reset Crop",
             ReviewButton::Discard => "Discard",
             ReviewButton::Save => "Save",
@@ -1473,6 +1578,56 @@ fn draw_tooltip(device: windows::Win32::Graphics::Gdi::HDC, state: &ReviewState)
 mod tests {
     use super::*;
 
+    #[test]
+    fn an_even_crop_stays_inside_the_picture() {
+        let picture = Rect {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 180,
+        };
+        // A one-pixel strip on the last row and the last column, as dragging an edge past the
+        // opposite one leaves it: rounded up to two, it moves in rather than out.
+        for crop in [
+            Rect {
+                x: 10,
+                y: 179,
+                width: 50,
+                height: 1,
+            },
+            Rect {
+                x: 319,
+                y: 10,
+                width: 1,
+                height: 50,
+            },
+            Rect {
+                x: 319,
+                y: 179,
+                width: 1,
+                height: 1,
+            },
+        ] {
+            let even = even(crop, picture);
+            assert!(
+                even.width.is_multiple_of(2) && even.height.is_multiple_of(2),
+                "{even:?}"
+            );
+            assert!(even.x >= 0 && even.y >= 0, "{even:?}");
+            assert!(even.x as u32 + even.width <= picture.width, "{even:?}");
+            assert!(even.y as u32 + even.height <= picture.height, "{even:?}");
+        }
+    }
+
+    #[test]
+    fn a_recording_shorter_than_the_minimum_span_can_still_be_trimmed() {
+        let mut trim = Trim::new(Duration::from_millis(4), 30);
+        trim.set_end(Duration::from_millis(2));
+        assert!(trim.end <= trim.duration);
+        trim.set_end(Duration::ZERO);
+        assert!(trim.end <= trim.duration);
+    }
+
     fn ms(millis: u64) -> Duration {
         Duration::from_millis(millis)
     }
@@ -1533,7 +1688,15 @@ mod tests {
             height: 1,
         };
         assert_eq!(
-            even(crop),
+            even(
+                crop,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 320,
+                    height: 180
+                }
+            ),
             Rect {
                 x: 3,
                 y: 5,
@@ -1561,7 +1724,47 @@ mod tests {
             UiMetrics::new(UiMetrics::BASE_DPI),
             640,
             360,
+            false,
         )
+    }
+
+    #[test]
+    fn mute_takes_room_beside_play_only_for_a_recording_with_sound() {
+        let client = UiRect {
+            left: 0,
+            top: 0,
+            right: 1_000,
+            bottom: 600,
+        };
+        let metrics = UiMetrics::new(UiMetrics::BASE_DPI);
+        let silent = ReviewLayout::new(client, metrics, 640, 360, false);
+        let sounding = ReviewLayout::new(client, metrics, 640, 360, true);
+        let mute = sounding.button_rect(ReviewButton::Mute);
+        let play = sounding.button_rect(ReviewButton::Play);
+        assert!(mute.left > play.right && mute.right > mute.left);
+        assert_eq!(
+            sounding.button_at(POINT {
+                x: (mute.left + mute.right) / 2,
+                y: (mute.top + mute.bottom) / 2,
+            }),
+            Some(ReviewButton::Mute)
+        );
+        assert!(sounding.time_label.left > mute.right);
+        // Without sound there is nothing to press, and the time sits where it always has.
+        let none = silent.button_rect(ReviewButton::Mute);
+        assert_eq!(none.left, none.right);
+        assert_eq!(
+            silent.time_label.left,
+            play.right + metrics.px(GROUP_GAP_DIP)
+        );
+        assert!(silent
+            .buttons
+            .iter()
+            .all(|(button, rect)| *button != ReviewButton::Mute
+                || !rect.contains(POINT {
+                    x: rect.left,
+                    y: (rect.top + rect.bottom) / 2,
+                })));
     }
 
     #[test]
@@ -1624,6 +1827,117 @@ mod tests {
         }
         let (bytes, _) = writer.finish(Duration::from_secs(seconds)).expect("finish");
         bytes.into()
+    }
+
+    #[test]
+    #[ignore = "opens a review and plays a tone through the default output device"]
+    fn a_review_plays_its_sound_while_playing_and_not_once_muted() {
+        use super::super::DesktopUi;
+        use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW};
+
+        // Four seconds of a quiet 440 Hz tone, with frames.
+        let (width, height) = (320_u32, 180_u32);
+        let rate = crate::AUDIO_SAMPLE_RATE as usize;
+        let mut writer =
+            crate::Mp4Writer::create_recording(None, width, height, 30, true).expect("writer");
+        for packet in 0..400 {
+            let start = Duration::from_millis(packet as u64 * 10);
+            let samples: Vec<i16> = (0..rate / 100)
+                .flat_map(|i| {
+                    let n = (packet * rate / 100 + i) as f64;
+                    let value = (3_000.0
+                        * (2.0 * std::f64::consts::PI * 440.0 * n / rate as f64).sin())
+                        as i16;
+                    [value, value]
+                })
+                .collect();
+            if packet % 3 == 0 {
+                writer
+                    .push(
+                        &vec![(packet % 200) as u8; (width * height * 4) as usize],
+                        start,
+                    )
+                    .expect("frame");
+            }
+            writer
+                .push_audio(&crate::AudioPacket { start, samples }, None)
+                .expect("sound");
+        }
+        let (bytes, _) = writer
+            .finish_in_memory(Duration::from_secs(4))
+            .expect("finish");
+
+        let _dpi = super::super::shell::ThreadDpiContext::enter_per_monitor_v2()
+            .expect("per-monitor DPI awareness for the test thread");
+        let host = DesktopUi::start().expect("the desktop UI thread starts");
+        host.review(
+            bytes.into(),
+            RecordingFormat::Mp4,
+            Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+            |_| {},
+        )
+        .expect("the review request is accepted");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let review = loop {
+            // SAFETY: Looks a window up by its class only.
+            let found = unsafe { FindWindowW(REVIEW_CLASS_NAME, PCWSTR::null()) };
+            if found.0 != 0 {
+                break found;
+            }
+            assert!(Instant::now() < deadline, "the review never appeared");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let key = |code: usize| {
+            // SAFETY: Posting to a live window owned by the desktop UI thread.
+            unsafe { PostMessageW(review, WM_KEYDOWN, WPARAM(code), LPARAM(0)) }
+                .expect("post to the review");
+        };
+
+        // What the computer plays, from now on, to tell when the review was heard.
+        let listening = Instant::now();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1_000);
+        let loopback = crate::LoopbackCapture::start(listening, sender).expect("loopback");
+        std::thread::sleep(Duration::from_millis(300));
+        let played = listening.elapsed();
+        key(usize::from(VK_SPACE.0));
+        std::thread::sleep(Duration::from_millis(900));
+        let muted = listening.elapsed();
+        key(0x4D);
+        std::thread::sleep(Duration::from_millis(900));
+        key(usize::from(VK_SPACE.0));
+        std::thread::sleep(Duration::from_millis(100));
+        let summary = loopback.stop();
+        assert!(host.stop(Instant::now() + Duration::from_secs(5)));
+
+        let mut sound = Vec::new();
+        for packet in receiver.try_iter() {
+            sound.extend(packet.samples);
+        }
+        let level = |from: Duration, to: Duration| {
+            let at =
+                |time: Duration| ((time.as_secs_f64() * rate as f64) as usize * 2).min(sound.len());
+            let part = &sound[at(from)..at(to)];
+            (part.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>() / part.len().max(1) as f64)
+                .sqrt()
+        };
+        let before = level(Duration::ZERO, played);
+        let playing = level(played + Duration::from_millis(300), muted);
+        let after = level(
+            muted + Duration::from_millis(300),
+            muted + Duration::from_millis(800),
+        );
+        eprintln!("before {before:.0}, playing {playing:.0}, muted {after:.0}; {summary:?}");
+        assert!(summary.device_opened, "{summary:?}");
+        assert!(playing > 1_000.0, "the tone was not heard while playing");
+        assert!(
+            after < playing / 10.0,
+            "the tone was still heard once muted"
+        );
     }
 
     #[test]
@@ -1704,6 +2018,7 @@ mod tests {
             metrics,
             320,
             180,
+            false,
         );
         let on_picture = |x: f64, y: f64| {
             let x = layout.image.left + (x * layout.scale).round() as i32;

@@ -11,7 +11,7 @@
     <bugTrackerUrl>https://github.com/stevenpickles/captastic/issues</bugTrackerUrl>
     <licenseUrl>https://github.com/stevenpickles/captastic/blob/v$version$/LICENSE-MIT</licenseUrl>
     <requireLicenseAcceptance>false</requireLicenseAcceptance>
-    <projectSourceUrl>https://github.com/stevenpickles/captastic</projectSourceUrl>
+    <projectSourceUrl>https://github.com/stevenpickles/captastic/tree/v$version$</projectSourceUrl>
     <docsUrl>https://github.com/stevenpickles/captastic#readme</docsUrl>
     <mailingListUrl>https://github.com/stevenpickles/captastic/discussions</mailingListUrl>
     <iconUrl>https://cdn.jsdelivr.net/gh/stevenpickles/captastic@5b85094c095237d31ae7f78e35c02525cd85a0d0/assets/branding/captastic-logo.png</iconUrl>

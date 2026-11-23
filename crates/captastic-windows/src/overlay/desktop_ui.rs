@@ -27,7 +27,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use super::editor::{create_editor, editor_window_proc, EditFinished, EDITOR_CLASS_NAME};
 use super::pin::{create_pin, pin_window_proc, set_click_through, PIN_CLASS_NAME};
 use super::recording_frame::{
-    create_recording_frame, recording_frame_proc, RECORDING_FRAME_CLASS_NAME,
+    create_recording_frame, follow_window, recording_frame_proc, RECORDING_FRAME_CLASS_NAME,
 };
 use super::review::{create_review, review_window_proc, ReviewFinished, REVIEW_CLASS_NAME};
 use super::shell::{PrivateFontResource, ThreadDpiContext};
@@ -64,6 +64,10 @@ enum UiCommand {
         area: Rect,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
         limit: Duration,
+        sound: bool,
+    },
+    FollowRecording {
+        window: crate::NativeWindowHandle,
     },
     HideRecording,
     Review {
@@ -136,14 +140,27 @@ impl DesktopUi {
     }
 
     /// Shows the recording indicator around `area`: a red border and a bar with the elapsed time
-    /// and a **Stop** button that sets `stop`. Replaces an indicator already showing.
+    /// and a **Stop** button that sets `stop`, and a speaker beside the time while `sound` is
+    /// recorded (ADR 0015). Replaces an indicator already showing.
     pub fn show_recording(
         &self,
         area: Rect,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
         limit: Duration,
+        sound: bool,
     ) -> Result<(), CaptureError> {
-        self.request(UiCommand::ShowRecording { area, stop, limit })
+        self.request(UiCommand::ShowRecording {
+            area,
+            stop,
+            limit,
+            sound,
+        })
+    }
+
+    /// Makes the recording indicator follow `window` as it moves and is resized, for a window
+    /// recorded as itself (ADR 0013).
+    pub fn follow_recording(&self, window: crate::NativeWindowHandle) -> Result<(), CaptureError> {
+        self.request(UiCommand::FollowRecording { window })
     }
 
     /// Opens a review of `recording`, the bytes of a recording in `format` not yet saved, on the
@@ -495,15 +512,26 @@ unsafe fn apply(state: *mut HostState, command: UiCommand) {
                 unsafe { (*state).editors.push(editor) };
             }
         }
-        UiCommand::ShowRecording { area, stop, limit } => {
+        UiCommand::ShowRecording {
+            area,
+            stop,
+            limit,
+            sound,
+        } => {
             // SAFETY: Per this function's contract; the borrow ends before the window is made.
             unsafe { close_recording(state) };
             // SAFETY: As above.
             let instance = unsafe { (*state).instance };
-            match create_recording_frame(instance, area, stop, limit) {
+            match create_recording_frame(instance, area, stop, limit, sound) {
                 // SAFETY: As above.
                 Ok(frame) => unsafe { (*state).recording = Some(frame) },
                 Err(error) => log::warn!("could not show the recording border: {error}"),
+            }
+        }
+        UiCommand::FollowRecording { window } => {
+            // SAFETY: Per this function's contract.
+            if let Some(frame) = unsafe { (*state).recording } {
+                follow_window(frame, window);
             }
         }
         // SAFETY: As above.

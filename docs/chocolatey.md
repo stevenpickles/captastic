@@ -1,11 +1,14 @@
 # Chocolatey packaging
 
-Captastic's Chocolatey package is self-contained: the release executable, licenses,
+Captastic's Chocolatey package is self-contained: the release executables, licenses,
 documentation, and example configuration are embedded in the `.nupkg`. Installation and
 upgrades therefore do not download or execute a second installer. The package exposes
 `captastic.exe` on `PATH` through a GUI shim, so the shim holds no console open while Captastic
 runs, and adds it to the all-users Start Menu (`CommonPrograms`); the portable installer's shortcut
-is per-user instead. The developer command line, `captastic-dev.exe`, is not packaged. The all-users shortcut is a Chocolatey packaging convention only — the installed startup
+is per-user instead. `captastic-cli.exe`, the command line that asks the running Captastic for
+captures ([ADR 0014](adr/0014-command-line-capture.md)), gets a console shim instead, so a
+terminal waits for it and sees its output and exit code. The developer command line,
+`captastic-dev.exe`, is not packaged. The all-users shortcut is a Chocolatey packaging convention only — the installed startup
 entry, configuration, and daemon control remain scoped to the installing user's session.
 
 The package intentionally does not launch Captastic on its first installation. Start it from
@@ -126,7 +129,8 @@ Portable package, as a standard user:
 
 1. Download the ZIP and its `.sha256`, check the hash, `Unblock-File` the ZIP, extract it, and run
    `.\install.ps1`. Captastic appears in the notification area with no console window, and its Start
-   Menu shortcut exists.
+   Menu shortcut exists. `.\captastic-cli.exe status` in the install folder prints
+   `"running":true` and the daemon's version.
 2. Press the hotkey, choose a region, and press Enter: the clipboard holds the region.
 3. Confirm with **Pin** (Shift+Enter) and with **Edit** (Ctrl+Enter), then press **Done**: a pin
    appears, and the edited image reaches the clipboard.
@@ -138,13 +142,22 @@ Chocolatey package, from an elevated prompt, after restoring the snapshot:
 
 6. `choco install captastic --version <version>-vm.1 --pre --source <folder>`: nothing launches.
    Start it from the Start Menu; there is no console, and `(Get-Command captastic).Source` is the
-   Chocolatey shim.
-7. Repeat steps 2 and 3.
+   Chocolatey shim. In a normal (not elevated) prompt, `captastic-cli capture --display primary`
+   prints the path of a new capture with exit code 0 and raises *Captured by a command-line
+   request*; `captastic-cli capture --window-title x` prints a refusal with exit code 2.
+   Quit Captastic from the tray and run the same capture again: it prints `"taken_by":"one_shot"`
+   with exit code 0 straight away, and the same notification appears from an icon that goes away
+   about ten seconds later.
+7. Repeat steps 2 and 3. Then, with a video or any sound playing, choose **Options -> Record As:
+   MP4** and **Record Sound**, record a few seconds: the bar shows a speaker beside the time, and
+   the review plays the sound with **Play** and silences it with **Mute**. Saved, the MP4 plays with
+   sound in another player. (A VM with no audio device records silence, and the notification says
+   it was recorded without sound: that is the expected result there.)
 8. With Captastic running, `choco upgrade captastic --version <version> --source <folder>` to the
    release package: it stops, and comes back on its own within a few seconds. Task Manager's
    **Details** tab, with the **Elevated** column shown, reports `captastic.exe` as **No**, and the
    log's `starting daemon version=` line names the release.
-9. `choco uninstall captastic`: Captastic stops, the shim, shortcut and login entry are gone, and
+9. `choco uninstall captastic`: Captastic stops, both shims, the shortcut and login entry are gone, and
    `~/.captastic` remains.
 
 Record the result in the release notes' "What was not observed" section before publishing.
@@ -158,16 +171,56 @@ exact archive's contents in `captastic.<version>.nupkg`. The ZIP, checksum, Choc
 `VERIFICATION.txt` records the direct tagged GitHub release archive URL and SHA-256 hashes for the
 archive and both executables. A tagged package build fails if given an indirect or non-release URL.
 
-The workflow does not publish to the Chocolatey community repository automatically. Do not push a
-package until the tagged GitHub release exists, its direct download URLs work, its manifest hashes
-match, and the disposable-VM checklist passes. Then publish manually with an API key kept outside
-the repository:
+### Pushing to the Chocolatey community repository
+
+The package is pushed by
+[.github/workflows/packages.yml](../.github/workflows/packages.yml) (Actions → **Packages**). For a
+release tag (`vX.Y.Z`, no prerelease label), `release.yml` calls it once the GitHub release is
+published, so the disposable-VM checklist must pass before the tag. A failure there leaves the
+published release as it is.
+
+The workflow builds nothing. It runs
+[scripts/publish-chocolatey.ps1](../scripts/publish-chocolatey.ps1), which:
+
+1. downloads the release's `artifacts.json` and every file it lists, through the direct release
+   URLs that `VERIFICATION.txt` names and `choco install` fetches from;
+2. checks that the manifest is publishable and for the tag's version, and that each file has the
+   SHA-256 the manifest records.
+
+The workflow then attaches that `.nupkg` to its run and pushes it with the `CHOCO_API_KEY` secret.
+Without the secret it skips the push with a notice, and the package stays attached to the run. On
+a pull request that touches the workflow or the script, it checks the latest published release's
+package and never pushes.
+
+**One-time setup:**
+
+1. Create an account on [community.chocolatey.org](https://community.chocolatey.org/) and confirm
+   its email address.
+2. Copy the API key from the account page.
+3. Store it as the repository secret; the command prompts for the value, so the key never appears
+   in a command line or in shell history:
+
+   ```powershell
+   gh secret set CHOCO_API_KEY --repo stevenpickles/captastic
+   ```
+
+**To retry** an already published release, use Actions → **Packages** → **Run workflow**, with its
+version (`X.Y.Z`). To check or push from a machine instead:
 
 ```powershell
-choco push ./dist/captastic.<version>.nupkg `
-    --source https://push.chocolatey.org/ `
-    --api-key $env:CHOCOLATEY_API_KEY
+./scripts/publish-chocolatey.ps1 -Tag v<version> -Repository stevenpickles/captastic -DryRun
+$env:CHOCO_API_KEY = '<key>'   # then without -DryRun, to push
+./scripts/publish-chocolatey.ps1 -Tag v<version> -Repository stevenpickles/captastic
 ```
+
+**Caveats:**
+
+- **Versions are never reused.** Chocolatey never accepts the same version twice. Fix forward with
+  a new version; never delete or move a published tag.
+- **Every version is checked.** Each one goes through Chocolatey's automated checks and possibly a
+  human moderator, with the results emailed. The queue:
+  [ch0.co/moderation](https://ch0.co/moderation).
+- **The key's reach.** The API key can publish any package on the account.
 
 The first package submission must pass Chocolatey community validation and moderation before
 `choco install captastic` works against the default community source. Keep the package ID,

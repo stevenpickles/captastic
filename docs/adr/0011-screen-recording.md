@@ -4,6 +4,10 @@
 
 Accepted for the Windows prototype, 2026-10-15. Governs Milestone 9, the 0.4.0 theme.
 Trimming, ruled out of 0.4.0 below, was brought into it by [ADR 0012](0012-recording-review.md).
+From 0.5.0, [ADR 0013](0013-window-recording.md) records a window through Windows Graphics Capture,
+superseding the first *As built* note below for windows it can capture.
+From 0.5.0, an MP4 recording can also carry the system's sound, off by default, per
+[ADR 0015](0015-recording-system-audio.md).
 
 ## Context
 
@@ -108,6 +112,9 @@ What implementing this settled, for the next reader:
   regions, and records whatever is in that rectangle - including another window moved over it.
   So the chosen window is brought to the front as the overlay closes, rather than focus going back
   to the window that had it, which would otherwise cover it wherever the two overlap.
+  *Superseded in 0.5.0* by [ADR 0013](0013-window-recording.md) for every window Windows Graphics
+  Capture can capture: such a window is recorded as itself, and the indicator follows it. This note
+  still describes the fallback for a window it cannot.
 - **Frames come from the daemon's capture thread**, one `RecordFrame` request at a time, so a
   recording shares the engine's display list and recovery. Each is a full CPU readback cropped to
   the area; reading back only the area on the GPU is a later optimization.

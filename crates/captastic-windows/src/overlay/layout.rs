@@ -4,7 +4,7 @@ const TOOLBAR_WIDTH: i32 = 558;
 const TOOLBAR_HEIGHT: i32 = 56;
 const TOOLBAR_BOTTOM_MARGIN: i32 = 24;
 const MENU_WIDTH: i32 = 248;
-const MENU_HEIGHT: i32 = 332;
+const MENU_HEIGHT: i32 = 372;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ToolbarControl {
@@ -24,6 +24,7 @@ pub(super) enum ToolbarControl {
     ClipboardDestination,
     FileOutputDestination,
     RecordFormat,
+    RecordSound,
     Cancel,
 }
 
@@ -473,6 +474,7 @@ pub(super) struct ToolbarLayout {
     pub(super) clipboard_destination: UiRect,
     pub(super) file_output_destination: UiRect,
     pub(super) record_format: UiRect,
+    pub(super) record_sound: UiRect,
     pub(super) cancel: UiRect,
 }
 
@@ -661,11 +663,17 @@ impl ToolbarLayout {
                 right: row_right,
                 bottom: menu.top + metrics.px(286),
             },
-            cancel: UiRect {
+            record_sound: UiRect {
                 left: row_left,
                 top: menu.top + metrics.px(286),
                 right: row_right,
                 bottom: menu.top + metrics.px(326),
+            },
+            cancel: UiRect {
+                left: row_left,
+                top: menu.top + metrics.px(326),
+                right: row_right,
+                bottom: menu.top + metrics.px(366),
             },
             menu,
         }
@@ -693,6 +701,9 @@ impl ToolbarLayout {
             }
             if self.record_format.contains(point) {
                 return Some(ToolbarControl::RecordFormat);
+            }
+            if self.record_sound.contains(point) {
+                return Some(ToolbarControl::RecordSound);
             }
             if self.cancel.contains(point) {
                 return Some(ToolbarControl::Cancel);
@@ -1096,10 +1107,10 @@ mod tests {
     #[test]
     fn compact_toolbar_scales_at_supported_dpi_levels() {
         for (dpi, expected_width, expected_height, expected_menu) in [
-            (96, 558, 56, (248, 332)),
-            (120, 698, 70, (310, 415)),
-            (144, 837, 84, (372, 498)),
-            (192, 1116, 112, (496, 664)),
+            (96, 558, 56, (248, 372)),
+            (120, 698, 70, (310, 465)),
+            (144, 837, 84, (372, 558)),
+            (192, 1116, 112, (496, 744)),
         ] {
             let environment = DisplayEnvironment {
                 work_area: UiRect {
@@ -1130,6 +1141,7 @@ mod tests {
                 layout.clipboard_destination,
                 layout.file_output_destination,
                 layout.record_format,
+                layout.record_sound,
                 layout.cancel,
             ];
             for row in rows {

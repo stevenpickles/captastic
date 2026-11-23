@@ -19,7 +19,7 @@ use windows::Win32::Media::MediaFoundation::{
     MFVideoArea, MFVideoFormat_RGB32, MF_BYTESTREAM_CONTENT_TYPE, MF_MT_DEFAULT_STRIDE,
     MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_MINIMUM_DISPLAY_APERTURE, MF_MT_SUBTYPE,
     MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED, MF_SOURCE_READERF_ENDOFSTREAM,
-    MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+    MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
 };
 use windows::Win32::System::Com::StructuredStorage::{PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0};
 use windows::Win32::System::Variant::VT_I8;
@@ -28,6 +28,11 @@ use crate::video::MediaFoundation;
 
 /// Reading on decodes every frame between; past this many, seeking is quicker.
 const READ_ON_LIMIT: usize = 45;
+
+/// How much memory decoded frames may keep, so that stepping back over frames a seek has just
+/// decoded on the way to another needs no second seek. A drag backwards across a recording asks
+/// for frame after frame that the key frame before them was decoded to reach.
+const CACHE_BYTES: usize = 256 * 1024 * 1024;
 
 /// How the decoded frames are laid out, which can change while reading.
 #[derive(Clone, Copy)]
@@ -52,6 +57,8 @@ pub struct Mp4Reader {
     pixels: Vec<u8>,
     decoded: Option<usize>,
     at_end: bool,
+    /// Frames decoded lately, by index, oldest first, within [`CACHE_BYTES`].
+    cache: std::collections::VecDeque<(usize, Vec<u8>)>,
     _media_foundation: MediaFoundation,
 }
 
@@ -158,7 +165,7 @@ impl Mp4Reader {
                 .map_err(|error| failure("creating reader attributes", error))?;
             let attributes = attributes.expect("MFCreateAttributes returns attributes on success");
             attributes
-                .SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)
+                .SetUINT32(&MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, 1)
                 .map_err(|error| failure("enabling video processing", error))?;
             let reader = source
                 .reader(Some(&attributes))
@@ -187,6 +194,7 @@ impl Mp4Reader {
             pixels: vec![0; width as usize * height as usize * 4],
             decoded: None,
             at_end: false,
+            cache: std::collections::VecDeque::new(),
             _media_foundation: media_foundation,
         })
     }
@@ -273,6 +281,96 @@ impl Mp4Reader {
     }
 }
 
+/// The sound stream of the MP4 in `bytes`, decoded: interleaved 16-bit stereo samples at the
+/// rate it was written at, [`crate::AUDIO_SAMPLE_RATE`] for a Captastic recording. `None` when the
+/// MP4 has no sound stream (ADR 0015).
+pub fn mp4_sound(bytes: &[u8]) -> Result<Option<Vec<i16>>, PlaybackError> {
+    use windows::Win32::Media::MediaFoundation::{
+        MFAudioFormat_PCM, MFMediaType_Audio, MF_MT_AUDIO_BITS_PER_SAMPLE,
+        MF_SOURCE_READER_FIRST_AUDIO_STREAM,
+    };
+    let _media_foundation =
+        MediaFoundation::start().map_err(|error| failure("starting Media Foundation", error))?;
+    let stream = MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32;
+    let mut samples = Vec::new();
+    // SAFETY: Every object is created here, on this thread, and used only by it.
+    unsafe {
+        let reader = Source::Memory(bytes)
+            .reader(None)
+            .map_err(|error| failure("opening the MP4", error))?;
+        let wanted =
+            MFCreateMediaType().map_err(|error| failure("creating a media type", error))?;
+        wanted
+            .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)
+            .map_err(|error| failure("setting the major type", error))?;
+        wanted
+            .SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM)
+            .map_err(|error| failure("setting the subtype", error))?;
+        wanted
+            .SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)
+            .map_err(|error| failure("setting the sample size", error))?;
+        if reader.SetCurrentMediaType(stream, None, &wanted).is_err() {
+            return Ok(None);
+        }
+        // Only the sound: with the picture selected too, the reader would queue every video
+        // sample it passes on the way, a second copy of the recording held for nothing.
+        let _ = reader.SetStreamSelection(
+            windows::Win32::Media::MediaFoundation::MF_SOURCE_READER_ALL_STREAMS.0 as u32,
+            false,
+        );
+        reader
+            .SetStreamSelection(stream, true)
+            .map_err(|error| failure("selecting the MP4's sound", error))?;
+        loop {
+            let mut flags = 0_u32;
+            let mut sample = None;
+            reader
+                .ReadSample(stream, 0, None, Some(&mut flags), None, Some(&mut sample))
+                .map_err(|error| failure("decoding the MP4's sound", error))?;
+            if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
+                break;
+            }
+            let Some(sample) = sample else { continue };
+            let buffer = sample
+                .ConvertToContiguousBuffer()
+                .map_err(|error| failure("reading decoded sound", error))?;
+            let mut data = std::ptr::null_mut();
+            let mut length = 0_u32;
+            buffer
+                .Lock(&mut data, None, Some(&mut length))
+                .map_err(|error| failure("locking decoded sound", error))?;
+            let bytes = std::slice::from_raw_parts(data, length as usize);
+            samples.extend(
+                bytes
+                    .chunks_exact(2)
+                    .map(|pair| i16::from_le_bytes([pair[0], pair[1]])),
+            );
+            let _ = buffer.Unlock();
+        }
+    }
+    Ok(Some(samples))
+}
+
+impl Mp4Reader {
+    /// Keeps a copy of the frame just decoded, dropping the oldest to stay within the budget.
+    fn remember(&mut self, index: usize) {
+        let frame_bytes = self.pixels.len().max(1);
+        let capacity = CACHE_BYTES / frame_bytes;
+        if capacity == 0 || self.cache.iter().any(|(cached, _)| *cached == index) {
+            return;
+        }
+        let reused = if self.cache.len() >= capacity {
+            self.cache.pop_front().map(|(_, pixels)| pixels)
+        } else {
+            None
+        };
+        let mut copy = reused.unwrap_or_default();
+        copy.clear();
+        copy.extend_from_slice(&self.pixels);
+        self.cache.push_back((index, copy));
+    }
+}
+
 impl RecordingFrames for Mp4Reader {
     fn size(&self) -> (u32, u32) {
         (self.width, self.height)
@@ -289,14 +387,20 @@ impl RecordingFrames for Mp4Reader {
                 self.timeline.len()
             )));
         }
+        if self.decoded != Some(index) {
+            if let Some(position) = self.cache.iter().position(|(cached, _)| *cached == index) {
+                return Ok(&self.cache[position].1);
+            }
+        }
         let reads_on = matches!(self.decoded, Some(current) if current < index && index - current <= READ_ON_LIMIT);
         if self.decoded != Some(index) && !reads_on {
             self.seek(index)?;
         }
         while self.decoded.is_none_or(|current| current < index) {
-            if self.read_next()?.is_none() {
+            let Some(decoded) = self.read_next()? else {
                 break;
-            }
+            };
+            self.remember(decoded);
         }
         Ok(&self.pixels)
     }
@@ -527,5 +631,65 @@ mod tests {
         assert_eq!(white_rows(&frame, width, height), 80);
         let frame = reader.frame(0).expect("first frame").to_vec();
         assert_eq!(white_rows(&frame, width, height), 8);
+    }
+
+    /// How long the review waits for a frame when it is scrubbed, at a recording's size and at a
+    /// large one: dragging forward, dragging backward, and jumping. A report, not a test; run it
+    /// with `cargo test --profile dist -p captastic-windows scrub_timing -- --ignored
+    /// --nocapture`. The release profile's LTO currently trips a compiler crash in `windows`.
+    #[test]
+    #[ignore = "a timing report for scrubbing; needs Media Foundation's H.264 encoder"]
+    fn scrub_timing() {
+        for (width, height) in [(874_u32, 1274_u32), (3400, 1528)] {
+            let mut writer = crate::Mp4Writer::create_in_memory(width, height, 30).expect("writer");
+            for step in 0..300_u32 {
+                writer
+                    .push(
+                        &bars(width, height, (step * height / 300).max(1)),
+                        Duration::from_micros(u64::from(step) * 33_333),
+                    )
+                    .expect("push");
+            }
+            let (bytes, summary) = writer
+                .finish_in_memory(Duration::from_secs(10))
+                .expect("finish");
+            let started = std::time::Instant::now();
+            let frames = Mp4Reader::from_bytes(&bytes)
+                .expect("reader")
+                .timeline()
+                .len();
+            let opened = started.elapsed();
+            let time = |label: &str, indices: &[usize]| {
+                let mut reader = Mp4Reader::from_bytes(&bytes).expect("reader");
+                let mut worst = Duration::ZERO;
+                let started = std::time::Instant::now();
+                for &index in indices {
+                    let one = std::time::Instant::now();
+                    reader.frame(index).expect("frame");
+                    worst = worst.max(one.elapsed());
+                }
+                let total = started.elapsed();
+                println!(
+                    "{width}x{height} {label}: {} calls, mean {:.1} ms, worst {:.1} ms",
+                    indices.len(),
+                    total.as_secs_f64() * 1000.0 / indices.len() as f64,
+                    worst.as_secs_f64() * 1000.0
+                );
+            };
+            let forward: Vec<usize> = (0..frames).step_by(3).collect();
+            let backward: Vec<usize> = (0..frames).rev().step_by(3).collect();
+            let jumps: Vec<usize> = (0..40).map(|i| (i * 97) % frames).collect();
+            time("drag forward, every 3rd frame", &forward);
+            time("drag backward, every 3rd frame", &backward);
+            time("jumps", &jumps);
+            let keys: Vec<usize> = (0..40).map(|i| ((i * 7) % (frames / 30)) * 30).collect();
+            time("jumps to key frames only", &keys);
+            println!(
+                "{width}x{height}: {} bytes, {frames} frames in timeline, {:?} written, open {:.1} ms",
+                bytes.len(),
+                summary.frames_written,
+                opened.as_secs_f64() * 1000.0
+            );
+        }
     }
 }

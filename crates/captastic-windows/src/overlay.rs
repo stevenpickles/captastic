@@ -45,6 +45,7 @@ use shell::{
     ThreadDpiContext, LOUPE_TIMER_ID, REGION_CURSOR_CENTER,
 };
 use snap::{SnapAxis, SnapTarget, SnapTargetKind, SnapTargets, NO_SNAPS};
+pub use window_enumeration::{capturable_windows, CapturableWindow};
 use window_enumeration::{enumerate_visible_windows, WindowCandidate};
 
 use machine::{
@@ -214,12 +215,13 @@ pub(crate) enum Presenter {
 pub struct NativeWindowHandle(isize);
 
 impl NativeWindowHandle {
-    #[cfg(test)]
-    pub(crate) const fn from_raw(raw: isize) -> Self {
+    /// A handle as `captastic-cli windows` printed it. Nothing is checked here: a capture of it
+    /// first finds it among the windows that may be captured.
+    pub const fn from_raw(raw: isize) -> Self {
         Self(raw)
     }
 
-    pub(crate) const fn raw(self) -> isize {
+    pub const fn raw(self) -> isize {
         self.0
     }
 }
@@ -372,6 +374,9 @@ pub struct OverlayDestinations {
     /// What **Record** records into, or `None` when this run cannot record: a recording outlives
     /// the overlay, so only a daemon can run one (ADR 0011).
     pub record_format: Option<captastic_config::RecordingFormat>,
+    /// Whether an MP4 recording records the computer's sound, as **Record Sound** shows it
+    /// (ADR 0015). Meaningless when `record_format` is `None`.
+    pub record_sound: bool,
 }
 
 impl OverlayDestinations {
@@ -383,6 +388,7 @@ impl OverlayDestinations {
         pin_available: false,
         edit_available: false,
         record_format: None,
+        record_sound: false,
     };
 }
 
@@ -418,6 +424,18 @@ pub enum OverlayUiUpdate {
     RecordingFormat {
         format: captastic_config::RecordingFormat,
     },
+    /// The user switched **Record Sound** in the Options menu. Handed to the daemon, which uses it
+    /// for this and later MP4 recordings and writes it back as `recording.audio` (ADR 0015).
+    RecordingSound { enabled: bool },
+}
+
+/// Clears a run's [`OverlayController::close_current`] when the run ends, on every path out.
+struct CloseScope<'a>(&'a OverlayControllerInner);
+
+impl Drop for CloseScope<'_> {
+    fn drop(&mut self) {
+        self.0.close_requested.store(false, Ordering::SeqCst);
+    }
 }
 
 #[derive(Clone, Default)]
@@ -428,7 +446,11 @@ pub struct OverlayController {
 #[derive(Default)]
 struct OverlayControllerInner {
     hwnd: AtomicIsize,
+    /// Set at shutdown and never cleared: no overlay opens again.
     cancelled: AtomicBool,
+    /// Set by [`OverlayController::close_current`] for the one run showing or about to show,
+    /// taken by that run, and cleared when any run ends, so it never reaches a later one.
+    close_requested: AtomicBool,
     ui_updates: Option<OverlayUiSink>,
 }
 
@@ -500,6 +522,27 @@ impl OverlayController {
         if let Some(sink) = self.inner.ui_updates.as_ref() {
             sink.submit(update);
         }
+    }
+
+    /// Closes the overlay that is showing, or the one about to show, as Esc would, and only that
+    /// one: unlike [`cancel`](Self::cancel), later overlays open as usual. For a command-line
+    /// request that stopped waiting (ADR 0014). The caller must know its overlay is the one
+    /// showing or about to, and calls [`withdraw_close`](Self::withdraw_close) if it learns its
+    /// overlay had already ended.
+    pub fn close_current(&self) {
+        // The same store-then-load rendezvous as `cancel`, against the run's publish-then-check.
+        self.inner.close_requested.store(true, Ordering::SeqCst);
+        let hwnd = self.inner.hwnd.load(Ordering::SeqCst);
+        if hwnd != 0 && overlay_window_is_current(HWND(hwnd)) {
+            // SAFETY: hwnd was published by the live overlay thread. Posting does not retain it.
+            let _ = unsafe { PostMessageW(HWND(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+        }
+    }
+
+    /// Withdraws a [`close_current`](Self::close_current) whose overlay had already ended, so it
+    /// cannot close the next one.
+    pub fn withdraw_close(&self) {
+        self.inner.close_requested.store(false, Ordering::SeqCst);
     }
 
     pub fn cancel(&self) {
@@ -659,9 +702,17 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
     resources: &mut OverlayResources,
 ) -> Result<SelectionOutcome, CaptureError> {
     let preparation_started = Instant::now();
-    if controller.inner.cancelled.load(Ordering::SeqCst) {
+    if controller.inner.cancelled.load(Ordering::SeqCst)
+        || controller
+            .inner
+            .close_requested
+            .swap(false, Ordering::SeqCst)
+    {
         return Ok(SelectionOutcome::Cancelled);
     }
+    // However the run ends, an error return before the window exists included, a close meant
+    // for it ends with it and cannot reach the next overlay.
+    let _close_scope = CloseScope(&controller.inner);
     let _dpi_context = ThreadDpiContext::enter_per_monitor_v2()?;
     if let Some(frame) = preview_source.snapshot {
         validate_frame(frame)?;
@@ -796,6 +847,7 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
             pin_available: destinations.pin_available,
             edit_available: destinations.edit_available,
             record_format: destinations.record_format,
+            record_sound: destinations.record_sound,
             record_armed: false,
             hovered_control: None,
             pointer_local: None,
@@ -832,6 +884,7 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
         window_preview: None,
         window_thumbnails: Vec::new(),
         live_window_thumbnails: Vec::new(),
+        unrenderable_windows: Vec::new(),
         // A previous run's chooser surface is only ever an allocation to draw into, never
         // presentable content: the cache starts empty so the first Window-mode compose is
         // forced to rebuild, and the rebuild reclaims the spare buffer below.
@@ -899,6 +952,9 @@ struct OverlayState {
     window_preview: Option<WindowPreviewState>,
     window_thumbnails: Vec<WindowThumbnail>,
     live_window_thumbnails: Vec<LiveWindowThumbnail>,
+    /// Windows whose tile render failed for good in this chooser: never queued again, or the
+    /// chooser would render the same window, fail, and queue it once more for as long as it is open.
+    unrenderable_windows: Vec<NativeWindowHandle>,
     window_overview_cache: Option<WindowOverviewCache>,
     /// The in-flight incremental thumbnail build, if any. Shell inventory work, not product
     /// state: it survives a tool switch away (frozen; its posted messages are ignored) and
@@ -1259,7 +1315,9 @@ fn apply_overlay_ui_update(state: &mut LiveUiState, update: &OverlayUiUpdate) {
         OverlayUiUpdate::RegionZoom { mode } => state.region_zoom = Some(*mode),
         // Not UI state: the daemon owns the answer, and every run is told it afresh from the
         // destination set rather than from what an earlier run asked for.
-        OverlayUiUpdate::FileOutput { .. } | OverlayUiUpdate::RecordingFormat { .. } => {}
+        OverlayUiUpdate::FileOutput { .. }
+        | OverlayUiUpdate::RecordingFormat { .. }
+        | OverlayUiUpdate::RecordingSound { .. } => {}
         OverlayUiUpdate::Interaction {
             display_id,
             tool,
@@ -1358,7 +1416,12 @@ fn run_overlay(
         }
     }
     controller.inner.hwnd.store(hwnd.0, Ordering::SeqCst);
-    if controller.inner.cancelled.load(Ordering::SeqCst) {
+    if controller.inner.cancelled.load(Ordering::SeqCst)
+        || controller
+            .inner
+            .close_requested
+            .swap(false, Ordering::SeqCst)
+    {
         // A cancel raced construction: destroy immediately and fall through to the message
         // loop, which consumes the WM_QUIT that WM_DESTROY just latched and exits through
         // the normal teardown (state reclaim, resource cache, controller clear). The handle
@@ -1566,6 +1629,9 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             // returns the value can be recycled, and cancel() must not be able to load it.
             // run_overlay's later store(0) remains as belt and braces for non-window paths.
             state.controller.inner.hwnd.store(0, Ordering::SeqCst);
+            // The close flag is left alone: when the layered presenter falls back, this is the
+            // first window of a run that goes on, and a close sent meanwhile is for that run.
+            // The run clears it when it ends.
         }
         // SAFETY: Prevents any later callback from observing the state pointer.
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
@@ -2113,6 +2179,13 @@ fn apply_overlay_effects(
                 let state = unsafe { &*state_pointer };
                 if let Some(sink) = state.ui_updates.as_ref() {
                     sink.submit(OverlayUiUpdate::RecordingFormat { format });
+                }
+            }
+            OverlayEffect::RequestRecordingSound { enabled } => {
+                // SAFETY: Shared borrow released at the block's end.
+                let state = unsafe { &*state_pointer };
+                if let Some(sink) = state.ui_updates.as_ref() {
+                    sink.submit(OverlayUiUpdate::RecordingSound { enabled });
                 }
             }
             OverlayEffect::RequestFileOutput { enabled } => {
@@ -2919,6 +2992,7 @@ fn start_window_overview_build(hwnd: HWND, state: &mut OverlayState) {
         // Every window gets a tile immediately, shaped from what DWM already knows. Only the
         // windows DWM cannot draw are queued for a render, because rendering one it *can* draw
         // costs tens of milliseconds to produce pixels the compositor covers a moment later.
+        state.unrenderable_windows.clear();
         let needs_render = seed_window_tiles(state, &handles);
         if !needs_render.is_empty() {
             state.overview_build_generation = state.overview_build_generation.wrapping_add(1);
@@ -2981,6 +3055,7 @@ fn render_overview_batch(hwnd: HWND, state: &mut OverlayState, generation: usize
         .as_mut()
         .expect("the build is untouched while its batch renders");
     let mut new_thumbnails = Vec::new();
+    let mut failed = Vec::new();
     for (handle, attempt, capture) in rendered {
         let capture = match capture {
             Ok(capture) => capture,
@@ -2990,6 +3065,7 @@ fn render_overview_batch(hwnd: HWND, state: &mut OverlayState, generation: usize
                     "window handle=0x{:X} omitted from overview after render failure: {error}",
                     handle.raw()
                 );
+                failed.push(handle);
                 continue;
             }
         };
@@ -2998,6 +3074,7 @@ fn render_overview_batch(hwnd: HWND, state: &mut OverlayState, generation: usize
             capture.frame.height(),
             capture.frame.pixels(),
         ) else {
+            failed.push(handle);
             continue;
         };
         new_thumbnails.push(WindowThumbnail {
@@ -3010,6 +3087,7 @@ fn render_overview_batch(hwnd: HWND, state: &mut OverlayState, generation: usize
     }
     let finished = build.queue.is_done();
     let started = build.started;
+    state.unrenderable_windows.extend(failed);
     // A render either fills in a tile DWM could not draw, or adds one in frozen mode. Replacing
     // in place keeps the chooser's ordering stable while tiles arrive.
     for rendered in new_thumbnails {
@@ -3192,19 +3270,28 @@ fn refresh_live_window_thumbnails(state: &mut OverlayState) {
 /// how it was built: the toolbar is dragged over it, a menu opens above it, or DWM stops drawing
 /// it. Seeding decided which tiles needed rendering *at the time*; this is what keeps that
 /// decision honest afterwards.
-fn queue_uncovered_window_tiles(state: &mut OverlayState) {
-    let uncovered: Vec<NativeWindowHandle> = state
-        .window_thumbnails
+/// The tiles that still need a render: no pixels, no live preview drawing them, and not a window
+/// whose render already failed for good in this chooser.
+fn tiles_to_render(
+    tiles: &[WindowThumbnail],
+    live: &[NativeWindowHandle],
+    unrenderable: &[NativeWindowHandle],
+) -> Vec<NativeWindowHandle> {
+    tiles
         .iter()
         .filter(|tile| tile.surface.is_none())
         .map(|tile| tile.handle)
-        .filter(|handle| {
-            !state
-                .live_window_thumbnails
-                .iter()
-                .any(|preview| preview.handle == *handle)
-        })
+        .filter(|handle| !unrenderable.contains(handle) && !live.contains(handle))
+        .collect()
+}
+
+fn queue_uncovered_window_tiles(state: &mut OverlayState) {
+    let live: Vec<NativeWindowHandle> = state
+        .live_window_thumbnails
+        .iter()
+        .map(|preview| preview.handle)
         .collect();
+    let uncovered = tiles_to_render(&state.window_thumbnails, &live, &state.unrenderable_windows);
     if uncovered.is_empty() {
         return;
     }
@@ -4345,6 +4432,11 @@ fn draw_view_tag(state: &OverlayState, layout: ToolbarLayout) {
     );
 }
 
+/// The Record Sound row's label, and what it says while **Record As** is GIF: the row is greyed
+/// then, and a menu row has no tooltip to say why.
+const RECORD_SOUND_LABEL: &str = "Record Sound";
+const RECORD_SOUND_MP4_ONLY_LABEL: &str = "Record Sound (MP4 only)";
+
 /// The Record As row's label.
 const fn record_format_label(format: Option<captastic_config::RecordingFormat>) -> &'static str {
     match format {
@@ -4377,6 +4469,7 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
             layout.file_output_destination,
         ),
         (ToolbarControl::RecordFormat, layout.record_format),
+        (ToolbarControl::RecordSound, layout.record_sound),
         (ToolbarControl::Cancel, layout.cancel),
     ];
     for (control, row) in rows {
@@ -4541,6 +4634,39 @@ fn draw_options_menu(device: HDC, state: &OverlayState, layout: ToolbarLayout) {
         TextAlignment::Left,
         tokens.font_height,
     );
+    // A checkmark row, like the disk row. Only an MP4 carries sound, so with GIF chosen (or no
+    // recording possible) it is greyed, says why, and shows no checkmark.
+    let sound_available = state.model.record_format == Some(captastic_config::RecordingFormat::Mp4);
+    if sound_available && state.model.record_sound {
+        draw_checkmark(
+            device,
+            layout.record_sound.left + tokens.menu_check_offset,
+            (layout.record_sound.top + layout.record_sound.bottom) / 2,
+            rgb(86, 156, 255),
+            metrics,
+        );
+    }
+    draw_text(
+        device,
+        UiRect {
+            left: layout.record_sound.left + tokens.menu_text_offset,
+            top: layout.record_sound.top,
+            right: layout.record_sound.right - tokens.text_padding,
+            bottom: layout.record_sound.bottom,
+        },
+        if sound_available || state.model.record_format.is_none() {
+            RECORD_SOUND_LABEL
+        } else {
+            RECORD_SOUND_MP4_ONLY_LABEL
+        },
+        if sound_available {
+            rgb(245, 245, 247)
+        } else {
+            rgb(130, 130, 136)
+        },
+        TextAlignment::Left,
+        tokens.font_height,
+    );
     draw_lines(
         device,
         &[
@@ -4642,6 +4768,70 @@ fn validate_frame(frame: &CpuFrame) -> Result<(), CaptureError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_window_whose_tile_cannot_be_rendered_is_not_queued_again() {
+        use super::NativeWindowHandle as Handle;
+        let tile = |raw| super::WindowThumbnail {
+            handle: Handle::from_raw(raw),
+            source_width: 100,
+            source_height: 100,
+            corner_radius_px: 0.0,
+            surface: None,
+        };
+        let tiles = [tile(1), tile(2), tile(3)];
+        let live = [Handle::from_raw(2)];
+        // Windows 1 and 3 have nothing drawing them, so they are queued; 2 has a live preview.
+        assert_eq!(
+            super::tiles_to_render(&tiles, &live, &[]),
+            vec![Handle::from_raw(1), Handle::from_raw(3)]
+        );
+        // Once 1's render has failed for good, it is not queued again, or the chooser would
+        // render, fail and queue it for as long as it is open.
+        assert_eq!(
+            super::tiles_to_render(&tiles, &live, &[Handle::from_raw(1)]),
+            vec![Handle::from_raw(3)]
+        );
+    }
+
+    #[test]
+    fn closing_the_current_overlay_reaches_that_run_only() {
+        use std::sync::atomic::Ordering;
+        let controller = super::OverlayController::new();
+        // No overlay is showing: the close waits for the run about to show, which takes it.
+        controller.close_current();
+        assert!(controller
+            .inner
+            .close_requested
+            .swap(false, Ordering::SeqCst));
+        assert!(
+            !controller.inner.close_requested.load(Ordering::SeqCst),
+            "taken once"
+        );
+        // Withdrawn by a request that learned its overlay had ended: nothing is left over.
+        controller.close_current();
+        controller.withdraw_close();
+        assert!(!controller.inner.close_requested.load(Ordering::SeqCst));
+        // Neither touches shutdown's cancel, which no overlay ever comes back from.
+        assert!(!controller.inner.cancelled.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_close_sent_during_a_run_ends_with_that_run_however_it_ends() {
+        use std::sync::atomic::Ordering;
+        let controller = super::OverlayController::new();
+        let failed_run = || -> Result<(), ()> {
+            let _close_scope = super::CloseScope(&controller.inner);
+            // The close arrives while the run is setting up, and the setup then fails.
+            controller.close_current();
+            Err(())
+        };
+        assert!(failed_run().is_err());
+        assert!(
+            !controller.inner.close_requested.load(Ordering::SeqCst),
+            "the next overlay is not closed by a close meant for the run that failed"
+        );
+    }
+
     use captastic_core::PixelFormat;
 
     use super::*;

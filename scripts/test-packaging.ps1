@@ -23,6 +23,9 @@ function New-TestBinaries([string]$Name, [uint16]$Machine) {
     $directory = Join-Path $testRoot $Name
     New-Item -ItemType Directory -Path $directory -Force | Out-Null
     Write-TestPe (Join-Path $directory 'captastic.exe') $Machine
+    # A different size, so the two executables have different hashes in VERIFICATION.txt.
+    Write-TestPe (Join-Path $directory 'captastic-cli.exe') $Machine
+    [System.IO.File]::AppendAllText((Join-Path $directory 'captastic-cli.exe'), 'cli')
     return $directory
 }
 
@@ -136,6 +139,8 @@ try {
         'tools/chocolateyUninstall.ps1',
         'tools/captastic/captastic.exe',
         'tools/captastic/captastic.exe.ignore',
+        'tools/captastic/captastic-cli.exe',
+        'tools/captastic/captastic-cli.exe.ignore',
         'tools/captastic/LICENSE-MIT',
         'tools/captastic/LICENSE-APACHE',
         'tools/captastic/README.md',
@@ -151,7 +156,7 @@ try {
         '^_rels/\.rels$',
         '^captastic\.nuspec$',
         '^tools/(LICENSE\.txt|VERIFICATION\.txt|chocolatey(?:Install|BeforeModify|Uninstall)\.ps1)$',
-        '^tools/captastic/(captastic\.exe(?:\.ignore)?|captastic\.example\.toml|LICENSE-(?:MIT|APACHE)|README\.md)$',
+        '^tools/captastic/(captastic(?:-cli)?\.exe(?:\.ignore)?|captastic\.example\.toml|LICENSE-(?:MIT|APACHE)|README\.md)$',
         '^\[Content_Types\]\.xml$',
         '^package/services/metadata/core-properties/[0-9a-f]+\.psmdcp$'
     )
@@ -167,7 +172,8 @@ try {
         'Chocolatey verification file does not contain the source URL.'
     $archiveHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $chocolateyArchive).Hash.ToLowerInvariant()
     $executableHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $x64 'captastic.exe')).Hash.ToLowerInvariant()
-    foreach ($hash in @($archiveHash, $executableHash)) {
+    $commandLineHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $x64 'captastic-cli.exe')).Hash.ToLowerInvariant()
+    foreach ($hash in @($archiveHash, $executableHash, $commandLineHash)) {
         Assert-True ($verification -match $hash) "Chocolatey verification file does not contain hash $hash."
     }
 
@@ -183,6 +189,13 @@ try {
     Assert-True ($nuspec.package.metadata.licenseUrl -eq `
         'https://github.com/stevenpickles/captastic/blob/v0.0.0-test-choco/LICENSE-MIT') `
         'Chocolatey license URL is not version-specific.'
+    # Chocolatey moderation (0.4.0) asks that projectSourceUrl point at the source code itself,
+    # not repeat projectUrl.
+    Assert-True ($nuspec.package.metadata.projectSourceUrl -eq `
+        'https://github.com/stevenpickles/captastic/tree/v0.0.0-test-choco') `
+        'Chocolatey project source URL is not the tagged source tree.'
+    Assert-True ($nuspec.package.metadata.projectSourceUrl -ne $nuspec.package.metadata.projectUrl) `
+        'Chocolatey project source URL repeats the project URL.'
     foreach ($urlProperty in @(
         'projectUrl',
         'packageSourceUrl',
@@ -285,6 +298,18 @@ try {
             -SourceUrl 'https://example.invalid/stale.zip' -SkipBuild
     } '*binaries were built from*current source is*'
     $env:CAPTASTIC_GIT_COMMIT = $previousGitCommit
+
+    # The portable uninstaller deletes its folder with everything in it, so a folder that is not a
+    # Captastic installation is refused before anything is touched.
+    $notAnInstallation = Join-Path $testRoot 'not-an-installation'
+    New-Item -ItemType Directory -Path $notAnInstallation | Out-Null
+    $keepsake = Join-Path $notAnInstallation 'keep-me.txt'
+    Set-Content -LiteralPath $keepsake -Value 'not Captastic'
+    Assert-ThrowsLike {
+        & (Join-Path $repositoryRoot 'scripts\uninstall.ps1') -InstallDirectory $notAnInstallation
+    } '*does not hold a Captastic installation*'
+    Assert-True (Test-Path -LiteralPath $keepsake -PathType Leaf) `
+        'The portable uninstaller deleted a folder that was not a Captastic installation.'
 
     Write-Host 'PowerShell packaging tests passed.'
 } finally {

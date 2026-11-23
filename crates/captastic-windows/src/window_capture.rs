@@ -25,7 +25,7 @@ use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowLongPtrW, GetWindowRect, IsZoomed, SendMessageTimeoutW, GWL_STYLE,
+    GetWindowLongPtrW, GetWindowRect, IsIconic, IsWindow, IsZoomed, SendMessageTimeoutW, GWL_STYLE,
     PW_RENDERFULLCONTENT, SMTO_ABORTIFHUNG, SMTO_BLOCK, WM_NULL, WS_CAPTION,
 };
 
@@ -94,6 +94,16 @@ pub fn captured_window_frame(selection: &OverlaySelection) -> Option<CpuFrame> {
         .flatten()
 }
 
+/// Captures one window as the overlay would on confirming it, WGC first and `PrintWindow` where
+/// WGC cannot, for a command-line request (ADR 0014). `reference_metadata` is a frame of the
+/// window's display, as the overlay passes its frozen desktop.
+pub fn capture_window_frame(
+    handle: NativeWindowHandle,
+    reference_metadata: &FrameMetadata,
+) -> Result<CpuFrame, CaptureError> {
+    capture_window(handle, reference_metadata)
+}
+
 pub(crate) fn capture_window(
     handle: NativeWindowHandle,
     reference_metadata: &FrameMetadata,
@@ -106,6 +116,29 @@ pub(crate) fn capture_window_visual(
     reference_metadata: &FrameMetadata,
 ) -> Result<CapturedWindow, CaptureError> {
     capture_window_bounded(handle, reference_metadata, None)
+}
+
+/// Whether Windows scales this window's drawing to its monitor: a window that is not per-monitor
+/// DPI aware, shown on a monitor whose DPI is not the one it draws at. `PrintWindow` hands such a
+/// window back at the size it draws, in the top-left corner of a bitmap the size it is shown, so
+/// Windows Graphics Capture, which takes it as composited, goes first.
+fn window_is_dpi_scaled(hwnd: HWND) -> bool {
+    use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONEAREST};
+    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+    // SAFETY: Reads the DPI the window draws at: 96 for an unaware window, the system DPI for a
+    // system-aware one, its monitor's for a per-monitor aware one.
+    let window_dpi = unsafe { GetDpiForWindow(hwnd) };
+    if window_dpi == 0 {
+        return false;
+    }
+    // SAFETY: Finds the monitor showing most of a live top-level window.
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    let (mut dpi_x, mut dpi_y) = (0_u32, 0_u32);
+    // SAFETY: Both outputs are writable locals for this synchronous query.
+    if unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }.is_err() {
+        return false;
+    }
+    dpi_x != 0 && dpi_x != window_dpi
 }
 
 /// What a window capture can say about the cursor, which is only ever that it has none.
@@ -337,11 +370,22 @@ fn capture_window_inner(
     })?;
     let geometry = window_geometry(hwnd, capture_bounds);
     let visible_bounds = geometry.content;
-    let probe_wgc_error = if !window_is_responsive(hwnd) {
+    let wgc_first = if !window_is_responsive(hwnd) {
         log::debug!(
             "window handle=0x{:X} did not answer the responsiveness probe; using Windows Graphics Capture",
             handle.raw()
         );
+        true
+    } else if window_is_dpi_scaled(hwnd) {
+        log::debug!(
+            "window handle=0x{:X} is drawn at another DPI and scaled by Windows; using Windows Graphics Capture first",
+            handle.raw()
+        );
+        true
+    } else {
+        false
+    };
+    let probe_wgc_error = if wgc_first {
         match capture_window_with_wgc(hwnd, reference_metadata, max_pixels, &geometry, deadline) {
             Ok(capture) => return Ok(capture),
             Err(error) => {
@@ -1031,6 +1075,64 @@ pub(crate) fn window_geometry(hwnd: HWND, window: Rect) -> WindowGeometry {
     }
 }
 
+/// Where `window` is on the desktop as the user sees it, its DWM visible frame: what a window
+/// recording through Windows Graphics Capture records, and what its indicator follows (ADR 0013).
+/// `None` while the window is minimised or once it has closed, when the indicator stays where it
+/// was.
+pub(crate) fn visible_window_frame(window: NativeWindowHandle) -> Option<Rect> {
+    let hwnd = HWND(window.raw());
+    // SAFETY: Read-only queries of a foreign window, which fail cleanly once it has closed.
+    if !unsafe { IsWindow(hwnd) }.as_bool() || unsafe { IsIconic(hwnd) }.as_bool() {
+        return None;
+    }
+    let mut native = RECT::default();
+    // SAFETY: native is writable for the exact RECT size.
+    unsafe { GetWindowRect(hwnd, &mut native) }.ok()?;
+    Some(window_geometry(hwnd, rect_from_native(native)?).frame)
+}
+
+/// Where a window's visible frame lands inside a raw Windows Graphics Capture surface, and where
+/// that frame is on the desktop.
+///
+/// A recording shows the window as the user sees it - the DWM visible frame, its own border
+/// included - rather than the still path's content with a rebuilt border. When the surface lines
+/// up with neither measured rectangle (the window resized since the frame was rendered, or the
+/// window is gone) the whole surface is kept and the desktop position is unknown.
+pub(crate) fn wgc_visible_frame(
+    hwnd: HWND,
+    surface_width: u32,
+    surface_height: u32,
+) -> (Rect, Option<Rect>) {
+    let surface = Rect {
+        x: 0,
+        y: 0,
+        width: surface_width,
+        height: surface_height,
+    };
+    let mut native = RECT::default();
+    // SAFETY: native is writable for the exact RECT size; a window that has closed fails cleanly.
+    if unsafe { GetWindowRect(hwnd, &mut native) }.is_err() {
+        return (surface, None);
+    }
+    let Some(window) = rect_from_native(native) else {
+        return (surface, None);
+    };
+    let geometry = window_geometry(hwnd, window);
+    for origin in [geometry.window, geometry.frame] {
+        if origin.width != surface_width || origin.height != surface_height {
+            continue;
+        }
+        if let Some(crop) =
+            translate_rect(geometry.frame, -i64::from(origin.x), -i64::from(origin.y))
+        {
+            if rect_contains(surface, crop) {
+                return (crop, Some(geometry.frame));
+            }
+        }
+    }
+    (surface, None)
+}
+
 /// Where the shared `content` crop lands inside a raw Windows Graphics Capture surface.
 #[derive(Debug, Eq, PartialEq)]
 struct WgcCrop {
@@ -1136,7 +1238,11 @@ fn inset_rect(rect: Rect, inset: u32) -> Option<Rect> {
     })
 }
 
-fn crop_bgra(source: &[u8], source_bounds: Rect, crop: Rect) -> Result<Vec<u8>, CaptureError> {
+pub(crate) fn crop_bgra(
+    source: &[u8],
+    source_bounds: Rect,
+    crop: Rect,
+) -> Result<Vec<u8>, CaptureError> {
     if crop.x < source_bounds.x
         || crop.y < source_bounds.y
         || crop.right() > source_bounds.right()

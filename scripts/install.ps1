@@ -12,7 +12,9 @@ $ErrorActionPreference = 'Stop'
 # to an executable is what lets this script stop a 0.2 daemon and a 0.3 one alike; 0.3 ships no
 # command line to ask.
 function Stop-Captastic {
-    param([int]$TimeoutSeconds = 5)
+    # Thirty: Captastic gives a recording running when it is stopped up to fifteen seconds to
+    # finish writing before it exits.
+    param([int]$TimeoutSeconds = 30)
 
     $name = 'Local\CaptasticDaemonControl-v1'
     $controlEvent = $null
@@ -66,6 +68,7 @@ if (Test-Path -LiteralPath $legacyLauncher -PathType Leaf) {
 }
 foreach ($name in @(
     'captastic.exe',
+    'captastic-cli.exe',
     'captastic.example.toml',
     'README.md',
     'LICENSE-MIT',
@@ -108,3 +111,4 @@ if (-not $NoLaunch) {
 
 Write-Host "Captastic installed to $InstallDirectory"
 Write-Host "Start Menu shortcut: $shortcutPath"
+Write-Host "Command line for scripts and agents: $(Join-Path $InstallDirectory 'captastic-cli.exe')"
