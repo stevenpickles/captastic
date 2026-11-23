@@ -79,6 +79,15 @@ millisecond as the picture. A crop changes nothing about the sound.
   Every packet is resampled to a single 48 kHz track, so a device change from 48 kHz to 44.1 kHz
   partway cannot change the track's rate. `scripts/check-recording-audio.ps1` plays a tone and
   checks it is heard.
+- **Slice 3, first part (sound in the MP4).** `Mp4Writer::create_recording` adds an AAC-LC stream
+  (48 kHz stereo, 160 kbit/s, raw payload for MP4) beside the H.264 one. The recording's encoder
+  thread takes the sound packets between frames, so the one sink writer is only ever used from one
+  thread. The reader is stopped before the frame queue closes, so its last silence reaches the
+  encoder, and sound past the picture's end is cut. The report carries `sound`: whether a device
+  was read, why not, how much silence was filled, device changes and dropped packets. A trimmed
+  save drops the sound until slice 4 re-encodes it. **Record Sound**, the bar's glyph and the
+  notification come in slice 3's second part; until then `recording.audio` is set in the
+  configuration only.
 
 ## Consequences
 

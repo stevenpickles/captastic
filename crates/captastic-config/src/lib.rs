@@ -1148,6 +1148,10 @@ pub struct RecordingConfig {
     /// Whether a finished recording opens in the review window, to be trimmed and cropped, before
     /// it is saved (ADR 0012). Off, it is saved as soon as it ends.
     pub review: bool,
+    /// Whether an MP4 recording carries the computer's sound: the whole mix sent to the default
+    /// output device, never the microphone (ADR 0015). Off by default, since that mix holds
+    /// everything the computer plays. GIF has no sound, whatever this says.
+    pub audio: bool,
 }
 
 impl RecordingConfig {
@@ -1182,6 +1186,7 @@ impl Default for RecordingConfig {
             max_seconds: 60,
             gif_max_dimension: 1280,
             review: true,
+            audio: false,
         }
     }
 }

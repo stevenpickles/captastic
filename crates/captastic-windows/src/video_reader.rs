@@ -281,6 +281,67 @@ impl Mp4Reader {
     }
 }
 
+/// The sound stream of the MP4 in `bytes`, decoded: interleaved 16-bit stereo samples at the
+/// rate it was written at, [`crate::AUDIO_SAMPLE_RATE`] for a Captastic recording. `None` when the
+/// MP4 has no sound stream (ADR 0015).
+pub fn mp4_sound(bytes: &[u8]) -> Result<Option<Vec<i16>>, PlaybackError> {
+    use windows::Win32::Media::MediaFoundation::{
+        MFAudioFormat_PCM, MFMediaType_Audio, MF_MT_AUDIO_BITS_PER_SAMPLE,
+        MF_SOURCE_READER_FIRST_AUDIO_STREAM,
+    };
+    let _media_foundation =
+        MediaFoundation::start().map_err(|error| failure("starting Media Foundation", error))?;
+    let stream = MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32;
+    let mut samples = Vec::new();
+    // SAFETY: Every object is created here, on this thread, and used only by it.
+    unsafe {
+        let reader = Source::Memory(bytes)
+            .reader(None)
+            .map_err(|error| failure("opening the MP4", error))?;
+        let wanted =
+            MFCreateMediaType().map_err(|error| failure("creating a media type", error))?;
+        wanted
+            .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)
+            .map_err(|error| failure("setting the major type", error))?;
+        wanted
+            .SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM)
+            .map_err(|error| failure("setting the subtype", error))?;
+        wanted
+            .SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)
+            .map_err(|error| failure("setting the sample size", error))?;
+        if reader.SetCurrentMediaType(stream, None, &wanted).is_err() {
+            return Ok(None);
+        }
+        loop {
+            let mut flags = 0_u32;
+            let mut sample = None;
+            reader
+                .ReadSample(stream, 0, None, Some(&mut flags), None, Some(&mut sample))
+                .map_err(|error| failure("decoding the MP4's sound", error))?;
+            if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
+                break;
+            }
+            let Some(sample) = sample else { continue };
+            let buffer = sample
+                .ConvertToContiguousBuffer()
+                .map_err(|error| failure("reading decoded sound", error))?;
+            let mut data = std::ptr::null_mut();
+            let mut length = 0_u32;
+            buffer
+                .Lock(&mut data, None, Some(&mut length))
+                .map_err(|error| failure("locking decoded sound", error))?;
+            let bytes = std::slice::from_raw_parts(data, length as usize);
+            samples.extend(
+                bytes
+                    .chunks_exact(2)
+                    .map(|pair| i16::from_le_bytes([pair[0], pair[1]])),
+            );
+            let _ = buffer.Unlock();
+        }
+    }
+    Ok(Some(samples))
+}
+
 impl Mp4Reader {
     /// Keeps a copy of the frame just decoded, dropping the oldest to stay within the budget.
     fn remember(&mut self, index: usize) {

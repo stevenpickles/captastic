@@ -125,6 +125,10 @@ gif_max_dimension = 1280
 # saved. false saves it as soon as it ends. The notification area's Review Recordings switch
 # changes it too.
 review = true
+# Whether an MP4 recording also records the computer's sound: everything sent to the default output
+# device, as you hear it, and never the microphone. Off by default, since that includes any chime
+# or call the computer plays. GIF recordings have no sound.
+audio = false
 
 [metrics]
 enabled = true
