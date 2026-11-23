@@ -12,7 +12,9 @@ $ErrorActionPreference = 'Stop'
 # to an executable is what lets this script stop a 0.2 daemon and a 0.3 one alike; 0.3 ships no
 # command line to ask.
 function Stop-Captastic {
-    param([int]$TimeoutSeconds = 5)
+    # Thirty: Captastic gives a recording running when it is stopped up to fifteen seconds to
+    # finish writing before it exits.
+    param([int]$TimeoutSeconds = 30)
 
     $name = 'Local\CaptasticDaemonControl-v1'
     $controlEvent = $null

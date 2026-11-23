@@ -689,7 +689,14 @@ impl CaptureBackend for DxgiBackend {
                 ));
             }
             let timeout_ms = duration_to_timeout_ms(remaining);
-            let acquired = AcquiredFrame::acquire(&self.duplication, timeout_ms)?;
+            // Nothing presented within the budget goes round to the fallback above, which can
+            // prove the retained frame current on an idle desktop; returned from here, it made
+            // that fallback unreachable for any budget but zero.
+            let acquired = match AcquiredFrame::acquire(&self.duplication, timeout_ms) {
+                Ok(acquired) => acquired,
+                Err(error) if error.kind == CaptureErrorKind::Timeout => continue,
+                Err(error) => return Err(error),
+            };
             self.record_pointer_report(&acquired)?;
             let presentation_offset_ns = if acquired.info.LastPresentTime == 0 {
                 None

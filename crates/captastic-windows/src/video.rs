@@ -17,7 +17,7 @@
 //! same clock as the frames. A writer without sound writes exactly what it always has.
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use captastic_core::{CaptureError, CaptureErrorKind};
 use windows::core::{HSTRING, PCWSTR};
@@ -57,6 +57,9 @@ const AAC_BYTES_PER_SECOND: u32 = 20_000;
 /// How many frames may wait on the H.264 encoder in an unthrottled writer before new ones are
 /// skipped: a second at 30 frames a second, at most about a gigabyte at 4K.
 const MAXIMUM_ENCODER_BACKLOG: u64 = 30;
+/// How long the encoder may encode nothing while frames are held back before it is taken to be
+/// waiting for more input (a lookahead holding frames in flight) rather than falling behind.
+const ENCODER_STALL: Duration = Duration::from_millis(250);
 
 /// The size a `width` by `height` recording is encoded at: scaled down, keeping its shape, to fit
 /// [`MP4_MAXIMUM_SIZE`], then rounded down to even sides, which H.264's 4:2:0 sampling needs.
@@ -143,6 +146,11 @@ pub struct Mp4Writer {
     summary: VideoSummary,
     /// Where the MP4 is written when it is written into memory.
     memory: Option<IMFByteStream>,
+    /// Waits for a behind encoder instead of skipping frames: for re-encoding a recording, where
+    /// every frame is already there and none may be lost, rather than capturing one live.
+    paced: bool,
+    /// While frames are held back: the encoder's count of encoded frames, and when it last moved.
+    holding_back: Option<(u64, Instant)>,
     _media_foundation: MediaFoundation,
 }
 
@@ -287,6 +295,8 @@ impl Mp4Writer {
             first_at: None,
             summary: VideoSummary::default(),
             memory,
+            paced: false,
+            holding_back: None,
             _media_foundation: media_foundation,
         })
     }
@@ -314,12 +324,19 @@ impl Mp4Writer {
             return Ok(());
         }
         // An unthrottled writer (one with sound) never pushes back, so a slow encoder would queue
-        // uncompressed frames inside Media Foundation without limit. Past a second of backlog the
-        // frame is skipped, as the recording's own queue drops frames when the encoder is behind.
-        if self.audio_stream.is_some() && self.encoder_backlog() > MAXIMUM_ENCODER_BACKLOG {
-            self.summary.frames_skipped += 1;
-            return Ok(());
+        // uncompressed frames inside Media Foundation without limit. Past a second of backlog a
+        // live recording skips the frame, as its own queue drops frames when the encoder is
+        // behind; a paced writer waits instead.
+        if self.audio_stream.is_some() && self.encoder_is_behind() {
+            if !self.paced {
+                self.summary.frames_skipped += 1;
+                return Ok(());
+            }
+            while self.encoder_is_behind() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
+        self.holding_back = None;
         let sample = self.sample(bgra)?;
         if let Some(pending) = self.pending.take() {
             self.write(pending, at)?;
@@ -329,8 +346,37 @@ impl Mp4Writer {
         Ok(())
     }
 
+    /// Makes the writer wait for a behind encoder rather than skip frames, for re-encoding a
+    /// recording that is already whole.
+    pub fn pace_to_encoder(&mut self) {
+        self.paced = true;
+    }
+
+    /// Whether more than [`MAXIMUM_ENCODER_BACKLOG`] frames wait on an encoder that is still
+    /// encoding. One that has encoded nothing for [`ENCODER_STALL`] while frames were held back is
+    /// waiting for input, not behind, and holding back more would stop the recording for good.
+    fn encoder_is_behind(&mut self) -> bool {
+        let (backlog, encoded) = self.encoder_progress();
+        if backlog <= MAXIMUM_ENCODER_BACKLOG {
+            return false;
+        }
+        match self.holding_back {
+            Some((last, since)) if last == encoded => since.elapsed() < ENCODER_STALL,
+            _ => {
+                self.holding_back = Some((encoded, Instant::now()));
+                true
+            }
+        }
+    }
+
     /// Frames handed to the sink writer that its encoder has not yet encoded.
+    #[cfg(test)]
     fn encoder_backlog(&self) -> u64 {
+        self.encoder_progress().0
+    }
+
+    /// Frames waiting on the encoder, and frames it has encoded.
+    fn encoder_progress(&self) -> (u64, u64) {
         let mut statistics = windows::Win32::Media::MediaFoundation::MF_SINK_WRITER_STATISTICS {
             cb: std::mem::size_of::<windows::Win32::Media::MediaFoundation::MF_SINK_WRITER_STATISTICS>(
             ) as u32,
@@ -338,10 +384,13 @@ impl Mp4Writer {
         };
         // SAFETY: The writer is this thread's and the statistics are a local of the size given.
         match unsafe { self.writer.GetStatistics(self.stream, &mut statistics) } {
-            Ok(()) => statistics
-                .qwNumSamplesReceived
-                .saturating_sub(statistics.qwNumSamplesEncoded),
-            Err(_) => 0,
+            Ok(()) => (
+                statistics
+                    .qwNumSamplesReceived
+                    .saturating_sub(statistics.qwNumSamplesEncoded),
+                statistics.qwNumSamplesEncoded,
+            ),
+            Err(_) => (0, 0),
         }
     }
 
@@ -875,6 +924,27 @@ mod tests {
         eprintln!("{summary:?}");
         assert_eq!(summary.frames_received, 240);
         assert_eq!(summary.frames_written + summary.frames_skipped, 240);
+    }
+
+    #[test]
+    #[ignore = "needs Media Foundation's H.264 and AAC encoders, which a Windows Server CI image may lack"]
+    fn a_paced_writer_with_sound_keeps_every_frame() {
+        // As re-encoding an edited recording does: frames far faster than real time, none skipped.
+        let (width, height) = (1920_u32, 1080_u32);
+        let mut writer =
+            Mp4Writer::create_recording(None, width, height, 30, true).expect("writer");
+        writer.pace_to_encoder();
+        for index in 0..120_u64 {
+            let frame = vec![(index % 250) as u8; (width * height * 4) as usize];
+            writer
+                .push(&frame, Duration::from_millis(index * 33))
+                .expect("frame");
+        }
+        let (_, summary) = writer
+            .finish_in_memory(Duration::from_millis(120 * 33))
+            .expect("finish");
+        assert_eq!(summary.frames_skipped, 0, "{summary:?}");
+        assert_eq!(summary.frames_written, 120, "{summary:?}");
     }
 
     #[test]

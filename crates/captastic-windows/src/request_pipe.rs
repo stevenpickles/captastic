@@ -120,6 +120,7 @@ impl RequestPipeServer {
 
     /// Waits for the next client. `Ok(None)` once stopped.
     pub fn accept(&mut self) -> Result<Option<RequestPipeConnection<'_>>, CaptureError> {
+        let mut given_up = 0_u32;
         loop {
             // Loops, not recursion: each client that gives up before it is taken, or is turned away,
             // costs one turn, and any number of them cannot grow the stack.
@@ -137,6 +138,12 @@ impl RequestPipeServer {
                     Err(error) if error.code() == ERROR_NO_DATA.to_hresult() => {
                         // SAFETY: The instance is this server's own.
                         let _ = unsafe { DisconnectNamedPipe(self.pipe.0) };
+                        // Bounded: an instance that stays half-closed however often it is
+                        // disconnected is an error, not a reason to spin.
+                        given_up += 1;
+                        if given_up > MAX_ABANDONED_CONNECTS {
+                            return Err(pipe_error("connect_named_pipe", error));
+                        }
                         continue;
                     }
                     Err(error) if error.code() == ERROR_IO_PENDING.to_hresult() => {
@@ -295,6 +302,8 @@ impl std::fmt::Display for RequestError {
 impl std::error::Error for RequestError {}
 
 /// How many bytes a client may send after its request; more is read and dropped.
+/// How many clients in a row may give up before they are taken before `accept` stops trying.
+const MAX_ABANDONED_CONNECTS: u32 = 1_000;
 /// How many lines sent after the request are read and ignored before the connection is let go.
 const MAX_TRAILING_LINES: usize = 16;
 const MAX_TRAILING_BYTES: usize = 64;

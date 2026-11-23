@@ -78,6 +78,9 @@ impl FileLock {
                     // reads as "already gone", and continuing on that without the deadline spun
                     // forever at full speed.
                     if Instant::now() < deadline && break_stale_lock(&path) {
+                        // Paced: in a folder where the lock cannot be created this comes round
+                        // every turn until the deadline, and must not spin a core meanwhile.
+                        thread::sleep(LOCK_RETRY_DELAY);
                         continue;
                     }
                     if Instant::now() >= deadline {
