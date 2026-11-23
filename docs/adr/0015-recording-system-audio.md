@@ -94,8 +94,11 @@ millisecond as the picture. A crop changes nothing about the sound.
   **Record Sound (MP4 only)**. Switching it writes `recording.audio` back, as **Record As** writes
   `recording.format`. The recording bar draws an 18-DIP speaker between the elapsed time and
   **Stop** while sound is recorded. The saved notification begins "Recorded without sound:
-  <reason>" when sound was asked for and no device could be read. Until slice 4 a trimmed or
-  cropped save also says so, since it does not yet carry the sound.
+  <reason>" when sound was asked for and no device could be read.
+- **Slice 4, first part (sound in a trimmed save).** A trimmed or cropped MP4 decodes the
+  recording's sound, keeps the samples between the trim's start and end, and writes them from zero
+  beside the re-encoded picture, a little ahead of each frame so the sink writer interleaves the
+  two. A crop leaves the sound as it is. A recording without a sound stream is saved without one.
 
 ## Consequences
 

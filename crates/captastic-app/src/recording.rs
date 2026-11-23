@@ -1465,14 +1465,6 @@ impl RecordingHost {
             &bytes,
         ) {
             Ok(path) => {
-                // A trimmed or cropped save encodes the picture again and, until ADR 0015's
-                // fourth slice, not the sound: the notification says so rather than lose it
-                // quietly.
-                let sound = draft.report.sound.clone().map(|sound| RecordingSound {
-                    recorded: false,
-                    error: Some("trimming or cropping does not keep the sound yet".to_owned()),
-                    ..sound
-                });
                 let report = RecordingReport {
                     path,
                     bytes: bytes.len() as u64,
@@ -1480,7 +1472,6 @@ impl RecordingHost {
                     height: summary.height,
                     duration: edit.length(),
                     frames_written: summary.frames_written,
-                    sound,
                     ..draft.report
                 };
                 self.announce_saved(
@@ -1714,13 +1705,41 @@ pub fn encode_edited(
             (bytes, summary.frames_written)
         }
         RecordingFormat::Mp4 => {
-            let mut writer =
-                captastic_windows::Mp4Writer::create_in_memory(width, height, format.frame_rate())
-                    .map_err(|error| encode(error.to_string()))?;
+            // The sound of the kept span, cut at the same moments as the picture and moved to
+            // the start with it (ADR 0015). A crop changes nothing about it.
+            let sound = captastic_windows::mp4_sound(recording)
+                .map_err(playback)?
+                .map(|samples| kept_sound(&samples, edit.start, edit.end));
+            let mut writer = captastic_windows::Mp4Writer::create_recording(
+                None,
+                width,
+                height,
+                format.frame_rate(),
+                sound.is_some(),
+            )
+            .map_err(|error| encode(error.to_string()))?;
+            let mut sound_packets = sound.as_deref().map(sound_packets).unwrap_or_default();
+            sound_packets.reverse();
             for frame in &kept {
                 let pixels = reader.frame(frame.index).map_err(playback)?;
                 writer
                     .push(&edit.crop_pixels(pixels, size.0), frame.at)
+                    .map_err(|error| encode(error.to_string()))?;
+                // The sound up to a little past this frame, so the two streams go to the sink
+                // writer in step rather than one after the other.
+                while sound_packets
+                    .last()
+                    .is_some_and(|packet| packet.start <= frame.at + SOUND_LEAD)
+                {
+                    let packet = sound_packets.pop().expect("checked above");
+                    writer
+                        .push_audio(&packet, Some(edit.length()))
+                        .map_err(|error| encode(error.to_string()))?;
+                }
+            }
+            for packet in sound_packets.into_iter().rev() {
+                writer
+                    .push_audio(&packet, Some(edit.length()))
                     .map_err(|error| encode(error.to_string()))?;
             }
             let (bytes, summary) = writer
@@ -1737,6 +1756,35 @@ pub fn encode_edited(
             frames_written,
         },
     ))
+}
+
+/// How far ahead of the frame being written an edited save writes its sound.
+const SOUND_LEAD: Duration = Duration::from_millis(200);
+
+/// The samples of `samples` (interleaved stereo at the loopback's rate) from `start` to `end`.
+fn kept_sound(samples: &[i16], start: Duration, end: Duration) -> Vec<i16> {
+    let channels = usize::from(captastic_windows::AUDIO_CHANNELS);
+    let frame = |at: Duration| {
+        let index = (at.as_nanos() * u128::from(captastic_windows::AUDIO_SAMPLE_RATE)
+            / 1_000_000_000) as usize;
+        (index * channels).min(samples.len())
+    };
+    samples[frame(start)..frame(end).max(frame(start))].to_vec()
+}
+
+/// `samples` as packets of a tenth of a second, timed from zero.
+fn sound_packets(samples: &[i16]) -> Vec<captastic_windows::AudioPacket> {
+    let channels = usize::from(captastic_windows::AUDIO_CHANNELS);
+    let rate = captastic_windows::AUDIO_SAMPLE_RATE as usize;
+    let chunk = rate / 10 * channels;
+    samples
+        .chunks(chunk)
+        .enumerate()
+        .map(|(index, part)| captastic_windows::AudioPacket {
+            start: Duration::from_millis(index as u64 * 100),
+            samples: part.to_vec(),
+        })
+        .collect()
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1880,6 +1928,80 @@ mod tests {
             gif_max_dimension: 64,
             audio: false,
         }
+    }
+
+    #[test]
+    #[ignore = "needs Media Foundation's H.264 and AAC encoders"]
+    fn a_trimmed_and_cropped_save_keeps_the_sound_of_the_span_kept() {
+        // Three seconds: silence, then a 440 Hz tone, then silence, a second each.
+        let (width, height) = (160_u32, 96_u32);
+        let mut writer =
+            captastic_windows::Mp4Writer::create_recording(None, width, height, 30, true)
+                .expect("writer");
+        let rate = captastic_windows::AUDIO_SAMPLE_RATE as usize;
+        for packet in 0..300 {
+            let start = Duration::from_millis(packet as u64 * 10);
+            let samples: Vec<i16> = (0..rate / 100)
+                .flat_map(|i| {
+                    let n = packet * rate / 100 + i;
+                    let value = if (100..200).contains(&packet) {
+                        (12_000.0
+                            * (2.0 * std::f64::consts::PI * 440.0 * n as f64 / rate as f64).sin())
+                            as i16
+                    } else {
+                        0
+                    };
+                    [value, value]
+                })
+                .collect();
+            if packet % 3 == 0 {
+                writer
+                    .push(
+                        &vec![(packet % 250) as u8; (width * height * 4) as usize],
+                        start,
+                    )
+                    .expect("frame");
+            }
+            writer
+                .push_audio(&captastic_windows::AudioPacket { start, samples }, None)
+                .expect("sound");
+        }
+        let (recording, _) = writer
+            .finish_in_memory(Duration::from_secs(3))
+            .expect("finish");
+
+        // Keep 0.5 s to 2.5 s, cropped: half a second of silence, the tone, half of silence.
+        let edit = RecordingEdit {
+            start: Duration::from_millis(500),
+            end: Duration::from_millis(2_500),
+            crop: Some(PixelRect {
+                x: 10,
+                y: 10,
+                width: 100,
+                height: 60,
+            }),
+        };
+        let (edited, summary) =
+            encode_edited(&recording, RecordingFormat::Mp4, edit).expect("edited");
+        assert_eq!((summary.width, summary.height), (100, 60));
+        let sound = captastic_windows::mp4_sound(&edited)
+            .expect("decoded")
+            .expect("the edited MP4 keeps a sound stream");
+        let seconds = sound.len() as f64 / 2.0 / rate as f64;
+        assert!((seconds - 2.0).abs() < 0.1, "{seconds} s of sound kept");
+        let rms = |from: f64, to: f64| {
+            let part = &sound[(from * rate as f64) as usize * 2..(to * rate as f64) as usize * 2];
+            (part.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>() / part.len() as f64).sqrt()
+        };
+        assert!(
+            rms(0.05, 0.4) < 100.0,
+            "the start is the silence before the tone"
+        );
+        assert!(
+            (rms(0.65, 1.35) - 8_485.0).abs() < 1_500.0,
+            "the tone in the middle"
+        );
+        assert!(rms(1.6, 1.95) < 100.0, "the end is the silence after it");
     }
 
     #[test]
