@@ -51,7 +51,11 @@ if ((Test-Path -LiteralPath $legacyExecutable -PathType Leaf) -and
     # Launch at login that started the old copy starts this one instead, rather than being lost.
     $legacyRunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
     $legacyStartup = (Get-ItemProperty -LiteralPath $legacyRunKey -Name 'Captastic' -ErrorAction SilentlyContinue).Captastic
-    if ($legacyStartup -and $legacyStartup.Trim().Trim('"').Equals($legacyExecutable, [System.StringComparison]::OrdinalIgnoreCase)) {
+    # 0.2 and earlier registered their launcher, captastic-desktop.exe, rather than captastic.exe.
+    $legacyLauncher = Join-Path $legacyDirectory 'captastic-desktop.exe'
+    $legacyStartupPath = if ($legacyStartup) { $legacyStartup.Trim().Trim('"') } else { '' }
+    if ($legacyStartupPath.Equals($legacyExecutable, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $legacyStartupPath.Equals($legacyLauncher, [System.StringComparison]::OrdinalIgnoreCase)) {
         Set-ItemProperty -LiteralPath $legacyRunKey -Name 'Captastic' -Value ('"{0}"' -f $executable)
         Write-Host 'Launch at login now starts the Chocolatey copy of Captastic.'
     }

@@ -1803,6 +1803,9 @@ pub fn encode_edited(
                 sound.is_some(),
             )
             .map_err(|error| encode(error.to_string()))?;
+            // Every frame is here already, read as fast as it decodes: the writer waits for the
+            // encoder rather than skipping frames, as it does live.
+            writer.pace_to_encoder();
             let mut sound_packets = sound.as_deref().map(sound_packets).unwrap_or_default();
             sound_packets.reverse();
             for frame in &kept {
