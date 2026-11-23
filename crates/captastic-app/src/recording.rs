@@ -102,6 +102,9 @@ pub enum RecordingEnd {
     TimeLimit,
     /// The window being recorded closed.
     WindowClosed,
+    /// The frames stopped coming: the capture failed partway, and what was recorded until then is
+    /// kept (ADR 0013).
+    SourceFailed,
 }
 
 /// A finished recording.
@@ -250,10 +253,17 @@ fn record_into(
             .spawn(move || encode(&queue, format, path.as_deref(), width, height, audio))
             .map_err(|error| RecordingError::Encode(error.to_string()))?
     };
-    queue.push(
-        pixels_for(&first, whole, area, width, height)?,
-        Duration::ZERO,
-    );
+    let first_pixels = match pixels_for(&first, whole, area, width, height) {
+        Ok(pixels) => pixels,
+        Err(error) => {
+            // Nothing is recorded yet: the encoder and the sound are stopped, not left waiting.
+            drop(loopback);
+            queue.close(Duration::ZERO);
+            let _ = encoder.join();
+            return Err(error);
+        }
+    };
+    queue.push(first_pixels, Duration::ZERO);
     let mut captured = 1_u64;
     let mut failures = 0_u32;
     let mut next = started + interval;
@@ -293,7 +303,15 @@ fn record_into(
                 failures = 0;
                 captured += 1;
                 let at = started.elapsed();
-                queue.push(pixels_for(&frame, whole, area, width, height)?, at);
+                match pixels_for(&frame, whole, area, width, height) {
+                    Ok(pixels) => queue.push(pixels, at),
+                    Err(error) => {
+                        crate::logging::warn(format_args!(
+                            "a recording frame could not be used, so the recording ends here: {error}"
+                        ));
+                        break RecordingEnd::SourceFailed;
+                    }
+                }
             }
             // The window closed between the check above and this frame: it ends the recording,
             // as the check would have.
@@ -304,11 +322,13 @@ fn record_into(
                     "a recording frame could not be captured ({failures} in a row): {error}"
                 );
                 if failures > SOURCE_FAILURES_TOLERATED {
-                    // The sound stops first: the encoder takes the last of it after the frames.
-                    drop(loopback);
-                    queue.close(started.elapsed());
-                    let _ = encoder.join();
-                    return Err(RecordingError::Source(error));
+                    // The recording ends here and keeps what it has, as ADR 0013 says: a window
+                    // session that fails, a device lost, is not a reason to lose the minutes
+                    // before it.
+                    crate::logging::warn(format_args!(
+                        "the recording's frames stopped coming, so it ends with what it has: {error}"
+                    ));
+                    break RecordingEnd::SourceFailed;
                 }
             }
         }
@@ -2180,7 +2200,7 @@ mod tests {
     }
 
     #[test]
-    fn a_source_that_keeps_failing_ends_the_recording_and_leaves_no_file() {
+    fn a_source_that_keeps_failing_ends_the_recording_and_keeps_what_it_has() {
         let directory = directory("fail");
         let path = reserve_path(&directory, "clip", "gif").expect("reserve");
         let mut source = Changing {
@@ -2196,11 +2216,10 @@ mod tests {
             &path,
             &stop,
         );
-        assert!(
-            matches!(result, Err(RecordingError::Source(_))),
-            "{result:?}"
-        );
-        assert!(!path.exists());
+        let report = result.expect("kept");
+        assert_eq!(report.ended, RecordingEnd::SourceFailed);
+        assert!(report.frames_captured >= 2, "{report:?}");
+        assert!(std::fs::metadata(&path).expect("the file is kept").len() > 0);
         let _ = std::fs::remove_dir_all(&directory);
     }
 

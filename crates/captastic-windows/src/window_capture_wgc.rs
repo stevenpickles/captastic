@@ -325,18 +325,12 @@ pub(crate) fn readback_frame(
             None,
         ));
     }
-    if desc.Width < width || desc.Height < height {
-        return Err(capture_error(
-            CaptureErrorKind::TopologyChanged,
-            "validate_frame_texture",
-            format!(
-                "WGC window resized while capturing: texture={}x{} content={}x{}",
-                desc.Width, desc.Height, width, height
-            ),
-            true,
-            None,
-        ));
-    }
+    // A window growing as it is captured hands over frames whose content is already larger than
+    // the texture they were drawn into, the pool not yet recreated at the new size. What the
+    // texture holds is read, the part of the window that fitted, rather than the frame being
+    // refused: refused, every frame of a steady drag would fail and end a recording of it.
+    let width = width.min(desc.Width);
+    let height = height.min(desc.Height);
 
     let staging_desc = D3D11_TEXTURE2D_DESC {
         Width: desc.Width,

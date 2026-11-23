@@ -118,6 +118,7 @@ What implementing this settled, for the next reader:
   and bringing forward a window recorded as itself costs nothing.
 - **The indicator follows the window's visible frame**, read every 33 ms on the desktop UI thread,
   which is what a WGC recording records. While the window is minimised it stays where it was.
+- **Fixes from the review of 0.5.0 (before the tag).** A window growing as it was recorded handed over frames whose content was larger than their texture; each was refused, and a steady drag failed enough of them in a row to end the session. The part of the window the texture holds is now read instead. A source that fails partway ended the recording by discarding it, against this ADR's Decision; it now ends as `SourceFailed` and keeps what it has. A session that fails as its window is destroyed is taken as the window closing.
 
 ## Slices
 
