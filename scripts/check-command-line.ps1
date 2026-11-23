@@ -78,6 +78,8 @@ public static extern void keybd_event(byte key, byte scan, uint flags, UIntPtr e
 public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
 [DllImport("user32.dll", EntryPoint = "FindWindowW", CharSet = CharSet.Unicode)]
 public static extern IntPtr FindWindowOfClass(string className, IntPtr anyTitle);
+[DllImport("user32.dll")]
+public static extern uint GetClipboardSequenceNumber();
 '@
 # Desktop pixels, as captastic-cli reports them, for the cursor this script moves.
 [void][CaptasticCheck.Native]::SetThreadDpiAwarenessContext([IntPtr]-4)
@@ -492,7 +494,15 @@ $sourceToml
         $lastRegion.Code -eq 0 -and $lastRegion.Json.captured.kind -eq 'last_region' -and
         $colours -and $colours.Blue -gt 0.9 -and $colours.Width -eq $region.width) "exit $($lastRegion.Code)"
 
-    # The clipboard: saved immediately before, put back immediately after, whatever happens.
+    # The clipboard: saved immediately before, put back immediately after, whatever happens. Only
+    # text and HTML can be put back, so a clipboard holding anything else (an image, files, rich
+    # text) is not touched at all and the leg is skipped.
+    $restorable = @('UnicodeText', 'Text', 'System.String', 'OEMText', 'Locale', 'HTML Format')
+    $held = @(([System.Windows.Forms.Clipboard]::GetDataObject()).GetFormats())
+    $unrestorable = @($held | Where-Object { $restorable -notcontains $_ })
+    if ($unrestorable.Count -gt 0) {
+        Add-Skip 'the clipboard checks' "the clipboard holds $($unrestorable -join ', '), which this script cannot put back"
+    } else {
     $savedText = [System.Windows.Forms.Clipboard]::GetText([System.Windows.Forms.TextDataFormat]::UnicodeText)
     $savedHtml = [System.Windows.Forms.Clipboard]::GetText([System.Windows.Forms.TextDataFormat]::Html)
     try {
@@ -517,8 +527,12 @@ $sourceToml
             [System.Windows.Forms.Clipboard]::Clear()
         }
     }
+    $restoredAt = [CaptasticCheck.Native]::GetClipboardSequenceNumber()
     $restored = [System.Windows.Forms.Clipboard]::GetText([System.Windows.Forms.TextDataFormat]::UnicodeText)
-    Add-Result 'the clipboard is put back as it was' ($restored -eq $savedText)
+    $changedSince = [CaptasticCheck.Native]::GetClipboardSequenceNumber() -ne $restoredAt
+    Add-Result 'the clipboard is put back as it was' ([string]::Equals($restored, [string]$savedText, [System.StringComparison]::Ordinal)) (
+        "saved $(([string]$savedText).Length) characters, read back $(([string]$restored).Length)$(if ($changedSince) { '; something else wrote to the clipboard meanwhile' })")
+    }
 
     # The overlay, for the command line: a drag inside B confirmed three ways, and an Esc.
     $dragInsideB = {
@@ -557,7 +571,27 @@ $sourceToml
     Add-Result '--interactive closed with Esc is refused as cancelled' (
         $cancelled.Code -eq 2 -and $cancelled.Json.reason -eq 'cancelled' -and
         -not (Test-Path (Join-Path $workDirectory 'interactive-cancelled.png'))) "exit $($cancelled.Code)"
-    Add-Skip '--interactive closes the overlay after two minutes' 'takes two minutes; manual'
+    # Nobody chooses for two minutes: the overlay closes, and the next overlay of the same
+    # daemon still opens.
+    Restart-DevDaemon
+    $waitFile = Join-Path $workDirectory 'interactive-timeout.json'
+    $waiting = Start-Process -FilePath $cli -PassThru -WindowStyle Hidden -RedirectStandardOutput $waitFile `
+        -ArgumentList @('capture', '--interactive', '--output', (Join-Path $workDirectory 'interactive-timeout.png'))
+    $timedOut = $waiting.WaitForExit(150000)
+    $answer = if ($timedOut) {
+        @(Get-Content -LiteralPath $waitFile | Where-Object { $_ -match '^\s*\{' }) | Select-Object -Last 1 | ConvertFrom-Json
+    }
+    $overlayGone = [CaptasticCheck.Native]::FindWindowOfClass('CaptasticFrozenSelectionOverlay', [IntPtr]::Zero) -eq [IntPtr]::Zero
+    Add-Result '--interactive left alone times out and closes its overlay' (
+        $timedOut -and $waiting.ExitCode -eq 2 -and $answer.reason -eq 'timed_out' -and $overlayGone) "exit $($waiting.ExitCode)"
+    if (-not $timedOut) { $waiting.Kill() }
+    $output = Join-Path $workDirectory 'interactive-after-timeout.png'
+    $after = Invoke-Interactive $output {
+        & $dragInsideB
+        Send-Keys @() 0x0D
+    }
+    Add-Result 'after a timeout the next overlay still opens and answers' (
+        $after.Code -eq 0 -and $after.Json.captured.chosen.intent -eq 'capture') "exit $($after.Code) $($after.Line)"
 
     $usage = Invoke-Cli @('capture', '--rect', '1,2,3')
     Add-Result 'a wrong command line is a usage answer' ($usage.Code -eq 64 -and $usage.Json.status -eq 'usage')

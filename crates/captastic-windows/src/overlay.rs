@@ -437,7 +437,11 @@ pub struct OverlayController {
 #[derive(Default)]
 struct OverlayControllerInner {
     hwnd: AtomicIsize,
+    /// Set at shutdown and never cleared: no overlay opens again.
     cancelled: AtomicBool,
+    /// Set by [`OverlayController::close_current`] for the one run showing or about to show,
+    /// taken by that run, and cleared when any run ends, so it never reaches a later one.
+    close_requested: AtomicBool,
     ui_updates: Option<OverlayUiSink>,
 }
 
@@ -509,6 +513,27 @@ impl OverlayController {
         if let Some(sink) = self.inner.ui_updates.as_ref() {
             sink.submit(update);
         }
+    }
+
+    /// Closes the overlay that is showing, or the one about to show, as Esc would, and only that
+    /// one: unlike [`cancel`](Self::cancel), later overlays open as usual. For a command-line
+    /// request that stopped waiting (ADR 0014). The caller must know its overlay is the one
+    /// showing or about to, and calls [`withdraw_close`](Self::withdraw_close) if it learns its
+    /// overlay had already ended.
+    pub fn close_current(&self) {
+        // The same store-then-load rendezvous as `cancel`, against the run's publish-then-check.
+        self.inner.close_requested.store(true, Ordering::SeqCst);
+        let hwnd = self.inner.hwnd.load(Ordering::SeqCst);
+        if hwnd != 0 && overlay_window_is_current(HWND(hwnd)) {
+            // SAFETY: hwnd was published by the live overlay thread. Posting does not retain it.
+            let _ = unsafe { PostMessageW(HWND(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+        }
+    }
+
+    /// Withdraws a [`close_current`](Self::close_current) whose overlay had already ended, so it
+    /// cannot close the next one.
+    pub fn withdraw_close(&self) {
+        self.inner.close_requested.store(false, Ordering::SeqCst);
     }
 
     pub fn cancel(&self) {
@@ -668,7 +693,12 @@ pub fn select_from_preview_source_with_initial_tool_and_ui(
     resources: &mut OverlayResources,
 ) -> Result<SelectionOutcome, CaptureError> {
     let preparation_started = Instant::now();
-    if controller.inner.cancelled.load(Ordering::SeqCst) {
+    if controller.inner.cancelled.load(Ordering::SeqCst)
+        || controller
+            .inner
+            .close_requested
+            .swap(false, Ordering::SeqCst)
+    {
         return Ok(SelectionOutcome::Cancelled);
     }
     let _dpi_context = ThreadDpiContext::enter_per_monitor_v2()?;
@@ -1370,7 +1400,12 @@ fn run_overlay(
         }
     }
     controller.inner.hwnd.store(hwnd.0, Ordering::SeqCst);
-    if controller.inner.cancelled.load(Ordering::SeqCst) {
+    if controller.inner.cancelled.load(Ordering::SeqCst)
+        || controller
+            .inner
+            .close_requested
+            .swap(false, Ordering::SeqCst)
+    {
         // A cancel raced construction: destroy immediately and fall through to the message
         // loop, which consumes the WM_QUIT that WM_DESTROY just latched and exits through
         // the normal teardown (state reclaim, resource cache, controller clear). The handle
@@ -1398,6 +1433,10 @@ fn run_overlay(
             // SAFETY: The callback will no longer access state after DestroyWindow returns.
             let state = unsafe { Box::from_raw(state_pointer) };
             controller.inner.hwnd.store(0, Ordering::SeqCst);
+            controller
+                .inner
+                .close_requested
+                .store(false, Ordering::SeqCst);
             let previous_foreground = state.previous_foreground;
             let _ = cache_overlay_state(state, resources);
             restore_input_context(previous_foreground);
@@ -1415,6 +1454,10 @@ fn run_overlay(
     // SAFETY: WM_NCDESTROY cleared the window user-data pointer and the loop has ended.
     let state = unsafe { Box::from_raw(state_pointer) };
     controller.inner.hwnd.store(0, Ordering::SeqCst);
+    controller
+        .inner
+        .close_requested
+        .store(false, Ordering::SeqCst);
     let previous_foreground = state.previous_foreground;
     let outcome = cache_overlay_state(state, resources);
     restore_input_context(focus_after_run(&outcome).unwrap_or(previous_foreground));
@@ -1578,6 +1621,11 @@ fn overlay_window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: L
             // returns the value can be recycled, and cancel() must not be able to load it.
             // run_overlay's later store(0) remains as belt and braces for non-window paths.
             state.controller.inner.hwnd.store(0, Ordering::SeqCst);
+            state
+                .controller
+                .inner
+                .close_requested
+                .store(false, Ordering::SeqCst);
         }
         // SAFETY: Prevents any later callback from observing the state pointer.
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
@@ -4700,6 +4748,28 @@ fn validate_frame(frame: &CpuFrame) -> Result<(), CaptureError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn closing_the_current_overlay_reaches_that_run_only() {
+        use std::sync::atomic::Ordering;
+        let controller = super::OverlayController::new();
+        // No overlay is showing: the close waits for the run about to show, which takes it.
+        controller.close_current();
+        assert!(controller
+            .inner
+            .close_requested
+            .swap(false, Ordering::SeqCst));
+        assert!(
+            !controller.inner.close_requested.load(Ordering::SeqCst),
+            "taken once"
+        );
+        // Withdrawn by a request that learned its overlay had ended: nothing is left over.
+        controller.close_current();
+        controller.withdraw_close();
+        assert!(!controller.inner.close_requested.load(Ordering::SeqCst));
+        // Neither touches shutdown's cancel, which no overlay ever comes back from.
+        assert!(!controller.inner.cancelled.load(Ordering::SeqCst));
+    }
+
     use captastic_core::PixelFormat;
 
     use super::*;

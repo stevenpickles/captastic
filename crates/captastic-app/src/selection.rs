@@ -336,6 +336,11 @@ impl SelectionWorker {
 
                 if let Some(command_line) = &job.command_line {
                     command_line.state.showing.store(false, Ordering::SeqCst);
+                    // A close the request sent just as this run ended is withdrawn, so it cannot
+                    // reach the next overlay.
+                    if command_line.state.abandoned.load(Ordering::SeqCst) {
+                        worker_controller.withdraw_close();
+                    }
                     if matches!(selection, Ok(captastic_windows::SelectionOutcome::Selected(_))) {
                         command_line.state.confirmed.store(true, Ordering::SeqCst);
                     }
@@ -661,7 +666,7 @@ impl SelectionWorker {
                                         "capture {}: Record was chosen for a command-line request; nothing was recorded",
                                         publication.capture_id.0
                                     );
-                                    command_line.answer(CommandLineOutcome::RecordingRefused);
+                                    let _ = command_line.answer(CommandLineOutcome::RecordingRefused);
                                 }
                             }
                             captastic_windows::ConfirmIntent::Record => {
@@ -714,16 +719,24 @@ impl SelectionWorker {
                                 // time a capture takes to reach the clipboard.
                                 let pin_frame = matches!(intent, captastic_windows::ConfirmIntent::Pin)
                                     .then(|| selected_frame.clone());
-                                match command_line {
-                                    Some((command_line, described)) => {
-                                        command_line.answer(CommandLineOutcome::Selected {
+                                // For a request still waiting, its answer; for one that stopped
+                                // waiting, the user's own destinations, so the choice is kept.
+                                let unanswered = match command_line {
+                                    Some((command_line, described)) => command_line
+                                        .answer(CommandLineOutcome::Selected {
                                             frame: Box::new(selected_frame),
                                             described,
-                                        });
-                                    }
-                                    None => {
-                                        publication.publish(&destinations, selected_frame, json_output);
-                                    }
+                                        })
+                                        .and_then(|outcome| match outcome {
+                                            CommandLineOutcome::Selected { frame, .. } => {
+                                                Some(*frame)
+                                            }
+                                            _ => None,
+                                        }),
+                                    None => Some(selected_frame),
+                                };
+                                if let Some(frame) = unanswered {
+                                    publication.publish(&destinations, frame, json_output);
                                 }
                                 if let Some(frame) = pin_frame {
                                     pin_capture(
@@ -738,7 +751,7 @@ impl SelectionWorker {
                     }
                     Ok(captastic_windows::SelectionOutcome::Cancelled) => {
                         if let Some(command_line) = job.command_line.take() {
-                            command_line.answer(CommandLineOutcome::Cancelled);
+                            let _ = command_line.answer(CommandLineOutcome::Cancelled);
                         }
                         if !selection_was_confirmed {
                             job.recorder.record(
@@ -993,8 +1006,15 @@ impl std::fmt::Debug for CommandLineSelection {
 }
 
 impl CommandLineSelection {
-    fn answer(&self, outcome: CommandLineOutcome) {
-        let _ = self.reply.try_send(outcome);
+    /// Hands the request its answer, or gives the answer back when the request stopped waiting,
+    /// so what the user chose is not lost.
+    fn answer(&self, outcome: CommandLineOutcome) -> Option<CommandLineOutcome> {
+        match self.reply.try_send(outcome) {
+            Ok(()) => None,
+            Err(mpsc::TrySendError::Full(outcome) | mpsc::TrySendError::Disconnected(outcome)) => {
+                Some(outcome)
+            }
+        }
     }
 }
 
@@ -1431,21 +1451,27 @@ fn finish_edit(outcome: captastic_windows::EditOutcome, context: EditContext) {
                 frame.width(),
                 frame.height()
             );
-            match context.command_line {
-                Some((command_line, described)) => {
-                    command_line.answer(CommandLineOutcome::Selected { frame, described });
-                }
-                None => {
-                    context
-                        .publication
-                        .publish(&context.destinations, *frame, context.json_output);
-                }
+            // The edit goes to the request still waiting for it, and otherwise to the user's own
+            // destinations: a request that gave up while the user was editing must not lose it.
+            let unanswered = match context.command_line {
+                Some((command_line, described)) => command_line
+                    .answer(CommandLineOutcome::Selected { frame, described })
+                    .and_then(|outcome| match outcome {
+                        CommandLineOutcome::Selected { frame, .. } => Some(*frame),
+                        _ => None,
+                    }),
+                None => Some(*frame),
+            };
+            if let Some(frame) = unanswered {
+                context
+                    .publication
+                    .publish(&context.destinations, frame, context.json_output);
             }
             "done"
         }
         captastic_windows::EditOutcome::Cancelled => {
             if let Some((command_line, _)) = &context.command_line {
-                command_line.answer(CommandLineOutcome::Cancelled);
+                let _ = command_line.answer(CommandLineOutcome::Cancelled);
             }
             log::info!(
                 "capture {}: editing was cancelled; nothing was published",
@@ -1462,7 +1488,7 @@ fn finish_edit(outcome: captastic_windows::EditOutcome, context: EditContext) {
         }
         captastic_windows::EditOutcome::Failed(message) => {
             if let Some((command_line, _)) = &context.command_line {
-                command_line.answer(CommandLineOutcome::Failed(format!(
+                let _ = command_line.answer(CommandLineOutcome::Failed(format!(
                     "the editor failed: {message}"
                 )));
             }

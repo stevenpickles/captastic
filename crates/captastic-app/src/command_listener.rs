@@ -142,16 +142,6 @@ impl<E: CommandEngine> Commands<E> {
         };
         let format = capture.format.unwrap_or(self.output.format);
         let path = self.write(&frame, format, capture.output.as_deref())?;
-        // Only when asked: a capture the user did not start must not replace what they copied.
-        if capture.clipboard {
-            self.engine.publish_clipboard(&frame).map_err(|error| {
-                Failure::new(
-                    Reason::ClipboardFailed,
-                    format!("the capture was saved and could not be put on the clipboard: {error}"),
-                )
-                .with_detail("path", json!(path.display().to_string()))
-            })?;
-        }
         if let Some(history) = &self.history {
             history.record_command_line(
                 &path,
@@ -173,6 +163,16 @@ impl<E: CommandEngine> Commands<E> {
                     .unwrap_or_default(),
                 path: path.clone(),
             });
+        }
+        // Only when asked: a capture the user did not start must not replace what they copied.
+        if capture.clipboard {
+            self.engine.publish_clipboard(&frame).map_err(|error| {
+                Failure::new(
+                    Reason::ClipboardFailed,
+                    format!("the capture was saved and could not be put on the clipboard: {error}"),
+                )
+                .with_detail("path", json!(path.display().to_string()))
+            })?;
         }
         let mut fields = Map::new();
         fields.insert("path".to_owned(), json!(path.display().to_string()));
@@ -429,10 +429,16 @@ impl CommandEngine for DaemonEngine {
                         extended = true;
                         continue;
                     }
-                    // Given up: an overlay still queued is never opened, and one on screen closes.
+                    // Given up: an overlay still queued is never opened, and the one showing for
+                    // this request closes. Only that one: `close_current` is taken by the run it
+                    // closes and cleared when a run ends, and withdrawn here if the request's
+                    // overlay ended meanwhile, so it cannot reach the user's next overlay.
                     state.abandoned.store(true, Ordering::SeqCst);
                     if state.showing.load(Ordering::SeqCst) {
-                        overlay.cancel();
+                        overlay.close_current();
+                        if !state.showing.load(Ordering::SeqCst) {
+                            overlay.withdraw_close();
+                        }
                     }
                     return Err(Failure::new(
                         Reason::TimedOut,
@@ -566,6 +572,8 @@ mod tests {
         interactive: Option<Result<Rect, Reason>>,
         /// The size of every capture put on the clipboard.
         clipboard: Mutex<Vec<(u32, u32)>>,
+        /// Whether putting a capture on the clipboard fails, as when another program holds it.
+        clipboard_fails: bool,
     }
 
     impl FakeEngine {
@@ -582,6 +590,7 @@ mod tests {
                 last_regions: BTreeMap::new(),
                 interactive: None,
                 clipboard: Mutex::new(Vec::new()),
+                clipboard_fails: false,
             }
         }
     }
@@ -618,6 +627,9 @@ mod tests {
         }
 
         fn publish_clipboard(&self, frame: &CpuFrame) -> Result<(), String> {
+            if self.clipboard_fails {
+                return Err("another program has the clipboard open".to_owned());
+            }
             self.clipboard
                 .lock()
                 .expect("clipboard")
@@ -1070,6 +1082,43 @@ mod tests {
             PathBuf::from(captured["path"].as_str().expect("path"))
         );
         assert!(entry.bytes > 0);
+    }
+
+    #[test]
+    fn a_capture_whose_clipboard_fails_is_still_announced_and_remembered() {
+        let directory = Scratch::new();
+        let mut commands = commands(directory.path(), false);
+        commands.engine.clipboard_fails = true;
+        let (notices, announced) = mpsc::sync_channel(4);
+        commands.notices = Some(notices);
+        let store =
+            captastic_config::HistoryStore::for_config(directory.path().join("captastic.toml"));
+        commands.history = Some(crate::file_output::HistoryRecorder::new(
+            store.clone(),
+            captastic_config::RetentionPolicy {
+                max_items: 10,
+                max_age: None,
+                max_total_bytes: None,
+            },
+        ));
+        let request: crate::command_channel::Request = serde_json::from_value(json!({
+            "version": 1, "command": "capture",
+            "target": { "kind": "display", "display": "primary" },
+            "clipboard": true,
+        }))
+        .expect("request");
+        let failure = commands
+            .answer(request.command)
+            .expect_err("the clipboard failed");
+        assert_eq!(failure.reason, Reason::ClipboardFailed);
+        let path = PathBuf::from(failure.details["path"].as_str().expect("path"));
+        assert!(path.exists(), "the capture was written");
+        // Written, so announced and remembered, whatever became of the clipboard.
+        assert!(matches!(
+            announced.try_recv(),
+            Ok(crate::daemon::DaemonNotice::CommandLineCapture { .. })
+        ));
+        assert_eq!(store.load().expect("history").entries[0].path, path);
     }
 
     #[test]

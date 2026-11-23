@@ -231,16 +231,29 @@ fn capture_command(args: CaptureArgs, current_dir: &Path) -> CaptureCommand {
     CaptureCommand {
         target,
         // The daemon refuses a relative path, since its current directory is not the caller's.
-        output: args.output.map(|path| {
-            if path.is_absolute() {
-                path
-            } else {
-                current_dir.join(path)
-            }
-        }),
+        output: args.output.map(|path| absolute_output(&path, current_dir)),
         format: args.format.map(OutputFormat::from),
         clipboard: args.clipboard,
     }
+}
+
+/// `path` made absolute against the caller: relative to `current_dir`, or for a drive-relative
+/// path such as `C:shot.png`, to that drive's current directory, as Windows resolves it.
+fn absolute_output(path: &Path, current_dir: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    if path.has_root()
+        || path
+            .components()
+            .next()
+            .is_some_and(|c| matches!(c, std::path::Component::Prefix(_)))
+    {
+        if let Ok(resolved) = std::path::absolute(path) {
+            return resolved;
+        }
+    }
+    current_dir.join(path)
 }
 
 /// The daemon's answer, printed as it came, with the exit code its status means.
@@ -793,6 +806,26 @@ mod tests {
             assert_eq!(line["reason"], "bad_command_line");
             assert!(!line["message"].as_str().expect("message").is_empty());
         }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn an_output_relative_to_a_drive_is_resolved_not_refused() {
+        let current = Path::new(r"C:\work");
+        let resolved = absolute_output(Path::new("C:shot.png"), current);
+        assert!(resolved.is_absolute(), "{}", resolved.display());
+        assert_eq!(
+            resolved.file_name().and_then(|name| name.to_str()),
+            Some("shot.png")
+        );
+        assert_eq!(
+            absolute_output(Path::new(r"shots\a.png"), current),
+            Path::new(r"C:\work\shots\a.png")
+        );
+        assert_eq!(
+            absolute_output(Path::new(r"D:\x.png"), current),
+            Path::new(r"D:\x.png")
+        );
     }
 
     #[test]
