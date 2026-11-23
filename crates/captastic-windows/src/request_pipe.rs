@@ -120,40 +120,47 @@ impl RequestPipeServer {
 
     /// Waits for the next client. `Ok(None)` once stopped.
     pub fn accept(&mut self) -> Result<Option<RequestPipeConnection<'_>>, CaptureError> {
-        let overlapped = Overlapped::new()?;
-        // SAFETY: The pipe and the OVERLAPPED both outlive the operation, which is waited for or
-        // cancelled below before either is dropped.
-        let started = unsafe { ConnectNamedPipe(self.pipe.0, Some(overlapped.pointer())) };
-        let connected = match started {
-            Ok(()) => true,
-            // A client connected between creating the instance and this call.
-            Err(error) if error.code() == ERROR_PIPE_CONNECTED.to_hresult() => true,
-            // A client connected and gave up before this call: the instance is left half-closed
-            // until it is disconnected, and every later connect on it would fail the same way.
-            Err(error) if error.code() == ERROR_NO_DATA.to_hresult() => {
+        loop {
+            // Loops, not recursion: each client that gives up before it is taken, or is turned away,
+            // costs one turn, and any number of them cannot grow the stack.
+            let connected = loop {
+                let overlapped = Overlapped::new()?;
+                // SAFETY: The pipe and the OVERLAPPED both outlive the operation, which is waited for
+                // or cancelled below before either is dropped.
+                let started = unsafe { ConnectNamedPipe(self.pipe.0, Some(overlapped.pointer())) };
+                break match started {
+                    Ok(()) => true,
+                    // A client connected between creating the instance and this call.
+                    Err(error) if error.code() == ERROR_PIPE_CONNECTED.to_hresult() => true,
+                    // A client connected and gave up before this call: the instance is left half-closed
+                    // until it is disconnected, and every later connect on it would fail the same way.
+                    Err(error) if error.code() == ERROR_NO_DATA.to_hresult() => {
+                        // SAFETY: The instance is this server's own.
+                        let _ = unsafe { DisconnectNamedPipe(self.pipe.0) };
+                        continue;
+                    }
+                    Err(error) if error.code() == ERROR_IO_PENDING.to_hresult() => {
+                        match overlapped.wait(self.pipe.0, Some(&self.stop), None)? {
+                            Waited::Done(_) => true,
+                            Waited::Stopped => false,
+                            Waited::TimedOut => unreachable!("no timeout was given"),
+                        }
+                    }
+                    Err(error) => return Err(pipe_error("connect_named_pipe", error)),
+                };
+            };
+            if !connected {
+                return Ok(None);
+            }
+            // The DACL admits this user from any session; the boundary is the session (ADR 0014), so a
+            // client from another one, the same user over RDP say, is turned away unanswered.
+            if !client_is_in_this_session(self.pipe.0) {
                 // SAFETY: The instance is this server's own.
                 let _ = unsafe { DisconnectNamedPipe(self.pipe.0) };
-                return self.accept();
+                log::warn!("a command-line request from another session was refused");
+                continue;
             }
-            Err(error) if error.code() == ERROR_IO_PENDING.to_hresult() => {
-                match overlapped.wait(self.pipe.0, Some(&self.stop), None)? {
-                    Waited::Done(_) => true,
-                    Waited::Stopped => false,
-                    Waited::TimedOut => unreachable!("no timeout was given"),
-                }
-            }
-            Err(error) => return Err(pipe_error("connect_named_pipe", error)),
-        };
-        if !connected {
-            return Ok(None);
-        }
-        // The DACL admits this user from any session; the boundary is the session (ADR 0014), so a
-        // client from another one, the same user over RDP say, is turned away unanswered.
-        if !client_is_in_this_session(self.pipe.0) {
-            // SAFETY: The instance is this server's own.
-            let _ = unsafe { DisconnectNamedPipe(self.pipe.0) };
-            log::warn!("a command-line request from another session was refused");
-            return self.accept();
+            break;
         }
         // The next client gets a fresh instance; this one is the connection's until it drops.
         let next = create_instance(&self.name, &self.security, false)?;
@@ -182,12 +189,23 @@ impl RequestPipeConnection<'_> {
         let deadline = Instant::now() + timeout;
         // Anything more the client sends is read and ignored; it closing, the stop, an error or
         // the deadline ends the wait.
-        while let Ok(Some(_)) = read_line(
-            self.pipe.0,
-            Some(&self.server.stop),
-            MAX_TRAILING_BYTES,
-            deadline.saturating_duration_since(Instant::now()),
-        ) {}
+        // A client that floods lines is read for at most a few of them, and never past the
+        // deadline: answering it costs the timeout at most, like one that never reads.
+        for _ in 0..MAX_TRAILING_LINES {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match read_line(
+                self.pipe.0,
+                Some(&self.server.stop),
+                MAX_TRAILING_BYTES,
+                remaining,
+            ) {
+                Ok(Some(_)) => {}
+                _ => break,
+            }
+        }
         Ok(())
     }
 }
@@ -277,6 +295,8 @@ impl std::fmt::Display for RequestError {
 impl std::error::Error for RequestError {}
 
 /// How many bytes a client may send after its request; more is read and dropped.
+/// How many lines sent after the request are read and ignored before the connection is let go.
+const MAX_TRAILING_LINES: usize = 16;
 const MAX_TRAILING_BYTES: usize = 64;
 
 /// Whether the client on `pipe` runs in this process's session.

@@ -275,7 +275,12 @@ impl SelectionWorker {
                 }
                 if let Some(command_line) = &job.command_line {
                     command_line.state.showing.store(true, Ordering::SeqCst);
-                    if command_line.state.abandoned.load(Ordering::SeqCst) {
+                    // A selection the user already confirmed in the live view is theirs, and
+                    // goes on to be captured even though the request stopped waiting: with no
+                    // one left to answer, its outcome goes to the usual destinations.
+                    if command_line.state.abandoned.load(Ordering::SeqCst)
+                        && job.confirmed_selection.is_none()
+                    {
                         command_line.state.showing.store(false, Ordering::SeqCst);
                         finish_without_clipboard(
                             &mut job,
