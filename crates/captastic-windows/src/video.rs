@@ -61,6 +61,47 @@ const MAXIMUM_ENCODER_BACKLOG: u64 = 30;
 /// waiting for more input (a lookahead holding frames in flight) rather than falling behind.
 const ENCODER_STALL: Duration = Duration::from_millis(250);
 
+/// Decides whether an unthrottled writer's encoder is behind. Past [`MAXIMUM_ENCODER_BACKLOG`]
+/// frames waiting it is, while it keeps encoding. One that encodes nothing for [`ENCODER_STALL`]
+/// while frames are held back is waiting for input instead: frames it holds in flight (a
+/// lookahead) that only more input releases. That many become its depth, the backlog it is allowed
+/// on top of the maximum from then on, so it is not held back again a frame at a time.
+#[derive(Debug, Default)]
+struct EncoderPacer {
+    /// Frames the encoder holds in flight, learned from a stall.
+    depth: u64,
+    /// While frames are held back: the encoder's count of encoded frames, and when it last moved.
+    holding_back: Option<(u64, Instant)>,
+}
+
+impl EncoderPacer {
+    /// Whether to hold back a frame, given `backlog` frames waiting and `encoded` encoded so far.
+    fn is_behind(&mut self, backlog: u64, encoded: u64, now: Instant) -> bool {
+        if backlog <= self.depth.saturating_add(MAXIMUM_ENCODER_BACKLOG) {
+            return false;
+        }
+        match self.holding_back {
+            Some((last, since)) if last == encoded => {
+                if now.saturating_duration_since(since) < ENCODER_STALL {
+                    return true;
+                }
+                self.depth = backlog.saturating_sub(MAXIMUM_ENCODER_BACKLOG);
+                self.holding_back = None;
+                false
+            }
+            _ => {
+                self.holding_back = Some((encoded, now));
+                true
+            }
+        }
+    }
+
+    /// A frame went to the encoder.
+    fn fed(&mut self) {
+        self.holding_back = None;
+    }
+}
+
 /// The size a `width` by `height` recording is encoded at: scaled down, keeping its shape, to fit
 /// [`MP4_MAXIMUM_SIZE`], then rounded down to even sides, which H.264's 4:2:0 sampling needs.
 pub fn mp4_frame_size(width: u32, height: u32) -> (u32, u32) {
@@ -149,8 +190,7 @@ pub struct Mp4Writer {
     /// Waits for a behind encoder instead of skipping frames: for re-encoding a recording, where
     /// every frame is already there and none may be lost, rather than capturing one live.
     paced: bool,
-    /// While frames are held back: the encoder's count of encoded frames, and when it last moved.
-    holding_back: Option<(u64, Instant)>,
+    pacer: EncoderPacer,
     _media_foundation: MediaFoundation,
 }
 
@@ -296,7 +336,7 @@ impl Mp4Writer {
             summary: VideoSummary::default(),
             memory,
             paced: false,
-            holding_back: None,
+            pacer: EncoderPacer::default(),
             _media_foundation: media_foundation,
         })
     }
@@ -336,7 +376,7 @@ impl Mp4Writer {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
-        self.holding_back = None;
+        self.pacer.fed();
         let sample = self.sample(bgra)?;
         if let Some(pending) = self.pending.take() {
             self.write(pending, at)?;
@@ -352,21 +392,10 @@ impl Mp4Writer {
         self.paced = true;
     }
 
-    /// Whether more than [`MAXIMUM_ENCODER_BACKLOG`] frames wait on an encoder that is still
-    /// encoding. One that has encoded nothing for [`ENCODER_STALL`] while frames were held back is
-    /// waiting for input, not behind, and holding back more would stop the recording for good.
+    /// Whether the encoder is behind, as [`EncoderPacer`] decides.
     fn encoder_is_behind(&mut self) -> bool {
         let (backlog, encoded) = self.encoder_progress();
-        if backlog <= MAXIMUM_ENCODER_BACKLOG {
-            return false;
-        }
-        match self.holding_back {
-            Some((last, since)) if last == encoded => since.elapsed() < ENCODER_STALL,
-            _ => {
-                self.holding_back = Some((encoded, Instant::now()));
-                true
-            }
-        }
+        self.pacer.is_behind(backlog, encoded, Instant::now())
     }
 
     /// Frames handed to the sink writer that its encoder has not yet encoded.
@@ -686,6 +715,31 @@ fn video_failure(operation: &'static str, message: String) -> CaptureError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_encoder_that_holds_frames_in_flight_is_held_back_once_not_a_frame_at_a_time() {
+        let start = Instant::now();
+        let later = |ms| start + Duration::from_millis(ms);
+        let mut pacer = EncoderPacer::default();
+        let deep = MAXIMUM_ENCODER_BACKLOG + 10;
+        assert!(!pacer.is_behind(MAXIMUM_ENCODER_BACKLOG, 0, start));
+        // Behind, and nothing encoded meanwhile: held back until the stall, then let through.
+        assert!(pacer.is_behind(deep, 0, start));
+        assert!(pacer.is_behind(deep, 0, later(100)));
+        assert!(!pacer.is_behind(deep, 0, later(250)));
+        pacer.fed();
+        // From then on its depth is allowed: as it gives back a frame for each one fed, none is
+        // held back again.
+        for frame in 1..=MAXIMUM_ENCODER_BACKLOG {
+            assert!(!pacer.is_behind(deep, frame, later(260 + frame)), "{frame}");
+            pacer.fed();
+        }
+        // But a backlog beyond its depth and the maximum still is, while it keeps encoding.
+        let behind = deep + MAXIMUM_ENCODER_BACKLOG;
+        assert!(pacer.is_behind(behind, 40, later(400)));
+        assert!(pacer.is_behind(behind, 41, later(500)));
+        assert!(pacer.is_behind(behind, 42, later(900)));
+    }
 
     #[test]
     fn sizes_are_even_and_fit_the_encoder() {
