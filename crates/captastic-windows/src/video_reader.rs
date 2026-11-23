@@ -312,6 +312,15 @@ pub fn mp4_sound(bytes: &[u8]) -> Result<Option<Vec<i16>>, PlaybackError> {
         if reader.SetCurrentMediaType(stream, None, &wanted).is_err() {
             return Ok(None);
         }
+        // Only the sound: with the picture selected too, the reader would queue every video
+        // sample it passes on the way, a second copy of the recording held for nothing.
+        let _ = reader.SetStreamSelection(
+            windows::Win32::Media::MediaFoundation::MF_SOURCE_READER_ALL_STREAMS.0 as u32,
+            false,
+        );
+        reader
+            .SetStreamSelection(stream, true)
+            .map_err(|error| failure("selecting the MP4's sound", error))?;
         loop {
             let mut flags = 0_u32;
             let mut sample = None;
