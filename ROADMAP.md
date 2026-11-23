@@ -97,9 +97,13 @@ Milestone 5's criterion vacuously and on purpose.
 
 ## Release readiness — v0.5.0
 
-**Status:** planned 2026-10-21. Recording a window through WGC is built (#140, #141, #142), and the
-command line's request channel (#143); sound is not started yet. The 0.4.0 Chocolatey submission was pushed on
-2026-10-21 and is in moderation. Decided on 2026-10-21:
+**Status:** gates met on 2026-11-23, ready to tag. Every slice merged (#134-#155). An adversarial
+review of the whole code base and two re-reviews were fixed (#156-#164). On the installed build
+`0.5.0-dev.661`, the desktop checklists and `scripts/check-command-line.ps1` (34 passed) and
+`scripts/check-recording-audio.ps1` passed, as did the disposable-VM checklist. Two items of the
+window-recording checklist were not observed and are listed as such in the release notes: a window
+spanning two displays, and a GPU-rendered window recorded for long. Release notes:
+[docs/release-notes-v0.5.0.md](docs/release-notes-v0.5.0.md). Decided on 2026-10-21:
 
 - **Theme: recording a window itself.** 0.4.0 records a window as the rectangle it occupied when
   **Record** was pressed, so anything moved over it, always-on-top windows, and the desktop behind a

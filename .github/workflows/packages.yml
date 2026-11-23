@@ -1,0 +1,102 @@
+name: Packages
+
+# Pushes a published release's Chocolatey package to the community repository. The package is the
+# one attached to the release, checked against its artifacts.json by
+# scripts/publish-chocolatey.ps1; nothing is built here. See docs/chocolatey.md.
+
+on:
+  # From release.yml once the release is published. Called directly because a release created
+  # with the workflow's GITHUB_TOKEN does not trigger `release: published` in other workflows.
+  workflow_call:
+    inputs:
+      version:
+        description: Release version to push (X.Y.Z)
+        required: true
+        type: string
+    secrets:
+      CHOCO_API_KEY:
+        required: false
+  # To retry an already published release by hand.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Published release version to push (X.Y.Z)
+        required: true
+        type: string
+  # Checks the package of the latest published release, and never pushes.
+  pull_request:
+    paths:
+      - .github/workflows/packages.yml
+      - scripts/publish-chocolatey.ps1
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Resolve the release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      submit: ${{ steps.resolve.outputs.submit }}
+    steps:
+      - name: Resolve and validate the version
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = pull_request ]; then
+            version=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
+            submit=false
+          else
+            version=$INPUT_VERSION
+            submit=true
+          fi
+          version=${version#v}
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'$version' is not a release version (X.Y.Z)."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "submit=$submit" >> "$GITHUB_OUTPUT"
+          echo "Version $version, push: $submit"
+
+  chocolatey:
+    name: Chocolatey
+    needs: version
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Check the published release's package
+        shell: pwsh
+        run: >-
+          ./scripts/publish-chocolatey.ps1 -Tag "v$env:VERSION" -Repository $env:GITHUB_REPOSITORY
+          -DryRun -OutputDirectory dist
+
+      - name: Upload the checked package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: chocolatey-package
+          path: dist/captastic.${{ needs.version.outputs.version }}.nupkg
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Push to the Chocolatey community repository
+        if: needs.version.outputs.submit == 'true'
+        shell: pwsh
+        env:
+          CHOCO_API_KEY: ${{ secrets.CHOCO_API_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CHOCO_API_KEY)) {
+            Write-Output '::notice::CHOCO_API_KEY is not set, so the push was skipped; the checked package is attached to this run.'
+            exit 0
+          }
+          choco push "dist/captastic.$env:VERSION.nupkg" --source https://push.chocolatey.org/ --api-key $env:CHOCO_API_KEY --no-progress
+          exit $LASTEXITCODE

@@ -148,7 +148,11 @@ Chocolatey package, from an elevated prompt, after restoring the snapshot:
    Quit Captastic from the tray and run the same capture again: it prints `"taken_by":"one_shot"`
    with exit code 0 straight away, and the same notification appears from an icon that goes away
    about ten seconds later.
-7. Repeat steps 2 and 3.
+7. Repeat steps 2 and 3. Then, with a video or any sound playing, choose **Options -> Record As:
+   MP4** and **Record Sound**, record a few seconds: the bar shows a speaker beside the time, and
+   the review plays the sound with **Play** and silences it with **Mute**. Saved, the MP4 plays with
+   sound in another player. (A VM with no audio device records silence, and the notification says
+   it was recorded without sound: that is the expected result there.)
 8. With Captastic running, `choco upgrade captastic --version <version> --source <folder>` to the
    release package: it stops, and comes back on its own within a few seconds. Task Manager's
    **Details** tab, with the **Elevated** column shown, reports `captastic.exe` as **No**, and the
@@ -167,16 +171,56 @@ exact archive's contents in `captastic.<version>.nupkg`. The ZIP, checksum, Choc
 `VERIFICATION.txt` records the direct tagged GitHub release archive URL and SHA-256 hashes for the
 archive and both executables. A tagged package build fails if given an indirect or non-release URL.
 
-The workflow does not publish to the Chocolatey community repository automatically. Do not push a
-package until the tagged GitHub release exists, its direct download URLs work, its manifest hashes
-match, and the disposable-VM checklist passes. Then publish manually with an API key kept outside
-the repository:
+### Pushing to the Chocolatey community repository
+
+The package is pushed by
+[.github/workflows/packages.yml](../.github/workflows/packages.yml) (Actions → **Packages**). For a
+release tag (`vX.Y.Z`, no prerelease label), `release.yml` calls it once the GitHub release is
+published, so the disposable-VM checklist must pass before the tag. A failure there leaves the
+published release as it is.
+
+The workflow builds nothing. It runs
+[scripts/publish-chocolatey.ps1](../scripts/publish-chocolatey.ps1), which:
+
+1. downloads the release's `artifacts.json` and every file it lists, through the direct release
+   URLs that `VERIFICATION.txt` names and `choco install` fetches from;
+2. checks that the manifest is publishable and for the tag's version, and that each file has the
+   SHA-256 the manifest records.
+
+The workflow then attaches that `.nupkg` to its run and pushes it with the `CHOCO_API_KEY` secret.
+Without the secret it skips the push with a notice, and the package stays attached to the run. On
+a pull request that touches the workflow or the script, it checks the latest published release's
+package and never pushes.
+
+**One-time setup:**
+
+1. Create an account on [community.chocolatey.org](https://community.chocolatey.org/) and confirm
+   its email address.
+2. Copy the API key from the account page.
+3. Store it as the repository secret; the command prompts for the value, so the key never appears
+   in a command line or in shell history:
+
+   ```powershell
+   gh secret set CHOCO_API_KEY --repo stevenpickles/captastic
+   ```
+
+**To retry** an already published release, use Actions → **Packages** → **Run workflow**, with its
+version (`X.Y.Z`). To check or push from a machine instead:
 
 ```powershell
-choco push ./dist/captastic.<version>.nupkg `
-    --source https://push.chocolatey.org/ `
-    --api-key $env:CHOCOLATEY_API_KEY
+./scripts/publish-chocolatey.ps1 -Tag v<version> -Repository stevenpickles/captastic -DryRun
+$env:CHOCO_API_KEY = '<key>'   # then without -DryRun, to push
+./scripts/publish-chocolatey.ps1 -Tag v<version> -Repository stevenpickles/captastic
 ```
+
+**Caveats:**
+
+- **Versions are never reused.** Chocolatey never accepts the same version twice. Fix forward with
+  a new version; never delete or move a published tag.
+- **Every version is checked.** Each one goes through Chocolatey's automated checks and possibly a
+  human moderator, with the results emailed. The queue:
+  [ch0.co/moderation](https://ch0.co/moderation).
+- **The key's reach.** The API key can publish any package on the account.
 
 The first package submission must pass Chocolatey community validation and moderation before
 `choco install captastic` works against the default community source. Keep the package ID,
