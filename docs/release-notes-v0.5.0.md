@@ -5,15 +5,13 @@
 > tag is published, confirming that the attached artifact names match. This file lives in the
 > repository so the wording can be reviewed before it is published.
 >
-> **Before the tag:** the items marked _(open)_ under "What was observed" are gates in
-> `ROADMAP.md` that had not been met when this draft was written. Each is either observed and moved
-> into the list, or moved to "What was not observed", before publishing.
+> **Gates:** every gate in `ROADMAP.md` was met on 2026-11-23; see "What was observed".
 
 ---
 
 Captastic v0.5.0 records a window as itself, records the computer's sound into MP4 recordings, and
 ships a command line, `captastic-cli`, that lets a script or an agent take a capture and read back
-where it went. The release carries PRs #134 through #155 on top of v0.4.0. Everything v0.1.0 said
+where it went. The release carries PRs #134 through #164 on top of v0.4.0. Everything v0.1.0 said
 about what Captastic is and is not still holds; see the
 [v0.1.0 release](https://github.com/stevenpickles/captastic/releases/tag/v0.1.0) for the full
 description and its known limitations.
@@ -96,7 +94,7 @@ three features touches the still-capture path: a capture confirmed with **Captur
 - **A window that Windows scales for display** (one that is not per-monitor DPI aware, on a display
   at 125% or more) was captured at its unscaled size in the top-left corner of a larger black image.
   It is now captured whole, on the overlay and from the command line (PR #146).
-- **From an adversarial review of the whole code base** before the tag (PRs #156 to #163):
+- **From an adversarial review of the whole code base** before the tag (PRs #156 to #164):
   - **Recordings are not lost.** A recording running when Captastic exits gets up to 15 seconds
     to finish writing; a reviewed recording that cannot be saved in the output folder is saved in
     `~/.captastic/recordings` instead; an MP4 with sound no longer grows without limit in memory
@@ -131,13 +129,17 @@ Those found three defects, all fixed before the tag: a window scaled for display
 wrong size (PR #146), the one-shot command line waiting for its announcement to close (PR #145),
 and a status answer whose daemon version overwrote the protocol version (PR #143).
 
-- _(open)_ An agent's capture on the **installed** build, with and without Captastic running.
-- _(open)_ A recording with sound while a video plays, with silence, and with headphones plugged in
-  part-way through.
-- _(open)_ **Record Sound** and the bar's speaker, seen on a real overlay.
-- _(open)_ The disposable-VM checklist in
+After the review's fixes, on 2026-11-23, on the installed build `0.5.0-dev.661`, which is the
+release's code:
+
+- `scripts/check-command-line.ps1`: 34 checks passed and none failed, with Captastic running and
+  without it. It skips one, a capture refused during a recording, which was checked by hand;
+- `scripts/check-recording-audio.ps1`: passed;
+- by hand: a recording with sound while a video plays, with silence, and with headphones plugged in
+  part-way through; **Record Sound** and the bar's speaker on a real overlay;
+- the disposable-VM checklist in
   [docs/chocolatey.md](https://github.com/stevenpickles/captastic/blob/v0.5.0/docs/chocolatey.md),
-  now with `captastic-cli` and sound steps.
+  with its `captastic-cli` and sound steps and the upgrade from a per-user install.
 
 ## What was not observed
 
